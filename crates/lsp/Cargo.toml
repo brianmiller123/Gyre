@@ -1,0 +1,24 @@
+[package]
+name        = "agent-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "全功能 LSP 客户端：诊断、跳转定义、查找引用、悬停、符号、重命名、代码操作、工作区符号。自动检测 Rust/TS/Go/Python 等项目类型的服务器。"
+
+[dependencies]
+agent-core = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }
+url        = "2"
+
+# LSP 协议类型（完整覆盖 LSP 3.17 规范）
+lsp-types  = { version = "0.97", features = ["proposed"] }
+
+[lints]
+workspace = true

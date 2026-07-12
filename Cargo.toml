@@ -1,0 +1,147 @@
+[workspace]
+resolver = "3"
+members  = ["crates/*"]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "MIT"
+authors      = ["agent-project"]
+repository   = "https://github.com/agent-project/agent-project"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all         = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+# 务实放宽：与 oh-my-pi 一致的工程化取舍
+module_name_repetitions    = "allow"
+must_use_candidate         = "allow"
+missing_errors_doc         = "allow"
+missing_panics_doc         = "allow"
+cast_possible_truncation   = "allow"
+cast_possible_wrap         = "allow"
+cast_sign_loss             = "allow"
+cast_precision_loss        = "allow"
+needless_pass_by_value     = "allow"
+fn_params_excessive_bools  = "allow"
+struct_excessive_bools     = "allow"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 共享依赖（crates 内通过 `dep.workspace = true` 引用）
+# ──────────────────────────────────────────────────────────────────────────────
+[workspace.dependencies]
+# 文件系统隔离
+similar     = "3.1"
+
+# 异步与并发
+tokio       = { version = "1", features = ["full"] }
+tokio-util  = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+async-stream = "0.3"
+futures     = "0.3"
+inventory   = "0.3"
+tokio-stream = "0.1"
+
+# 序列化
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+
+# 错误与日志
+thiserror   = "2"
+anyhow      = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 网络 / TLS（跨平台：rustls 免去 Windows OpenSSL）
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+tokio-tungstenite = "0.26"
+
+# Web 服务
+axum        = { version = "0.8", features = ["ws"] }
+tower-http  = { version = "0.6", features = ["fs", "cors", "trace"] }
+# 前端静态资源编译期嵌入二进制（debug 从磁盘热读 / release 内嵌）
+rust-embed  = { version = "8", features = ["compression", "include-exclude"] }
+mime_guess  = "2"
+
+# 代码操控 / 计数
+tiktoken-rs = "0.6"
+tree-sitter = "0.25"
+# 搜索（移植 pi-natives grep/glob/fd）
+ignore     = "0.4"            # ripgrep 核心：尊重 .gitignore 的并行遍历
+regex      = "1"
+globset    = "0.4"
+syntect    = { version = "5", default-features = false, features = ["default-fancy"] }
+# LSP 协议类型
+lsp-types  = { version = "0.97", features = ["proposed"] }
+# URL 解析
+url        = "2"
+# YAML（swarm 编排定义）
+serde_yaml = "0.9"
+# 密码学（collab 端到端加密：AES-256-GCM + base64 房间密钥）
+aes-gcm    = "0.10"
+rand       = { version = "0.8", features = ["std_rng"] }
+base64     = "0.22"
+# 图像 / 剪贴板（CLI 图片粘贴：RGBA→PNG 编码 + 跨平台剪贴板读取）
+image      = { version = "0.25", default-features = false, features = ["png"] }
+arboard    = "3"
+# 散列（hashline 文件版本绑定 / 文件指纹）
+sha2       = "0.10"
+# 跨平台 PTY（ConPTY / posix openpty）
+portable-pty = "0.8"
+# 遥测（OTel）
+opentelemetry = "0.27"
+opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+tracing-opentelemetry = "0.28"
+# ast-grep  = "0.7"   # 阶段5 AST 部分启用
+
+# 配置与跨平台
+secrecy     = { version = "0.10", features = ["serde"] }
+dirs        = "5"
+glob        = "0.3"            # 命令规则 glob 匹配
+uuid        = { version = "1", features = ["v4"] }
+
+# 工具 JSON Schema
+schemars    = "0.8"
+
+# CLI
+clap        = { version = "4", features = ["derive", "env"] }
+rustyline   = { version = "14", features = ["derive"] }
+
+# ── 内部 crate（path 引用）────────────────────────────────────────────────────
+agent-core    = { path = "crates/core" }
+agent-config  = { path = "crates/config" }
+agent-llm     = { path = "crates/llm" }
+agent-mcp     = { path = "crates/mcp" }
+agent-memory  = { path = "crates/memory" }
+agent-context = { path = "crates/context" }
+agent-prompt  = { path = "crates/prompt" }
+agent-tools   = { path = "crates/tools" }
+agent-ast     = { path = "crates/ast" }
+agent-search  = { path = "crates/search" }
+agent-skills  = { path = "crates/skills" }
+agent-lsp     = { path = "crates/lsp" }
+agent-iso     = { path = "crates/iso" }
+agent-server  = { path = "crates/server" }
+agent         = { path = "crates/agent" }
+agent-telemetry = { path = "crates/telemetry" }
+agent-swarm   = { path = "crates/swarm" }
+agent-hashline = { path = "crates/hashline" }
+agent-pty     = { path = "crates/pty" }
+agent-collab  = { path = "crates/collab" }
+agent-supervisor = { path = "crates/supervisor" }
+agent-acp     = { path = "crates/acp" }
+agent-i18n    = { path = "crates/i18n" }
+agent-cli     = { path = "crates/cli" }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 16
+strip         = true

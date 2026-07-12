@@ -1,0 +1,38 @@
+[package]
+name        = "agent-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP/WebSocket server: SessionManager + wire protocol + WebApprovalPolicy + static frontend"
+
+[dependencies]
+agent-core   = { workspace = true }
+agent        = { workspace = true }
+agent-supervisor = { workspace = true }
+agent-config = { workspace = true }
+agent-context = { workspace = true }
+agent-tools  = { workspace = true }
+agent-prompt = { workspace = true }
+agent-skills = { workspace = true }
+agent-mcp    = { workspace = true }
+agent-memory = { workspace = true }
+agent-collab = { workspace = true }
+agent-llm    = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+futures      = { workspace = true }
+axum         = { workspace = true }
+tower-http   = { workspace = true }
+rust-embed   = { workspace = true }
+mime_guess   = { workspace = true }
+reqwest      = { workspace = true }
+secrecy      = { workspace = true }
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name        = "agent-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Code search: grep (ripgrep core) + glob, ported from pi-natives"
+
+[dependencies]
+ignore     = { workspace = true }
+regex      = { workspace = true }
+globset    = { workspace = true }
+syntect    = { workspace = true }
+tiktoken-rs = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,164 @@
+# 复制本文件为 .agent/config.toml（项目级）或 ~/.config/agent/config.toml（用户级）
+# 项目级覆盖用户级（深度合并）。
+
+# 界面语言（CLI 与 Web）：en / zh / ru / ja。省略则自动跟随系统语言
+# （CLI 读 LANG/LC_*；Web 读 navigator.languages）。新增语言见 crates/i18n/locales。
+# language = "zh"
+
+[default_model]
+id               = "gpt-4o-mini"
+api              = "openai-completions"   # 决定 Provider 路由
+base_url         = "https://api.openai.com/v1"
+api_key          = "${OPENAI_API_KEY}"     # 支持 ${ENV} 展开，永不进日志
+temperature      = 0.2
+max_input_tokens  = 128000                 # 上下文窗口大小，达 context_window_guard% 触发压缩；留空回退 128000
+max_output_tokens = 4096
+
+# 额外模型 profile，运行时 `agent --model ds` 切换
+[[models]]
+id        = "deepseek-chat"
+alias     = "ds"
+api       = "openai-completions"
+base_url  = "https://api.deepseek.com"
+api_key   = "${DEEPSEEK_API_KEY}"
+temperature = 0.0
+
+# 本地 Ollama（OpenAI 兼容端点；OllamaChat 已被 OpenAiCompletionsAdapter 支持）
+[[models]]
+id        = "qwen2.5-coder:7b"
+alias     = "ollama"
+api       = "ollama-chat"
+base_url  = "http://localhost:11434/v1"
+api_key   = "ollama"            # Ollama 不校验，任意非空即可
+
+# 本地 vLLM（OpenAI 兼容端点）—— extra_body 传递 Provider 特有的非标准参数到请求体顶层。
+# 例如 vLLM 的 chat_template_kwargs（控制模板渲染，如 Qwen 思考开关）：
+# [[models]]
+# id        = "Qwen/Qwen3-32B"
+# alias     = "vllm"
+# api       = "openai-completions"
+# base_url  = "http://localhost:8000/v1"
+# api_key   = "EMPTY"
+# extra_body = { chat_template_kwargs = { thinking = true } }
+
+# OpenRouter（单 key 访问 200+ 模型，走 OpenAI 兼容）
+[[models]]
+id        = "anthropic/claude-3.5-sonnet"
+alias     = "or"
+api       = "openai-completions"
+base_url  = "https://openrouter.ai/api/v1"
+api_key   = "${OPENROUTER_API_KEY}"
+
+# GLM（智谱 / Z.ai）官方 API：完整支持 thinking 开关 + reasoning_content 思考内容回显。
+# 用专用 api = "zai" 协议（非 openai-completions），否则思考内容不会被解析、思考开关不会发送。
+# 国际版 base_url = "https://api.z.ai/api/paas/v4"；国内版（智谱开放平台）用下方 bigmodel.cn。
+# 启用思考：在下方 [agent] 段设 enable_thinking = true，GLM 思考模型（glm-4.7+/glm-5+）将
+# 显式发送 thinking:{type:"enabled"} + reasoning_effort（high/max），并回显 reasoning_content。
+[[models]]
+id        = "glm-5.2"
+alias     = "glm"
+api       = "zai"
+base_url  = "https://open.bigmodel.cn/api/paas/v4"   # 国内；国际版改 https://api.z.ai/api/paas/v4
+api_key   = "${ZAI_API_KEY}"                          # 或 ${GLM_API_KEY}
+max_input_tokens  = 1000000
+max_output_tokens = 131072
+
+[agent]
+mode                 = "code"            # code | architect | ask | debug（code/debug 写类自动放行）
+approval_mode        = "always-ask"      # always-ask | write | yolo（code/debug 模式下写类仍自动放行）
+max_mistakes         = 3
+context_window_guard = 0.8               # token 占用达 80% 触发压缩
+# 思考模式（reasoning/thinking）
+enable_thinking      = false             # 启用后由支持思考的模型消费（如 deepseek-reasoner）
+reasoning_budget     = 16000             # 思考 token 预算（可选）
+max_turns            = 10000             # agent最大循环次数
+
+# 逐工具审批覆盖（优先于模式与能力分级）。code/debug 模式下写类（write_file /
+# str_replace / apply_diff 等）默认已自动放行——编码是其核心能力；若需逐次确认，
+# 取消下方注释设为 "prompt"。命令执行（run_command）始终走审批门禁。
+[agent.tools.approval]
+read_file   = "allow"
+# write_file  = "prompt"    # code/debug 默认已放行；取消注释可强制逐次确认
+# str_replace = "prompt"    # 同上
+run_command = "ask"
+
+[agent.commands]
+# 命令规则（glob）：allow > deny > ask
+#
+# 支持两种写法（不可混用于同一键）：
+#   简写——裸字符串数组：
+#     allow = ["ls", "cat", "grep"]
+#   完整——带 pattern 字段的数组表（支持 glob 通配符）：
+#     [[agent.commands.allow]]
+#     pattern = "cargo *"
+#
+# 下面用完整写法演示 allow/deny/ask 三类规则：
+[[agent.commands.allow]]
+pattern = "ls"
+[[agent.commands.allow]]
+pattern = "cat"
+[[agent.commands.allow]]
+pattern = "grep"
+[[agent.commands.allow]]
+pattern = "cargo *"
+[[agent.commands.deny]]
+pattern = "rm -rf *"
+[[agent.commands.ask]]
+pattern = "docker *"
+
+[server]
+bind = "127.0.0.1:8080"
+# auth_token = "${AGENT_SERVER_TOKEN}"
+
+# Agent Client Protocol (ACP) 服务端：为 ACP 兼容客户端（Zed Editor / 自定义前端）
+# 提供标准化 JSON-RPC + SSE/stdio 接口。复用同一会话管理与审批机制，与 Web/CLI 等价。
+# CLI flag 可运行时覆盖：`agent --serve --acp`（HTTP+SSE）或 `agent --acp-stdio`（编辑器集成）。
+[acp]
+enabled   = false             # 默认关；true 则 --serve 时自动挂载 /acp/* 路由
+transport = "http"            # "http"（HTTP+SSE）/ "stdio" / "both"
+
+[skills]
+enabled = true
+enable_commands = false
+# custom_directories = ["~/extra-skills"]   # 额外扫描目录（~ 展开，非递归 */SKILL.md）
+# ignored = []   # 排除 glob，作用于 skill 名
+# included = []  # 包含 glob，空 = 全部
+
+# MCP server（stdio JSON-RPC 2.0）。每个 server 暴露的工具自动注册为 agent 工具。
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + LLM 合并）
+[memory]
+enabled = false          # 默认关；启用后跨会话积累技术决策/惯例/已踩坑
+auto_consolidate = true  # 任务结束触发 LLM 合并 raw notes → MEMORY.md
+
+# GitHub 工具（查询/操作 PR、issue、Actions(CI)），按需加载以控制上下文成本。
+# enabled = true 启动即注册工具并把使用指引注入 system prompt；
+#   运行时也可用 `/github on|off|write` 动态切换——仅启用时才注入提示词，
+#   未启用完全屏蔽（零 Token 开销）。鉴权读取环境变量 GH_TOKEN / GITHUB_TOKEN。
+[github]
+enabled = false       # 默认关；启用后可 get/list PR/issue/Actions、graphql
+allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高审批门禁）
+
+# 可选工具组开关：仅启用组才注册工具并把操作提示词注入 system prompt；
+# 未启用完全屏蔽（工具不进 LLM 工具列表、提示词不进上下文），严格控制初始 Token 开销。
+# 运行时也可用 `/tools <key> on|off` 动态切换（切换后重建 Agent 即时生效）。
+# 核心工具（read_file/write_file/str_replace/apply_diff/list_files/run_command/grep/glob）
+# 始终启用，不受此控制；GitHub 由上面 [github] enabled 控制。
+[tools.enabled]
+# ast      = true    # replace_block / ast_search / ast_rewrite（tree-sitter 句法感知）
+# lsp      = true    # 诊断/定义/引用/重命名（需工作区可发现语言服务器）
+# image    = true    # read_image / image_gen（后者需 IMAGE_API_KEY/OPENAI_API_KEY）
+# hashline = true    # apply_hashline（行锚定批量编辑，多文件多区间）
+# pty      = true    # run_pty_command（TTY 依赖命令：top/vim/交互式 REPL）
+
+# 子 Agent（task 委派 + swarm 多代理编排）统一配置。
+# 控制 task 工具开关、并发护栏、是否继承父 temperature/thinking、独立 token 预算。
+[subagent]
+enabled            = true      # 总开关：false 则不注册 task 工具，且 /swarm 拒绝执行
+max_concurrent     = 4         # 同波/并行子 Agent 最大并发数（信号量护栏，防触发上游速率限制）
+inherit_parent     = true      # 子 Agent 是否继承父 temperature / thinking（消除「父思考、子不思考」割裂）
+# max_output_tokens = 8192     # 子 Agent 独立输出 token 预算；留空则回退到 [default_model].max_output_tokens
+# task 工具支持单任务（task）与并行多任务（tasks 数组）；多任务按 max_concurrent 并发执行后聚合。

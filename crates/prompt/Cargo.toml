@@ -1,0 +1,13 @@
+[package]
+name        = "agent-prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Prompt template engine + system/mode prompts"
+
+[dependencies]
+agent-core = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name        = "agent-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sub-agent supervision bus: live status registry + event stream for Web/CLI monitoring"
+
+[dependencies]
+agent-core = { workspace = true }
+serde      = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

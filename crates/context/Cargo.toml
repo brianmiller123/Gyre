@@ -1,0 +1,22 @@
+[package]
+name        = "agent-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Context memory: AppendOnlyLog + StablePrefix + tiktoken count + summarization/shake"
+
+[dependencies]
+agent-core  = { workspace = true }
+agent-prompt = { workspace = true }
+futures     = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+tiktoken-rs = { workspace = true }
+
+base64   = { workspace = true }
+
+[lints]
+workspace = true

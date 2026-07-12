@@ -1,0 +1,23 @@
+[package]
+name        = "agent-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cross-session long-term memory: per-project markdown store + LLM consolidation"
+
+[dependencies]
+agent-core   = { workspace = true }
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+serde_json   = { workspace = true }
+futures      = { workspace = true }
+uuid         = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name        = "agent-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AST code manipulation: block_range_at (tree-sitter), ported from pi-ast"
+
+[dependencies]
+# tree-sitter 0.24（与 ast-grep-core 的 facade 0.24 对齐，避免 links 冲突）
+tree-sitter       = "0.24"
+# 多语言 grammar（0.23.x 均基于 tree-sitter 0.24 facade，避免版本分裂）
+tree-sitter-rust       = "0.23"
+tree-sitter-python     = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go         = "0.23"
+# ast-grep-core 提供结构化 meta-variable 匹配（$X / $$$Y）
+ast-grep-core     = "0.34"
+tracing           = { workspace = true }
+
+[lints]
+workspace = true

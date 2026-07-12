@@ -1,0 +1,28 @@
+[package]
+name = "agent-swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Swarm 多代理编排：YAML 定义 → DAG 拓扑波 → 并行子 Agent 编排（移植 oh-my-pi swarm-extension）。"
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-core.workspace = true
+agent.workspace = true
+agent-prompt.workspace = true
+agent-tools.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

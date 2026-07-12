@@ -1,0 +1,27 @@
+[package]
+name = "agent-collab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Collab Web：端到端加密（AES-256-GCM）的协同会话中继，房间密钥仅存于 URL 片段（移植 oh-my-pi collab-web）。"
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-core.workspace = true
+async-trait.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

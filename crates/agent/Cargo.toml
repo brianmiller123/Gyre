@@ -1,0 +1,25 @@
+[package]
+name        = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent execution loop: state machine + tool orchestration + approval gate"
+
+[dependencies]
+agent-core   = { workspace = true }
+agent-iso    = { workspace = true }
+agent-supervisor = { workspace = true }
+agent-tools  = { workspace = true }
+agent-prompt = { workspace = true }
+agent-skills = { workspace = true }
+async-trait  = { workspace = true }
+async-stream = { workspace = true }
+futures      = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+
+[lints]
+workspace = true
