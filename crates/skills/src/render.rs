@@ -11,7 +11,10 @@ pub fn render_skills_section(skills: &[&Skill]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
-    let mut out = String::from("\n\n<skills>\n以下 skill 可用，需要时用 read_file skill://<name> 加载完整说明：\n");
+    let mut out = String::from(
+        "\n\n<skills>\n以下 skill 可用，需要时用 read_file skill://<name> 加载完整说明\
+         （分体式 skill 的附属文件用 skill://<name>/<相对路径> 读取）：\n",
+    );
     for skill in skills {
         let name = one_line(&skill.name);
         let desc = one_line(&skill.description);

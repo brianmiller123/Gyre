@@ -402,7 +402,7 @@ fn run_loop(
         // 若注入了 Skill 目录，则追加 `<skills>` 段（仅当 read_file 工具可用时）。
         let specs0 = tools.specs();
         let has_read = specs0.iter().any(|s| s.name == "read_file");
-        let mut system = prompts.system(mode);
+        let mut system = prompts.system_with_platform(mode);
         // 上下文约定文件（AGENTS.md）注入为额外 system 段
         for cf in &context_files {
             system.push(cf.clone());

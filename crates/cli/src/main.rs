@@ -53,8 +53,9 @@ struct Cli {
     #[arg(long)]
     lang: Option<String>,
     /// 启动 Web 服务（HTTP + WebSocket + 前端），而非运行单次任务。
-    #[arg(long)]
-    serve: bool,
+    /// 不带值时监听配置文件 `[server].bind` 地址；带值则覆盖监听地址（如 `--serve 0.0.0.0:80`）。
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    serve: Option<String>,
     /// 启用 ACP（Agent Client Protocol）HTTP+SSE 端点（与 --serve 配合；亦受 [acp].enabled 控制）。
     #[arg(long)]
     acp: bool,
@@ -167,7 +168,24 @@ async fn main() -> Result<()> {
     }
 
     // Web 服务模式
-    if cli.serve {
+    if let Some(serve_addr) = &cli.serve {
+        // --serve 不带值 → 沿用配置文件 `[server].bind`；
+        // 带完整地址（如 `0.0.0.0:80`）→ 直接覆盖；
+        // 仅端口形式（如 `:80`）→ 取配置 bind 的 host 部分补全（`:80` → `127.0.0.1:80`）。
+        if !serve_addr.is_empty() {
+            let resolved = if let Some(port) = serve_addr.strip_prefix(':') {
+                let host = cfg
+                    .server
+                    .bind
+                    .rsplit_once(':')
+                    .map(|(h, _)| h)
+                    .unwrap_or("127.0.0.1");
+                format!("{host}:{port}")
+            } else {
+                serve_addr.clone()
+            };
+            cfg.server.bind = resolved;
+        }
         return run_server(cfg, cwd, cli.acp).await;
     }
 
@@ -240,7 +258,7 @@ async fn main() -> Result<()> {
     let mode = cfg.agent.mode;
     let prompts = Arc::new(agent_prompt::PromptCatalog::new());
     let session_path = session_store.path_for(&session_id);
-    let pctx = agent_context::PersistentContext::open(prompts.system(mode), &session_path)
+    let pctx = agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
         .await
         .context(t!("error.open_persistence"))?;
     pctx.set_summarizer(Box::new(
@@ -597,7 +615,7 @@ async fn main() -> Result<()> {
                         eprintln!("{}", t!("session.not_exist", id = id));
                     } else {
                         match agent_context::PersistentContext::open(
-                            prompts.system(current_mode),
+                            prompts.system_with_platform(current_mode),
                             &path,
                         )
                         .await

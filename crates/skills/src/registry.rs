@@ -129,7 +129,10 @@ impl SkillResolver for SkillCatalog {
 /// 缺名 / 未知名 / 绝对路径 / 路径遍历时返回 [`SkillError`]。
 pub fn resolve_skill_url(url: &str, skills: &[Skill]) -> Result<PathBuf, SkillError> {
     let rest = url.strip_prefix("skill://").unwrap_or(url);
-    let (name, path_part) = match rest.find('/') {
+    // 同时认 `/` 与 `\`：skill 名规范（^[a-z0-9]+(-[a-z0-9]+)*$）禁止二者，
+    // 故首个 `/` 或 `\` 必为 name/rel 分隔符。Windows 环境下 LLM 易用 `\` 构造 URL，
+    // 仅按 `/` 分割会把整个 `name\sub\file.md` 当作 skill 名 → Unknown。
+    let (name, path_part) = match rest.find(|c| c == '/' || c == '\\') {
         Some(idx) => (&rest[..idx], Some(&rest[idx + 1..])),
         None => (rest, None),
     };
@@ -302,5 +305,13 @@ mod tests {
         };
         let p = SkillResolver::resolve(&cat, "skill://pdf").unwrap();
         assert_eq!(p, PathBuf::from("/x/pdf/SKILL.md"));
+    }
+
+    /// 回归：Windows 反斜杠作子路径分隔符时，应能正确分割 skill 名与子路径。
+    #[test]
+    fn resolve_skill_backslash_subpath() {
+        let s = skill("pdf", "/skills/pdf");
+        let result = resolve_skill_url("skill://pdf\\references\\tables.md", &[s]);
+        assert!(result.is_ok(), "反斜杠子路径应能解析，实际: {result:?}");
     }
 }

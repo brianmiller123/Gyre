@@ -738,7 +738,7 @@ async fn build_agent(
     let prompts = Arc::new(agent_prompt::PromptCatalog::new());
     // 持久化上下文（与 CLI 共享 <cwd>/.agent/sessions/<id>.jsonl）：resume 时自动加载历史。
     let session_path = agent_context::SessionStore::for_cwd(cwd).path_for(session_id);
-    let ctx = agent_context::PersistentContext::open(prompts.system(mode), &session_path)
+    let ctx = agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
         .await
         .map_err(|e| e.to_string())?;
     ctx.set_summarizer(Box::new(

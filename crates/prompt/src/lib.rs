@@ -37,6 +37,62 @@ impl PromptCatalog {
         .to_string()]
     }
 
+    /// 检测当前操作系统与架构，生成平台感知系统提示词段落。
+    ///
+    /// 让模型知晓运行环境，从而使用正确的 `shell` 语法、路径分隔符与原生命令，
+    /// 避免在 `Windows` 上生成 `bash` 语法或在 `unix` 上生成 `PowerShell` 语法。
+    /// 输出在进程运行期内固定不变，属稳定前缀，不破坏 `provider` 前缀缓存。
+    #[must_use]
+    pub fn platform_section(&self) -> String {
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let (platform_name, shell, notes): (&str, &str, &[&str]) = match os {
+            "windows" => (
+                "Windows",
+                "PowerShell",
+                &[
+                    "路径分隔符为反斜杠 `\\`",
+                    "列出文件用 `dir` 或 `Get-ChildItem`，而非 `ls`",
+                    "读取环境变量用 `$env:VAR`（而非 `$VAR` 或 `%VAR%`）",
+                    "换行符为 CRLF（`\\r\\n`）",
+                ],
+            ),
+            "macos" => (
+                "macOS",
+                "zsh / bash",
+                &[
+                    "路径分隔符为正斜杠 `/`",
+                    "文件系统默认大小写不敏感（APFS）",
+                    "macOS 专有命令：`open`、`pbcopy`/`pbpaste`、`defaults`",
+                ],
+            ),
+            "linux" => (
+                "Linux",
+                "bash / sh",
+                &["路径分隔符为正斜杠 `/`", "文件系统大小写敏感"],
+            ),
+            _ => ("类 Unix", "sh", &["路径分隔符为正斜杠 `/`"]),
+        };
+        let notes_text = notes
+            .iter()
+            .map(|n| format!("- {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "\n\n<environment>\n当前运行环境：{platform_name}（{os}/{arch}）。\n默认 Shell：{shell}。\n平台注意事项：\n{notes_text}\n执行命令与编写脚本时须遵循上述平台约定。\n</environment>\n"
+        )
+    }
+
+    /// 按模式返回 system prompt，并自动追加平台感知段落（稳定前缀）。
+    ///
+    /// 平台段位于模式主体之后，适合作为 `system` 首部之后的固定块。
+    #[must_use]
+    pub fn system_with_platform(&self, mode: Mode) -> Vec<String> {
+        let mut system = self.system(mode);
+        system.push(self.platform_section());
+        system
+    }
+
     /// 轻量 `{{var}}` 模板渲染。
     #[must_use]
     pub fn render(&self, template: &str, vars: &[(&str, &str)]) -> String {
@@ -65,5 +121,27 @@ mod tests {
         assert!(cat.system(Mode::Ask)[0].contains("技术顾问"));
         assert!(cat.system(Mode::Architect)[0].contains("架构师"));
         assert!(cat.system(Mode::Debug)[0].contains("调试专家"));
+    }
+
+    #[test]
+    fn platform_section_contains_environment_tag() {
+        let cat = PromptCatalog::new();
+        let section = cat.platform_section();
+        assert!(section.contains("<environment>"), "应含 <environment> 标签");
+        assert!(section.contains("</environment>"));
+        // 应含当前 OS 与架构常量
+        assert!(section.contains(std::env::consts::OS), "应含当前 OS");
+        assert!(section.contains(std::env::consts::ARCH), "应含当前 ARCH");
+        // 应含 Shell 提示
+        assert!(section.contains("Shell"));
+    }
+
+    #[test]
+    fn system_with_platform_appends_section() {
+        let cat = PromptCatalog::new();
+        let sys = cat.system_with_platform(Mode::Code);
+        assert_eq!(sys.len(), 2, "应为基础 prompt + 平台段");
+        assert!(sys[0].contains("软件工程师"), "首段为模式主体");
+        assert!(sys[1].contains("<environment>"), "次段为平台感知");
     }
 }
