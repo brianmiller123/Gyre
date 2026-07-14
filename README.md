@@ -1,6 +1,8 @@
-# agent-project
+# Gyre
 
-> **高性能 Rust 智能体框架**——融合 Zoo-Code 的高阶认知与流程控制，以及 oh-my-pi 的底层代码操控精确性，在纯 Rust 生态中实现现代化 AI 编程智能体。
+**English** | [简体中文](README_ZH.md) | [Русский](README_RU.md)
+
+> **A high-performance Rust agent framework** — fusing the higher-order cognition and process control of Zoo-Code with the low-level code-manipulation precision of oh-my-pi, realizing a modern AI coding agent entirely within the Rust ecosystem.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue)](rust-toolchain.toml)
@@ -8,109 +10,109 @@
 
 ---
 
-## 📋 核心功能
+## 📋 Core Features
 
-agent-project 是一个**生产级 AI 编程智能体框架**，提供完整的「感知→推理→行动」闭环：
+Gyre is a **production-grade AI coding agent framework** that provides a complete *perceive → reason → act* closed loop:
 
-### 🤖 智能体引擎
-- **五态状态机**（NoTask → Running → Streaming → WaitingForInput → Idle）：移植 Zoo-Code 成熟的状态模型，精确控制智能体生命周期。
-- **消息驱动架构**：`say`（信息性）/ `ask`（交互阻塞）消息模型，支持审批网关与用户回执。
-- **多模式**：`code`（编码）/ `architect`（架构）/ `ask`（问答）/ `debug`（调试），模式决定 system prompt 与工具子集。
-- **Steering 机制**：运行时中途注入消息，动态干预智能体推理方向。
-- **软工具需求**：先提醒后强制，保护 Provider 前缀缓存。
+### 🤖 Agent Engine
+- **Five-state state machine** (NoTask → Running → Streaming → WaitingForInput → Idle): ported from Zoo-Code's mature state model for precise control of the agent lifecycle.
+- **Message-driven architecture**: `say` (informational) / `ask` (interactive-blocking) message models, with an approval gateway and user receipts.
+- **Multiple modes**: `code` (coding) / `architect` (architecture) / `ask` (Q&A) / `debug` (debugging). The mode determines the system prompt and the tool subset.
+- **Steering mechanism**: inject messages mid-run to dynamically intervene in the agent's reasoning direction.
+- **Soft tool requirements**: warn first, then enforce, protecting the provider prefix cache.
 
-### 🛠️ 工具链
-- **核心工具**：`read_file` / `write_file` / `str_replace` / `apply_diff` / `list_files` / `run_command` / `grep` / `glob`
-- **AST 代码操控**（可选）：`replace_block`（tree-sitter 句法块替换）/ `ast_search` / `ast_rewrite`（ast-grep 结构化搜索重写）
-- **LSP 集成**（可选）：诊断 / 跳转到定义 / 查找引用 / 重命名符号
-- **Hashline DSL**（可选）：行锚定批量编辑，多文件多区间一次性应用
-- **PTY 伪终端**（可选）：`run_pty_command`，支持交互式终端应用（top / vim / REPL）
-- **图像处理**（可选）：`read_image` / `image_gen`（DALL·E 或兼容 API）
-- **GitHub 集成**（可选）：PR / Issue / Actions 查询与操作，GraphQL 查询
-- **MCP 协议**：兼容 Model Context Protocol，可挂载任意 MCP server 工具
+### 🛠️ Toolchain
+- **Core tools**: `read_file` / `write_file` / `str_replace` / `apply_diff` / `list_files` / `run_command` / `grep` / `glob`
+- **AST code manipulation** (optional): `replace_block` (tree-sitter syntactic block replacement) / `ast_search` / `ast_rewrite` (ast-grep structural search & rewrite)
+- **LSP integration** (optional): diagnostics / go-to-definition / find references / rename symbol
+- **Hashline DSL** (optional): line-anchored batch editing, applying multiple files and ranges in one pass
+- **PTY pseudo-terminal** (optional): `run_pty_command`, supports interactive terminal apps (top / vim / REPL)
+- **Image processing** (optional): `read_image` / `image_gen` (DALL·E or a compatible API)
+- **GitHub integration** (optional): query and operate on PRs / Issues / Actions, plus GraphQL queries
+- **MCP protocol**: compatible with the Model Context Protocol; any MCP server's tools can be mounted
 
-### 🧠 上下文管理
-- **AppendOnlyLog**：消息只追加，唯一变异路径是压缩时合法 `replaceTail`
-- **StablePrefix 指纹化**：system prompt + tool spec 一次快照、SHA-256 字节指纹冻结，最大化 Provider 端前缀缓存命中率
-- **三级压缩**：Shake（抖动去冗余）→ Summarize（LLM handoff 摘要）→ Prune（窗口兜底），配合 Tool-Protection 保护工具结果
-- **Token 计数**：基于 `tiktoken-rs`，精确追踪每轮用量
+### 🧠 Context Management
+- **AppendOnlyLog**: messages are append-only; the only legal mutation path is `replaceTail` during compaction
+- **StablePrefix fingerprinting**: system prompt + tool spec are snapshotted once and frozen with a SHA-256 byte fingerprint to maximize the provider-side prefix cache hit rate
+- **Three-tier compaction**: Shake (jitter-based dedup) → Summarize (LLM handoff summary) → Prune (window fallback), combined with Tool-Protection to safeguard tool results
+- **Token counting**: based on `tiktoken-rs`, accurately tracking per-turn usage
 
-### 🔌 LLM 多 Provider
-- **ProviderRegistry**：单一入口按 `model.api` 路由，内置 `ProviderCallContext` 鉴权与并发限流
-- **OpenAI Chat Completions**：覆盖 OpenAI / 兼容网关 / 本地 vLLM / Ollama
-- **DeepSeek**：DeepSeek Chat / Reasoner
-- **GLM（智谱 / Z.ai）**：官方 API 完整支持 —— `thinking` 开关、`reasoning_content` 思考回显、`preserveReasoning` 多轮续接
-- **开放适配器**：实现 `LlmProvider` trait + 一行注册即可接入新 Provider
-- **思考模式**（Thinking/Reasoning）：支持 `deepseek-reasoner` / GLM 思考模型（glm-4.7+/glm-5+）的思考 token 预算
+### 🔌 LLM Multi-Provider
+- **ProviderRegistry**: a single entry point routes by `model.api`, with built-in `ProviderCallContext` authentication and concurrency rate-limiting
+- **OpenAI Chat Completions**: covers OpenAI / compatible gateways / local vLLM / Ollama
+- **DeepSeek**: DeepSeek Chat / Reasoner
+- **GLM (Zhipu / Z.ai)**: full official API support — `thinking` toggle, `reasoning_content` thinking echo, `preserveReasoning` multi-turn continuation
+- **Open adapter**: implement the `LlmProvider` trait + a one-line registration to add a new provider
+- **Thinking mode** (Thinking/Reasoning): supports the thinking-token budget for `deepseek-reasoner` / GLM thinking models (glm-4.7+/glm-5+)
 
-### 🌐 双前端
-- **CLI / REPL**：`rustyline` 行编辑 + Tab 补全 + Markdown 流式渲染 + 色彩高亮
-- **Web UI**（React + TypeScript + Vite）：实时 WebSocket 双向通信，带宽优化线协议（增量优先）
-- **会话管理**：持久化 JSONL 历史，支持恢复 / fork / 导出
-- **多语种（i18n）**：CLI 与 Web 默认跟随系统语言，内置中文 / English / Русский / 日本語，可在设置或配置中切换，扩展新语言仅需加一个资源文件
+### 🌐 Dual Front-Ends
+- **CLI / REPL**: `rustyline` line editing + Tab completion + streaming Markdown rendering + syntax highlighting
+- **Web UI** (React + TypeScript + Vite): real-time bidirectional WebSocket communication, a bandwidth-optimized wire protocol (delta-first)
+- **Session management**: persisted JSONL history, with support for resume / fork / export
+- **Multilingual (i18n)**: CLI and Web follow the system language by default; built-in Chinese / English / Русский / 日本語; switchable in settings or config; adding a language takes just one resource file
 
-### 🔌 ACP 协议（编辑器集成）
-- **Agent Client Protocol v1**：遵循 [agentclientprotocol.com](https://agentclientprotocol.com) 标准，为 Zed Editor 等兼容客户端提供 JSON-RPC 2.0 + SSE/stdio 接口
-- **双传输模式**：`stdio`（编辑器作为子进程调用，零端口占用）/ `http`（HTTP+SSE，与 Web 前端同端口复用）
-- **三端等价**：ACP 与 CLI、Web 前端共享同一份会话管理与审批机制，同一会话可被多客户端同时订阅
-- **标准事件流**：`session/update` 推送 `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update` 等 ACP 标准事件
-- **能力声明**：`initialize` 握手时如实声明 `promptCapabilities`（image 支持）与 `mcpCapabilities`（stdio 支持），严格客户端 schema 校验通过
+### 🔌 ACP Protocol (Editor Integration)
+- **Agent Client Protocol v1**: follows the [agentclientprotocol.com](https://agentclientprotocol.com) standard, providing a JSON-RPC 2.0 + SSE/stdio interface for compatible clients such as the Zed Editor
+- **Dual transport modes**: `stdio` (the editor invokes it as a subprocess, zero port usage) / `http` (HTTP+SSE, multiplexed on the same port as the Web front-end)
+- **Three-way equivalence**: ACP shares the same session management and approval mechanism as the CLI and Web front-ends; the same session can even be subscribed to by multiple clients simultaneously
+- **Standard event stream**: `session/update` pushes ACP-standard events such as `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update`
+- **Capability declaration**: the `initialize` handshake truthfully declares `promptCapabilities` (image support) and `mcpCapabilities` (stdio support), passing strict client schema validation
 
-### 🔄 多 Agent 编排
-- **子 Agent 委派**（TaskTool）：父 Agent 可委派子任务给子 Agent，支持并发护栏与独立 Token 预算
-- **Swarm 多代理**：YAML 定义 DAG 工作流，波内并行执行，管道进度回调
-- **Supervisor 监控**：实时追踪所有子 Agent 状态（运行/成功/失败），CLI Dashboard 与 Web 仪表盘
+### 🔄 Multi-Agent Orchestration
+- **Sub-agent delegation** (TaskTool): a parent agent can delegate subtasks to sub-agents, with concurrency guardrails and independent token budgets
+- **Swarm multi-agent**: YAML-defined DAG workflows, intra-wave parallel execution, pipeline progress callbacks
+- **Supervisor monitoring**: real-time tracking of all sub-agent states (running/success/failure), with a CLI dashboard and a Web dashboard
 
-### 🤝 协同中继
-- **端到端加密**：AES-256-GCM 密封字节，中继服务器盲视（仅按 room_id 路由）
-- **WebSocket 桥接**：多用户可加入同一房间，实时共享智能体会话
+### 🤝 Collaboration Relay
+- **End-to-end encryption**: AES-256-GCM sealed bytes; the relay server is blind (routes only by room_id)
+- **WebSocket bridging**: multiple users can join the same room to share an agent session in real time
 
-### 📐 架构设计
-- **Ports & Adapters（六边形架构）**：所有核心依赖以 `Arc<dyn Trait>` 注入，循环对传输/Provider/Tool 完全透明
-- **零侵入扩展**：`inventory` 编译期插件自荐注册，新增 Provider/Tool 无需修改中央注册清单
-- **单向依赖**：`core` 零业务依赖，`agent` 仅依赖 Trait 而非具体实现，依赖链单向无环
-- **事件驱动**：循环产出 `Stream<Item = AgentEvent>`，前端/CLI 统一订阅
+### 📐 Architecture Design
+- **Ports & Adapters (Hexagonal Architecture)**: all core dependencies are injected as `Arc<dyn Trait>`; the loop is completely transparent to transport / provider / tool
+- **Non-invasive extension**: `inventory` compile-time plugin self-registration; adding a provider/tool requires no changes to any central registry
+- **Unidirectional dependencies**: `core` has zero business dependencies; `agent` depends only on Traits, not concrete implementations; the dependency graph is unidirectional and acyclic
+- **Event-driven**: the loop yields `Stream<Item = AgentEvent>`; both front-ends subscribe uniformly
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 前置要求
+### Prerequisites
 
-- Rust 工具链 1.85+（见 [`rust-toolchain.toml`](rust-toolchain.toml)）
-- 一个 LLM API key（OpenAI / Anthropic / DeepSeek / GLM / 本地 vLLM）
+- Rust toolchain 1.85+ (see [`rust-toolchain.toml`](rust-toolchain.toml))
+- An LLM API key (OpenAI / Anthropic / DeepSeek / GLM / local vLLM)
 
-### 安装与运行
+### Install & Run
 
 ```bash
-# 克隆仓库
-git clone https://github.com/agent-project/agent-project.git
-cd agent-project
+# Clone the repository
+git clone https://github.com/Gyre/Gyre.git
+cd Gyre
 
-# 复制配置并填入 API key
+# Copy the config and fill in your API key
 cp config.example.toml .agent/config.toml
 
-# 构建（Release 模式）
+# Build (Release mode)
 cargo build --release
 
-# 运行单次任务
-./target/release/agent "列出当前目录文件并用树状图展示"
+# Run a one-off task
+./target/release/agent "List the files in the current directory and show a tree"
 
-# 或启动交互式 REPL
+# Or launch the interactive REPL
 ./target/release/agent
 
-# 启动 Web 服务
+# Start the Web service
 ./target/release/agent --serve
 ```
 
-### 配置文件
+### Configuration
 
-配置使用 TOML 格式，分层加载（后者覆盖前者）：
+Configuration uses TOML and is loaded in layers (later overrides earlier):
 
-1. **用户级**：`~/.config/agent/config.toml`（Windows `%APPDATA%\agent`）
-2. **项目级**：`<cwd>/.agent/config.toml`
+1. **User level**: `~/.config/agent/config.toml` (Windows `%APPDATA%\agent`)
+2. **Project level**: `<cwd>/.agent/config.toml`
 
-支持多模型 profile，运行时通过 `--model <alias>` 或 `/model <alias>` 命令切换：
+Multiple model profiles are supported; switch at runtime via `--model <alias>` or the `/model <alias>` command:
 
 ```toml
 [default_model]
@@ -129,181 +131,181 @@ base_url  = "https://api.deepseek.com"
 api_key   = "${DEEPSEEK_API_KEY}"
 ```
 
-详细配置选项见 [`config.example.toml`](config.example.toml)。
+See [`config.example.toml`](config.example.toml) for the full set of options.
 
-### 🌐 多语种（i18n）
+### 🌐 Multilingual (i18n)
 
-CLI 与 Web 默认**跟随系统语言**（CLI 读 `LANG` / `LC_ALL` / `LC_MESSAGES`；Web 读 `navigator.languages`），内置 4 种语言：
+CLI and Web **follow the system language by default** (the CLI reads `LANG` / `LC_ALL` / `LC_MESSAGES`; the Web reads `navigator.languages`), with 4 built-in languages:
 
-| 代码 | 语言 | CLI 资源 | Web 资源 |
-| ---- | ---- | -------- | -------- |
+| Code | Language | CLI resource | Web resource |
+| ---- | -------- | ------------ | ------------ |
 | `en` | English  | [`crates/i18n/locales/en.json`](crates/i18n/locales/en.json) | [`web/c5-ui/src/lib/locales.ts`](web/c5-ui/src/lib/locales.ts) |
-| `zh` | 中文     | `crates/i18n/locales/zh.json` | 同上 |
-| `ru` | Русский  | `crates/i18n/locales/ru.json` | 同上 |
-| `ja` | 日本語   | `crates/i18n/locales/ja.json` | 同上 |
+| `zh` | 中文     | `crates/i18n/locales/zh.json` | same |
+| `ru` | Русский  | `crates/i18n/locales/ru.json` | same |
+| `ja` | 日本語   | `crates/i18n/locales/ja.json` | same |
 
-**配置覆盖**（可选，留空则自动探测系统语言）：
+**Config override** (optional; leave blank to auto-detect the system language):
 
 ```toml
-# 置于 config.toml 顶层
+# Top level of config.toml
 language = "zh"   # en / zh / ru / ja
 ```
 
-- **CLI**：在 [`main.rs`](crates/cli/src/main.rs) 启动期先以系统语言初始化（`agent_i18n::init(None)`），配置加载后若指定 `language` 再覆盖。
-- **Web**：在 [设置面板](web/c5-ui/src/components/agent/SettingsPanel.tsx) 的「外观 → 语言」下拉切换；偏好持久化于 `localStorage`，选「Auto」则跟随系统并在系统语言变化时即时切换。
+- **CLI**: [`main.rs`](crates/cli/src/main.rs) initializes with the system language at startup (`agent_i18n::init(None)`); once config is loaded, an explicit `language` overrides it.
+- **Web**: switch in the [settings panel](web/c5-ui/src/components/agent/SettingsPanel.tsx) under "Appearance → Language"; the preference is persisted in `localStorage`, and "Auto" follows the system and updates instantly when the system language changes.
 
-#### 新增一种语言（两处对称）
+#### Adding a language (symmetric in two places)
 
-1. **CLI**：在 [`crates/i18n/locales/`](crates/i18n/locales/) 复制 `en.json` 为 `<code>.json` 并翻译；再在 [`lib.rs`](crates/i18n/src/lib.rs) 的 `LOCALE_FILES` 与 `SUPPORTED`、`match_supported` 各登记一行。
-2. **Web**：在 [`locales.ts`](web/c5-ui/src/lib/locales.ts) 追加一个 `Dict` 并加入 `locales`/`SUPPORTED_LOCALES`，并在各语言里补 `lang.<code>` 的母语自显示名。
+1. **CLI**: copy `en.json` to `<code>.json` in [`crates/i18n/locales/`](crates/i18n/locales/) and translate it; then register one line each in `LOCALE_FILES`, `SUPPORTED`, and `match_supported` inside [`lib.rs`](crates/i18n/src/lib.rs).
+2. **Web**: append a `Dict` in [`locales.ts`](web/c5-ui/src/lib/locales.ts), add it to `locales`/`SUPPORTED_LOCALES`, and fill in the native self-display name via `lang.<code>` in every language.
 
-回退链统一为：当前语言 → 英文 → key 本身（开发期可见缺失，不报错）。
+The fallback chain is uniform: current language → English → the key itself (missing keys are visible during development without errors).
 
 ---
 
-## 📦 模块结构
+## 📦 Module Structure
 
 ```
-agent-project/
-├── Cargo.toml                  # workspace 配置
+Gyre/
+├── Cargo.toml                  # workspace config
 ├── crates/
-│   ├── core/                   # 契约层：类型 + Trait + 错误（零业务依赖）
-│   ├── config/                 # TOML 分层配置 + 模型 profile + 审批规则引擎
-│   ├── llm/                    # LLM Provider 适配器（OpenAI/Anthropic/DeepSeek）
-│   ├── context/                # 上下文管理（AppendOnlyLog + StablePrefix + 压缩）
-│   ├── prompt/                 # System prompt 模板引擎
-│   ├── tools/                  # 工具集（文件系统/AST/LSP/搜索/Shell/GitHub/图像）
-│   ├── agent/                  # 执行循环状态机（智能体核心）
-│   ├── server/                 # HTTP/WebSocket 服务（axum）
-│   ├── cli/                    # CLI 二进制入口（REPL + 命令调度）
-│   ├── ast/                    # AST 操控（tree-sitter + ast-grep）
-│   ├── search/                 # 代码搜索（grep/glob/fd/highlight/tokens）
-│   ├── mcp/                    # MCP 协议客户端
-│   ├── memory/                 # 跨会话长期记忆
-│   ├── skills/                 # Skill 系统（file-backed 技能）
-│   ├── swarm/                  # 多 Agent 编排（DAG 管道）
-│   ├── collab/                 # 协同中继（端到端加密）
-│   ├── hashline/               # Hashline DSL 批量编辑
-│   ├── pty/                    # PTY 伪终端工具
-│   ├── lsp/                    # LSP 语言服务器客户端
-│   ├── iso/                    # 文件系统隔离（沙箱 diff）
-│   ├── supervisor/             # 子 Agent 监控总线
-│   ├── i18n/                   # 多语种消息目录（编译期内嵌 + 系统语言探测）
-│   └── telemetry/              # OpenTelemetry 可观测性
-├── web/                        # Web UI 前端（React + Vite）
-│   └── c5-ui/                  # 前端源码
-├── prompts/                    # System prompt 模板（.md）
-├── plans/                      # 架构设计文档
-└── config.example.toml         # 配置示例
+│   ├── core/                   # contracts: types + traits + errors (zero business deps)
+│   ├── config/                 # layered TOML config + model profiles + approval rule engine
+│   ├── llm/                    # LLM provider adapters (OpenAI/Anthropic/DeepSeek)
+│   ├── context/                # context management (AppendOnlyLog + StablePrefix + compaction)
+│   ├── prompt/                 # system prompt template engine
+│   ├── tools/                  # toolset (filesystem/AST/LSP/search/shell/GitHub/image)
+│   ├── agent/                  # execution-loop state machine (the agent core)
+│   ├── server/                 # HTTP/WebSocket service (axum)
+│   ├── cli/                    # CLI binary entry (REPL + command dispatch)
+│   ├── ast/                    # AST manipulation (tree-sitter + ast-grep)
+│   ├── search/                 # code search (grep/glob/fd/highlight/tokens)
+│   ├── mcp/                    # MCP protocol client
+│   ├── memory/                 # cross-session long-term memory
+│   ├── skills/                 # skill system (file-backed skills)
+│   ├── swarm/                  # multi-agent orchestration (DAG pipelines)
+│   ├── collab/                 # collaboration relay (end-to-end encryption)
+│   ├── hashline/               # Hashline DSL batch editing
+│   ├── pty/                    # PTY pseudo-terminal tool
+│   ├── lsp/                    # LSP language-server client
+│   ├── iso/                    # filesystem isolation (sandbox diff)
+│   ├── supervisor/             # sub-agent monitoring bus
+│   ├── i18n/                   # multilingual message catalog (compile-time embedded + system-language detection)
+│   └── telemetry/              # OpenTelemetry observability
+├── web/                        # Web UI front-end (React + Vite)
+│   └── c5-ui/                  # front-end source
+├── prompts/                    # system prompt templates (.md)
+├── plans/                      # architecture design docs
+└── config.example.toml         # config example
 ```
 
 ---
 
-## 🔧 使用示例
+## 🔧 Usage Examples
 
-### CLI 交互模式
+### CLI Interactive Mode
 
 ```bash
-# 启动 REPL
+# Start the REPL
 agent
 
-# 执行任务
-> 分析 src/main.rs 并优化性能
+# Run a task
+> Analyze src/main.rs and optimize performance
 
-# 切换模型
+# Switch model
 /model ds
 
-# 切换模式
+# Switch mode
 /mode architect
 
-# 启用可选工具
+# Enable an optional tool
 /tools ast on
 
-# 手动压缩上下文
+# Manually compact the context
 /compact
 
-# 查看用量
+# Show usage
 /status
 
-# Swarm 多代理编排
+# Swarm multi-agent orchestration
 /swarm workflow.yaml
 ```
 
-### Web 服务
+### Web Service
 
 ```bash
-# 监听配置文件 [server].bind 地址（默认 127.0.0.1:8080）
+# Listen on the [server].bind address from the config (default 127.0.0.1:8080)
 agent --serve
 # → http://127.0.0.1:8080
 
-# 指定监听地址（覆盖配置）
-agent --serve 0.0.0.0:8080   # 监听所有网卡
-agent --serve :3000          # 仅端口：取配置 host 补全（→ 127.0.0.1:3000）
+# Specify the bind address (overrides config)
+agent --serve 0.0.0.0:8080   # listen on all interfaces
+agent --serve :3000          # port only: complete host from config (→ 127.0.0.1:3000)
 ```
 
-### 🔌 ACP 协议与编辑器集成
+### 🔌 ACP Protocol & Editor Integration
 
-agent-project 实现了 [Agent Client Protocol (ACP) v1](https://agentclientprotocol.com) 服务端，可将智能体能力暴露给 Zed Editor 等兼容客户端。ACP 与 CLI、Web 前端共享同一套会话管理与审批机制——同一会话甚至可被多客户端同时订阅。
+Gyre implements the [Agent Client Protocol (ACP) v1](https://agentclientprotocol.com) server, exposing agent capabilities to compatible clients such as the Zed Editor. ACP shares the same session management and approval mechanism as the CLI and Web front-ends — the same session can even be subscribed to by multiple clients at once.
 
-#### 传输模式
+#### Transport Modes
 
-| 模式 | 启动方式 | 适用场景 |
-| ---- | -------- | -------- |
-| **stdio** | `agent --acp-stdio` | 编辑器作为子进程调用（推荐，零端口占用，进程随编辑器退出自动终止） |
-| **http** | `agent --serve --acp` | HTTP+SSE，与 Web 前端同端口复用；适合自定义前端或远程接入 |
+| Mode | How to start | Use case |
+| ---- | ------------ | -------- |
+| **stdio** | `agent --acp-stdio` | The editor launches it as a subprocess (recommended; zero port usage; the process terminates automatically when the editor exits) |
+| **http** | `agent --serve --acp` | HTTP+SSE, multiplexed on the same port as the Web front-end; suitable for custom front-ends or remote access |
 
-#### stdio 模式
+#### stdio Mode
 
-编辑器以子进程方式启动 agent，通过 stdin/stdout 交换换行分隔的 JSON-RPC 消息。无需额外端口。
+The editor starts agent as a subprocess and exchanges newline-delimited JSON-RPC messages over stdin/stdout. No extra port is needed.
 
 ```bash
-# 直接运行（手动测试）
+# Run directly (manual testing)
 agent --acp-stdio
-# stdin 输入 JSON-RPC，stdout 返回响应与 session/update 通知
+# Feed JSON-RPC on stdin; responses and session/update notifications come back on stdout
 ```
 
-#### HTTP+SSE 模式
+#### HTTP+SSE Mode
 
-与 Web 前端共用同一 HTTP 服务，挂载两个端点：
+Shares the same HTTP service as the Web front-end, mounting two endpoints:
 
-| 端点 | 方法 | 说明 |
+| Endpoint | Method | Description |
 | ---- | ---- | ---- |
-| `/acp/rpc` | POST | JSON-RPC 2.0 请求入口（`initialize` / `session/new` / `session/prompt` …） |
-| `/acp/sse/{session_id}` | GET | SSE 事件流，订阅指定会话的 `session/update` 通知 |
+| `/acp/rpc` | POST | JSON-RPC 2.0 request entry (`initialize` / `session/new` / `session/prompt` …) |
+| `/acp/sse/{session_id}` | GET | SSE event stream; subscribes to `session/update` notifications for the given session |
 
 ```bash
-# 启用 ACP HTTP 端点（也可在 config.toml [acp] enabled = true 持久启用）
+# Enable the ACP HTTP endpoints (also enable persistently via [acp] enabled = true in config.toml)
 agent --serve --acp
 
-# 启动后输出：
+# On startup it prints:
 #   • ACP  JSON-RPC  POST /acp/rpc
-#            SSE 事件  GET  /acp/sse/{session_id}
+#            SSE events  GET  /acp/sse/{session_id}
 ```
 
-> **鉴权**：HTTP 模式复用 `[server] auth_token`（与 Web 前端同一份 token）。支持 `Authorization: Bearer <token>` 头或 `?token=<token>` 查询参数。未配置 `auth_token` 则不校验。
+> **Auth**: HTTP mode reuses `[server] auth_token` (the same token as the Web front-end). It supports the `Authorization: Bearer <token>` header or a `?token=<token>` query parameter. If no `auth_token` is configured, no validation is performed.
 
-#### 配置
+#### Configuration
 
-在 `config.toml` 中通过 `[acp]` 段控制（对应 `crates/acp`）：
+Control it via the `[acp]` section of `config.toml` (corresponds to `crates/acp`):
 
 ```toml
 [acp]
-enabled   = false             # 默认关；true 则 --serve 时自动挂载 /acp/* 路由
-transport = "http"            # "http"（HTTP+SSE）/ "stdio" / "both"
+enabled   = false             # off by default; true auto-mounts /acp/* routes on --serve
+transport = "http"            # "http" (HTTP+SSE) / "stdio" / "both"
 ```
 
-CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`（纯 stdio，最高优先级，不启动 HTTP）。
+CLI flags override the config at runtime: `--acp` (enable HTTP+SSE), `--acp-stdio` (stdio only; highest priority; does not start HTTP).
 
-#### Zed Editor 配置
+#### Zed Editor Configuration
 
-在 Zed 的 `settings.json` 中将 agent-project 注册为 ACP agent（**stdio 模式**，推荐）：
+Register Gyre as an ACP agent in Zed's `settings.json` (**stdio mode**, recommended):
 
 ```json
 {
   "agent": {
     "enabled": true,
     "profiles": {
-      "agent-project": {
+      "Gyre": {
         "name": "Agent Project",
         "transport": {
           "kind": "stdio",
@@ -313,27 +315,27 @@ CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`
         },
         "default_model": {
           "provider": "custom",
-          "name": "agent-project"
+          "name": "Gyre"
         }
       }
     },
-    "default_profile": "agent-project"
+    "default_profile": "Gyre"
   }
 }
 ```
 
-> **路径**：将 `/path/to/agent` 替换为编译产物实际路径（如 `./target/release/agent`，或安装到 `$PATH` 后直接写 `agent`）。
+> **Path**: replace `/path/to/agent` with the actual path of your build artifact (e.g. `./target/release/agent`, or just `agent` once installed on `$PATH`).
 >
-> **模型配置**：ACP 服务端复用 `config.toml` 的 `[default_model]` 与 `[[models]]` profile，加载同一套 Provider 路由。编辑器侧无需重复填入 API key——模型选择在 `session/new` 时通过 `model` 参数（或 `_meta.model`）指定别名即可。
+> **Model config**: the ACP server reuses the `[default_model]` and `[[models]]` profiles from `config.toml`, loading the same provider routing. You do not need to re-enter API keys in the editor — select a model alias via the `model` parameter (or `_meta.model`) on `session/new`.
 
-若使用 **HTTP 模式**（agent 以 `--serve --acp` 常驻运行），Zed 配置改为：
+If using **HTTP mode** (agent runs persistently with `--serve --acp`), the Zed config becomes:
 
 ```json
 {
   "agent": {
     "enabled": true,
     "profiles": {
-      "agent-project": {
+      "Gyre": {
         "name": "Agent Project",
         "transport": {
           "kind": "http",
@@ -341,36 +343,36 @@ CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`
         }
       }
     },
-    "default_profile": "agent-project"
+    "default_profile": "Gyre"
   }
 }
 ```
 
-#### 支持的 RPC 方法
+#### Supported RPC Methods
 
-| 方法 | 类型 | 说明 |
+| Method | Type | Description |
 | ---- | ---- | ---- |
-| `initialize` | 请求 | 握手 + 能力协商（返回 `protocolVersion` / `agentCapabilities` / `agentInfo`） |
-| `session/new` | 请求 | 创建新会话，返回 `{ sessionId }`；支持通过 `model` / `mode` 参数（或 `_meta`）指定初始模型与模式 |
-| `session/prompt` | 请求 | 投递用户消息，阻塞至 turn 完成返回 `{ stopReason }`；期间持续推送 `session/update` 通知 |
-| `session/cancel` | 通知 | 取消当前正在执行的 turn |
-| `session/load` | 请求 | 恢复历史会话（传入已有 `sessionId`），返回新 `sessionId` |
-| `session/close` | 请求 | 关闭并释放会话资源 |
-| `session/set_mode` | 请求 | 切换智能体模式（`code` / `architect` / `ask` / `debug`） |
+| `initialize` | Request | Handshake + capability negotiation (returns `protocolVersion` / `agentCapabilities` / `agentInfo`) |
+| `session/new` | Request | Create a new session; returns `{ sessionId }`; specify the initial model and mode via the `model` / `mode` params (or `_meta`) |
+| `session/prompt` | Request | Submit a user message; blocks until the turn completes and returns `{ stopReason }`; continuously pushes `session/update` notifications in the meantime |
+| `session/cancel` | Notification | Cancel the currently executing turn |
+| `session/load` | Request | Resume a historical session (pass an existing `sessionId`); returns a new `sessionId` |
+| `session/close` | Request | Close and release session resources |
+| `session/set_mode` | Request | Switch the agent mode (`code` / `architect` / `ask` / `debug`) |
 
-#### session/update 事件类型
+#### session/update Event Types
 
-`session/prompt` 期间通过 SSE（HTTP 模式）或 stdout（stdio 模式）推送的标准 ACP 事件：
+Standard ACP events pushed during `session/prompt` via SSE (HTTP mode) or stdout (stdio mode):
 
-| `sessionUpdate` | 说明 |
+| `sessionUpdate` | Description |
 | --------------- | ---- |
-| `agent_message_chunk` | 智能体回复文本增量 |
-| `agent_thought_chunk` | 智能体思考 / reasoning 增量 |
-| `tool_call` | 工具调用创建（含 `toolCallId` / `title` / `kind` / `status` / `rawOutput`） |
-| `tool_call_update` | 工具调用状态 / 输出更新 |
-| `usage_update` | 上下文窗口用量更新（`used` / `size`） |
+| `agent_message_chunk` | Incremental agent reply text |
+| `agent_thought_chunk` | Incremental agent thinking / reasoning |
+| `tool_call` | Tool-call creation (includes `toolCallId` / `title` / `kind` / `status` / `rawOutput`) |
+| `tool_call_update` | Tool-call status / output update |
+| `usage_update` | Context-window usage update (`used` / `size`) |
 
-#### 能力声明（initialize 响应）
+#### Capability Declaration (initialize response)
 
 ```json
 {
@@ -380,25 +382,25 @@ CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`
     "promptCapabilities": { "image": true, "embeddedContext": false },
     "mcpCapabilities": { "http": false, "stdio": true }
   },
-  "agentInfo": { "name": "agent-project", "version": "0.1.0" },
+  "agentInfo": { "name": "Gyre", "version": "0.1.0" },
   "authMethods": []
 }
 ```
 
-> `promptCapabilities` 与 `mcpCapabilities` 为 ACP v1 规范围必填字段，严格客户端（如 Zed）会做 schema 校验，缺失即拒绝握手。
+> `promptCapabilities` and `mcpCapabilities` are required fields in the ACP v1 spec; strict clients (such as Zed) validate the schema and reject the handshake if they are missing.
 
-#### 快速验证
+#### Quick Verification
 
 ```bash
-# 1. 手动测试 stdio 模式（逐行输入 JSON-RPC）
+# 1. Manually test stdio mode (enter JSON-RPC line by line)
 agent --acp-stdio
-# 输入：
+# Input:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test","version":"1.0"}}}
-# → 返回 agentCapabilities 响应
+# → returns the agentCapabilities response
 
-# 2. 手动测试 HTTP 模式
+# 2. Manually test HTTP mode
 agent --serve --acp &
-# 创建会话
+# Create a session
 curl -X POST http://127.0.0.1:8080/acp/rpc \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"model":"ds","mode":"code"}}'
@@ -410,80 +412,80 @@ curl -X POST http://127.0.0.1:8080/acp/rpc \
 ### build web
 ```bash
 cd web/c5-ui
-npm install          # 首次需要安装依赖
-npm run build        # tsc -b 类型检查 + vite build → 产物在 dist/
-npm run deploy       # 把 dist/ 内容拷贝到 ../（即 web/ 根目录）
+npm install          # first run requires installing dependencies
+npm run build        # tsc -b type checking + vite build → output in dist/
+npm run deploy       # copies the contents of dist/ to ../ (the web/ root)
 ```
-### build 
+### build
 ```bash
 cargo b -r
 ```
 ---
 
-## 📄 许可证
+## 📄 License
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
-
----
-
-## 🙏 致谢
-
-### 参考项目
-
-本项目的设计与实现深受以下开源项目的启发与借鉴：
-
-#### [Zoo-Code](https://github.com/nicepkg/zoo-code)（概念参考）
-
-Zoo-Code 提供了**智能体高阶认知与流程控制**的核心设计蓝图，本项目从中汲取了以下关键概念：
-
-- **五态状态机**（NoTask → Running → Streaming → WaitingForInput → Idle）：智能体生命周期的精确建模
-- **say/ask 消息模型**：信息性输出与交互阻塞请求的清晰分离
-- **审批路由（AskDispatcher）**：在流式输出与用户输入间的协调机制
-- **模式系统**（code / architect / ask / debug）：不同场景下的 system prompt 与工具子集配置
-- **Provider 抽象与 format transform**：多厂商线协议的格式转换与缓存策略
-
-#### [oh-my-pi](https://github.com/nicepkg/oh-my-pi)（概念参考 + 设计迁移）
-
-oh-my-pi 贡献了**底层代码操控精确性与执行循环工程化**的成熟实践，本项目将其 TypeScript/Rust 混合架构**全部移植为纯 Rust**：
-
-- **执行循环**（agent-loop.ts）：流式推理 → 工具调用解析 → 批量执行 → 结果回填的完整闭环
-- **AppendOnlyLog + StablePrefix**：上下文记忆与 Provider 前缀缓存最大化命中
-- **压缩子系统**（summarization / pruning / shake / tool-protection）：上下文窗口管理
-- **LLM 分发**（ProviderRegistry / streamSimple）：单一入口多 Provider 路由
-- **AST 操控**（pi-ast）：基于 tree-sitter + ast-grep 的代码结构性操作
-- **原生工具链**（pi-natives）：grep / glob / highlight / tokens 等底层能力
-- **分层配置**（settings-schema.ts）：用户级与项目级配置深度合并
-- **审批规则引擎**（approval.ts）：逐工具 allow/deny/ask 规则 + 命令级 glob 匹配
-- **带宽优化线协议**：增量优先的 WebSocket 通信协议
+This project is open-sourced under the [MIT License](LICENSE).
 
 ---
 
-### 独特优势
+## 🙏 Acknowledgements
 
-相较于上述参考项目，本项目在以下方面实现了**显著的架构改进与性能提升**：
+### Reference Projects
 
-| 维度 | Zoo-Code / oh-my-pi | agent-project | 改进 |
+The design and implementation of this project are deeply inspired by and draw on the following open-source projects:
+
+#### [Zoo-Code](https://github.com/nicepkg/zoo-code) (conceptual reference)
+
+Zoo-Code provided the core design blueprint for **higher-order agent cognition and process control**. This project draws the following key concepts from it:
+
+- **Five-state state machine** (NoTask → Running → Streaming → WaitingForInput → Idle): precise modeling of the agent lifecycle
+- **say/ask message model**: a clean separation between informational output and interactive blocking requests
+- **Approval routing (AskDispatcher)**: a coordination mechanism between streaming output and user input
+- **Mode system** (code / architect / ask / debug): system-prompt and tool-subset configuration for different scenarios
+- **Provider abstraction and format transform**: format conversion and caching strategies for multi-vendor wire protocols
+
+#### [oh-my-pi](https://github.com/nicepkg/oh-my-pi) (conceptual reference + design migration)
+
+oh-my-pi contributed mature practices in **low-level code-manipulation precision and execution-loop engineering**. This project ported its TypeScript/Rust hybrid architecture **entirely to pure Rust**:
+
+- **Execution loop** (agent-loop.ts): the full closed loop of streaming reasoning → tool-call parsing → batch execution → result backfill
+- **AppendOnlyLog + StablePrefix**: context memory and maximizing provider prefix-cache hits
+- **Compaction subsystem** (summarization / pruning / shake / tool-protection): context-window management
+- **LLM dispatch** (ProviderRegistry / streamSimple): single-entry multi-provider routing
+- **AST manipulation** (pi-ast): structural code operations based on tree-sitter + ast-grep
+- **Native toolchain** (pi-natives): low-level capabilities such as grep / glob / highlight / tokens
+- **Layered config** (settings-schema.ts): deep-merging user-level and project-level config
+- **Approval rule engine** (approval.ts): per-tool allow/deny/ask rules + command-level glob matching
+- **Bandwidth-optimized wire protocol**: delta-first WebSocket communication protocol
+
+---
+
+### Distinctive Advantages
+
+Compared with the reference projects above, this project achieves **significant architectural improvements and performance gains** in the following areas:
+
+| Dimension | Zoo-Code / oh-my-pi | Gyre | Improvement |
 | --- | --- | --- | --- |
-| **语言统一** | TypeScript 运行时 + Rust N-API 原生插件（混合架构） | **纯 Rust 单 workspace**（edition 2024） | 消除 N-API FFI 开销与跨语言序列化损耗，编译期类型安全，零运行时解释成本 |
-| **架构模式** | 类单体编排 + 部分 trait 抽象 | **完整 Ports & Adapters（六边形架构）** | 所有依赖以 `Arc<dyn Trait>` 注入，循环对传输/Provider/Tool 完全透明，单测可全局替身化 |
-| **扩展机制** | 手动注册中央清单 | **编译期零侵入发现**（`inventory` macro） | 新增 Provider/Tool 无需修改任何中央注册代码，`impl Trait + submit!` 即可 |
-| **并发模型** | Node.js 事件循环 + N-API 线程池 | **async/await + Tokio 全异步** | 原生 `Send + Sync`，无 GIL 锁竞争，`spawn_blocking` 隔离 CPU 密集任务 |
-| **工具可插拔** | 固定工具集 + 环境变量开关 | **配置驱动动态工具组**（`[tools.enabled]`） | 运行时 `/tools <key> on|off` 动态切换，未启用工具零 Token 开销 |
-| **上下文压缩** | 单级压缩策略 | **三级渐进压缩**（Shake → Summarize → Prune） | 先轻度抖动去冗余，再 LLM 摘要折叠历史，最后窗口裁剪兜底，平衡质量与 Token 消耗 |
-| **多 Agent 编排** | 仅基本子任务委派 | **Swarm DAG 管道**（YAML 定义 + 波内并行） | 支持复杂工作流定义，多 Agent 按依赖图并行执行，进度回调与状态监控 |
-| **协同能力** | 无 | **端到端加密协同中继**（AES-256-GCM） | 多用户实时共享会话，服务器盲视密封字节，安全隐私 |
-| **跨平台** | 主要面向 macOS/Linux | **Windows + Linux + macOS 一等公民** | `rustls-tls` 免 OpenSSL，`portable-pty` 双后端（ConPTY / posix），`dirs` 跨平台配置目录 |
-| **工具深度** | 基础文件/AST 操作 | **完整工具矩阵**（核心 + AST + LSP + Hashline + PTY + 图像 + GitHub + MCP） | 可选工具组按需加载，覆盖 IDE 级别代码操控与 DevOps 场景 |
-| **监控与可观测** | 基本日志 | **Supervisor 总线 + OpenTelemetry 导出** | 实时子 Agent 监控仪表盘，OTLP span 导出，全链路可追溯 |
-| **Web 前端** | 简单静态页面 | **现代化 React SPA**（TypeScript + Vite + Tailwind） | 实时 WS 订阅、带宽优化增量协议、子 Agent 监控仪表盘、文件浏览、设置面板 |
+| **Language unity** | TypeScript runtime + Rust N-API native plugins (hybrid) | **Pure Rust single workspace** (edition 2024) | Eliminates N-API FFI overhead and cross-language serialization loss; compile-time type safety; zero runtime interpretation cost |
+| **Architecture pattern** | Quasi-monolithic orchestration + partial trait abstraction | **Full Ports & Adapters (Hexagonal Architecture)** | All dependencies injected as `Arc<dyn Trait>`; the loop is fully transparent to transport/provider/tool; unit tests can stub globally |
+| **Extension mechanism** | Manual central registry | **Compile-time non-invasive discovery** (`inventory` macro) | Adding a provider/tool requires no changes to any central registration code; `impl Trait + submit!` suffices |
+| **Concurrency model** | Node.js event loop + N-API thread pool | **async/await + Tokio, fully async** | Native `Send + Sync`, no GIL-lock contention; `spawn_blocking` isolates CPU-heavy tasks |
+| **Tool pluggability** | Fixed toolset + environment-variable switches | **Config-driven dynamic tool groups** (`[tools.enabled]`) | Toggle at runtime via `/tools <key> on\|off`; disabled tools cost zero tokens |
+| **Context compaction** | Single-tier compaction strategy | **Three-tier progressive compaction** (Shake → Summarize → Prune) | Light jitter-based dedup first, then LLM summarization to fold history, then window-pruning fallback — balancing quality and token cost |
+| **Multi-agent orchestration** | Only basic subtask delegation | **Swarm DAG pipelines** (YAML-defined + intra-wave parallelism) | Supports complex workflow definitions; multiple agents execute in parallel along the dependency graph, with progress callbacks and status monitoring |
+| **Collaboration** | None | **End-to-end-encrypted collaboration relay** (AES-256-GCM) | Multiple users share a session in real time; the server is blind to the sealed bytes — secure and private |
+| **Cross-platform** | Primarily macOS/Linux | **Windows + Linux + macOS first-class citizens** | `rustls-tls` avoids OpenSSL; `portable-pty` dual backends (ConPTY / posix); `dirs` for cross-platform config directories |
+| **Tool depth** | Basic file/AST operations | **Complete tool matrix** (core + AST + LSP + Hashline + PTY + image + GitHub + MCP) | Optional tool groups loaded on demand, covering IDE-level code manipulation and DevOps scenarios |
+| **Monitoring & observability** | Basic logging | **Supervisor bus + OpenTelemetry export** | Real-time sub-agent monitoring dashboard; OTLP span export; full-chain traceability |
+| **Web front-end** | Simple static pages | **Modern React SPA** (TypeScript + Vite + Tailwind) | Real-time WS subscription; bandwidth-optimized delta protocol; sub-agent monitoring dashboard; file browser; settings panel |
 
-### 特别感谢
+### Special Thanks
 
-- **Zoo-Code 团队**：为智能体认知架构与状态机设计提供了卓越的参考实现。
-- **oh-my-pi 团队**：在代码操控精确性、上下文管理与执行循环工程化方面树立了标杆。
-- **Rust 社区**：提供了 `tokio`、`tree-sitter`、`ast-grep`、`axum`、`reqwest` 等优秀生态库，使纯 Rust 智能体框架成为可能。
-- **所有开源贡献者**：感谢每一位为 AI 编程智能体生态做出贡献的开发者。
+- **Zoo-Code team**: provided an outstanding reference implementation for agent cognitive architecture and state-machine design.
+- **oh-my-pi team**: set the benchmark for code-manipulation precision, context management, and execution-loop engineering.
+- **Rust community**: provided excellent ecosystem libraries such as `tokio`, `tree-sitter`, `ast-grep`, `axum`, and `reqwest`, making a pure-Rust agent framework possible.
+- **All open-source contributors**: thank you to every developer who has contributed to the AI coding-agent ecosystem.
 
 ---
 
-> **构建理念**：将 TypeScript 生态中成熟的智能体实践经验，以 Rust 的系统级性能与安全性重新实现，融合两家之长，打造可插拔、高性能、跨平台的下一代 AI 编程智能体框架。
+> **Design philosophy**: re-implement the mature agent practices of the TypeScript ecosystem with Rust's system-level performance and safety, fusing the best of both to build a pluggable, high-performance, cross-platform next-generation AI coding-agent framework.
