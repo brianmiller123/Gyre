@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use agent_core::forced_utf8_locale;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::Mutex;
 
@@ -97,6 +98,12 @@ pub async fn run_pty_command(opts: &PtyOptions) -> Result<PtyResult, io::Error> 
     }
     for (k, v) in &opts.env {
         cmd.env(k, v);
+    }
+    // 保障 UTF-8 输出（与 run_command 一致）：继承 locale 非 UTF-8 时注入 C.UTF-8，
+    // 避免 PTY 子进程以 GBK 等编码输出中文，捕获后解码产生乱码。
+    if let Some(loc) = forced_utf8_locale() {
+        cmd.env("LC_ALL", loc);
+        cmd.env("LANG", loc);
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
@@ -194,6 +201,11 @@ impl PtyShell {
         let mut cmd = CommandBuilder::new(shell_program());
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
+        }
+        // 保障 UTF-8 输出（持久 shell 同样需要：env 注入会被交互式 shell 继承）。
+        if let Some(loc) = forced_utf8_locale() {
+            cmd.env("LC_ALL", loc);
+            cmd.env("LANG", loc);
         }
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         let writer = pair.master.take_writer().map_err(pty_err)?;

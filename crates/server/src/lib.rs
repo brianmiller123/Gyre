@@ -21,10 +21,10 @@ use agent_core::{
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use agent_tools::Tool;
 use futures::{SinkExt, StreamExt};
@@ -35,6 +35,14 @@ use tokio_util::sync::CancellationToken;
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 /// 单进程最大并发会话数（软上限，缓解无界创建导致的内存/任务泄漏）。
 const MAX_SESSIONS: usize = 64;
+/// WebSocket 单条入站消息上限（字节）。
+///
+/// 多模态图片以内联 base64 经 `new_task` 帧发送，256 KiB 会让绝大多数图片帧被
+/// tungstenite 拒收（`Capacity::MessageTooBig`）→ 连接关闭、任务永不到达驱动、
+/// 前端表现为「上传图片后无任何内容响应」。提升到 16 MiB 以容纳常见截图/照片。
+const WS_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+/// 单张上传图片解码后字节上限（与 CLI `read_image` 的 MAX_IMAGE_BYTES 对齐）。
+const MAX_UPLOAD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 线协议（带宽优化：增量优先，不回传 partial 全量快照）
@@ -56,18 +64,36 @@ pub enum ContentInput {
         /// base64 数据（不含 `data:` 前缀）。
         data: String,
     },
+    /// 图像引用（句柄）。先经 `POST /api/sessions/{id}/upload` 上传拿到 `upload_id`，
+    /// 再以此句柄经 WS 发送，避免在控制信道传输大体积 base64（兼容旧的内联 `Image`）。
+    ImageRef {
+        /// `/upload` 返回的句柄。
+        upload_id: String,
+    },
 }
 
 impl ContentInput {
     /// 转为内部 [`UserContent`]。
+    ///
+    /// `ImageRef` 据 `uploads` 句柄表解析为真实 base64；句柄缺失（已过期/未知）返回
+    /// `None`，由调用方决定跳过或告警。
     #[must_use]
-    fn to_user_content(&self) -> UserContent {
+    fn to_user_content(
+        &self,
+        uploads: &HashMap<String, (String, String)>,
+    ) -> Option<UserContent> {
         match self {
-            Self::Text { text } => UserContent::Text { text: text.clone() },
-            Self::Image { mime, data } => UserContent::Image {
+            Self::Text { text } => Some(UserContent::Text { text: text.clone() }),
+            Self::Image { mime, data } => Some(UserContent::Image {
                 mime: mime.clone(),
                 data: data.clone(),
-            },
+            }),
+            Self::ImageRef { upload_id } => uploads.get(upload_id).map(|(mime, data)| {
+                UserContent::Image {
+                    mime: mime.clone(),
+                    data: data.clone(),
+                }
+            }),
         }
     }
 }
@@ -239,6 +265,11 @@ pub struct Session {
     /// 是否有任务正在运行（驱动任务维护真值）。WS 重连时据此回推一帧
     /// [`AgentState::Running`]，避免重连前端误判为空闲而发起新任务。
     pub running: Arc<std::sync::atomic::AtomicBool>,
+    /// 会话上下文（共享同一份 `PersistentContext`，与驱动任务同源）。
+    /// 供 `DELETE /api/sessions/{id}/messages/{line}` 在线删除单条消息使用。
+    pub context: Arc<dyn agent_core::ContextManager>,
+    /// 多模态图片上传句柄表（`POST /upload` 写、`new_task` 的 `ImageRef` 读，消费即清）。
+    pub uploads: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 impl Session {
@@ -393,6 +424,8 @@ impl SessionManager {
 
         // 运行标志与会话共享同一份 Arc：驱动任务维护其真值，WS 重连时据此回推状态。
         let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 多模态图片上传句柄表：会话级共享（upload 路由写、驱动任务读）。
+        let uploads = Arc::new(Mutex::new(HashMap::new()));
         let deps = DriverDeps {
             agent: Arc::new(agent),
             tx: broadcast_tx.clone(),
@@ -400,6 +433,7 @@ impl SessionManager {
             running: Arc::clone(&running),
             current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
             context: Arc::clone(&context),
+            uploads: Arc::clone(&uploads),
         };
         let driver_handle = tokio::spawn(driver(deps, inbound_rx));
         // 子 Agent 监控：聚合事件为 ServerFrame::SubAgents（≈8fps）下发 WS 订阅者。
@@ -418,6 +452,8 @@ impl SessionManager {
             skills: skill_catalog,
             mcp,
             running,
+            context,
+            uploads,
         });
         let mut inner = self.inner.lock().await;
         inner.insert(id.clone(), session);
@@ -489,6 +525,8 @@ struct DriverDeps {
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     /// 上下文管理器（手动压缩 `/compact` + 任务后 ContextUsage 下发）。
     context: Arc<dyn ContextManager>,
+    /// 多模态图片上传句柄表（`POST /upload` 写、`new_task` 的 `ImageRef` 读，消费即清）。
+    uploads: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 /// RAII 守卫：确保 spawn 任务即使 panic（或被 abort）也能复位 `running`，防止会话永久楔死。
@@ -558,9 +596,18 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
                             if !text.is_empty() {
                                 contents.push(UserContent::Text { text });
                             }
-                            for b in blocks {
-                                contents.push(b.to_user_content());
+                            // 锁一次 uploads 快照：把 ImageRef 句柄解析为真实 base64；
+                            // 缺失句柄跳过并告警。解析后清空，避免无界增长。
+                            let uploads_snapshot = d.uploads.lock().await.clone();
+                            for b in &blocks {
+                                match b.to_user_content(&uploads_snapshot) {
+                                    Some(uc) => contents.push(uc),
+                                    None => tracing::warn!(
+                                        "多模态内容块解析为空（upload_id 可能已过期/未知），已跳过"
+                                    ),
+                                }
                             }
+                            d.uploads.lock().await.clear();
                             Box::pin(d.agent.run_message_with_cancel(
                                 UserMessage { content: contents },
                                 run_cancel,
@@ -1003,7 +1050,9 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/sessions/{id}/skills", get(list_skills))
         .route("/api/sessions/{id}/skill/{name}", get(skill_body))
         .route("/api/sessions/{id}/mcp", get(list_mcp))
+        .route("/api/sessions/{id}/upload", post(upload_image))
         .route("/api/sessions/{id}/history", get(session_history))
+        .route("/api/sessions/{id}/messages/{line}", delete(delete_message))
         .route("/api/commands", get(list_commands))
         .route("/api/models", get(list_models))
         .route("/api/stats", get(stats))
@@ -1013,6 +1062,8 @@ pub fn app(state: SessionManager) -> Router {
         .route("/ws/{id}", get(ws_handler))
         .route("/api/collab/room", get(new_collab_room))
         .route("/collab/{room_id}", get(collab_ws_handler))
+        // 上传 / 多模态：允许较大请求体（base64 图片），其余端点仍受此上限保护。
+        .layer(DefaultBodyLimit::max(WS_MAX_MESSAGE_SIZE))
         .with_state(state)
         .fallback(serve_embedded)
 }
@@ -1457,13 +1508,21 @@ fn read_first_user(path: &std::path::Path) -> Option<String> {
 }
 
 /// 读取会话历史（user/thinking/assistant 文本，前端恢复对话用）。
+///
+/// 每条历史项附带 `line` 字段：**该消息在内存日志中的索引**（每条成功解析的
+/// `AgentMessage` 占一个索引，含 tool/status 等不展示的消息）。前端据此定位删除
+/// 目标行，与 [`agent_core::ContextManager::delete_message_at`] 的索引同源。
 fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
     use std::io::BufRead;
     let mut out = Vec::new();
     let Some(file) = std::fs::File::open(path).ok() else {
         return out;
     };
-    for line in std::io::BufReader::new(file).lines().flatten() {
+    let mut msg_index = 0usize;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1484,12 +1543,13 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
                     .join("");
                 let t = text.trim();
                 if !t.is_empty() {
-                    out.push(serde_json::json!({ "kind": "user", "text": t }));
+                    out.push(serde_json::json!({ "kind": "user", "text": t, "line": msg_index }));
                 }
             }
             agent_core::AgentMessage::Assistant(a) => {
                 // 思考内容（reasoning）：通常先于正文出现，前端以可折叠「思考」块展示，
-                // 与实时流的 ThinkingDelta 行为一致。
+                // 与实时流的 ThinkingDelta 行为一致。思考与正文同属一条 assistant 消息，
+                // 故共享同一 `line` 索引（删除任一会移除整条 assistant 轮次）。
                 let thinking: String = a
                     .content
                     .iter()
@@ -1501,7 +1561,7 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
                     .join("");
                 let tk = thinking.trim();
                 if !tk.is_empty() {
-                    out.push(serde_json::json!({ "kind": "thinking", "text": tk }));
+                    out.push(serde_json::json!({ "kind": "thinking", "text": tk, "line": msg_index }));
                 }
                 let text: String = a
                     .content
@@ -1514,11 +1574,12 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
                     .join("");
                 let t = text.trim();
                 if !t.is_empty() {
-                    out.push(serde_json::json!({ "kind": "assistant", "text": t }));
+                    out.push(serde_json::json!({ "kind": "assistant", "text": t, "line": msg_index }));
                 }
             }
             _ => {}
         }
+        msg_index += 1;
     }
     out
 }
@@ -1585,6 +1646,69 @@ async fn session_history(
     Json(serde_json::json!({ "items": items })).into_response()
 }
 
+/// `DELETE /api/sessions/{id}/messages/{line}` → 删除指定索引处的单条消息（含孤立 tool 结果）。
+///
+/// - **活跃会话**：在内存上下文就地删除并原子重写 JSONL，下一轮即生效。
+/// - **非活跃会话**：直接离线改写 JSONL 文件（[`agent_context::delete_message_in_file`]）。
+///
+/// `line` 为消息在日志中的索引（与 `GET /history` 返回的 `line` 同源）。
+/// 任务运行中返回 409，避免与并发 append 竞争；索引越界返回 404。
+async fn delete_message(
+    State(state): State<SessionManager>,
+    Path((id, line)): Path<(String, usize)>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    if !is_safe_session_id(&id) {
+        return (StatusCode::BAD_REQUEST, "非法会话 id").into_response();
+    }
+    let removed: usize = match state.get(&id).await {
+        // 活跃会话：内存上下文 + JSONL 一致删除。
+        Some(session) => {
+            if session
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return (StatusCode::CONFLICT, "任务运行中，无法删除消息").into_response();
+            }
+            match session.context.delete_message_at(line).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("删除失败: {e}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        // 非活跃会话：离线改写 JSONL 文件。
+        None => {
+            let store = agent_context::SessionStore::for_cwd(state.cwd());
+            let path = store.path_for(&id);
+            if !path.exists() {
+                return (StatusCode::NOT_FOUND, "会话不存在").into_response();
+            }
+            match agent_context::delete_message_in_file(&path, line).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("删除失败: {e}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    if removed == 0 {
+        return (StatusCode::NOT_FOUND, "消息行号越界").into_response();
+    }
+    Json(serde_json::json!({ "ok": true, "removed": removed })).into_response()
+}
+
 /// 重命名请求体（自定义会话标题）。
 #[derive(Debug, Deserialize)]
 struct RenameBody {
@@ -1645,6 +1769,53 @@ async fn rename_session(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct UploadBody {
+    /// MIME 类型（image/png|jpeg|gif|webp）。
+    mime: String,
+    /// base64 数据（不含 `data:` 前缀）。
+    data: String,
+}
+
+/// `POST /api/sessions/{id}/upload` → 上传单张图片（base64），返回 `upload_id` 句柄。
+///
+/// 前端拿到句柄后以 `ContentInput::ImageRef` 经 WS 发送，避免在控制信道传输大体积
+/// base64（解决 WS `max_message_size` 过小导致图片帧被拒收、前端无响应的问题）。
+/// 句柄在驱动任务解析 `new_task` 时消费即清空，不长期驻留。
+async fn upload_image(
+    State(state): State<SessionManager>,
+    Path(id): Path<String>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+    axum::Json(body): axum::Json<UploadBody>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    let Some(session) = state.get(&id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    const ALLOWED_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+    if !ALLOWED_MIMES.contains(&body.mime.as_str()) {
+        return (StatusCode::BAD_REQUEST, "不支持的图片 MIME 类型").into_response();
+    }
+    // 以 base64 文本长度近似解码后大小（≈ len·4/3），避免引入 base64 解码做精确校验；
+    // 前端上传前已按解码字节硬限拦截，此处为防御性二次校验。
+    if body.data.len() > MAX_UPLOAD_IMAGE_BYTES * 4 / 3 + 4 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "图片过大（解码后超过 10MiB 上限）",
+        )
+            .into_response();
+    }
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    session
+        .uploads
+        .lock()
+        .await
+        .insert(upload_id.clone(), (body.mime, body.data));
+    Json(serde_json::json!({ "upload_id": upload_id })).into_response()
+}
+
 /// 校验 token：配置了 auth_token 则必须匹配。
 fn check_auth(state: &SessionManager, token: &Option<String>) -> Result<(), Response> {
     let Some(expected) = state.expected_token() else {
@@ -1686,7 +1857,7 @@ async fn ws_handler(
     let Some(session) = state.get(&id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    ws.max_message_size(256 * 1024)
+    ws.max_message_size(WS_MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, session))
 }
 

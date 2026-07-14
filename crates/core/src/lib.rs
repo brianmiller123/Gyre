@@ -47,7 +47,7 @@ pub use message::{
     ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use model::{Api, Model};
-pub use platform::config_dir;
+pub use platform::{config_dir, forced_utf8_locale};
 pub use resource::{ResourceEntry, ResourceError, ResourceResolver};
 pub use skill::{
     Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillResolver, SkillSource,

@@ -70,6 +70,21 @@ impl agent_core::ContextManager for PersistentContext {
         Ok(())
     }
 
+    async fn delete_message_at(
+        &self,
+        index: usize,
+    ) -> Result<usize, agent_core::ContextError> {
+        let removed = self.inner.delete_at(index).await;
+        if removed > 0 {
+            let log = self.inner.snapshot().await;
+            if let Err(e) = rewrite_jsonl(&self.path, &log).await {
+                tracing::warn!("删除消息后重写持久化失败: {e}");
+                return Err(agent_core::ContextError::Io(e));
+            }
+        }
+        Ok(removed)
+    }
+
     fn token_usage(&self) -> agent_core::TokenUsage {
         self.inner.token_usage()
     }
@@ -358,6 +373,33 @@ async fn rewrite_jsonl(path: &Path, log: &[AgentMessage]) -> Result<(), std::io:
     Ok(())
 }
 
+/// 直接从 JSONL 文件删除第 `index` 条有效消息（含孤立 tool 结果清理），原子重写落盘。
+///
+/// 适用于会话未加载到内存（无活跃 [`PersistentContext`）时的离线删除：读取全部
+/// 有效消息 → [`crate::remove_entry_with_orphans`] → [`rewrite_jsonl`] 原子覆盖。
+///
+/// 返回 `Ok(0)` 表示索引越界（无变更）；`Ok(n>0)` 表示已删除 n 条并落盘。
+///
+/// # Errors
+/// 读取/解析/写入失败时返回 IO 错误。
+pub async fn delete_message_in_file(
+    path: &std::path::Path,
+    index: usize,
+) -> Result<usize, std::io::Error> {
+    let log = load_jsonl(path)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("加载会话失败: {e}")))?;
+    let Some(new_log) = crate::remove_entry_with_orphans(&log, index) else {
+        return Ok(0);
+    };
+    let removed = log.len().saturating_sub(new_log.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+    rewrite_jsonl(path, &new_log).await?;
+    Ok(removed)
+}
+
 /// 加载恢复：流式逐行反序列化，并对总字节数与单行长度设上限，防止超大历史会话 OOM。
 async fn load_jsonl(path: &Path) -> Result<Vec<AgentMessage>, agent_core::ContextError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -495,5 +537,48 @@ mod tests {
         assert!(store.title_for("s1").is_none());
         assert_eq!(store.title_for("s2").as_deref(), Some("Second"));
         let _ = std::fs::remove_dir_all(&store.dir);
+    }
+
+    /// 删除消息后：内存日志与落盘 JSONL 同步更新——重新从磁盘打开会话，
+    /// 被删消息不再存在（证明 session 内容确被持久移除，而非仅前端隐藏）。
+    #[tokio::test]
+    async fn delete_message_persists_to_disk() {
+        use agent_core::ContextManager;
+        let path = tmp_path();
+        // 写入 3 条用户消息（每条 append 即落盘一行 JSONL）。
+        {
+            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            pc.append(AgentMessage::user_text("a")).await;
+            pc.append(AgentMessage::user_text("b")).await;
+            pc.append(AgentMessage::user_text("c")).await;
+        }
+        // 删除索引 1（"b"）：内存日志 + 原子重写 JSONL。
+        {
+            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            let removed = pc.delete_message_at(1).await.unwrap();
+            assert_eq!(removed, 1, "应删除 1 条");
+        }
+        // 重新从磁盘打开：应只剩 a、c（b 已持久移除）。
+        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let built = pc.build_provider_context(&model, &[]).await.unwrap();
+        let texts: Vec<String> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::User { content } => content
+                    .iter()
+                    .filter_map(|c| match c {
+                        agent_core::UserContent::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .next(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(built.messages.len(), 2);
+        assert_eq!(texts, vec!["a".to_string(), "c".to_string()]);
+        let _ = std::fs::remove_file(&path);
     }
 }

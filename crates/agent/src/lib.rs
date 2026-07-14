@@ -566,16 +566,23 @@ fn run_loop(
             // 避免上游挂起时取消信号无法中断（仅靠 loop 顶部检查不足以打断 await）。
             let mut authoritative: Option<AssistantMessage> = None;
             let mut usage = Usage::default();
+            // 累积流式文本增量：流被取消/异常断开（未到达 MessageEnd）时，已生成并
+            // 显示给用户的文本若不落盘会丢失对话历史。中断时兜底持久化（仅保留 Text——
+            // Thinking 的 signature 在流式中不可靠，ToolCall 参数可能残缺，二者丢弃）。
+            let mut acc_text = String::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
+                        // 中断兜底：持久化已生成的部分回复，避免丢失对话历史。
+                        persist_interrupted(&context, &mut acc_text, &model, &usage).await;
                         yield AgentEvent::Error("任务被取消".into());
                         yield AgentEvent::StateChanged(AgentState::Idle);
                         return;
                     }
                     ev = event_stream.next() => match ev {
                         Some(AssistantEvent::TextDelta(d)) => {
+                            acc_text.push_str(&d);
                             yield AgentEvent::TextDelta(d);
                         }
                         Some(AssistantEvent::ThinkingDelta(d)) => {
@@ -596,7 +603,8 @@ fn run_loop(
             }
 
             let Some(assistant) = authoritative else {
-                // 未见 MessageEnd：视作空回复
+                // 未见 MessageEnd：流异常中断。兜底持久化已生成的部分文本，避免丢失。
+                persist_interrupted(&context, &mut acc_text, &model, &usage).await;
                 mistakes += 1;
                 yield AgentEvent::Error("未收到完整助手消息".into());
                 if mistakes >= max_mistakes {
@@ -799,5 +807,60 @@ fn run_loop(
             }
             // 继续下一轮（工具结果已回填，模型再次推理）
         }
+    }
+}
+
+/// 流式中断兜底持久化：把已累积的文本增量作为一条被中断的 assistant 消息落盘。
+///
+/// 仅在流式被取消或异常断开（未到达 [`AssistantEvent::MessageEnd`]）时调用，避免
+/// 已显示给用户的回复因未落盘而在 resume 会话时丢失。仅保留 `Text` 块：
+/// - `Thinking` 的 signature 在流式中不可靠，持久化后重放可能导致 provider 校验失败；
+/// - `ToolCall` 的参数 JSON 可能残缺，会产生悬空工具调用（无对应 tool 结果）。
+/// 故二者丢弃。`stop_reason` 置 `None` 标记此条为中断产物。
+async fn persist_interrupted(
+    context: &Arc<dyn ContextManager>,
+    acc_text: &mut String,
+    model: &agent_core::Model,
+    usage: &Usage,
+) {
+    if acc_text.is_empty() {
+        return;
+    }
+    let text = std::mem::take(acc_text);
+    tracing::info!(bytes = text.len(), "持久化被中断的部分回复");
+    context
+        .append(agent_core::AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text }],
+            usage: usage.clone(),
+            model: model.id.clone(),
+            stop_reason: None,
+        }))
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_context::InMemoryContext;
+    use agent_core::ContextManager;
+
+    /// 回归：流式中断（用户取消 / 流异常断开）时，已累积的文本必须兜底持久化为一条
+    /// assistant 消息；否则 resume 会话会丢失这轮已显示给用户的回复。
+    #[tokio::test]
+    async fn persist_interrupted_saves_partial_text() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        // 有内容：应落盘为 1 条 assistant 文本消息，并清空缓冲。
+        let mut acc = String::from("这是一段被中断的部分回复");
+        persist_interrupted(&ctx, &mut acc, &model, &Usage::default()).await;
+        assert!(acc.is_empty(), "持久化后累积缓冲应被清空");
+        let built = ctx.build_provider_context(&model, &[]).await.unwrap();
+        assert_eq!(built.messages.len(), 1, "应持久化 1 条 assistant 消息");
+        // 空缓冲：幂等无副作用，不追加消息。
+        let mut empty = String::new();
+        persist_interrupted(&ctx, &mut empty, &model, &Usage::default()).await;
+        let built2 = ctx.build_provider_context(&model, &[]).await.unwrap();
+        assert_eq!(built2.messages.len(), 1, "空缓冲不应追加消息");
     }
 }

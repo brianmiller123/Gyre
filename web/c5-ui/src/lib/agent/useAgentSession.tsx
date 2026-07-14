@@ -71,6 +71,8 @@ interface AgentSessionValue {
   deleteSession: (id: string) => Promise<SessionOpResult>
   /** 重命名指定历史会话（设置自定义标题）。 */
   renameSession: (id: string, title: string) => Promise<SessionOpResult>
+  /** 删除指定对话项（user 输入或 assistant 响应），落盘并就地刷新 transcript。 */
+  deleteMessage: (item: TranscriptItem) => Promise<SessionOpResult>
   switchModel: (alias: string | null) => void
   /** 切换模式：以 resume=当前会话 重连（应用新 system prompt，保留对话历史）。 */
   switchMode: (mode: Mode) => void
@@ -123,6 +125,27 @@ function addUsage(a: Usage, b: Usage): Usage {
 }
 
 /**
+ * 按顺序把历史项（user/thinking/assistant）与当前 transcript 中的同类项配对，
+ * 返回指定 id 项对应的日志行索引。
+ *
+ * 删除仅在 idle 时触发，此时实时项已全部落盘，transcript 中可删除项与历史项
+ * 顺序一一对应；遇到 streaming（未落盘）的项会因顺序错位而无法匹配，返回 undefined。
+ */
+function resolveLineIndex(
+  items: TranscriptItem[],
+  itemId: string,
+  history: SessionHistoryItem[],
+): number | undefined {
+  let hi = 0
+  for (const it of items) {
+    if (it.kind !== 'user' && it.kind !== 'assistant' && it.kind !== 'thinking') continue
+    const h = history[hi++]
+    if (it.id === itemId) return h?.line
+  }
+  return undefined
+}
+
+/**
  * Owns the connection to `agent --serve`: creates a session over HTTP, opens a
  * WebSocket, and reduces the streamed `ServerFrame`s into a renderable
  * transcript. Sends `ClientFrame`s for new tasks, approvals and cancellation.
@@ -140,6 +163,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     bindWorkspaceContext(settings.serverUrl, settings.token)
   }, [settings.serverUrl, settings.token])
   const [items, setItems] = useState<TranscriptItem[]>([])
+  // items 真值引用：deleteMessage 解析行索引时读取最新列表，避免闭包捕获陈旧快照。
+  const itemsRef = useRef<TranscriptItem[]>([])
+  itemsRef.current = items
   const [state, setState] = useState<AgentStateName | string>('no_task')
   const [usage, setUsage] = useState<Usage>(EMPTY_USAGE)
   const [connected, setConnected] = useState(false)
@@ -298,29 +324,41 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  /** 拉取某会话的历史消息并填充到对话区（恢复展示用）。 */
-  const loadHistory = useCallback(async (id: string) => {
-    const cfg = settingsRef.current
-    const origin = cfg.serverUrl.replace(/\/$/, '')
-    const qs = new URLSearchParams()
-    if (cfg.token) qs.set('token', cfg.token)
-    try {
-      const res = await fetch(`${origin}/api/sessions/${encodeURIComponent(id)}/history?${qs}`)
-      if (!res.ok) return
-      const data = await res.json()
-      const list: SessionHistoryItem[] = Array.isArray(data.items) ? data.items : []
+  /** 拉取某会话的历史消息列表（含日志行索引 line）。 */
+  const fetchHistoryList = useCallback(
+    async (id: string): Promise<SessionHistoryItem[]> => {
+      const cfg = settingsRef.current
+      const origin = cfg.serverUrl.replace(/\/$/, '')
+      const qs = new URLSearchParams()
+      if (cfg.token) qs.set('token', cfg.token)
+      try {
+        const res = await fetch(`${origin}/api/sessions/${encodeURIComponent(id)}/history?${qs}`)
+        if (!res.ok) return []
+        const data = await res.json()
+        return Array.isArray(data.items) ? (data.items as SessionHistoryItem[]) : []
+      } catch {
+        return []
+      }
+    },
+    [],
+  )
+
+  /** 拉取某会话的历史消息并填充到对话区（恢复展示用）。历史项携带日志行索引 `line`，
+   *  供前端定位删除目标。 */
+  const loadHistory = useCallback(
+    async (id: string) => {
+      const list = await fetchHistoryList(id)
       const mapped: TranscriptItem[] = list.map((h) =>
         h.kind === 'user'
-          ? { id: uid(), kind: 'user', text: h.text, ts: Date.now() }
+          ? { id: uid(), kind: 'user', text: h.text, ts: Date.now(), line: h.line }
           : h.kind === 'thinking'
-            ? { id: uid(), kind: 'thinking', text: h.text, ts: Date.now() }
-            : { id: uid(), kind: 'assistant', text: h.text, ts: Date.now() },
+            ? { id: uid(), kind: 'thinking', text: h.text, ts: Date.now(), line: h.line }
+            : { id: uid(), kind: 'assistant', text: h.text, ts: Date.now(), line: h.line },
       )
       setItems(mapped)
-    } catch {
-      /* 忽略：历史拉取失败不阻塞重连 */
-    }
-  }, [])
+    },
+    [fetchHistoryList],
+  )
 
   const connect = useCallback(async (resume?: string | null, fork?: string | null) => {
     // 用 ref 作真值：newChat/重连的 setTimeout 即使捕获陈旧闭包，也能读到最新连接态。
@@ -612,6 +650,80 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [],
   )
 
+  /** 删除指定对话项（仅 user / assistant）。落盘到服务端日志并就地刷新本地 transcript。
+   *
+   *  - 历史恢复的项已有 `line`（日志索引），直接删除。
+   *  - 本会话实时新增的项暂无 `line`：先拉取历史定位其索引再删除。
+   *  - 删除 assistant 时连带移除其同索引的 thinking 块；后续项的 line 按服务端返回的
+   *    removed 计数整体下移，保持与日志索引一致（无需整表重拉，保留 say/tool 等本地项）。 */
+  const deleteMessage = useCallback(
+    async (item: TranscriptItem): Promise<SessionOpResult> => {
+      if (item.kind !== 'user' && item.kind !== 'assistant') {
+        return { ok: false, error: '仅支持删除用户输入或助手响应' }
+      }
+      const sid = sessionIdRef.current
+      if (!sid) return { ok: false, error: '无活跃会话' }
+      // 解析日志行索引：已有则直接用，否则拉历史按顺序定位。
+      let line = item.line
+      if (line == null) {
+        const hist = await fetchHistoryList(sid)
+        line = resolveLineIndex(itemsRef.current, item.id, hist)
+      }
+      if (line == null) {
+        return { ok: false, error: '无法定位消息（可能仍在生成中）' }
+      }
+      const cfg = settingsRef.current
+      const origin = cfg.serverUrl.replace(/\/$/, '')
+      const qs = new URLSearchParams()
+      if (cfg.token) qs.set('token', cfg.token)
+      let removed = 1
+      try {
+        const res = await fetch(
+          `${origin}/api/sessions/${encodeURIComponent(sid)}/messages/${line}?${qs}`,
+          { method: 'DELETE' },
+        )
+        if (res.status === 409) {
+          return { ok: false, error: '任务运行中，无法删除' }
+        }
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '')
+          throw new Error(txt || `HTTP ${res.status}`)
+        }
+        const data = await res.json()
+        removed = typeof data.removed === 'number' ? data.removed : 1
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+      // 本地就地更新：移除目标项（+ assistant 的同索引 thinking），后续 line 下移。
+      const deletedLine = line
+      setItems((prev) => {
+        const idx = prev.findIndex((it) => it.id === item.id)
+        if (idx === -1) return prev
+        // 删除区间：目标项 +（assistant 时）前邻同索引 thinking + 后续连续 tool 块，
+        // 避免删除一条响应后留下悬空的推理/工具调用块。
+        let start = idx
+        let end = idx + 1
+        if (item.kind === 'assistant') {
+          // 先绑定局部变量再判别，便于 TS 正确收窄到 thinking 变体访问 line。
+          const before = start > 0 ? prev[start - 1] : null
+          if (before && before.kind === 'thinking' && before.line === deletedLine) {
+            start -= 1
+          }
+          while (end < prev.length && prev[end].kind === 'tool') end++
+        }
+        const spliced = [...prev.slice(0, start), ...prev.slice(end)]
+        // 后续项的日志行索引按服务端 removed 计数整体下移，保持与日志一致。
+        return spliced.map((it) =>
+          'line' in it && it.line != null && it.line > deletedLine
+            ? ({ ...it, line: it.line - removed } as TranscriptItem)
+            : it,
+        )
+      })
+      return { ok: true }
+    },
+    [fetchHistoryList],
+  )
+
   /** Switch the active model by starting a fresh session with the given alias. */
   const switchModel = useCallback(
     (alias: string | null) => {
@@ -635,7 +747,38 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [settings.mode, sessionId, update, disconnect, connect],
   )
 
-  /** 发送带多模态内容块（图片等）的消息。 */
+  /** 上传单张图片（base64）到服务端，返回 upload_id 句柄。
+   *
+   * 把大体积 base64 卸载到 HTTP 信道，避免在 WS 控制信道里传输（受 max_message_size 限制）。
+   * 上传失败返回 null（调用方可回退内联发送，依赖 WS 已提升的上限）。 */
+  const uploadImage = useCallback(async (mime: string, data: string): Promise<string | null> => {
+    const sid = sessionIdRef.current
+    if (!sid) return null
+    const cfg = settingsRef.current
+    const origin = cfg.serverUrl.replace(/\/$/, '')
+    const qs = new URLSearchParams()
+    if (cfg.token) qs.set('token', cfg.token)
+    try {
+      const res = await fetch(
+        `${origin}/api/sessions/${encodeURIComponent(sid)}/upload?${qs}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mime, data }),
+        },
+      )
+      if (!res.ok) return null
+      const d = (await res.json()) as { upload_id?: string }
+      return d.upload_id ?? null
+    } catch {
+      return null
+    }
+  }, [])
+
+  /** 发送带多模态内容块（图片等）的消息。
+   *
+   * 内联 image 块先经 /upload 上传拿句柄（image_ref），再经 WS 发送，
+   * 避免大 base64 触发 WS 入站消息上限；上传失败则回退内联（依赖 WS 16MiB 上限）。 */
   const sendContent = useCallback(
     (text: string, content: ContentInput[]) => {
       if (!connected) return
@@ -650,14 +793,26 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       ])
       setStopping(false)
       setState('running')
-      sendFrame({
-        type: 'new_task',
-        text: trimmed,
-        mode: settings.mode,
-        content: hasContent ? content : undefined,
-      })
+      // 异步把内联图片上传为句柄后再发送（不阻塞 UI：用户气泡已即时显示）。
+      void (async () => {
+        const resolved: ContentInput[] = []
+        for (const c of content) {
+          if (c.type === 'image' && c.data && c.mime) {
+            const uploadId = await uploadImage(c.mime, c.data)
+            resolved.push(uploadId ? { type: 'image_ref', upload_id: uploadId } : c)
+          } else {
+            resolved.push(c)
+          }
+        }
+        sendFrame({
+          type: 'new_task',
+          text: trimmed,
+          mode: settings.mode,
+          content: resolved.length > 0 ? resolved : undefined,
+        })
+      })()
     },
-    [connected, settings.mode, sendFrame, closeOpen],
+    [connected, settings.mode, sendFrame, closeOpen, uploadImage],
   )
 
   /** 手动压缩上下文（对应 CLI `/compact`）。 */
@@ -767,6 +922,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       refreshSessions,
       deleteSession,
       renameSession,
+      deleteMessage,
       switchModel,
       switchMode,
       send,
@@ -808,6 +964,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       refreshSessions,
       deleteSession,
       renameSession,
+      deleteMessage,
       switchModel,
       switchMode,
       send,

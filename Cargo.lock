@@ -53,6 +53,7 @@ dependencies = [
 name = "agent"
 version = "0.1.0"
 dependencies = [
+ "agent-context",
  "agent-core",
  "agent-iso",
  "agent-prompt",

@@ -88,6 +88,19 @@ pub trait ContextManager: Send + Sync {
     /// 压缩失败时返回 [`ContextError`]。
     async fn compact(&self, strategy: CompactionStrategy) -> Result<(), ContextError>;
 
+    /// 删除指定日志索引（0-based）的消息，并连带清理其孤立工具结果。
+    ///
+    /// 返回实际移除的日志条目数（含被删除消息本身及其孤立 tool 结果）；
+    /// 索引越界返回 `Ok(0)`。默认实现返回错误（不支持删除）。
+    ///
+    /// # Errors
+    /// 不支持删除或内部错误时返回 [`ContextError`]。
+    async fn delete_message_at(&self, _index: usize) -> Result<usize, ContextError> {
+        Err(ContextError::Compaction(
+            "此上下文不支持删除消息".into(),
+        ))
+    }
+
     /// 当前 token 用量。
     fn token_usage(&self) -> TokenUsage;
 

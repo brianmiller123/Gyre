@@ -192,6 +192,12 @@ fn shell_command(command: &str) -> tokio::process::Command {
     {
         let mut c = tokio::process::Command::new("/bin/sh");
         c.arg("-c").arg(command);
+        // 保障 UTF-8 输出：继承的 locale 非 UTF-8（服务端常由 systemd / 容器 / 后台启动器
+        // 拉起）时，中文等程序会以 GBK 编码输出，经 from_utf8_lossy 解码即乱码。
+        if let Some(loc) = agent_core::forced_utf8_locale() {
+            c.env("LC_ALL", loc);
+            c.env("LANG", loc);
+        }
         c
     }
     #[cfg(windows)]

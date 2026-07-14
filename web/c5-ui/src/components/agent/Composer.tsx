@@ -236,9 +236,15 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   }
 
   // ── 图片处理（上传按钮 + 剪贴板粘贴）──
+  // 与 CLI read_image 的 MAX_IMAGE_BYTES 对齐：解码后超 10MiB 直接拦截并提示。
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024
   function handleFiles(files: FileList | File[]) {
     const arr = Array.from(files).filter((f) => IMAGE_MIMES.includes(f.type))
     for (const f of arr) {
+      if (f.size > MAX_IMAGE_BYTES) {
+        say(`图片「${f.name || '未命名'}」超过 10 MiB 上限，已跳过`, 'warning')
+        continue
+      }
       const reader = new FileReader()
       reader.onload = () => {
         const result = typeof reader.result === 'string' ? reader.result : ''

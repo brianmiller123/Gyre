@@ -5,6 +5,7 @@ import { Badge, Button } from '@/components/ui'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { askKindLabel, levelMeta, stateMeta } from '@/lib/agent/ui'
 import type { AskMessage, TranscriptItem } from '@/lib/agent/types'
+import { useNotifications } from '@/lib/notifications'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
 
@@ -92,13 +93,7 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
 function ItemView({ item }: { item: TranscriptItem }) {
   switch (item.kind) {
     case 'user':
-      return (
-        <div className="flex justify-end">
-          <div className="max-w-[85%] rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-white dark:text-[#06241f]">
-            <p className="whitespace-pre-wrap break-words">{item.text}</p>
-          </div>
-        </div>
-      )
+      return <UserMessage item={item} />
     case 'assistant':
       return <AssistantMessage item={item} />
     case 'thinking':
@@ -148,6 +143,103 @@ function Avatar() {
 }
 
 /**
+ * 消息删除按钮：两步确认（首次点击进入确认态 → ✓ 执行 / ✕ 取消）。
+ *
+ * 仅 user / assistant 项可删除；运行中或流式中禁用。删除失败时弹 toast。
+ * 不直接操作 transcript，而是回调会话 hook 的 `deleteMessage`（落盘 + 本地刷新）。
+ */
+function MessageDeleteButton({
+  item,
+  confirmKey,
+}: {
+  item: TranscriptItem
+  confirmKey: string
+}) {
+  const { deleteMessage, running } = useAgentSession()
+  const { t } = useI18n()
+  const { toast } = useNotifications()
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  const streaming = 'streaming' in item && !!item.streaming
+  const disabled = running || busy || streaming
+
+  const doDelete = async () => {
+    setBusy(true)
+    const res = await deleteMessage(item)
+    setBusy(false)
+    setConfirming(false)
+    if (!res.ok) {
+      toast({
+        title: t('transcript.delete_failed'),
+        body: res.error,
+        severity: 'danger',
+      })
+    }
+  }
+
+  if (confirming) {
+    return (
+      <span className="inline-flex items-center gap-1">
+        <span className="mr-0.5 text-[11px] text-danger">{t(confirmKey)}</span>
+        <button
+          type="button"
+          onClick={doDelete}
+          disabled={busy}
+          title={t('common.confirm')}
+          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] font-medium text-danger transition-colors hover:bg-danger/10 disabled:opacity-50"
+        >
+          <Icon name="check" size={12} />
+        </button>
+        <button
+          type="button"
+          onClick={() => setConfirming(false)}
+          disabled={busy}
+          title={t('common.cancel')}
+          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface-2 hover:text-text-2 disabled:opacity-50"
+        >
+          <Icon name="close" size={12} />
+        </button>
+      </span>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => setConfirming(true)}
+      disabled={disabled}
+      title={disabled ? t('transcript.delete_running') : t('transcript.delete')}
+      aria-label={t('transcript.delete')}
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+    >
+      <Icon name="trash" size={12} />
+      {t('common.delete')}
+    </button>
+  )
+}
+
+/**
+ * 用户输入气泡：右对齐，悬停（移动端常驻）显示删除按钮。
+ *
+ * 删除按钮绝对定位于气泡左侧（right-full），不占据布局空间，避免气泡位移。
+ */
+function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }> }) {
+  return (
+    <div className="group flex justify-end">
+      <div className="relative max-w-[85%]">
+        <div className="absolute right-full top-0 mr-1 flex items-center opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+          <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_user" />
+        </div>
+        <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-white dark:text-[#06241f]">
+          <p className="whitespace-pre-wrap break-words">{item.text}</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
  * Assistant 回复气泡：Markdown 渲染 + 流式光标 + 一键复制整条响应。
  *
  * 复制写入的是原始 markdown（`item.text`），而非渲染后的纯文本，便于
@@ -183,17 +275,18 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'ass
           <span className="ml-0.5 inline-block h-4 w-1.5 animate-pulse rounded-sm bg-primary align-middle" />
         )}
         {hasText && !item.streaming && (
-          <div className="mt-1.5">
+          <div className="mt-1.5 flex items-center gap-2 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
             <button
               type="button"
               onClick={copy}
               title={copied ? t('common.copied') : t('common.copy')}
               aria-label={copied ? t('common.copied') : t('common.copy')}
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface-2 hover:text-text-2 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface-2 hover:text-text-2"
             >
               <Icon name={copied ? 'check' : 'copy'} size={12} />
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_assistant" />
           </div>
         )}
       </div>

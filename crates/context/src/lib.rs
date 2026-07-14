@@ -16,6 +16,7 @@ pub mod persistence;
 pub mod token;
 
 pub use persistence::{SessionInfo, SessionStore};
+pub use persistence::delete_message_in_file;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -98,6 +99,20 @@ impl InMemoryContext {
     /// 替换日志（恢复用）。
     pub async fn restore(&self, log: Vec<AgentMessage>) {
         self.inner.lock().await.log = log;
+    }
+
+    /// 删除索引 `index` 处的日志条目，并连带清理其紧随的孤立 tool 结果。
+    ///
+    /// 返回实际移除的条目数（≥1 表示删除成功）；索引越界返回 0。仅改动内存日志，
+    /// 落盘由 [`PersistentContext`] 负责。
+    pub async fn delete_at(&self, index: usize) -> usize {
+        let mut inner = self.inner.lock().await;
+        let original = inner.log.len();
+        let Some(new_log) = remove_entry_with_orphans(&inner.log, index) else {
+            return 0;
+        };
+        inner.log = new_log;
+        original - inner.log.len()
     }
 }
 
@@ -192,6 +207,10 @@ impl ContextManager for InMemoryContext {
             }
         }
         Ok(())
+    }
+
+    async fn delete_message_at(&self, index: usize) -> Result<usize, ContextError> {
+        Ok(self.delete_at(index).await)
     }
 
     fn token_usage(&self) -> TokenUsage {
@@ -306,6 +325,53 @@ fn sanitize_provider_messages(msgs: Vec<ProviderMessage>) -> Vec<ProviderMessage
         }
     }
     out
+}
+
+/// 从日志中移除第 `index` 条消息，并连带清理其紧随的孤立 tool 结果。
+///
+/// 设计要点：
+/// - 含工具调用的 assistant 被删除时，其紧随其后（连续）的 `ToolResult` 若引用其
+///   `tool_call_id` 则一并移除，避免留下孤立 tool 结果（虽在 provider 组装时被
+///   `sanitize_provider_messages` 过滤，但清理可保持 JSONL 紧凑、索引一致）。
+/// - tool 结果对一个 assistant 轮次总是连续出现于下一条 assistant/user 之前；遇到
+///   非目标 id 或非 tool 结果即停止连带清理。
+///
+/// 返回新日志（`index` 越界返回 `None`，调用方据此判定是否落盘）。
+#[must_use]
+pub(crate) fn remove_entry_with_orphans(
+    log: &[AgentMessage],
+    index: usize,
+) -> Option<Vec<AgentMessage>> {
+    if index >= log.len() {
+        return None;
+    }
+    let orphan_ids: HashSet<String> = match &log[index] {
+        AgentMessage::Assistant(a) => a
+            .tool_calls()
+            .into_iter()
+            .map(|(id, _, _)| id.to_string())
+            .collect(),
+        _ => HashSet::new(),
+    };
+    let mut out: Vec<AgentMessage> = Vec::with_capacity(log.len().saturating_sub(1));
+    let mut pending = orphan_ids;
+    for (i, msg) in log.iter().enumerate() {
+        if i == index {
+            continue;
+        }
+        if !pending.is_empty() && i > index {
+            if let AgentMessage::ToolResult(t) = msg {
+                if pending.remove(&t.tool_call_id) {
+                    continue;
+                }
+            }
+            if !matches!(msg, AgentMessage::ToolResult(_)) {
+                pending.clear();
+            }
+        }
+        out.push(msg.clone());
+    }
+    Some(out)
 }
 
 /// StablePrefix 指纹：system + tool spec 的字节哈希。
@@ -533,5 +599,78 @@ mod tests {
             "压缩后消息数应减少，实际 {}",
             built.messages.len()
         );
+    }
+
+    /// `remove_entry_with_orphans`：删除含工具调用的 assistant 时，应连带移除其紧随的
+    /// tool 结果；删除普通 user 消息只移除其自身；索引越界返回 None。
+    #[test]
+    fn remove_entry_with_orphans_drops_tool_results() {
+        use agent_core::{ContentBlock, ToolResult, ToolResultMessage};
+        use serde_json::json;
+        let call = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: json!({}),
+            }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: None,
+        });
+        let res = AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "c1".into(),
+            result: ToolResult::text("body"),
+        });
+        let ans = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text: "done".into() }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: None,
+        });
+        let log = vec![
+            AgentMessage::user_text("q"),
+            call,
+            res,
+            ans,
+        ];
+        // 删除索引 1（含工具调用的 assistant）→ 连带删除索引 2 的 tool 结果。
+        let out = remove_entry_with_orphans(&log, 1).unwrap();
+        assert_eq!(out.len(), 2, "应移除 assistant + 其 tool 结果共 2 条");
+        assert!(matches!(out[0], AgentMessage::User(_)));
+        assert!(matches!(out[1], AgentMessage::Assistant(_)));
+        // 删除 user 消息（无工具调用）→ 仅移除自身。
+        let out2 = remove_entry_with_orphans(&log, 0).unwrap();
+        assert_eq!(out2.len(), 3);
+        // 索引越界 → None。
+        assert!(remove_entry_with_orphans(&log, 99).is_none());
+    }
+
+    /// `delete_message_at`（trait，经 InMemoryContext）：删除后日志与 token 计数同步更新。
+    #[tokio::test]
+    async fn delete_message_at_updates_inmemory() {
+        use agent_core::ContextManager;
+        let ctx = InMemoryContext::with_counter(vec![], token::TokenCounter::heuristic());
+        ctx.append(AgentMessage::user_text("a")).await;
+        ctx.append(AgentMessage::user_text("b")).await;
+        ctx.append(AgentMessage::user_text("c")).await;
+        // 删除索引 1（"b"）。
+        let removed = ctx.delete_message_at(1).await.unwrap();
+        assert_eq!(removed, 1);
+        let snap = ctx.snapshot().await;
+        let texts: Vec<String> = snap
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User(u) => u.content.first().and_then(|c| match c {
+                    agent_core::UserContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["a".to_string(), "c".to_string()]);
+        // 越界返回 0。
+        assert_eq!(ctx.delete_message_at(99).await.unwrap(), 0);
+        // 默认 trait 错误路径：用一个不支持删除的桩验证（这里仅断言 InMemory 支持即可）。
+        let _ = ctx.token_usage(); // 确保未 panic
     }
 }

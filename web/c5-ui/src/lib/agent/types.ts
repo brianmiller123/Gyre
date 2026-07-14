@@ -151,10 +151,11 @@ export function parseFrame(raw: unknown): Frame | null {
 
 /* -------- Multimodal content (image upload / paste) -------- */
 export interface ContentInput {
-  type: 'text' | 'image'
+  type: 'text' | 'image' | 'image_ref'
   text?: string
   mime?: string
   data?: string
+  upload_id?: string
 }
 
 /* ----------------------------- Client → Server ---------------------------- */
@@ -177,9 +178,9 @@ export type ClientFrame =
 
 /* ------------------------------- UI models -------------------------------- */
 export type TranscriptItem =
-  | { id: string; kind: 'user'; text: string; ts: number }
-  | { id: string; kind: 'assistant'; text: string; ts: number; streaming?: boolean }
-  | { id: string; kind: 'thinking'; text: string; ts: number; streaming?: boolean }
+  | { id: string; kind: 'user'; text: string; ts: number; line?: number }
+  | { id: string; kind: 'assistant'; text: string; ts: number; streaming?: boolean; line?: number }
+  | { id: string; kind: 'thinking'; text: string; ts: number; streaming?: boolean; line?: number }
   | { id: string; kind: 'tool'; name: string; output: string; ts: number }
   | { id: string; kind: 'say'; text: string; level: string; ts: number }
   | {
@@ -220,6 +221,8 @@ export interface SessionOpResult {
 export interface SessionHistoryItem {
   kind: 'user' | 'assistant' | 'thinking'
   text: string
+  /** 该消息在服务端日志中的索引（与 DELETE /messages/{line} 同源）。 */
+  line: number
 }
 
 /** 自定义 slash 命令（`.agent/commands/*.md`，与 CLI 同源）。 */

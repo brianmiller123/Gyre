@@ -21,5 +21,9 @@ tokio-util   = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
 
+[dev-dependencies]
+# 仅测试用：提供现成的 ContextManager 实现（InMemoryContext）以验证中断兜底持久化。
+agent-context = { workspace = true }
+
 [lints]
 workspace = true
