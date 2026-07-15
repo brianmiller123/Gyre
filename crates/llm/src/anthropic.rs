@@ -265,10 +265,24 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
         let mut usage = Usage::default();
         let mut stop: Option<String> = None;
 
-        while let Some(chunk) = bytes.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => { yield AssistantEvent::Error(LlmError::StreamInterrupted(e.to_string())); break; }
+        loop {
+            // 按 chunk 的空闲读超时：只要上游持续吐 token，每次读到新 chunk 即顺延计时；
+            // 仅当真正静默超过阈值（上游挂起/网络中断）才判超时（替代整条请求总超时，
+            // 避免慢速 LLM 长流被误杀、未到达 message_stop 而误判「未收到结束标记」）。
+            let chunk = match tokio::time::timeout(crate::STREAM_IDLE_TIMEOUT, bytes.next()).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => {
+                    yield AssistantEvent::Error(LlmError::StreamInterrupted(e.to_string()));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    yield AssistantEvent::Error(LlmError::StreamInterrupted(format!(
+                        "流空闲超过 {} 秒未收到数据，判定上游静默",
+                        crate::STREAM_IDLE_TIMEOUT.as_secs()
+                    )));
+                    break;
+                }
             };
             buf.extend_from_slice(chunk.as_ref());
             loop {

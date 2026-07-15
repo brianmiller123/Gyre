@@ -424,7 +424,26 @@ fn parse_glm_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
         let mut finish: Option<String> = None;
         let mut usage_acc = Usage::default();
 
-        while let Some(chunk_res) = bytes_stream.next().await {
+        loop {
+            // 按 chunk 的空闲读超时：只要上游持续吐 token，每次读到新 chunk 即顺延计时；
+            // 仅当真正静默超过阈值（上游挂起/网络中断）才判超时（替代整条请求总超时，
+            // 避免慢速 LLM 长流被误杀、收不到 `[DONE]` 而误判「未收到结束标记」）。
+            let chunk_res = match tokio::time::timeout(
+                crate::STREAM_IDLE_TIMEOUT,
+                bytes_stream.next(),
+            )
+            .await
+            {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(_) => {
+                    yield AssistantEvent::Error(LlmError::StreamInterrupted(format!(
+                        "GLM 流空闲超过 {} 秒未收到数据，判定上游静默",
+                        crate::STREAM_IDLE_TIMEOUT.as_secs()
+                    )));
+                    break;
+                }
+            };
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {

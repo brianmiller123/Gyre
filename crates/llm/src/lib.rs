@@ -65,6 +65,18 @@ pub(crate) fn line_buffer_too_long(buf: &[u8]) -> bool {
     buf.len() > MAX_SSE_LINE_BYTES
 }
 
+/// 流式 SSE 的「按 chunk 空闲读超时」：两次 chunk 之间允许的最大静默时间。
+///
+/// 这是**按 chunk 的空闲读超时**，而非 [`reqwest::ClientBuilder::timeout`] 那种覆盖整条
+/// 请求（含响应体读取）的总超时。只要上游持续吐 token，每次读到新 chunk 就顺延该计时；
+/// 只有当上游真正静默超过此时长（如挂起、网络中断）才判超时。
+///
+/// 为何需要它：慢速 LLM（首 token 慢、出 token 速度低）的单轮总耗时可能远超常见的
+/// 300s 总超时；总超时会切断仍在正常输出的长流，导致收不到 `data: [DONE]` 终止帧，
+/// 被上游 agent 误判为「未收到结束标记 / 响应流异常中断」并触发自动续写。各 SSE
+/// 适配器用 `tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())` 包裹逐 chunk 读取。
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// 将 `extra_body`（per-model 配置的额外请求体字段）合并到请求体顶层。
 ///
 /// 仅当 `extra` 为 JSON 对象时执行合并；其每个键值对直接插入 `body` 顶层，

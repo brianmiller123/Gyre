@@ -166,6 +166,12 @@ pub enum ServerFrame {
         /// 模型上限。
         limit: usize,
     },
+    /// 应用层心跳（无业务负载）。由 WS 转发层在无其它帧时空闲下发，目的是：
+    /// ① 保活反向代理 / LB 的读超时（默认常为 60s，慢速 LLM 长时间无数据会被切连）；
+    /// ② 刷新前端「心跳看门狗」的活动时间戳——前端 `onmessage` 收到任意帧即更新
+    ///    `lastActivityRef`，避免在慢速生成阶段误判后端静默终止。前端 `parseFrame`
+    ///    对未知 `type` 返回 null，故本帧被静默忽略，不影响 transcript。
+    Heartbeat,
 }
 
 fn to_server_frame(ev: AgentEvent) -> ServerFrame {
@@ -1880,16 +1886,36 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: Arc<Sessio
 
     // 广播 → 客户端
     let send_task = tokio::spawn(async move {
-        while let Ok(frame) = out_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&frame) else {
-                continue;
-            };
-            if sink
-                .send(axum::extract::ws::Message::Text(text.into()))
-                .await
-                .is_err()
-            {
-                break;
+        // 应用层心跳：每 20 秒无业务帧时下发一帧 Heartbeat，保活反向代理读超时 +
+        // 刷新前端心跳看门狗（慢速 LLM 长时间无 token 输出时尤为关键，避免误判静默
+        // 终止 / 被中间代理切连而触发自动重连）。间隔远小于前端 60s 看门狗阈值，留足余量。
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await; // 跳过 interval 立即触发的首 tick，首帧心跳延迟到 20s 后
+        loop {
+            tokio::select! {
+                biased;
+                frame = out_rx.recv() => {
+                    let Ok(frame) = frame else { break };
+                    let Ok(text) = serde_json::to_string(&frame) else { continue };
+                    if sink
+                        .send(axum::extract::ws::Message::Text(text.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    let Ok(text) = serde_json::to_string(&ServerFrame::Heartbeat) else { continue };
+                    if sink
+                        .send(axum::extract::ws::Message::Text(text.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });

@@ -80,10 +80,12 @@ struct Cli {
 async fn run_server(cfg: agent_config::Config, cwd: PathBuf, acp: bool) -> Result<()> {
     let bind = cfg.server.bind.clone();
     let acp_enabled = acp || cfg.acp.enabled;
-    // 服务端共享 HTTP 客户端：连接/整体超时 + keepalive，避免上游挂起时请求永久阻塞。
+    // 服务端共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时。该客户端
+    // 专供流式 LLM 调用——总超时会切断仍在正常输出的慢速长流（收不到 `data: [DONE]`
+    // 终止帧而误判「未收到结束标记」）；真正的「上游挂起」由各 SSE 适配器的按 chunk
+    // 空闲读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
@@ -113,9 +115,10 @@ async fn run_server(cfg: agent_config::Config, cwd: PathBuf, acp: bool) -> Resul
 
 /// 纯 stdio 模式运行 ACP（编辑器作为子进程调用：stdin 读 JSON-RPC，stdout 写事件）。
 async fn run_acp_stdio(cfg: agent_config::Config, cwd: PathBuf) -> Result<()> {
+    // 流式 LLM 客户端：不设整条请求总超时（会误杀慢速长流），上游静默由按 chunk 空闲
+    // 读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
@@ -234,10 +237,11 @@ async fn main() -> Result<()> {
     };
 
     // 3. 装配 Provider（registry + OpenAI Chat Completions 适配器）
-    // 共享 HTTP 客户端：连接/整体超时 + keepalive，避免 LLM 上游挂起导致流式请求永久阻塞。
+    // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
+    // LLM 调用，总超时会切断仍在正常输出的慢速长流（收不到终止帧而误判「未收到结束标记」）；
+    // 真正的「上游挂起」由各 SSE 适配器的按 chunk 空闲读超时（STREAM_IDLE_TIMEOUT）兜底。
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
