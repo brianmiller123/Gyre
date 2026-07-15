@@ -72,7 +72,15 @@ impl Tool for RunCommandTool {
             output = tokio::time::timeout(CMD_TIMEOUT, run_command_capped(cmd)) => match output {
                 Ok(Ok(CmdOutput { status, combined })) => {
                     if status.map_or(false, |s| s.success()) {
-                        Ok(ToolResult::text(combined))
+                        // 成功且无输出（mkdir/touch/git config 等静默命令）：显式标注。
+                        // 既让模型明确「命令已成功执行」避免误判/重试，又在源头消除空文本
+                        // （序列化层另有兜底，此处为语义与 UI 改善）。
+                        let text = if combined.is_empty() {
+                            "(命令成功，无输出)".to_string()
+                        } else {
+                            combined
+                        };
+                        Ok(ToolResult::text(text))
                     } else {
                         Ok(ToolResult::text(format!(
                             "[exit {}]\n{combined}",

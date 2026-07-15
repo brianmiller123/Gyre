@@ -258,9 +258,18 @@ fn convert_to_llm(log: &[AgentMessage]) -> Vec<ProviderMessage> {
                     }
                     _ => Vec::new(),
                 };
+                // 兜底空 content：部分兼容 provider（GLM/Z.ai 等）拒绝 content 为空的 tool
+                // 消息，直接返回 400。静默命令（mkdir/touch）、读空文件、无匹配搜索等会产出
+                // 空文本，触发「工具调用后偶发 400」。此处统一填充占位，保证请求体始终合法。
+                let content = t.result.to_llm_text();
+                let content = if content.is_empty() {
+                    "(无输出)".to_string()
+                } else {
+                    content
+                };
                 Some(ProviderMessage::Tool {
                     tool_call_id: t.tool_call_id.clone(),
-                    content: t.result.to_llm_text(),
+                    content,
                     is_error: matches!(t.result, agent_core::ToolResult::Error { .. }),
                     images,
                 })
@@ -414,6 +423,46 @@ mod tests {
         assert_eq!(built.messages.len(), 2);
         assert!(!built.fingerprint.is_empty());
         assert!(built.tokens.current > 0);
+    }
+
+    /// 回归：空 content 的 ToolResult（静默命令 mkdir/touch、读空文件、无匹配搜索等）
+    /// 序列化为 provider tool 消息后必须非空，否则 GLM/Z.ai 等兼容 provider 拒绝空 tool
+    /// content 并返回 400——这正是「工具调用后偶发 400」的根因。
+    #[tokio::test]
+    async fn empty_tool_result_content_gets_placeholder() {
+        let ctx = InMemoryContext::new(vec!["sys".into()]);
+        ctx.append(AgentMessage::Assistant(AssistantMessage {
+            content: vec![agent_core::ContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({"command":"mkdir x"}),
+            }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: Some(agent_core::StopReason::ToolUse),
+        }))
+        .await;
+        ctx.append(AgentMessage::ToolResult(agent_core::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            result: agent_core::ToolResult::text(""),
+        }))
+        .await;
+
+        let model = Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let built = ctx.build_provider_context(&model, &[]).await.unwrap();
+
+        let tool_contents: Vec<&str> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_contents.iter().all(|c| !c.is_empty()),
+            "tool 消息 content 不应为空（兼容 provider 会返回 400），实际: {tool_contents:?}"
+        );
     }
 
     #[tokio::test]
