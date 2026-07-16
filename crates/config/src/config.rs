@@ -639,7 +639,7 @@ pub struct GithubConfig {
 /// 可选工具开关配置（对应 TOML `[tools]`）。
 ///
 /// 仅作用于「可选工具组」（ast / lsp / image / hashline / pty）：
-/// - 核心工具（read_file / write_file / str_replace / apply_diff / list_files /
+/// - 核心工具（read_file / write_file / list_files /
 ///   run_command / grep / glob）始终启用，不受此控制。
 /// - GitHub 工具仍由 `[github] enabled` 控制（保留其 `allow_write` 子选项）。
 ///

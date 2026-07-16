@@ -5,7 +5,7 @@
 //!
 //! ## 动机
 //!
-//! 编辑工具（`write_file` / `str_replace` / `apply_diff` / `apply_hashline` /
+//! 编辑工具（`write_file` / `apply_hashline` /
 //! `replace_block` / `ast_rewrite`）原先各自直接 `tokio::fs::write`，若要让每个工具
 //! 在写盘后统一接 LSP format / diagnostics，会出现大量重复胶水。本端口提供一个
 //! 「写盘后副作用」的统一注入点：装配层注入具体实现（如 LSP format + diagnostics

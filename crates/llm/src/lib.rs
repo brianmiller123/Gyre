@@ -75,7 +75,7 @@ pub(crate) fn line_buffer_too_long(buf: &[u8]) -> bool {
 /// 300s 总超时；总超时会切断仍在正常输出的长流，导致收不到 `data: [DONE]` 终止帧，
 /// 被上游 agent 误判为「未收到结束标记 / 响应流异常中断」并触发自动续写。各 SSE
 /// 适配器用 `tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())` 包裹逐 chunk 读取。
-pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
 
 /// 将 `extra_body`（per-model 配置的额外请求体字段）合并到请求体顶层。
 ///

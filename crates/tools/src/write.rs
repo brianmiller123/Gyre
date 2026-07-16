@@ -1,6 +1,6 @@
 //! 统一写入辅助：写盘 + 触发 [`WriteEffect`]（LSP format / diagnostics 等）。
 //!
-//! 所有写工具（`write_file` / `str_replace` / `apply_diff` / `apply_hashline` /
+//! 所有写工具（`write_file` / `apply_hashline` /
 //! `replace_block` / `ast_rewrite`）经 [`write_with_effects`] 写盘，避免各自直接
 //! `tokio::fs::write` 并重复接 LSP 胶水。装配层在 [`ToolContext`](crate::ToolContext)
 //! 注入具体 [`WriteEffect`]（如 `LspWriteEffect`）即可让全部写工具自动获得

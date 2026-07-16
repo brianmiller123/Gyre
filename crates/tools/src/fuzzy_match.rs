@@ -1,8 +1,8 @@
 //! SEARCH 块模糊匹配：L0 精确 → L1 行级归一化 → L2 相似度阈值。
 //!
 //! 移植自 oh-my-pi [`normalize.ts`](../../../third/oh-my-pi/packages/coding-agent/src/edit/normalize.ts)
-//! 的 `normalizeForFuzzy`。用于 [`crate::ApplyDiffTool`] / [`crate::StrReplaceTool`] 在硬匹配
-//! 失败时容错（行尾空白、fancy 引号 / 破折号、空白折叠差异）。
+//! 的 `normalizeForFuzzy`。原供 SEARCH 类编辑工具在硬匹配失败时容错（行尾空白、fancy 引号 /
+//! 破折号、空白折叠差异）；该工具已随 str_replace/apply_diff 移除，此处保留为工具库。
 //!
 //! ## 三级策略
 //!
@@ -476,7 +476,10 @@ fn convert_leading_tabs_to_spaces(text: &str, spaces_per_tab: usize) -> String {
 ///
 /// 移植 oh-my-pi [`normalize.ts adjustIndentation`](../../../third/oh-my-pi/packages/coding-agent/src/edit/normalize.ts:303)。
 /// 仅在「均匀缩进偏移」或「tab↔space 转换」时调整；混合缩进或不一致则原样返回。
+///
+/// 注：原消费工具 str_replace/apply_diff 已移除；保留为工具库，供未来 fuzzy 编辑能力复用。
 #[must_use]
+#[allow(dead_code)]
 pub fn adjust_indentation(old_text: &str, actual_text: &str, new_text: &str) -> String {
     if old_text == actual_text || is_indentation_only_rewrite(old_text, new_text) {
         return new_text.to_string();

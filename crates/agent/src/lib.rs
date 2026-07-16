@@ -352,8 +352,7 @@ fn approval_prompt(tool: &str, args: &serde_json::Value) -> String {
             }
         }
         "write_file" => format!("Agent 想写入文件：{}", s("path")),
-        "str_replace" => format!("Agent 想替换文件 {} 中的内容", s("path")),
-        "apply_diff" => format!("Agent 想对文件 {} 应用差异编辑", s("path")),
+        "apply_hashline" => "Agent 想批量编辑文件（hashline）".into(),
         "replace_block" => format!("Agent 想替换文件 {} 中的代码块", s("path")),
         "ast_rewrite" => format!("Agent 想重写文件 {} 中的代码", s("path")),
         "ast_search" => format!("Agent 想在文件 {} 中搜索：{}", s("path"), s("pattern")),

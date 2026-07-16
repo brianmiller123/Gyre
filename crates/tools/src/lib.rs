@@ -8,7 +8,6 @@
 #![warn(clippy::pedantic)]
 
 mod ast_tool;
-mod diff_tool;
 mod fs;
 mod fuzzy_match;
 mod github;
@@ -25,8 +24,7 @@ use agent_core::{
 };
 
 pub use ast_tool::{AstRewriteTool, AstSearchTool, ReplaceBlockTool};
-pub use diff_tool::ApplyDiffTool;
-pub use fs::{ReadFileTool, StrReplaceTool, WriteFileTool};
+pub use fs::{ReadFileTool, WriteFileTool};
 pub use fuzzy_match::{
     find_unique_match, set_fuzzy_opts, FuzzyOpts, MatchError, MatchMethod, MatchOutcome,
 };
@@ -146,14 +144,13 @@ impl ToolRegistry for DefaultToolRegistry {
 }
 
 /// 核心工具集（始终启用，不受 `[tools]` 开关控制）：
-/// read_file / write_file / str_replace / apply_diff / list_files / run_command / grep / glob。
+/// read_file / write_file / list_files / run_command / grep / glob。
+/// 编辑经可选的 `apply_hashline`（主推）完成；`write_file` 负责整文件创建/覆写。
 #[must_use]
 pub fn core_tools() -> DefaultToolRegistry {
     DefaultToolRegistry::new()
         .with(Box::new(ReadFileTool))
         .with(Box::new(WriteFileTool))
-        .with(Box::new(StrReplaceTool))
-        .with(Box::new(ApplyDiffTool))
         .with(Box::new(ListFilesTool))
         .with(Box::new(RunCommandTool))
         .with(Box::new(GrepTool))
@@ -223,7 +220,7 @@ pub struct OptionalToolPrompt {
 /// AST 组使用指引（覆盖 replace_block / ast_search / ast_rewrite）。
 const AST_PROMPT: &str = "<ast>\n\
 AST 结构化工具已启用：基于 tree-sitter 的句法感知编辑与检索。\n\
-- replace_block：按行号定位，整体替换一个句法块（函数/结构体/方法），自动确定块边界，比 str_replace 更稳。\n\
+- replace_block：按行号定位，整体替换一个句法块（函数/结构体/方法），自动确定块边界，比纯文本替换更稳。\n\
 - ast_search：按 AST 模式检索（如「所有函数定义」「所有方法调用」），精确于文本 grep。\n\
 - ast_rewrite：按 AST 模式做结构化重写。\n\
 当前主要支持 Rust；行号须基于最新 read 结果（编辑后重编号）。\n\
@@ -245,7 +242,7 @@ image_gen 需环境变量 IMAGE_API_KEY 或 OPENAI_API_KEY。\n\
 
 /// 编辑后 writethrough 组使用指引。
 const EDIT_PROMPT: &str = "<edit_writethrough>\n\
-编辑后 LSP writethrough 已启用：写工具（write_file/str_replace/apply_diff/apply_hashline/replace_block/ast_rewrite）\n\
+编辑后 LSP writethrough 已启用：写工具（write_file/apply_hashline/replace_block/ast_rewrite）\n\
 落盘后自动触发 LSP format（若服务器支持）与诊断回写，结果附在工具返回末尾。据此诊断修正代码。\n\
 SEARCH 块模糊匹配可经 PI_EDIT_FUZZY=on 启用（归一化 + 相似度容错），命中非精确时结果会标注相似度。\n\
 </edit_writethrough>";
@@ -304,8 +301,6 @@ mod tests {
         for core in [
             "read_file",
             "write_file",
-            "str_replace",
-            "apply_diff",
             "list_files",
             "run_command",
             "grep",

@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::format::compute_file_hash;
+use crate::mismatch::MismatchDetails;
 use crate::types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk};
 
 /// 把一个区段应用到 `text`，返回结果（含告警）。
@@ -16,13 +17,19 @@ use crate::types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk};
 pub fn apply_section(text: &str, section: &FileSection) -> ApplyResult {
     let mut warnings: Vec<String> = Vec::new();
 
-    // 指纹校验（宽容：不匹配仅告警，继续应用）
+    // 指纹校验（宽容：不匹配仅告警，继续应用）—— 失配时给出可操作富诊断。
     if let Some(expected) = &section.hash {
         let actual = compute_file_hash(text);
         if !actual.eq_ignore_ascii_case(expected) {
-            warnings.push(format!(
-                "hash 不匹配：段头 {expected}，实际 {actual}（宽容模式继续应用）"
-            ));
+            warnings.push(crate::mismatch::format_display_message(&MismatchDetails {
+                path: Some(section.path.clone()),
+                expected_file_hash: expected.clone(),
+                actual_file_hash: actual,
+                file_lines: text.lines().map(String::from).collect(),
+                anchor_lines: crate::mismatch::anchor_lines_of(section),
+                // apply 层无快照存储，无法判定「是否本会话产生」；按「文件被改」给文案。
+                hash_recognized: true,
+            }));
         }
     }
 
@@ -170,10 +177,12 @@ fn validate_anchor(a: Anchor, n: usize, warnings: &mut Vec<String>) {
     }
 }
 
-/// 结构闭包边界回声修复：去掉 body 误重述的区间外不变行。
+/// 结构闭包边界回声修复：去掉 body 误重述的区间外不变行（移植上游 boundary-repair 子集）。
 ///
-/// - body 首行等于区间前一行（`start-1`）时去掉
-/// - body 末行等于区间后一行（`end+1`）时去掉
+/// - 前回声：body 首行等于区间前一行（`start-1`）时去掉。
+/// - 后回声（多行）：body 后缀与区间**下方幸存行**逐行精确匹配，去掉最长匹配后缀。
+///   覆盖上游经典「闭合符重复」场景（模型重述了区间下方仍存的 `});` / `</>` + `);` 等多行闭合块）。
+///   仅删除与幸存行逐字一致的行——零误判风险（不会动合理内容）。
 fn repair_boundaries(lines: &[&str], start: Anchor, end: Anchor, body: &[String]) -> Vec<String> {
     if body.is_empty() {
         return Vec::new();
@@ -189,13 +198,29 @@ fn repair_boundaries(lines: &[&str], start: Anchor, end: Anchor, body: &[String]
             }
         }
     }
-    // 后回声：body 末行 == 区间后一行
-    let after_idx = end as usize; // 0-indexed: lines[end]
-    if let Some(next) = lines.get(after_idx) {
-        if repaired.last().is_some_and(|l| l == next) {
-            repaired.pop();
+
+    // 后回声（多行）：找最大 k 使 body 后缀整段 == 区间下方紧邻的 k 行（逐字精确匹配）。
+    // 不同 k 的对齐不同（body[len-k] 对齐 lines[after_idx]），故取最大匹配而非单调累加。
+    // 区间后一行是 0-indexed lines[end]（end 1-indexed → 第 end+1 行）。
+    let after_idx = end as usize;
+    let max_k = repaired.len().min(lines.len().saturating_sub(after_idx));
+    let mut back = 0usize;
+    for cand in (1..=max_k).rev() {
+        let body_suffix = &repaired[repaired.len() - cand..];
+        let below = &lines[after_idx..after_idx + cand];
+        if body_suffix
+            .iter()
+            .map(String::as_str)
+            .eq(below.iter().copied())
+        {
+            back = cand;
+            break;
         }
     }
+    if back > 0 {
+        repaired.truncate(repaired.len() - back);
+    }
+
     repaired
 }
 
@@ -233,6 +258,30 @@ mod tests {
         // body 末行 "+c" 误重述了区间后一行（原 line 3 = "c"），应被自动去除
         let r = apply("[a]\nSWAP 2.=2:\n+B\n+c\n", "a\nb\nc\nd\n");
         assert_eq!(r.text.as_deref(), Some("a\nB\nc\nd\n"));
+    }
+
+    #[test]
+    fn back_echo_drops_single_duplicated_closer() {
+        // 经典「单闭合符重复」：SWAP 替换两行体，但 body 末尾重述了区间下方仍存的 `});`
+        let file = "it('a', () => {\n\tsetup();\n\trun();\n});\nafter();\n";
+        let patch = "[t.ts]\nSWAP 2.=3:\n+\tsetup2();\n+\trun2();\n+});\n";
+        let out = apply(patch, file).text.unwrap();
+        assert_eq!(
+            out,
+            "it('a', () => {\n\tsetup2();\n\trun2();\n});\nafter();\n"
+        );
+        assert_eq!(out.matches("});").count(), 1);
+    }
+
+    #[test]
+    fn back_echo_drops_multi_line_duplicated_block() {
+        // 多行闭合块重复：body 后缀 [D, E] 与区间下方幸存行逐字一致，应整体去除
+        let file = "A\nB\nC\nD\nE\n";
+        let patch = "[t]\nSWAP 2.=3:\n+X\n+D\n+E\n";
+        let out = apply(patch, file).text.unwrap();
+        assert_eq!(out, "A\nX\nD\nE\n");
+        assert_eq!(out.matches('D').count(), 1, "不应出现重复的 D");
+        assert_eq!(out.matches('E').count(), 1, "不应出现重复的 E");
     }
 
     #[test]

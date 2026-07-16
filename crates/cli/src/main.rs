@@ -284,7 +284,11 @@ async fn main() -> Result<()> {
     for p in agent_tools::OPTIONAL_TOOL_PROMPTS {
         optional.insert(p.key.to_string(), cfg.tools.effective(p.key, p.default));
     }
-    optional.insert("hashline".to_string(), cfg.tools.effective("hashline", false));
+    // hashline 默认启用（主推编辑格式）；用户可在 [tools].enabled 显式置 false 关闭。
+    optional.insert(
+        "hashline".to_string(),
+        cfg.tools.effective("hashline", true),
+    );
     optional.insert("pty".to_string(), cfg.tools.effective("pty", false));
     // 子 Agent 工具集（按启用态装配的可选工具 + MCP，不含 task 以防递归；与模型无关，构建一次）
     let (mut sub_reg, _) = assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write);
@@ -858,7 +862,7 @@ fn assemble_builtin_tools(
         reg = reg.with(Box::new(lsp));
     }
     if *optional.get("hashline").unwrap_or(&false) {
-        reg = reg.with(Box::new(agent_hashline::HashlineTool));
+        reg = reg.with(Box::new(agent_hashline::HashlineTool::new()));
     }
     if *optional.get("pty").unwrap_or(&false) {
         reg = reg.with(Box::new(agent_pty::RunPtyTool));

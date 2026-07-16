@@ -1,13 +1,15 @@
-//! 文件系统工具：read_file / write_file / str_replace。
+//! 文件系统工具：read_file / write_file。
+//! （str_replace/apply_diff 已按工具收敛移除，编辑走 apply_hashline。）
 
 use std::path::Path;
 use std::time::Duration;
 
+use agent_ast::{summarize_code, SegmentKind, SummaryOptions, SupportLang};
 use agent_core::{CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::{find_unique_match, write_with_effects, MatchError, MatchMethod, Tool, ToolContext};
+use crate::{write_with_effects, Tool, ToolContext};
 
 /// 读取文件（带行号）。
 pub struct ReadFileTool;
@@ -24,7 +26,8 @@ impl Tool for ReadFileTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、http(s)://（抓取网页）" }
+                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、http(s)://（抓取网页）" },
+                "summary": { "type": "boolean", "description": "可选：对支持语言的代码文件做结构摘要——折叠大体块、保留签名，行号与原文一致。适合快速浏览大文件；需逐行编辑时仍用真实行号。" }
             },
             "required": ["path"]
         })
@@ -44,12 +47,67 @@ impl Tool for ReadFileTool {
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `path` 参数".into()))?;
         // 内部协议路由：skill:// memory:// mcp:// local:// http(s):// 或裸本地路径。
         let text = resolve_path(path, ctx).await?;
-        let mut out = String::with_capacity(text.len());
-        for (i, line) in text.lines().enumerate() {
-            out.push_str(&format!("{i:>5}\t{line}\n"));
-        }
+        // 可选摘要：对支持语言的代码文件做结构折叠，保留签名、行号保真。
+        let want_summary = input
+            .get("summary")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let out = if want_summary {
+            match SupportLang::from_path(Path::new(path)) {
+                Some(lang) => render_summary(&text, lang),
+                None => render_numbered(&text),
+            }
+        } else {
+            render_numbered(&text)
+        };
         Ok(ToolResult::text(out))
     }
+}
+
+/// 逐行带行号渲染（默认行为）。
+fn render_numbered(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        out.push_str(&format!("{i:>5}\t{line}\n"));
+    }
+    out
+}
+
+/// 结构摘要渲染：折叠大体块、保留签名；行号与原文一致（编辑须基于真实行号）。
+fn render_summary(text: &str, lang: SupportLang) -> String {
+    let result = summarize_code(text, lang, &SummaryOptions::default());
+    // 无可折叠内容（如小文件/解析失败）：回退逐行渲染，避免无意义的摘要头。
+    if !result.elided {
+        return render_numbered(text);
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "（结构摘要：原文 {} 行，已折叠体块；行号与原文一致，如需逐行编辑请基于这些行号）\n",
+        result.total_lines
+    ));
+    for seg in &result.segments {
+        match seg.kind {
+            SegmentKind::Kept => {
+                if let Some(body) = &seg.text {
+                    for (offset, line) in body.lines().enumerate() {
+                        out.push_str(&format!(
+                            "{:>5}\t{line}\n",
+                            seg.start_line as usize + offset
+                        ));
+                    }
+                }
+            }
+            SegmentKind::Elided => {
+                out.push_str(&format!(
+                    "     ⋯⋯ (折叠第 {}-{} 行，共 {} 行) ⋯⋯\n",
+                    seg.start_line,
+                    seg.end_line,
+                    seg.end_line.saturating_sub(seg.start_line).saturating_add(1),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// 解析 read_file 的 `path`：内部协议路由 + 裸本地路径，返回原始文本。
@@ -387,79 +445,6 @@ impl Tool for WriteFileTool {
     }
 }
 
-/// 精确字符串替换（要求 old 唯一匹配）。
-pub struct StrReplaceTool;
-
-#[async_trait]
-impl Tool for StrReplaceTool {
-    fn name(&self) -> &str {
-        "str_replace"
-    }
-    fn description(&self) -> &str {
-        "在文件中用 new 替换 old（要求 old 在文件中唯一匹配，避免误改）。"
-    }
-    fn schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "old":  { "type": "string", "description": "待替换的唯一文本片段" },
-                "new":  { "type": "string", "description": "替换为的新文本" }
-            },
-            "required": ["path", "old", "new"]
-        })
-    }
-    fn capability(&self) -> CapabilityTier {
-        CapabilityTier::Write
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        ctx: &ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let path = input
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `path`".into()))?;
-        let old = input
-            .get("old")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `old`".into()))?;
-        let new = input
-            .get("new")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `new`".into()))?;
-        let full = ctx.workspace.resolve(Path::new(path));
-        let text = tokio::fs::read_to_string(&full)
-            .await
-            .map_err(ToolError::Io)?;
-        let opts = crate::fuzzy_match::resolve_opts();
-        let outcome = find_unique_match(&text, old, &opts).map_err(|e| match e {
-            MatchError::NotFound => ToolError::Execution(format!("未在 {path} 找到匹配文本")),
-            MatchError::Ambiguous(c) => {
-                ToolError::Execution(format!("`old` 在 {path} 匹配 {c} 处，需唯一"))
-            }
-        })?;
-        let replacement: String = if outcome.method != MatchMethod::Exact {
-            // fuzzy 命中：按实际匹配位置的缩进自适应调整 new。
-            let actual = &text[outcome.byte_start..outcome.byte_end];
-            crate::fuzzy_match::adjust_indentation(old, actual, new)
-        } else {
-            new.to_string()
-        };
-        let mut updated = text;
-        updated.replace_range(outcome.byte_start..outcome.byte_end, &replacement);
-        let report = write_with_effects(&full, &updated, ctx).await?;
-        let mut msg = format!("已在 {path} 替换 1 处");
-        if outcome.method != MatchMethod::Exact {
-            msg.push_str(&format!("；模糊匹配（相似度 {:.2}）", outcome.similarity));
-        }
-        msg.push_str(&report.effect_suffix());
-        Ok(ToolResult::text(msg))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,53 +500,6 @@ mod tests {
             ToolResult::Text(t) => assert!(t.contains("hello") && t.contains("world")),
             _ => panic!("应为文本结果"),
         }
-    }
-
-    #[tokio::test]
-    async fn str_replace_unique() {
-        let tmp = tempfile_dir();
-        let ws = Workspace::new(&tmp);
-        let ctx = dummy_ctx(&ws);
-        WriteFileTool
-            .execute(
-                serde_json::json!({ "path": "b.txt", "content": "foo bar foo" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let res = StrReplaceTool
-            .execute(
-                serde_json::json!({ "path": "b.txt", "old": "bar", "new": "baz" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(res, ToolResult::Text(_)));
-        let after = tokio::fs::read_to_string(std::path::Path::new(&tmp).join("b.txt"))
-            .await
-            .unwrap();
-        assert_eq!(after, "foo baz foo");
-    }
-
-    #[tokio::test]
-    async fn str_replace_ambiguous_errors() {
-        let tmp = tempfile_dir();
-        let ws = Workspace::new(&tmp);
-        let ctx = dummy_ctx(&ws);
-        WriteFileTool
-            .execute(
-                serde_json::json!({ "path": "c.txt", "content": "x x x" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let res = StrReplaceTool
-            .execute(
-                serde_json::json!({ "path": "c.txt", "old": "x", "new": "y" }),
-                &ctx,
-            )
-            .await;
-        assert!(res.is_err());
     }
 
     #[test]

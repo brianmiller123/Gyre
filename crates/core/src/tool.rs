@@ -129,7 +129,7 @@ pub enum ApprovalMode {
 pub enum CapabilityTier {
     /// 只读（read_file / grep / ast 查询）。
     ReadOnly,
-    /// 写入（write_file / str_replace / ast 重写）。
+    /// 写入（write_file / apply_hashline / ast 重写）。
     Write,
     /// 执行（run_command）。
     Execute,

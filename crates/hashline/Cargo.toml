@@ -16,6 +16,7 @@ agent-tools.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

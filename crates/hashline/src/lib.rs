@@ -4,8 +4,8 @@
 //!
 //! 移植自 [`oh-my-pi hashline`](../../../third/oh-my-pi/packages/hashline)（核心语法 + 应用器 + 预览）。
 //!
-//! 与 `apply_diff`（块级 SEARCH/REPLACE）互补：hashline 用**行号锚定**描述批量编辑，
-//! 适合一次性改动多文件、多区间；每次编辑后行号重编号，须基于最新读取结果。
+//! hashline 用**行号锚定**描述批量编辑，适合一次性改动多文件、多区间；
+//! 每次编辑后行号重编号，须基于最新读取结果。工具收敛后为唯一编辑工具。
 //!
 //! 模块：
 //! - [`format`] —— sigil / 段头 / 内容指纹（FNV-1a 低 16 位 4 hex）
@@ -19,23 +19,40 @@
 
 pub mod apply;
 pub mod format;
+pub mod mismatch;
+pub mod normalize;
 pub mod parser;
 pub mod preview;
+pub mod recovery;
+pub mod snapshots;
 pub mod tool;
 pub mod types;
 
 pub use apply::apply_section;
 pub use format::{compute_file_hash, format_numbered_lines};
+pub use mismatch::{
+    anchor_lines_of, format_anchored_context, format_display_message, format_full_anchor_requirement,
+    parse_tag, rejection_header, validate_line_ref, MismatchDetails, MISMATCH_CONTEXT,
+};
+pub use normalize::{
+    detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom, BomResult, LineEnding,
+};
+pub use recovery::{recover, RecoveryResult, RECOVERY_SESSION_REPLAY_WARNING};
+pub use snapshots::{InMemorySnapshotStore, Snapshot};
 pub use parser::parse_hashline;
 pub use preview::{build_compact_diff, CompactDiffPreview};
 pub use tool::HashlineTool;
 pub use types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk, PatchReport};
 
 /// 注入 system prompt 的 hashline 工具使用指引（启用时由装配层追加）。
+///
+/// 工具收敛后：apply_hashline 为唯一编辑工具（write_file 仅整文件创建/覆写）。
 pub const PROMPT_SECTION: &str = "<hashline>\n\
-hashline 工具 `apply_hashline` 已启用：行锚定批量编辑格式。\n\
-每段以 [path#hash] 开头，段内用 SWAP/DEL/INS/REM/MV 描述行操作；适合一次性改多文件/多区间。\n\
-每次编辑后行号重编号，须基于最新 read 的行号。与 apply_diff（块级 SEARCH/REPLACE）互补。\n\
+编辑文件用 `apply_hashline`：行锚定、一次调用可改多文件/多区间。\n\
+每段以 [path#hash] 开头（hash 取自最近一次 read 的段头标签，勿编造、勿跨会话复用）；段内用 SWAP/DEL/INS/REM/MV 描述行操作。\n\
+每次编辑后行号重编号，须基于最新 read 的行号。\n\
+创建/整体覆写新文件用 `write_file`；对已有内容的任何改动一律用 apply_hashline（项目已移除 str_replace / apply_diff）。\n\
+hash 失配时按返回诊断修正（含期望/实际标签 + 锚行上下文，据此重读刷新标签后再试）。\n\
 </hashline>";
 
 /// 纯函数便捷入口：把单区段 patch 应用到 `original` 文本。

@@ -8,10 +8,16 @@
 #![warn(clippy::pedantic)]
 
 mod pattern;
+pub mod summary;
 
 pub use pattern::{AstMatch, AstMatchStrictness, rewrite, rewrite_rust, search, search_rust};
+pub use summary::{
+    summarize_code, SegmentKind, SummaryOptions, SummaryResult, SummarySegment,
+};
 
-use tree_sitter::{Language, Node, Parser, Point};
+use std::collections::BTreeSet;
+
+use tree_sitter::{Language, Node, Parser, Point, TreeCursor};
 
 /// 命名块行范围（1-indexed，闭区间）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +178,125 @@ fn first_content_col(line: &str) -> Option<usize> {
     None
 }
 
+// ── enclosing_block_boundaries（移植 pi-ast block.rs）──────────────────────
+
+/// 可见行区间（1-indexed，闭区间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    /// 起始行（含）。
+    pub start_line: u32,
+    /// 结束行（含）。
+    pub end_line: u32,
+}
+
+/// 对每个跨越可见窗口边界的多行命名节点，返回位于窗口*之外*的边界行。
+///
+/// 移植 pi-ast `enclosing_block_boundaries`：把「显示匹配括号」推广到任意 tree-sitter 块——
+/// 节点在可见行开口但闭合于窗口外 → 返回其闭合行；节点在可见行闭合但开口于窗口前 → 返回其起始行。
+/// 因触发条件是端点落入窗口内，结果受窗口大小（而非嵌套深度）约束；同时覆盖缩进语言（Python）。
+///
+/// 返回 `None` 当源码解析失败 / 含语法错误（调用方应回退词法括号扫描）；
+/// 否则返回排序去重的边界行（可能为空）。
+///
+/// # Errors
+/// 仅在 tree-sitter 解析器初始化失败时返回错误字符串。
+pub fn enclosing_block_boundaries(
+    code: &str,
+    lang: SupportLang,
+    ranges: &[LineRange],
+) -> Result<Option<Vec<u32>>, String> {
+    let merged = normalize_ranges(ranges);
+    if code.is_empty() || merged.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut parser = Parser::new();
+    let language = lang.ts_language();
+    parser
+        .set_language(&language)
+        .map_err(|e| format!("set_language: {e}"))?;
+    let Some(tree) = parser.parse(code, None) else {
+        return Ok(None);
+    };
+    let root = tree.root_node();
+    // 文件级语法错误会使错误恢复区间不可靠：交给词法扫描器，不在此产出边界。
+    if root.has_error() {
+        return Ok(None);
+    }
+
+    let mut boundaries = BTreeSet::new();
+    let mut cursor = root.walk();
+    collect_boundaries(&mut cursor, &merged, &mut boundaries);
+    Ok(Some(boundaries.into_iter().collect()))
+}
+
+/// 排序、丢弃非法、合并相邻/重叠区间，使可见性测试可二分查找。
+fn normalize_ranges(ranges: &[LineRange]) -> Vec<LineRange> {
+    let mut v: Vec<LineRange> = ranges
+        .iter()
+        .copied()
+        .filter(|r| r.start_line > 0 && r.end_line >= r.start_line)
+        .collect();
+    v.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.end_line.cmp(&b.end_line)));
+    let mut merged: Vec<LineRange> = Vec::with_capacity(v.len());
+    for range in v {
+        if let Some(last) = merged.last_mut() {
+            if range.start_line <= last.end_line.saturating_add(1) {
+                last.end_line = last.end_line.max(range.end_line);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+/// `line` 是否落在任一合并后的可见区间内（二分）。
+fn is_visible(merged: &[LineRange], line: u32) -> bool {
+    merged
+        .binary_search_by(|range| {
+            if line < range.start_line {
+                std::cmp::Ordering::Greater
+            } else if line > range.end_line {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// 深度优先遍历，从每个跨越可见区间边的多行命名节点收集边界行。
+/// 复用单个 [`TreeCursor`] 使遍历零分配。
+fn collect_boundaries(cursor: &mut TreeCursor<'_>, merged: &[LineRange], out: &mut BTreeSet<u32>) {
+    let node = cursor.node();
+    // 跳过整文件根：其唯一「边界」是 EOF，永不是有用的匹配行（与 block_range_at 排除根一致）。
+    if node.is_named() && node.parent().is_some() {
+        let start = node.start_position().row as u32 + 1;
+        let end = content_end_line(node);
+        if end > start {
+            let start_visible = is_visible(merged, start);
+            let end_visible = is_visible(merged, end);
+            // 开口在可见、闭合在窗口外 → 暴露闭合行（反之亦然）。
+            // 完全在窗口内或外的节点不贡献任何边界。
+            if start_visible && !end_visible {
+                out.insert(end);
+            } else if end_visible && !start_visible {
+                out.insert(start);
+            }
+        }
+    }
+    if cursor.goto_first_child() {
+        loop {
+            collect_boundaries(cursor, merged, out);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +327,80 @@ mod tests {
             Some(SupportLang::Rust)
         );
         assert_eq!(SupportLang::from_path(std::path::Path::new("a.txt")), None);
+    }
+
+    #[test]
+    fn enclosing_surfaces_closer_outside_window() {
+        // fn x 在 1-4 行；可见窗口仅到第 3 行 → 闭合行 4 在窗口外，应被暴露
+        let code = "fn x() {\n    if y {\n    }\n}\n";
+        let ranges = [LineRange {
+            start_line: 1,
+            end_line: 3,
+        }];
+        let b = enclosing_block_boundaries(code, SupportLang::Rust, &ranges)
+            .unwrap()
+            .unwrap();
+        assert!(b.contains(&4), "应暴露闭合行 4，得到 {b:?}");
+    }
+
+    #[test]
+    fn enclosing_surfaces_opener_before_window() {
+        // 闭合行 4 可见、开口行 1 在窗口前 → 暴露起始行 1
+        let code = "fn x() {\n    if y {\n    }\n}\n";
+        let ranges = [LineRange {
+            start_line: 4,
+            end_line: 4,
+        }];
+        let b = enclosing_block_boundaries(code, SupportLang::Rust, &ranges)
+            .unwrap()
+            .unwrap();
+        assert!(b.contains(&1), "应暴露起始行 1，得到 {b:?}");
+    }
+
+    #[test]
+    fn enclosing_empty_when_block_fully_visible() {
+        let code = "fn x() {\n}\n";
+        let ranges = [LineRange {
+            start_line: 1,
+            end_line: 2,
+        }];
+        let b = enclosing_block_boundaries(code, SupportLang::Rust, &ranges)
+            .unwrap()
+            .unwrap();
+        assert!(b.is_empty(), "块完全可见时无边界，得到 {b:?}");
+    }
+
+    #[test]
+    fn enclosing_empty_when_no_ranges_or_empty_code() {
+        let none: [LineRange; 0] = [];
+        assert!(enclosing_block_boundaries("fn x() {\n}\n", SupportLang::Rust, &none)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(enclosing_block_boundaries(
+            "",
+            SupportLang::Rust,
+            &[LineRange {
+                start_line: 1,
+                end_line: 3,
+            }]
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn enclosing_none_on_syntax_error() {
+        // 明显非法的 Rust → root.has_error() → None（调用方应回退词法扫描）
+        let code = "@@@ not valid rust @@@\n";
+        let ranges = [LineRange {
+            start_line: 1,
+            end_line: 1,
+        }];
+        assert_eq!(
+            enclosing_block_boundaries(code, SupportLang::Rust, &ranges).unwrap(),
+            None
+        );
     }
 }
