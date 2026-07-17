@@ -18,6 +18,7 @@
 #![warn(clippy::pedantic)]
 
 pub mod apply;
+mod repair;
 pub mod format;
 pub mod mismatch;
 pub mod normalize;
