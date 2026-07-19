@@ -14,6 +14,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # 赋予工作流创建 Release 的写入权限
+    permissions:
+      contents: write
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -45,3 +49,24 @@ jobs:
     # ✨ 核心改进 3：编译 Rust 后端
     - name: Build Rust Backend
       run: cargo build -r --verbose  # 默认在根目录执行，无需 cd ../../
+    
+      # ✨ 核心增补 1：重命名并整理二进制文件（方便用户下载）
+    # 注意：请把下面的 your_project_name 改成你 Cargo.toml 里的实际二进制程序名
+    - name: Prepare Artifacts
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        mkdir -p dist
+        cp target/release/agent dist/
+        cd dist && tar -czvf ../backend-linux-amd64.tar.gz *
+
+    # ✨ 核心增补 2：自动创建 Release 并上传文件
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: backend-linux-amd64.tar.gz # 要上传的压缩包路径
+        body: |
+          Automated Release by GitHub Actions.
+          - Commit: ${{ github.sha }}
+        draft: false
+        prerelease: false
