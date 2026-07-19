@@ -3,6 +3,9 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    # ⚠️ 关键：branches 过滤器会排除 tag 推送，必须显式加 tags 才能在打 tag 时触发 release
+    tags:
+      - 'v*'
   pull_request:
     branches: [ "main" ]
 
@@ -50,14 +53,22 @@ jobs:
     - name: Build Rust Backend
       run: cargo build -r --verbose  # 默认在根目录执行，无需 cd ../../
     
-      # ✨ 核心增补 1：重命名并整理二进制文件（方便用户下载）
-    # 注意：请把下面的 your_project_name 改成你 Cargo.toml 里的实际二进制程序名
+    # ✨ 核心增补 1：整理二进制文件（方便用户下载）
+    # 二进制名 agent 来自 crates/cli 的 [[bin]] name = "agent"
     - name: Prepare Artifacts
       if: startsWith(github.ref, 'refs/tags/')
       run: |
+        set -euo pipefail
+        # 显式校验：二进制不存在就直接失败，避免后面建出"只有源码"的空 release
+        test -f target/release/agent || {
+          echo "❌ target/release/agent 不存在：请确认 cargo build -r 成功，且 crates/cli 配置了 [[bin]] name=\"agent\""
+          exit 1
+        }
         mkdir -p dist
         cp target/release/agent dist/
-        cd dist && tar -czvf ../backend-linux-amd64.tar.gz *
+        # 用 -C 指定打包目录，比 cd + 通配符 * 更稳健（不丢 dotfile、不受 shell 展开影响）
+        tar -czvf backend-linux-amd64.tar.gz -C dist .
+        echo "✅ 产物已生成："; ls -lh backend-linux-amd64.tar.gz
 
     # ✨ 核心增补 2：自动创建 Release 并上传文件
     - name: Create GitHub Release
@@ -65,6 +76,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: backend-linux-amd64.tar.gz # 要上传的压缩包路径
+        # 关键：files 没匹配到任何文件时让 Action 直接失败，而不是静默建一个只有源码的 release
+        fail_on_unmatched_files: true
         body: |
           Automated Release by GitHub Actions.
           - Commit: ${{ github.sha }}
