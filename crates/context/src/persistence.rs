@@ -1,31 +1,44 @@
 //! 会话持久化：JSONL 落盘 + 恢复（断点续跑）。
 //!
-//! 每条 [`AgentMessage`] 序列化为一行 JSON（JSON Lines）。恢复时按行反序列化重建日志。
+//! 会话树原生持久化：每行一个 [`SessionNode`]（`id` + `parent_id` + `message`），
+//! 完整保留分支结构。旧版线性日志（每行一个裸 [`AgentMessage`]）在加载时被无损
+//! 迁移为单链树。活跃叶子（续写点）经 sidecar `<id>.jsonl.leaf` 跨进程保留。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use agent_core::AgentMessage;
+use agent_core::{AgentMessage, NodeId, SessionNode};
 
 /// JSONL 持久化的上下文：包裹 [`InMemoryContext`](crate::InMemoryContext)，append 时自动追加写盘。
 pub struct PersistentContext {
     inner: crate::InMemoryContext,
     path: PathBuf,
+    /// 活跃叶子 sidecar 路径（`<path>.leaf`）：跨进程保留续写点。
+    leaf_path: PathBuf,
 }
 
 impl PersistentContext {
-    /// 异步构造：加载已有 JSONL 恢复日志。若文件不存在则创建空会话。
+    /// 异步构造：加载已有 JSONL 恢复日志（会话树 + 活跃叶子）。若文件不存在则创建空会话。
     ///
     /// # Errors
     /// 读取已有文件解析失败时返回错误。
     pub async fn open(system: Vec<String>, path: impl Into<PathBuf>) -> Result<Self, agent_core::ContextError> {
         let path = path.into();
+        let leaf_path = leaf_sidecar(&path);
         let inner = crate::InMemoryContext::new(system);
         if path.exists() {
-            let log = load_jsonl(&path).await?;
-            inner.restore(log).await;
+            let nodes = load_jsonl(&path).await?;
+            inner.restore_nodes(nodes).await;
+            // 恢复活跃叶子（sidecar 缺失则保持 restore_nodes 默认的末节点）。
+            if let Some(leaf) = read_leaf_sidecar(&leaf_path) {
+                inner.set_active_leaf(&leaf).await;
+            }
         }
-        Ok(Self { inner, path })
+        Ok(Self {
+            inner,
+            path,
+            leaf_path,
+        })
     }
 
     /// 取底层内存上下文。
@@ -34,19 +47,42 @@ impl PersistentContext {
         &self.inner
     }
 
-    /// 注入摘要提供器（启用 summarize 压缩）。
+    /// 注入摘要提供器（启用 summarize 压缩 / branch handoff）。
     pub async fn set_summarizer(&self, provider: Box<dyn crate::compaction::SummaryProvider>) {
         self.inner.set_summarizer(provider).await;
+    }
+
+    /// 注入 Shake 落盘槽（启用大块归档 + `read_file artifact://` 回读）。
+    pub async fn set_shake_sink(&self, sink: std::sync::Arc<dyn crate::compaction::ShakeSink>) {
+        self.inner.set_shake_sink(sink).await;
+    }
+
+    /// 覆盖 Shake 配置（保护窗口 / 节省阈值 / 块门槛）。
+    pub async fn set_shake_config(&self, config: crate::compaction::ShakeConfig) {
+        self.inner.set_shake_config(config).await;
+    }
+
+    /// 压缩 / 删除等结构性改写后，把节点森林 + 活跃叶子落盘。
+    async fn persist_full(&self) {
+        let nodes = self.inner.snapshot_nodes().await;
+        if let Err(e) = rewrite_jsonl(&self.path, &nodes).await {
+            tracing::warn!("重写持久化失败: {e}");
+        }
+        // 压缩会赋予活跃路径全新 id，需同步刷新 sidecar。
+        if let Some(leaf) = self.inner.active_leaf().await {
+            let _ = write_leaf_sidecar(&self.leaf_path, &leaf);
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl agent_core::ContextManager for PersistentContext {
     async fn append(&self, message: AgentMessage) {
-        if let Err(e) = append_jsonl(&self.path, &message).await {
+        // append_node 返回新建节点（含 id/parent），增量写一行；内存同步更新。
+        let node = self.inner.append_node(message).await;
+        if let Err(e) = append_jsonl_node(&self.path, &node).await {
             tracing::warn!("持久化写入失败: {e}");
         }
-        self.inner.append(message).await;
     }
 
     async fn set_system(&self, system: Vec<String>, tools: &[agent_core::ToolSpec]) {
@@ -63,10 +99,7 @@ impl agent_core::ContextManager for PersistentContext {
 
     async fn compact(&self, strategy: agent_core::CompactionStrategy) -> Result<(), agent_core::ContextError> {
         self.inner.compact(strategy).await?;
-        let log = self.inner.snapshot().await;
-        if let Err(e) = rewrite_jsonl(&self.path, &log).await {
-            tracing::warn!("压缩后重写持久化失败: {e}");
-        }
+        self.persist_full().await;
         Ok(())
     }
 
@@ -76,11 +109,7 @@ impl agent_core::ContextManager for PersistentContext {
     ) -> Result<usize, agent_core::ContextError> {
         let removed = self.inner.delete_at(index).await;
         if removed > 0 {
-            let log = self.inner.snapshot().await;
-            if let Err(e) = rewrite_jsonl(&self.path, &log).await {
-                tracing::warn!("删除消息后重写持久化失败: {e}");
-                return Err(agent_core::ContextError::Io(e));
-            }
+            self.persist_full().await;
         }
         Ok(removed)
     }
@@ -89,8 +118,50 @@ impl agent_core::ContextManager for PersistentContext {
         self.inner.token_usage()
     }
 
+    fn accumulated_usage(&self) -> agent_core::Usage {
+        self.inner.accumulated_usage()
+    }
+
     fn prefix_fingerprint(&self) -> String {
         self.inner.prefix_fingerprint()
+    }
+
+    // ── 会话树 / 分支导航：委托内存实现 + 落盘活跃叶子 ──
+    async fn active_leaf(&self) -> Option<NodeId> {
+        self.inner.active_leaf().await
+    }
+
+    async fn set_active_leaf(&self, id: &NodeId) -> bool {
+        if self.inner.set_active_leaf(id).await {
+            let _ = write_leaf_sidecar(&self.leaf_path, id);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn switch_branch_with_handoff(
+        &self,
+        new_leaf: &NodeId,
+    ) -> Result<bool, agent_core::ContextError> {
+        // handoff 会追加一条节点 → 需落盘全量节点 + 活跃叶子。
+        let result = self.inner.switch_branch_with_handoff(new_leaf).await?;
+        if result {
+            self.persist_full().await;
+        }
+        Ok(result)
+    }
+
+    async fn snapshot_nodes(&self) -> Vec<SessionNode> {
+        self.inner.snapshot_nodes().await
+    }
+
+    async fn list_leaves(&self) -> Vec<NodeId> {
+        self.inner.list_leaves().await
+    }
+
+    async fn children_of(&self, id: &NodeId) -> Vec<NodeId> {
+        self.inner.children_of(id).await
     }
 }
 
@@ -159,6 +230,9 @@ impl SessionStore {
     }
 
     /// 列出全部会话（按修改时间倒序）。
+    ///
+    /// 只枚举 `.jsonl` 文件，sidecar `.jsonl.leaf` / `.jsonl.tmp` / `_titles.json`
+    /// 不会被误列为会话。
     #[must_use]
     pub fn list(&self) -> Vec<SessionInfo> {
         let mut out = Vec::new();
@@ -167,6 +241,7 @@ impl SessionStore {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // 仅直接以 `.jsonl` 结尾（排除 `sess.jsonl.leaf` / `.tmp`）。
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -207,10 +282,16 @@ impl SessionStore {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(&src, &dst)?;
+        // 复制活跃叶子 sidecar（若存在）。
+        let src_leaf = leaf_sidecar(&src);
+        let dst_leaf = leaf_sidecar(&dst);
+        if src_leaf.exists() {
+            let _ = std::fs::copy(&src_leaf, &dst_leaf);
+        }
         Ok(new_id)
     }
 
-    /// 删除会话：移除 JSONL 落盘文件及其自定义标题（若存在）。
+    /// 删除会话：移除 JSONL 落盘文件、活跃叶子 sidecar 及自定义标题（若存在）。
     ///
     /// 返回值：`Ok(true)` 表示文件存在并已删除；`Ok(false)` 表示会话文件不存在；
     /// `Err` 为非法 id 或 IO 错误。
@@ -229,7 +310,8 @@ impl SessionStore {
         if existed {
             std::fs::remove_file(&path)?;
         }
-        // 同步清理自定义标题（缺失则无操作）。
+        // 同步清理 sidecar 与自定义标题（缺失则无操作）。
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
         self.remove_title(id);
         Ok(existed)
     }
@@ -327,12 +409,39 @@ fn sanitize_session_id_segment(id: &str) -> String {
         .unwrap_or_else(|| "invalid-session".to_string())
 }
 
-/// 单条追加写（异步，O(1) append）。
-async fn append_jsonl(path: &Path, msg: &AgentMessage) -> Result<(), std::io::Error> {
+/// 活跃叶子 sidecar 路径：`<jsonl>.leaf`（非 `.jsonl`，不被 [`SessionStore::list`] 枚举）。
+fn leaf_sidecar(jsonl: &Path) -> PathBuf {
+    // with_extension 会把 `sess.jsonl` → `sess.leaf`（替换最后一段扩展名）。
+    jsonl.with_extension("leaf")
+}
+
+/// 读 sidecar 活跃叶子（缺失/损坏返回 `None`，不阻塞加载）。
+fn read_leaf_sidecar(path: &Path) -> Option<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return None;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 写 sidecar 活跃叶子（best-effort，失败仅告警）。
+fn write_leaf_sidecar(path: &Path, leaf: &str) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, leaf.as_bytes())
+}
+
+/// 单节点追加写（异步，O(1) append）。
+async fn append_jsonl_node(path: &Path, node: &SessionNode) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let line = serde_json::to_string(msg)
+    let line = serde_json::to_string(node)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -348,7 +457,7 @@ async fn append_jsonl(path: &Path, msg: &AgentMessage) -> Result<(), std::io::Er
 
 /// 整体重写（异步 + 原子）：先写临时文件并 sync，再 rename 覆盖，避免中途崩溃导致
 /// 会话 JSONL 被截断/损坏（数据丢失）。
-async fn rewrite_jsonl(path: &Path, log: &[AgentMessage]) -> Result<(), std::io::Error> {
+async fn rewrite_jsonl(path: &Path, nodes: &[SessionNode]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -360,8 +469,8 @@ async fn rewrite_jsonl(path: &Path, log: &[AgentMessage]) -> Result<(), std::io:
     {
         let mut file = tokio::fs::File::create(&tmp).await?;
         use tokio::io::AsyncWriteExt;
-        for m in log {
-            let line = serde_json::to_string(m)
+        for n in nodes {
+            let line = serde_json::to_string(n)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             file.write_all(line.as_bytes()).await?;
             file.write_all(b"\n").await?;
@@ -373,12 +482,12 @@ async fn rewrite_jsonl(path: &Path, log: &[AgentMessage]) -> Result<(), std::io:
     Ok(())
 }
 
-/// 直接从 JSONL 文件删除第 `index` 条有效消息（含孤立 tool 结果清理），原子重写落盘。
+/// 直接从 JSONL 文件删除第 `index` 个节点（含孤立工具结果清理），原子重写落盘。
 ///
-/// 适用于会话未加载到内存（无活跃 [`PersistentContext`）时的离线删除：读取全部
-/// 有效消息 → [`crate::remove_entry_with_orphans`] → [`rewrite_jsonl`] 原子覆盖。
+/// 适用于会话未加载到内存（无活跃 [`PersistentContext`]）时的离线删除：读取全部
+/// 节点 → [`crate::tree::remove_node_with_orphans`] → [`rewrite_jsonl`] 原子覆盖。
 ///
-/// 返回 `Ok(0)` 表示索引越界（无变更）；`Ok(n>0)` 表示已删除 n 条并落盘。
+/// 返回 `Ok(0)` 表示索引越界（无变更）；`Ok(n>0)` 表示已删除 n 个节点并落盘。
 ///
 /// # Errors
 /// 读取/解析/写入失败时返回 IO 错误。
@@ -386,22 +495,23 @@ pub async fn delete_message_in_file(
     path: &std::path::Path,
     index: usize,
 ) -> Result<usize, std::io::Error> {
-    let log = load_jsonl(path)
+    let nodes = load_jsonl(path)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("加载会话失败: {e}")))?;
-    let Some(new_log) = crate::remove_entry_with_orphans(&log, index) else {
+    let Some(new_nodes) = crate::tree::remove_node_with_orphans(&nodes, index) else {
         return Ok(0);
     };
-    let removed = log.len().saturating_sub(new_log.len());
+    let removed = nodes.len().saturating_sub(new_nodes.len());
     if removed == 0 {
         return Ok(0);
     }
-    rewrite_jsonl(path, &new_log).await?;
+    rewrite_jsonl(path, &new_nodes).await?;
     Ok(removed)
 }
 
-/// 加载恢复：流式逐行反序列化，并对总字节数与单行长度设上限，防止超大历史会话 OOM。
-async fn load_jsonl(path: &Path) -> Result<Vec<AgentMessage>, agent_core::ContextError> {
+/// 加载恢复：流式逐行反序列化为 [`SessionNode`]，并对总字节数与单行长度设上限，
+/// 防止超大历史会话 OOM。旧版线性日志（裸 [`AgentMessage`]）被无损迁移为单链树。
+async fn load_jsonl(path: &Path) -> Result<Vec<SessionNode>, agent_core::ContextError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     /// 会话恢复加载的最大总字节数（超出则仅加载首部并告警）。
     const MAX_LOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -410,7 +520,7 @@ async fn load_jsonl(path: &Path) -> Result<Vec<AgentMessage>, agent_core::Contex
 
     let file = tokio::fs::File::open(path).await?;
     let mut reader = BufReader::new(file);
-    let mut log = Vec::new();
+    let mut raw_lines: Vec<String> = Vec::new();
     let mut line = String::new();
     let mut consumed: u64 = 0;
     let mut i = 0usize;
@@ -422,18 +532,13 @@ async fn load_jsonl(path: &Path) -> Result<Vec<AgentMessage>, agent_core::Contex
         }
         consumed = consumed.saturating_add(n as u64);
         if line.len() > MAX_LINE_BYTES {
-            tracing::warn!(
-                "持久化第 {i} 行超过 {MAX_LINE_BYTES} 字节，跳过（疑似损坏）"
-            );
+            tracing::warn!("持久化第 {i} 行超过 {MAX_LINE_BYTES} 字节，跳过（疑似损坏）");
             i += 1;
             continue;
         }
-        let trimmed = line.trim();
+        let trimmed = line.trim_end_matches(['\n', '\r']);
         if !trimmed.is_empty() {
-            match serde_json::from_str::<AgentMessage>(trimmed) {
-                Ok(m) => log.push(m),
-                Err(e) => tracing::warn!("持久化第 {i} 行解析失败，跳过: {e}"),
-            }
+            raw_lines.push(trimmed.to_string());
         }
         i += 1;
         if consumed > MAX_LOAD_BYTES {
@@ -443,7 +548,42 @@ async fn load_jsonl(path: &Path) -> Result<Vec<AgentMessage>, agent_core::Contex
             break;
         }
     }
-    Ok(log)
+
+    // 两阶段解析：先按 SessionNode 解析；失败的行回退为裸 AgentMessage（旧版线性日志）
+    // 并就地迁移为单链树节点（顺序 parent 链）。
+    let mut nodes: Vec<SessionNode> = Vec::with_capacity(raw_lines.len());
+    let mut legacy_buffer: Vec<AgentMessage> = Vec::new();
+    for raw in &raw_lines {
+        match serde_json::from_str::<SessionNode>(raw) {
+            Ok(n) => {
+                // 切到 SessionNode 前，若有遗留线性消息，先 flush 为迁移链。
+                if !legacy_buffer.is_empty() {
+                    nodes.extend(crate::tree::wrap_linear_as_nodes(&legacy_buffer));
+                    legacy_buffer.clear();
+                }
+                nodes.push(n);
+            }
+            Err(_) => match serde_json::from_str::<AgentMessage>(raw) {
+                Ok(m) => legacy_buffer.push(m),
+                Err(e) => tracing::warn!("持久化一行解析失败，跳过: {e}"),
+            },
+        }
+    }
+    if !legacy_buffer.is_empty() {
+        // 修复迁移节点间的 parent 衔接：迁移链起点应接续到已解析节点末尾（若有）。
+        let attach = nodes.last().map(|n| n.id.clone());
+        let offset = nodes.len();
+        let mut migrated = crate::tree::wrap_linear_as_nodes(&legacy_buffer);
+        if let Some(parent) = attach {
+            if let Some(first) = migrated.first_mut() {
+                first.parent_id = Some(parent);
+            }
+        }
+        nodes.extend(migrated);
+        // 偏移仅用于调试可观测；id 已是稳定的 legacy-{i}，此处保留。
+        let _ = offset;
+    }
+    Ok(nodes)
 }
 
 #[cfg(test)]
@@ -484,6 +624,7 @@ mod tests {
         assert_eq!(built.messages.len(), 2);
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
     }
 
     #[test]
@@ -545,14 +686,14 @@ mod tests {
     async fn delete_message_persists_to_disk() {
         use agent_core::ContextManager;
         let path = tmp_path();
-        // 写入 3 条用户消息（每条 append 即落盘一行 JSONL）。
+        // 写入 3 条用户消息（每条 append 即落盘一行 SessionNode）。
         {
             let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
             pc.append(AgentMessage::user_text("a")).await;
             pc.append(AgentMessage::user_text("b")).await;
             pc.append(AgentMessage::user_text("c")).await;
         }
-        // 删除索引 1（"b"）：内存日志 + 原子重写 JSONL。
+        // 删除索引 1（"b"）：内存 + 原子重写 JSONL。
         {
             let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
             let removed = pc.delete_message_at(1).await.unwrap();
@@ -580,5 +721,69 @@ mod tests {
         assert_eq!(built.messages.len(), 2);
         assert_eq!(texts, vec!["a".to_string(), "c".to_string()]);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
+    }
+
+    /// 迁移：旧版线性日志（每行裸 `AgentMessage`）可无损加载为单链树，
+    /// 活跃路径与原顺序一致。
+    #[tokio::test]
+    async fn legacy_linear_jsonl_migrates_to_single_chain_tree() {
+        let path = tmp_path();
+        // 手写旧版格式：每行一个裸 AgentMessage（无 id/parent_id 信封）。
+        {
+            use std::io::Write;
+            let a = serde_json::to_string(&AgentMessage::user_text("old-a")).unwrap();
+            let b = serde_json::to_string(&AgentMessage::user_text("old-b")).unwrap();
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{a}").unwrap();
+            writeln!(f, "{b}").unwrap();
+        }
+        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let nodes = pc.snapshot_nodes().await;
+        assert_eq!(nodes.len(), 2, "应迁移为 2 个节点");
+        // 单链：首节点根，次节点 parent 指向首节点。
+        assert!(nodes[0].parent_id.is_none());
+        assert_eq!(nodes[1].parent_id.as_ref(), Some(&nodes[0].id));
+        // 活跃路径文本与原顺序一致。
+        let model = agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let built = pc.build_provider_context(&model, &[]).await.unwrap();
+        let texts: Vec<String> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::User { content } => content
+                    .iter()
+                    .filter_map(|c| match c {
+                        agent_core::UserContent::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .next(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["old-a".to_string(), "old-b".to_string()]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
+    }
+
+    /// fork 持久化分支：切到旧叶子 append 后保存，reload 仍能见到两个叶子。
+    #[tokio::test]
+    async fn fork_persists_across_reload() {
+        let path = tmp_path();
+        {
+            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            pc.append(AgentMessage::user_text("a")).await;
+            let a = pc.active_leaf().await.unwrap();
+            pc.append(AgentMessage::user_text("main")).await;
+            // fork：切回 a 再续写。
+            pc.set_active_leaf(&a).await;
+            pc.append(AgentMessage::user_text("alt")).await;
+        }
+        // reload：应有两个叶子。
+        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let leaves = pc.list_leaves().await;
+        assert_eq!(leaves.len(), 2, "fork 产生的两个叶子应跨 reload 保留");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
     }
 }

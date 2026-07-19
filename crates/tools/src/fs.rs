@@ -26,7 +26,7 @@ impl Tool for ReadFileTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、http(s)://（抓取网页）" },
+                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、artifact://<id>（shake 归档内容回读）、http(s)://（抓取网页）" },
                 "summary": { "type": "boolean", "description": "可选：对支持语言的代码文件做结构摘要——折叠大体块、保留签名，行号与原文一致。适合快速浏览大文件；需逐行编辑时仍用真实行号。" }
             },
             "required": ["path"]
@@ -135,6 +135,8 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
         resolve_memory(rest, ctx).await
     } else if let Some(rest) = path.strip_prefix("mcp://") {
         resolve_mcp(rest, ctx).await
+    } else if let Some(id) = path.strip_prefix("artifact://") {
+        resolve_artifact(id, ctx).await
     } else if let Some(rel) = path.strip_prefix("local://") {
         let full = ctx.workspace.resolve(Path::new(rel));
         Ok(read_bounded(&full).await?)
@@ -144,6 +146,21 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
         let full = ctx.workspace.resolve(Path::new(path));
         Ok(read_bounded(&full).await?)
     }
+}
+
+/// `artifact://<id>` 路由：读取 shake 归档落盘内容（`<workspace>/.gyre/artifacts/<id>`）。
+///
+/// id 仅允许十六进制字符（由 shake sink 的内容哈希产生），杜绝路径穿越。
+async fn resolve_artifact(id: &str, ctx: &ToolContext<'_>) -> Result<String, ToolError> {
+    let id = id.trim();
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ToolError::Execution(
+            "artifact:// id 非法（仅允许十六进制字符）".into(),
+        ));
+    }
+    let rel = format!(".gyre/artifacts/{id}");
+    let full = ctx.workspace.resolve(Path::new(&rel));
+    Ok(read_bounded(&full).await?)
 }
 
 /// `memory://` 路由：`` / `summary` → 启动摘要；`full` → 完整 MEMORY.md。

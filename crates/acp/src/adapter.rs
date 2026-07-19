@@ -38,10 +38,11 @@ pub fn server_frame_to_acp(frame: ServerFrame) -> Option<SessionUpdate> {
         },
         // 终止帧由 prompt 处理器消费，不映射为 update。
         ServerFrame::Done { .. } | ServerFrame::Error { .. } => return None,
-        // 状态变更 / 审批 / 用量统计 / 子 Agent 快照 / 应用层心跳：ACP 无独立 update 类型，跳过。
+        // 状态变更 / 审批 / 用量统计（增量与快照）/ 子 Agent 快照 / 应用层心跳：ACP 无独立 update 类型，跳过。
         ServerFrame::StateChanged { .. }
         | ServerFrame::Ask { .. }
         | ServerFrame::Usage(_)
+        | ServerFrame::UsageSnapshot(_)
         | ServerFrame::SubAgents { .. }
         | ServerFrame::Heartbeat => return None,
     })

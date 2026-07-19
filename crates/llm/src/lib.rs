@@ -7,16 +7,20 @@
 #![warn(clippy::pedantic)]
 
 mod anthropic;
+pub mod dialect;
 mod deepseek;
 mod glm;
+pub mod inband;
 mod openai;
 mod plugin;
 mod registry;
 pub mod transform;
 
 pub use anthropic::AnthropicMessagesAdapter;
+pub use dialect::Dialect;
 pub use deepseek::DeepSeekProvider;
 pub use glm::GlmProvider;
+pub use inband::{wrap_inband_if, InbandProvider};
 pub use openai::OpenAiCompletionsAdapter;
 pub use plugin::{collect_providers, LlmProviderPlugin};
 pub use registry::ProviderRegistry;

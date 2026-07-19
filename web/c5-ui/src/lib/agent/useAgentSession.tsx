@@ -12,6 +12,7 @@ import {
   parseFrame,
   type AgentStateName,
   type AskResponseValue,
+  type BranchTree,
   type ClientFrame,
   type CollabRoom,
   type ContentInput,
@@ -96,6 +97,10 @@ interface AgentSessionValue {
   fetchSkillBody: (name: string) => Promise<string | null>
   /** 拉取已加载 MCP 工具列表（`/api/sessions/{id}/mcp`）。 */
   fetchMcp: () => Promise<McpToolInfo[]>
+  /** 拉取指定会话的分支树（`/api/sessions/{id}/branches`）。 */
+  fetchBranches: (sessionId: string) => Promise<BranchTree | null>
+  /** 切换活跃分支（活跃会话即时生效并重载 transcript；`handoff` 注入被离开分支的摘要）。 */
+  switchBranch: (leafId: string, handoff?: boolean) => Promise<SessionOpResult>
   /** 生成端到端加密协同房间（`/api/collab/room`）。 */
   newCollabRoom: () => Promise<CollabRoom | null>
 }
@@ -476,6 +481,11 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
             break
           case 'usage':
             setUsage((u) => addUsage(u, frame.usage))
+            break
+          case 'usage_snapshot':
+            // 用量快照（SET 语义）：连接建立时回放活跃分支累计全量，整体覆盖。
+            // 恢复切换会话后的历史用量；与增量 usage（累加）区分，避免重连 / 切换模式时重复累加。
+            setUsage(frame.usage)
             break
           case 'done':
             pushItem({
@@ -876,6 +886,45 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     return d?.tools ?? []
   }, [apiGet, sessionId])
 
+  /** 拉取指定会话的分支树（活跃与非活跃会话皆可）。 */
+  const fetchBranches = useCallback(
+    async (sid: string): Promise<BranchTree | null> => {
+      if (!sid) return null
+      return apiGet<BranchTree>(`/api/sessions/${encodeURIComponent(sid)}/branches`)
+    },
+    [apiGet],
+  )
+
+  /** 切换活跃分支：POST 后若为当前会话则重连 resume 重载 transcript。 */
+  const switchBranch = useCallback(
+    async (leafId: string, handoff = false): Promise<SessionOpResult> => {
+      const cfg = settingsRef.current
+      const origin = cfg.serverUrl.replace(/\/$/, '')
+      const sid = sessionIdRef.current
+      if (!sid) return { ok: false, error: '无活跃会话' }
+      try {
+        const res = await fetch(
+          `${origin}/api/sessions/${encodeURIComponent(sid)}/branches/switch`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ leaf_id: leafId, handoff, token: cfg.token ?? null }),
+          },
+        )
+        if (!res.ok) {
+          const text = await res.text().catch(() => '')
+          return { ok: false, error: text || `HTTP ${res.status}` }
+        }
+        // 切换成功：重连 resume=当前会话 以重载新分支的 transcript。
+        switchSession(sid)
+        return { ok: true }
+      } catch (e) {
+        return { ok: false, error: String(e) }
+      }
+    },
+    [switchSession],
+  )
+
   const newCollabRoom = useCallback(async () => {
     const d = await apiGet<CollabRoom>('/api/collab/room')
     return d ?? null
@@ -937,6 +986,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchSkills,
       fetchSkillBody,
       fetchMcp,
+      fetchBranches,
+      switchBranch,
       newCollabRoom,
     }),
     [
@@ -979,6 +1030,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchSkills,
       fetchSkillBody,
       fetchMcp,
+      fetchBranches,
+      switchBranch,
       newCollabRoom,
     ],
   )

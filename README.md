@@ -251,7 +251,7 @@ Gyre implements the [Agent Client Protocol (ACP) v1](https://agentclientprotocol
 
 | Mode | How to start | Use case |
 | ---- | ------------ | -------- |
-| **stdio** | `agent --acp-stdio` | The editor launches it as a subprocess (recommended; zero port usage; the process terminates automatically when the editor exits) |
+| **stdio** | `agent --acp` | The editor launches it as a subprocess (recommended; zero port usage; the process terminates automatically when the editor exits) |
 | **http** | `agent --serve --acp` | HTTP+SSE, multiplexed on the same port as the Web front-end; suitable for custom front-ends or remote access |
 
 #### stdio Mode
@@ -260,7 +260,7 @@ The editor starts agent as a subprocess and exchanges newline-delimited JSON-RPC
 
 ```bash
 # Run directly (manual testing)
-agent --acp-stdio
+agent --acp
 # Feed JSON-RPC on stdin; responses and session/update notifications come back on stdout
 ```
 
@@ -294,7 +294,7 @@ enabled   = false             # off by default; true auto-mounts /acp/* routes o
 transport = "http"            # "http" (HTTP+SSE) / "stdio" / "both"
 ```
 
-CLI flags override the config at runtime: `--acp` (enable HTTP+SSE), `--acp-stdio` (stdio only; highest priority; does not start HTTP).
+CLI flag overrides the config at runtime: `--acp` runs ACP in stdio mode when used alone (for editor integration; highest priority; does not start HTTP), and enables the HTTP+SSE endpoint when combined with `--serve`.
 
 #### Zed Editor Configuration
 
@@ -310,7 +310,7 @@ Register Gyre as an ACP agent in Zed's `settings.json` (**stdio mode**, recommen
         "transport": {
           "kind": "stdio",
           "command": "/path/to/agent",
-          "args": ["--acp-stdio"],
+          "args": ["--acp"],
           "env": {}
         },
         "default_model": {
@@ -393,7 +393,7 @@ Standard ACP events pushed during `session/prompt` via SSE (HTTP mode) or stdout
 
 ```bash
 # 1. Manually test stdio mode (enter JSON-RPC line by line)
-agent --acp-stdio
+agent --acp
 # Input:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test","version":"1.0"}}}
 # → returns the agentCapabilities response

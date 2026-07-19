@@ -88,6 +88,7 @@ export type Frame =
   | { type: 'ask'; ask: AskMessage }
   | { type: 'tool_exec'; name: string; output: string }
   | { type: 'usage'; usage: Usage }
+  | { type: 'usage_snapshot'; usage: Usage }
   | { type: 'done'; turns: number; tool_calls: number; success: boolean }
   | { type: 'error'; message: string }
   | { type: 'sub_agents'; agents: SubAgentStatus[] }
@@ -111,10 +112,13 @@ export function parseFrame(raw: unknown): Frame | null {
       return { type: 'ask', ask: r.ask as AskMessage }
     case 'tool_exec':
       return { type: 'tool_exec', name: r.name ?? '', output: r.output ?? '' }
-    case 'usage': {
+    case 'usage':
+    case 'usage_snapshot': {
+      // usage（增量，前端累加）与 usage_snapshot（全量，前端覆盖）共享归一化；
+      // 二者语义在 useAgentSession 的 reducer 中区分处理。
       const u = r.usage && typeof r.usage === 'object' ? r.usage : r
       return {
-        type: 'usage',
+        type: type as 'usage' | 'usage_snapshot',
         usage: {
           input_tokens: u.input_tokens ?? 0,
           output_tokens: u.output_tokens ?? 0,
@@ -223,6 +227,28 @@ export interface SessionHistoryItem {
   text: string
   /** 该消息在服务端日志中的索引（与 DELETE /messages/{line} 同源）。 */
   line: number
+}
+
+/** 会话分支树节点（`/api/sessions/{id}/branches`）。 */
+export interface BranchNode {
+  /** 节点 id。 */
+  id: string
+  /** 父节点 id（根节点为 null）。 */
+  parent_id: string | null
+  /** 角色：user / assistant / tool / status / ask。 */
+  role: string
+  /** 短预览文本。 */
+  preview: string
+}
+
+/** 会话分支树（`/api/sessions/{id}/branches`）。 */
+export interface BranchTree {
+  /** 全部节点（森林，插入顺序）。 */
+  nodes: BranchNode[]
+  /** 当前活跃叶子 id（续写点）。 */
+  active_leaf: string | null
+  /** 全部叶子节点 id（可切换的分支末端）。 */
+  leaves: string[]
 }
 
 /** 自定义 slash 命令（`.agent/commands/*.md`，与 CLI 同源）。 */

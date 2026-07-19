@@ -251,7 +251,7 @@ Gyre 实现了 [Agent Client Protocol (ACP) v1](https://agentclientprotocol.com)
 
 | 模式 | 启动方式 | 适用场景 |
 | ---- | -------- | -------- |
-| **stdio** | `agent --acp-stdio` | 编辑器作为子进程调用（推荐，零端口占用，进程随编辑器退出自动终止） |
+| **stdio** | `agent --acp` | 编辑器作为子进程调用（推荐，零端口占用，进程随编辑器退出自动终止） |
 | **http** | `agent --serve --acp` | HTTP+SSE，与 Web 前端同端口复用；适合自定义前端或远程接入 |
 
 #### stdio 模式
@@ -260,7 +260,7 @@ Gyre 实现了 [Agent Client Protocol (ACP) v1](https://agentclientprotocol.com)
 
 ```bash
 # 直接运行（手动测试）
-agent --acp-stdio
+agent --acp
 # stdin 输入 JSON-RPC，stdout 返回响应与 session/update 通知
 ```
 
@@ -294,7 +294,7 @@ enabled   = false             # 默认关；true 则 --serve 时自动挂载 /ac
 transport = "http"            # "http"（HTTP+SSE）/ "stdio" / "both"
 ```
 
-CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`（纯 stdio，最高优先级，不启动 HTTP）。
+CLI flag 可运行时覆盖配置：`--acp` 单独使用为纯 stdio 模式（编辑器集成，最高优先级，不启动 HTTP）；与 `--serve` 配合则启用 HTTP+SSE。
 
 #### Zed Editor 配置
 
@@ -310,7 +310,7 @@ CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`
         "transport": {
           "kind": "stdio",
           "command": "/path/to/agent",
-          "args": ["--acp-stdio"],
+          "args": ["--acp"],
           "env": {}
         },
         "default_model": {
@@ -393,7 +393,7 @@ CLI flag 可运行时覆盖配置：`--acp`（启用 HTTP+SSE）、`--acp-stdio`
 
 ```bash
 # 1. 手动测试 stdio 模式（逐行输入 JSON-RPC）
-agent --acp-stdio
+agent --acp
 # 输入：
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test","version":"1.0"}}}
 # → 返回 agentCapabilities 响应

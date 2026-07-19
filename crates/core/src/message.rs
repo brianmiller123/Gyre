@@ -4,6 +4,7 @@
 //! 与 Provider 线 [`ProviderMessage`] 分离。融合 Zoo-Code 的 say/ask 交互语义。
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::llm::AssistantEvent;
 use crate::tool::{SoftToolRequirement, ToolResult};
@@ -51,6 +52,8 @@ pub enum StopReason {
     Length,
     /// 触发工具调用。
     ToolUse,
+    /// 非终止停顿（provider 结束响应但未完成轮次，如分段输出/进度更新）。循环应重新采样继续。
+    Pause,
     /// 被中止。
     Aborted,
     /// 错误。
@@ -367,6 +370,17 @@ impl AgentMessage {
     }
 }
 
+/// 单个工具的运行计数（P2-K：可观测性，移植 oh-my-pi `run-collector` 的 [`ToolCounters`] 简化版）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCounters {
+    /// 总调用次数。
+    pub total: u64,
+    /// 成功次数（`Text` / `Image` 结果）。
+    pub ok: u64,
+    /// 错误次数（`Error` 结果）。
+    pub error: u64,
+}
+
 /// 运行结束摘要。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentRunSummary {
@@ -380,6 +394,40 @@ pub struct AgentRunSummary {
     pub success: bool,
     /// 隔离模式下的文件变更 unified diff（仅在启用隔离时有值）。
     pub iso_diff: Option<String>,
+    /// 每个工具的运行计数（P2-K）。键为工具名，BTreeMap 自然排序保证序列化稳定。
+    #[serde(default)]
+    pub tools_by_name: BTreeMap<String, ToolCounters>,
+    /// 注册的可用工具名（排序，P2-K coverage）。
+    #[serde(default)]
+    pub tools_available: Vec<String>,
+    /// 实际调用过的工具名集合（P2-K coverage）。`unused = available − invoked`，见 [`AgentRunSummary::unused_tools`]。
+    #[serde(default)]
+    pub tools_invoked: BTreeSet<String>,
+}
+
+impl AgentRunSummary {
+    /// 记录一次工具执行结果（P2-K）。在工具结果回填时调用：按工具名累加 total + (ok|error)，
+    /// 并把工具名加入 `tools_invoked`。
+    pub fn record_tool(&mut self, name: &str, result: &ToolResult) {
+        let counters = self.tools_by_name.entry(name.to_string()).or_default();
+        counters.total += 1;
+        if matches!(result, ToolResult::Error { .. }) {
+            counters.error += 1;
+        } else {
+            counters.ok += 1;
+        }
+        self.tools_invoked.insert(name.to_string());
+    }
+
+    /// 返回「注册但从未被调用」的工具名（排序，P2-K coverage）——用于评估「该用没用」。
+    #[must_use]
+    pub fn unused_tools(&self) -> Vec<String> {
+        self.tools_available
+            .iter()
+            .filter(|n| !self.tools_invoked.contains(*n))
+            .cloned()
+            .collect()
+    }
 }
 
 /// 智能体对外发射的事件流元素（前端订阅）。

@@ -29,11 +29,29 @@ pub enum HookEvent {
     },
 }
 
-/// Hook 端口：观察 agent 执行事件。
+/// Hook 端口：观察 agent 执行事件，并可选地拦截/改写工具执行（P2-I）。
 #[async_trait::async_trait]
 pub trait Hook: Send + Sync {
     /// 事件回调（不阻止执行，仅副作用）。
     async fn on_event(&self, event: &HookEvent);
+
+    /// 工具执行前拦截（P2-I）：返回 `Some(reason)` 则阻止执行——回填可恢复错误给模型，
+    /// **不调用** `Tool::execute`。默认 `None`（不阻止，与既有观察语义兼容，现有实现无需改动）。
+    /// 用于扩展 / MCP 程序化门禁危险工具（区别于交互式审批 `ApprovalPolicy`）。
+    async fn before_tool_intercept(
+        &self,
+        _tool: &str,
+        _args: &serde_json::Value,
+    ) -> Option<String> {
+        None
+    }
+
+    /// 工具执行后改写（P2-I）：接收真实 result，返回 `Some(new)` 替换；`None` 保留原结果。
+    /// 默认 `None`（不改写）。在 `AfterTool` 观察事件**之前**应用，故观察事件看到的是最终结果。
+    /// 用于结果脱敏、归一化、附加纠正提示等。
+    async fn after_tool_override(&self, _tool: &str, _result: &ToolResult) -> Option<ToolResult> {
+        None
+    }
 }
 
 #[cfg(test)]

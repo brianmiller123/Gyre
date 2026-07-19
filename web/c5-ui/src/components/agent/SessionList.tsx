@@ -6,6 +6,7 @@ import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/cn'
 import { Icon } from '@/components/icons'
 import { Button, Dropdown, EmptyState, Modal, Skeleton } from '@/components/ui'
+import { BranchTreeModal } from '@/components/agent/BranchTreeModal'
 
 /**
  * 历史会话管理列表：侧栏主区域。
@@ -36,6 +37,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [confirmDel, setConfirmDel] = useState<SessionListItem | null>(null)
+  const [branchesFor, setBranchesFor] = useState<SessionListItem | null>(null)
   const [busy, setBusy] = useState(false)
   const renameRef = useRef<HTMLInputElement>(null)
 
@@ -249,6 +251,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
                         onCommitRename={() => void commitRename()}
                         onCancelRename={() => setRenamingId(null)}
                         onRequestDelete={() => setConfirmDel(s)}
+                        onRequestBranches={() => setBranchesFor(s)}
                         display={display(s)}
                         timeLabel={formatRelative(s.mtime_ms, t)}
                       />
@@ -282,6 +285,15 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
           {confirmDel ? t('sessions.delete_desc', { name: display(confirmDel) }) : ''}
         </p>
       </Modal>
+
+      {/* 分支树：查看 / 切换活跃叶子（可选手工 handoff） */}
+      {branchesFor && (
+        <BranchTreeModal
+          sessionId={branchesFor.id}
+          open={branchesFor !== null}
+          onClose={() => setBranchesFor(null)}
+        />
+      )}
     </div>
   )
 }
@@ -300,6 +312,7 @@ function SessionRow({
   onCommitRename,
   onCancelRename,
   onRequestDelete,
+  onRequestBranches,
   display,
   timeLabel,
 }: {
@@ -314,6 +327,7 @@ function SessionRow({
   onCommitRename: () => void
   onCancelRename: () => void
   onRequestDelete: () => void
+  onRequestBranches: () => void
   display: string
   timeLabel: string
 }) {
@@ -396,6 +410,7 @@ function SessionRow({
             }
             items={[
               { label: t('sessions.rename'), icon: 'edit', onClick: onStartRename },
+              { label: t('sessions.branches'), icon: 'message-square', onClick: onRequestBranches },
               {
                 label: t('sessions.delete'),
                 icon: 'trash',

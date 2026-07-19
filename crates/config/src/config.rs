@@ -713,7 +713,8 @@ fn default_max_concurrent() -> usize {
 
 /// ACP（Agent Client Protocol）服务端配置（对应 TOML `[acp]`）。
 ///
-/// 控制 ACP 标准协议端点的启用与传输模式。`--acp` / `--acp-stdio` CLI flag 可运行时覆盖。
+/// 控制 ACP 标准协议端点的启用与传输模式。`--acp` CLI flag 可运行时覆盖
+/// （单独使用为纯 stdio 模式；与 `--serve` 配合为 HTTP+SSE）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcpConfig {
     /// 是否启用 ACP 服务端（默认 `false`；启用后 `--serve` 挂载 `/acp/*` 路由）。

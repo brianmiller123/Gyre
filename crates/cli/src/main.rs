@@ -56,12 +56,13 @@ struct Cli {
     /// 不带值时监听配置文件 `[server].bind` 地址；带值则覆盖监听地址（如 `--serve 0.0.0.0:80`）。
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     serve: Option<String>,
-    /// 启用 ACP（Agent Client Protocol）HTTP+SSE 端点（与 --serve 配合；亦受 [acp].enabled 控制）。
+    /// ACP（Agent Client Protocol）。
+    ///
+    /// - 单独使用（不带 `--serve`）：以纯 stdio 模式运行 ACP（供编辑器作为子进程调用；
+    ///   stdin 读 JSON-RPC，stdout 写事件，无需 HTTP 端口）。最高优先级，不启动 HTTP。
+    /// - 与 `--serve` 配合：额外启用 HTTP+SSE 端点（亦受 `[acp].enabled` 控制）。
     #[arg(long)]
     acp: bool,
-    /// 纯 stdio 模式运行 ACP（供编辑器作为子进程调用；无需 --serve）。
-    #[arg(long)]
-    acp_stdio: bool,
     /// 恢复历史会话（会话 id；用 --list-sessions 查看）。
     #[arg(long)]
     resume: Option<String>,
@@ -165,8 +166,9 @@ async fn main() -> Result<()> {
         };
     }
 
-    // 纯 stdio ACP 模式（编辑器作为子进程调用；最高优先级，不启动 HTTP）。
-    if cli.acp_stdio {
+    // 纯 stdio ACP 模式（--acp 且未指定 --serve）：编辑器作为子进程调用，不启动 HTTP。
+    // 与 `--serve --acp`（HTTP+SSE）区分——stdio 优先，仅在没有 serve 时触发。
+    if cli.acp && cli.serve.is_none() {
         return run_acp_stdio(cfg, cwd).await;
     }
 
@@ -250,7 +252,12 @@ async fn main() -> Result<()> {
     for p in agent_llm::collect_providers(client) {
         registry.register(p);
     }
-    let provider: Arc<dyn agent_core::LlmProvider> = Arc::new(registry);
+    // 环境变量 opt-in in-band 工具调用（GYRE_INBAND_TOOLS=1）：对 function-calling 不稳的
+    // 模型（GLM/DeepSeek 等）改用「提示词 + 文本协议」调用工具。
+    let provider: Arc<dyn agent_core::LlmProvider> = agent_llm::wrap_inband_if(
+        Arc::new(registry),
+        std::env::var("GYRE_INBAND_TOOLS").ok().as_deref(),
+    );
 
     let provider_ctx = agent_core::ProviderCallContext {
         api_key: Some(api_key.clone()),
@@ -272,6 +279,11 @@ async fn main() -> Result<()> {
             provider_ctx.clone(),
         ),
     ))
+    .await;
+    // Shake 归档落盘到 <cwd>/.gyre/artifacts，使被压缩的大块可经 read_file artifact:// 回读。
+    pctx.set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
+        cwd.join(".gyre").join("artifacts"),
+    )))
     .await;
     let mut context: Arc<dyn agent_core::ContextManager> = Arc::new(pctx);
     let workspace = Arc::new(agent_core::Workspace::new(cwd.clone()));
@@ -515,13 +527,13 @@ async fn main() -> Result<()> {
     // 交互 REPL：rustyline 行编辑 + Tab 补全。
     //
     // 防御性检测：若 stdin 非终端（被管道 / 编辑器子进程调用）且未显式指定
-    // --acp-stdio / --serve / 位置 task，极可能是 ACP 客户端（如 Zed）调用时漏了
-    // --acp-stdio——此时 REPL 会把 JSON-RPC 请求当用户提问发给 LLM，污染 stdout。
+    // --acp / --serve / 位置 task，极可能是 ACP 客户端（如 Zed）调用时漏了
+    // --acp——此时 REPL 会把 JSON-RPC 请求当用户提问发给 LLM，污染 stdout。
     // 在 stderr 给出明确提示，避免反复调试仍误判为「启动失败」。
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!(
             "提示：stdin 非终端（检测到管道/子进程输入）。若作为 ACP/LSP 服务端被编辑器\
-             （如 Zed）调用，须加 --acp-stdio 参数；否则此处进入交互 REPL。"
+             （如 Zed）调用，须加 --acp 参数；否则此处进入交互 REPL。"
         );
     }
     let helper = ReplHelper::new(
@@ -635,6 +647,13 @@ async fn main() -> Result<()> {
                                             Arc::clone(&provider),
                                             current_model.clone(),
                                             current_provider_ctx.clone(),
+                                        ),
+                                    ))
+                                    .await;
+                                new_pctx
+                                    .set_shake_sink(Arc::new(
+                                        agent_context::compaction::DirSink::new(
+                                            cwd.join(".gyre").join("artifacts"),
                                         ),
                                     ))
                                     .await;

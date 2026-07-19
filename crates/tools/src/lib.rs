@@ -55,6 +55,16 @@ pub struct ToolContext<'a> {
     pub write_effect: Option<&'a dyn WriteEffect>,
 }
 
+/// 工具并发模式（决定同一轮多工具调用的调度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concurrency {
+    /// 可与其它 `Shared` 工具并发执行（典型：只读 I/O，如 read_file / grep）。
+    Shared,
+    /// 串行执行，且作为屏障——其前的工具须全部完成，其后的工具须等它完成（典型：写/执行类，
+    /// 如 write_file / run_command，避免彼此或与读工具竞态）。
+    Exclusive,
+}
+
 /// 工具端口。
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -66,6 +76,22 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> serde_json::Value;
     /// 能力分级（决定审批门槛）。
     fn capability(&self) -> CapabilityTier;
+    /// 并发模式（决定一轮内多工具的调度）。默认按能力分级：只读 → [`Concurrency::Shared`]，
+    /// 写/执行/网络 → [`Concurrency::Exclusive`]。具体工具可按需覆写。
+    fn concurrency(&self) -> Concurrency {
+        match self.capability() {
+            CapabilityTier::ReadOnly => Concurrency::Shared,
+            _ => Concurrency::Exclusive,
+        }
+    }
+
+    /// 是否可被 steering 中途打断（Immediate 模式下，batch 含此类工具时 agent 循环按固定
+    /// 间隔轮询 steering 队列，命中即触发**批级** cancel 中断在途工具）。默认 `false`。
+    /// 长时阻塞工具（如 `run_command`）应覆写为 `true`，使其在用户中途发消息时尽快让出。
+    /// 工具实现须响应 [`ToolContext::cancel`] 才能真正被中断。
+    fn interruptible(&self) -> bool {
+        false
+    }
 
     /// 构造审批请求描述（默认：工具名 + 能力 + 无命令）；shell 工具重写以带 command。
     fn describe<'a>(&'a self, input: &'a serde_json::Value) -> ApprovalRequest<'a> {

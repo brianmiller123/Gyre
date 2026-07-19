@@ -34,7 +34,7 @@ pub mod tool;
 pub mod write_effect;
 pub mod workspace;
 
-pub use context::{CompactionStrategy, ContextManager, ProviderContext, TokenUsage};
+pub use context::{CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode, TokenUsage};
 pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
 pub use hook::{Hook, HookEvent};
 pub use memory::{MemoryNote, MemoryStore};
@@ -44,7 +44,7 @@ pub use llm::{
 pub use message::{
     AgentEvent, AgentMessage, AgentRunSummary, AgentState, AskKind, AskMessage, AskResponse,
     AssistantMessage, ContentBlock, Mode, ProviderMessage, StatusKind, StatusMessage, StopReason,
-    ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
+    ToolCounters, ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use model::{Api, Model};
 pub use platform::{config_dir, forced_utf8_locale};

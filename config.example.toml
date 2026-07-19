@@ -112,7 +112,7 @@ bind = "127.0.0.1:8080"
 
 # Agent Client Protocol (ACP) 服务端：为 ACP 兼容客户端（Zed Editor / 自定义前端）
 # 提供标准化 JSON-RPC + SSE/stdio 接口。复用同一会话管理与审批机制，与 Web/CLI 等价。
-# CLI flag 可运行时覆盖：`agent --serve --acp`（HTTP+SSE）或 `agent --acp-stdio`（编辑器集成）。
+# CLI flag 可运行时覆盖：`agent --acp`（编辑器集成，纯 stdio）或 `agent --serve --acp`（HTTP+SSE）。
 [acp]
 enabled   = false             # 默认关；true 则 --serve 时自动挂载 /acp/* 路由
 transport = "http"            # "http"（HTTP+SSE）/ "stdio" / "both"

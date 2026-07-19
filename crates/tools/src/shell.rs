@@ -35,6 +35,13 @@ impl Tool for RunCommandTool {
         CapabilityTier::Execute
     }
 
+    /// `run_command` 可被 steering 中途打断：execute 内已用 `select! { cancel.cancelled() => .. }`
+    /// 响应 `ctx.cancel`（批级 token），故 Immediate 模式下用户中途发消息会尽快中止在途命令
+    /// （`kill_on_drop` 回收子进程），steering 随后在下轮被处理。
+    fn interruptible(&self) -> bool {
+        true
+    }
+
     fn describe<'a>(&'a self, input: &'a serde_json::Value) -> ApprovalRequest<'a> {
         ApprovalRequest {
             tool: self.name(),

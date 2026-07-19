@@ -144,8 +144,13 @@ pub enum ServerFrame {
     Ask { ask: AskMessage },
     /// 工具执行进度。
     ToolExec { name: String, output: String },
-    /// 用量。
+    /// 用量增量（单次 LLM 调用；前端累加 addUsage）。
     Usage(Usage),
+    /// 用量快照（活跃分支累计全量；前端整体替换 SET）。
+    ///
+    /// 仅在 WS 连接建立时下发一次，作为基线恢复：切换会话 / 重连 / 切换模式时前端
+    /// 累计态可能与持久化真相不同步，以此权威快照覆盖，避免丢失或重复累加。
+    UsageSnapshot(Usage),
     /// 完成。
     Done {
         turns: u64,
@@ -774,7 +779,11 @@ async fn build_agent(
     for p in agent_llm::collect_providers(http) {
         registry.register(p);
     }
-    let provider: Arc<dyn LlmProvider> = Arc::new(registry);
+    // 环境变量 opt-in in-band 工具调用（GYRE_INBAND_TOOLS=1）。
+    let provider: Arc<dyn LlmProvider> = agent_llm::wrap_inband_if(
+        Arc::new(registry),
+        std::env::var("GYRE_INBAND_TOOLS").ok().as_deref(),
+    );
     let provider_ctx = ProviderCallContext {
         api_key: Some(api_key),
         base_url: Some(profile.base_url.clone()),
@@ -801,6 +810,11 @@ async fn build_agent(
             provider_ctx.clone(),
         ),
     ))
+    .await;
+    // Shake 归档落盘到 <cwd>/.gyre/artifacts，使被压缩的大块可经 read_file artifact:// 回读。
+    ctx.set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
+        cwd.join(".gyre").join("artifacts"),
+    )))
     .await;
     let context: Arc<dyn agent_core::ContextManager> = Arc::new(ctx);
     let workspace = Arc::new(Workspace::new(cwd));
@@ -1058,6 +1072,8 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/sessions/{id}/mcp", get(list_mcp))
         .route("/api/sessions/{id}/upload", post(upload_image))
         .route("/api/sessions/{id}/history", get(session_history))
+        .route("/api/sessions/{id}/branches", get(session_branches))
+        .route("/api/sessions/{id}/branches/switch", post(switch_branch))
         .route("/api/sessions/{id}/messages/{line}", delete(delete_message))
         .route("/api/commands", get(list_commands))
         .route("/api/models", get(list_models))
@@ -1482,6 +1498,17 @@ fn is_safe_session_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// 解析一行会话 JSONL：优先按 [`agent_core::SessionNode`]（新会话树格式）解析取其
+/// `message`；失败则回退为裸 [`agent_core::AgentMessage`]（旧线性日志格式）。
+///
+/// 使历史读取对新旧两种持久化格式都兼容。
+fn parse_history_line(line: &str) -> Option<agent_core::AgentMessage> {
+    if let Ok(node) = serde_json::from_str::<agent_core::SessionNode>(line) {
+        return Some(node.message);
+    }
+    serde_json::from_str::<agent_core::AgentMessage>(line).ok()
+}
+
 /// 读取会话 JSONL 的首条用户文本（列表预览用）。
 fn read_first_user(path: &std::path::Path) -> Option<String> {
     use std::io::BufRead;
@@ -1491,7 +1518,7 @@ fn read_first_user(path: &std::path::Path) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<agent_core::AgentMessage>(trimmed) else {
+        let Some(msg) = parse_history_line(trimmed) else {
             continue;
         };
         if let agent_core::AgentMessage::User(u) = msg {
@@ -1533,7 +1560,7 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<agent_core::AgentMessage>(trimmed) else {
+        let Some(msg) = parse_history_line(trimmed) else {
             continue;
         };
         match msg {
@@ -1650,6 +1677,191 @@ async fn session_history(
     let path = agent_context::SessionStore::for_cwd(state.cwd()).path_for(&id);
     let items = read_history(&path);
     Json(serde_json::json!({ "items": items })).into_response()
+}
+
+/// `GET /api/sessions/{id}/branches` → 会话分支树（节点 id / parent_id / 角色 / 预览 +
+/// 活跃叶子 + 叶子列表）。前端渲染分支视图、做分支切换用。
+///
+/// 直接读 JSONL 文件（活跃与非活跃会话皆可用），兼容旧线性日志（迁移为单链树）。
+async fn session_branches(
+    State(state): State<SessionManager>,
+    Path(id): Path<String>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    if !is_safe_session_id(&id) {
+        return (StatusCode::BAD_REQUEST, "非法会话 id").into_response();
+    }
+    let path = agent_context::SessionStore::for_cwd(state.cwd()).path_for(&id);
+    let tree = read_branch_tree(&path);
+    Json(tree).into_response()
+}
+
+/// `POST /api/sessions/{id}/branches/switch` → 切换活跃叶子（续写点）。
+///
+/// - 活跃会话：经内存上下文切换（同步 sidecar，立即影响下一轮）。
+/// - 非活跃会话：仅写 sidecar（下次 open 生效）。
+/// - 任务运行中：409（避免与并发 append 竞争）。
+#[derive(Debug, Deserialize)]
+struct SwitchBranchBody {
+    #[serde(default)]
+    token: Option<String>,
+    /// 目标叶子节点 id。
+    leaf_id: String,
+    /// 是否在切换时注入被离开分支的 handoff 摘要（默认 false）。
+    #[serde(default)]
+    handoff: bool,
+}
+
+async fn switch_branch(
+    State(state): State<SessionManager>,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<SwitchBranchBody>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &body.token) {
+        return resp;
+    }
+    if !is_safe_session_id(&id) || body.leaf_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "非法会话 id 或 leaf_id").into_response();
+    }
+    let leaf_id = body.leaf_id.trim().to_string();
+    match state.get(&id).await {
+        Some(session) => {
+            if session
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return (StatusCode::CONFLICT, "任务运行中，无法切换分支").into_response();
+            }
+            let ok = if body.handoff {
+                match session.context.switch_branch_with_handoff(&leaf_id).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("切换失败: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                session.context.set_active_leaf(&leaf_id).await
+            };
+            if ok {
+                Json(serde_json::json!({ "ok": true, "active_leaf": leaf_id })).into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "目标叶子不存在").into_response()
+            }
+        }
+        None => {
+            // 非活跃会话：校验 leaf_id 存在并写 sidecar。
+            let store = agent_context::SessionStore::for_cwd(state.cwd());
+            let path = store.path_for(&id);
+            if !path.exists() {
+                return (StatusCode::NOT_FOUND, "会话不存在").into_response();
+            }
+            let tree = read_branch_tree(&path);
+            let exists = tree["nodes"]
+                .as_array()
+                .map_or(false, |a| a.iter().any(|n| n["id"].as_str() == Some(leaf_id.as_str())));
+            if !exists {
+                return (StatusCode::NOT_FOUND, "目标叶子不存在").into_response();
+            }
+            let sidecar = path.with_extension("leaf");
+            if let Err(e) = std::fs::write(&sidecar, leaf_id.as_bytes()) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("写入活跃叶子失败: {e}"),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({ "ok": true, "active_leaf": leaf_id })).into_response()
+        }
+    }
+}
+
+/// 读取会话分支树（JSON 数组节点 + 活跃叶子 + 叶子列表）。
+///
+/// 兼容旧线性日志：裸 `AgentMessage` 行被迁移为单链树节点（`legacy-{i}`）。
+fn read_branch_tree(path: &std::path::Path) -> serde_json::Value {
+    use std::io::BufRead;
+    let mut nodes: Vec<agent_core::SessionNode> = Vec::new();
+    let mut legacy: Vec<agent_core::AgentMessage> = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        for line in std::io::BufReader::new(file).lines().flatten() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Ok(n) = serde_json::from_str::<agent_core::SessionNode>(t) {
+                if !legacy.is_empty() {
+                    nodes.extend(agent_context::wrap_linear_as_nodes(&legacy));
+                    legacy.clear();
+                }
+                nodes.push(n);
+            } else if let Ok(m) = serde_json::from_str::<agent_core::AgentMessage>(t) {
+                legacy.push(m);
+            }
+        }
+    }
+    if !legacy.is_empty() {
+        nodes.extend(agent_context::wrap_linear_as_nodes(&legacy));
+    }
+
+    let leaves_owned = agent_context::leaves(&nodes);
+    let leaves: Vec<&str> = leaves_owned.iter().map(String::as_str).collect();
+    let sidecar = path.with_extension("leaf");
+    let active_leaf = std::fs::read_to_string(&sidecar)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| nodes.last().map(|n| n.id.clone()));
+
+    let nodes_json: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|n| {
+            let (role, preview) = node_role_preview(&n.message);
+            serde_json::json!({
+                "id": n.id,
+                "parent_id": n.parent_id,
+                "role": role,
+                "preview": preview,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "nodes": nodes_json,
+        "active_leaf": active_leaf,
+        "leaves": leaves,
+    })
+}
+
+/// 节点消息的角色 + 短预览（分支树展示用）。
+fn node_role_preview(msg: &agent_core::AgentMessage) -> (&'static str, String) {
+    match msg {
+        agent_core::AgentMessage::User(u) => {
+            let t: String = u.content.iter().filter_map(|c| match c {
+                agent_core::UserContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>().join("");
+            ("user", preview_text(&t, 120))
+        }
+        agent_core::AgentMessage::Assistant(a) => {
+            let t: String = a.content.iter().filter_map(|b| match b {
+                agent_core::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>().join("");
+            ("assistant", preview_text(&t, 120))
+        }
+        agent_core::AgentMessage::ToolResult(t) => {
+            ("tool", preview_text(&t.result.to_llm_text(), 120))
+        }
+        agent_core::AgentMessage::Status(s) => ("status", preview_text(&s.text, 120)),
+        agent_core::AgentMessage::Ask(a) => ("ask", preview_text(&a.prompt, 120)),
+        agent_core::AgentMessage::SoftRequirement(_) => ("soft_requirement", String::new()),
+    }
 }
 
 /// `DELETE /api/sessions/{id}/messages/{line}` → 删除指定索引处的单条消息（含孤立 tool 结果）。
@@ -1884,6 +2096,17 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: Arc<Sessio
         }
     }
 
+    // 用量快照回放：每次 WS 连接建立时下发活跃分支累计用量（SET 语义，前端整体替换）。
+    // - 切换会话：前端 clear() 已清零，快照恢复为该会话的历史累计，不再丢失。
+    // - 重连 / 切换模式：前端累计态可能滞后，以服务端持久化真相覆盖（权威对账）。
+    // 与增量 `Usage`（addUsage 累加）区分，避免重连时对保留态重复累加。
+    let acc = session.context.accumulated_usage();
+    if let Ok(text) = serde_json::to_string(&ServerFrame::UsageSnapshot(acc)) {
+        let _ = sink
+            .send(axum::extract::ws::Message::Text(text.into()))
+            .await;
+    }
+
     // 广播 → 客户端
     let send_task = tokio::spawn(async move {
         // 应用层心跳：每 20 秒无业务帧时下发一帧 Heartbeat，保活反向代理读超时 +
@@ -2084,5 +2307,53 @@ mod tests {
         assert_eq!(kinds, vec!["thinking", "assistant"]);
         assert_eq!(items[0]["text"].as_str().unwrap(), "先思考一下");
         assert_eq!(items[1]["text"].as_str().unwrap(), "最终回答");
+    }
+
+    /// 会话树格式（SessionNode JSONL）的会话：read_history 与 read_branch_tree
+    /// 都应正确解析，且分支结构（两叶子）可见。
+    #[test]
+    fn read_history_and_branches_parse_session_nodes() {
+        use agent_core::{AgentMessage, SessionNode};
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "agent_tree_test_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        // a → b → b1（叶子1）；a → b → c1（叶子2）。
+        let nodes = vec![
+            SessionNode { id: "a".into(),  parent_id: None,             message: AgentMessage::user_text("a") },
+            SessionNode { id: "b".into(),  parent_id: Some("a".into()), message: AgentMessage::user_text("b") },
+            SessionNode { id: "b1".into(), parent_id: Some("b".into()), message: AgentMessage::user_text("b1") },
+            SessionNode { id: "c1".into(), parent_id: Some("b".into()), message: AgentMessage::user_text("c1") },
+        ];
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for n in &nodes {
+                writeln!(f, "{}", serde_json::to_string(n).unwrap()).unwrap();
+            }
+        }
+        // read_history：应解析全部 4 条（两条分支叶子都可见）。
+        let items = read_history(&path);
+        let texts: Vec<&str> = items.iter().map(|v| v["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, vec!["a", "b", "b1", "c1"]);
+
+        // read_branch_tree：两叶子 b1、c1；active_leaf 默认末节点 c1。
+        let tree = read_branch_tree(&path);
+        let mut leaves: Vec<String> = tree["leaves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        leaves.sort();
+        assert_eq!(leaves, vec!["b1".to_string(), "c1".to_string()]);
+        assert_eq!(tree["active_leaf"].as_str(), Some("c1"));
+        assert_eq!(tree["nodes"].as_array().unwrap().len(), 4);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
