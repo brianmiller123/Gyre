@@ -81,6 +81,17 @@ fn param_str<'a>(params: Option<&'a Value>, key: &str) -> Option<&'a str> {
     params.and_then(|p| p.get(key)).and_then(|v| v.as_str())
 }
 
+/// 从参数对象取路径字段（如 ACP `session/new` 的 `NewSessionRequest.cwd`）。
+///
+/// ACP 客户端（编辑器）在创建会话时携带其打开的项目根目录；此前该字段被忽略，导致 Agent
+/// 始终在服务端进程 cwd（容器内常为 `/workspace`）而非用户当前目录工作。
+fn param_path<'a>(params: Option<&'a Value>, key: &str) -> Option<&'a std::path::Path> {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new)
+}
+
 /// 从 `session/prompt` 的 `prompt` 数组中提取纯文本。
 ///
 /// 标准 ACP 的 `prompt` 是 `ContentBlock[]`，此处拼接所有 `type: "text"` 块的文本。
@@ -161,11 +172,13 @@ fn handle_initialize(req: &crate::types::JsonRpcRequest) -> Value {
 
 /// `session/new`：创建新会话，返回 `{ sessionId }`。
 ///
-/// 虽然标准 ACP 的 `NewSessionRequest` 只含 `cwd` + `mcpServers`，
-/// 但本项目通过 `_meta` 或扩展字段传递 `model` / `mode`（非标准但向前兼容）。
+/// 标准 ACP 的 `NewSessionRequest` 含 `cwd` + `mcpServers`；本项目额外通过 `_meta` 或扩展
+/// 字段传递 `model` / `mode`（非标准但向前兼容）。`cwd` 取客户端打开的项目根，使 Agent 工具
+/// 在用户当前目录而非服务端进程 cwd 工作。
 async fn handle_session_new(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
     let model = param_str(req.params.as_ref(), "model");
     let mode = param_str(req.params.as_ref(), "mode");
+    let cwd = param_path(req.params.as_ref(), "cwd");
     // 兼容：部分客户端通过 _meta 传递 model/mode。
     let model = model.or_else(|| {
         req.params
@@ -183,7 +196,7 @@ async fn handle_session_new(state: &SessionManager, req: &crate::types::JsonRpcR
     });
 
     let sid = state
-        .create_session(model, None, None, mode)
+        .create_session(model, None, None, mode, cwd)
         .await
         .map_err(|e| rpc_error(INTERNAL_ERROR, e))?;
 
@@ -209,8 +222,10 @@ async fn handle_session_load(state: &SessionManager, req: &crate::types::JsonRpc
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
     let model = param_str(req.params.as_ref(), "model");
     let mode = param_str(req.params.as_ref(), "mode");
+    // 与创建时一致：恢复也采用客户端 cwd，确保会话/记忆定位到同一项目目录。
+    let cwd = param_path(req.params.as_ref(), "cwd");
     let new_sid = state
-        .create_session(model, Some(sid), None, mode)
+        .create_session(model, Some(sid), None, mode, cwd)
         .await
         .map_err(|e| rpc_error(INTERNAL_ERROR, e))?;
     Ok(json!({ "sessionId": new_sid }))
@@ -232,9 +247,12 @@ async fn handle_set_mode(state: &SessionManager, req: &crate::types::JsonRpcRequ
     let mode = param_str(req.params.as_ref(), "modeId")
         .or_else(|| param_str(req.params.as_ref(), "mode"))
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 modeId"))?;
+    // 重建会话须沿用客户端 cwd，否则会回落到服务端进程 cwd（如 /workspace），导致
+    // 模式切换后丢失项目上下文、且会话 id 在错误目录下查不到历史。
+    let cwd = param_path(req.params.as_ref(), "cwd");
     // 模式切换 = resume 当前会话 id + 新模式覆盖（create_session 内部处理重建）。
     let new_sid = state
-        .create_session(None, Some(sid), None, Some(mode))
+        .create_session(None, Some(sid), None, Some(mode), cwd)
         .await
         .map_err(|e| rpc_error(INTERNAL_ERROR, e))?;
     Ok(json!({ "sessionId": new_sid }))
@@ -344,5 +362,30 @@ mod tests {
     #[test]
     fn extract_prompt_text_none_params() {
         assert_eq!(extract_prompt_text(None), "");
+    }
+
+    #[test]
+    fn param_path_extracts_cwd() {
+        // 标准 ACP NewSessionRequest 携带 cwd：编辑器实际打开的项目根。
+        let params = json!({ "cwd": "/home/user/project" });
+        assert_eq!(
+            param_path(Some(&params), "cwd"),
+            Some(std::path::Path::new("/home/user/project"))
+        );
+    }
+
+    #[test]
+    fn param_path_missing_returns_none() {
+        // 缺失 cwd 字段时返回 None（调用方据此回退到服务端 cwd）。
+        let params = json!({ "model": "default" });
+        assert_eq!(param_path(Some(&params), "cwd"), None);
+        assert_eq!(param_path(None, "cwd"), None);
+    }
+
+    #[test]
+    fn param_path_non_string_returns_none() {
+        // 非字符串的 cwd（协议误用）不得 panic，返回 None 安全回退。
+        let params = json!({ "cwd": 42 });
+        assert_eq!(param_path(Some(&params), "cwd"), None);
     }
 }

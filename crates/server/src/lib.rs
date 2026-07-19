@@ -341,6 +341,9 @@ impl SessionManager {
     /// - `fork`：`Some(id)` 则把源会话复制为新 id 后继续（resume 与 fork 互斥，resume 优先）。
     /// - `mode_override`：`Some(code|architect|ask|debug)` 覆盖配置默认模式（修复此前 Web
     ///   模式切换不生效——模式仅在会话创建时确定，故切换模式即以新会话 resume 旧 id）。
+    /// - `cwd`：会话工作目录覆盖（ACP `session/new` 的 `NewSessionRequest.cwd` 携带的项目根）。
+    ///   `None` 回退到服务端启动时锁定的 cwd（CLI / Web 场景）。修复 ACP 路径下客户端 cwd 被
+    ///   丢弃、Agent 始终在进程 cwd（容器内常为 `/workspace`）而非当前项目目录工作的问题。
     ///
     /// 会话与 CLI 共享同一目录，互可见。
     pub async fn create_session(
@@ -349,9 +352,18 @@ impl SessionManager {
         resume: Option<&str>,
         fork: Option<&str>,
         mode_override: Option<&str>,
+        cwd: Option<&std::path::Path>,
     ) -> Result<String, String> {
+        // 解析会话工作目录：客户端 cwd 优先，规范为绝对路径；相对路径相对服务端 cwd 解析；
+        // 缺省回退到服务端启动时锁定的 cwd。
+        let resolved_cwd: std::path::PathBuf = match cwd {
+            Some(c) if c.is_absolute() => c.canonicalize().unwrap_or_else(|_| c.to_path_buf()),
+            Some(c) => self.cwd.join(c),
+            None => self.cwd.as_path().to_path_buf(),
+        };
+        let effective_cwd: &std::path::Path = &resolved_cwd;
         // 解析会话 id：resume（复用）> fork（复制为新 id）> 新建。
-        let store = agent_context::SessionStore::for_cwd(&self.cwd);
+        let store = agent_context::SessionStore::for_cwd(effective_cwd);
         let id = if let Some(r) = resume.filter(|r| is_safe_session_id(r)) {
             r.to_string()
         } else if let Some(src) = fork.filter(|f| is_safe_session_id(f)) {
@@ -403,7 +415,7 @@ impl SessionManager {
         // Skill 目录 + MCP 注册表：每个会话加载一次，供 build_agent 与只读端点（/skills /mcp）共享。
         let skill_opts = self.config.skills.to_load_options();
         let skill_catalog: Arc<agent_skills::SkillCatalog> = if skill_opts.enabled {
-            match agent_skills::SkillRegistry::native(self.cwd.as_path().to_path_buf())
+            match agent_skills::SkillRegistry::native(effective_cwd.to_path_buf())
                 .load(&skill_opts)
                 .await
             {
@@ -421,7 +433,7 @@ impl SessionManager {
         let (agent, context) = build_agent(
             &self.config,
             self.http.clone(),
-            &self.cwd,
+            effective_cwd,
             &pending,
             &broadcast_tx,
             &supervisor,
@@ -1118,6 +1130,8 @@ async fn create_session(
             params.resume.as_deref(),
             params.fork.as_deref(),
             params.mode.as_deref(),
+            // Web 场景：cwd 即服务端启动目录（已由 SessionManager 持有），无需覆盖。
+            None,
         )
         .await
     {
