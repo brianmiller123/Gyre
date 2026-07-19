@@ -60,6 +60,35 @@ pub enum StopReason {
     Error,
 }
 
+/// 停止详情（provider 特定的终态描述，移植 oh-my-pi `stopDetails`）。
+///
+/// 当 [`StopReason::Error`] 时携带类型信息，供 [`AssistantMessage::is_provider_refusal`]
+/// 识别 API 级 refusal / sensitive（不应作为对话重放，移植 [`replay-policy.ts`]）。
+///
+/// [`replay-policy.ts`]: https://github.com/can1357/oh-my-pi/blob/master/packages/agent/src/replay-policy.ts
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StopDetails {
+    /// 终态类型（provider 特定：`refusal` / `sensitive` / `content_filter` / ...）。
+    ///
+    /// 使用 `type` 作为 JSON 字段名以对齐 oh-my-pi wire 格式（`stopDetails.type`）。
+    #[serde(rename = "type", default)]
+    pub kind: String,
+}
+
+impl StopDetails {
+    /// 构造停止详情。
+    #[must_use]
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self { kind: kind.into() }
+    }
+
+    /// 是否为 refusal / sensitive 类（API 级终态错误，不应重放）。
+    #[must_use]
+    pub fn is_refusal_like(&self) -> bool {
+        matches!(self.kind.as_str(), "refusal" | "sensitive" | "content_filter")
+    }
+}
+
 /// token 用量与成本。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -142,6 +171,9 @@ pub struct AssistantMessage {
     pub model: String,
     /// 停止原因。
     pub stop_reason: Option<StopReason>,
+    /// 停止详情（provider 特定终态描述；refusal/sensitive 类经 replay 过滤）。
+    #[serde(default)]
+    pub stop_details: Option<StopDetails>,
 }
 
 impl AssistantMessage {
@@ -171,6 +203,18 @@ impl AssistantMessage {
             .filter_map(|b| b.as_text())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// 是否为 provider 级 refusal（终态错误，不应作为对话重放）。
+    ///
+    /// 移植 oh-my-pi [`isProviderRefusalMessage`](https://github.com/can1357/oh-my-pi/blob/master/packages/agent/src/replay-policy.ts)：
+    /// `stopReason=Error` + `stopDetails.type ∈ {refusal, sensitive, content_filter}`。
+    /// 此类消息是 API 层终态拒绝（内容过滤 / 安全拒绝），重放会把 refusal 文本反复喂回
+    /// 模型；`build_provider_context` 经此判定过滤，保留其余 assistant 消息。
+    #[must_use]
+    pub fn is_provider_refusal(&self) -> bool {
+        matches!(self.stop_reason, Some(StopReason::Error))
+            && self.stop_details.as_ref().is_some_and(StopDetails::is_refusal_like)
     }
 }
 
@@ -458,4 +502,71 @@ pub enum AgentEvent {
     Done(AgentRunSummary),
     /// 错误。
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_details_refusal_like_detection() {
+        // P2-P：refusal / sensitive / content_filter 视为 refusal-like（终态拒绝，不重放）。
+        assert!(StopDetails::new("refusal").is_refusal_like());
+        assert!(StopDetails::new("sensitive").is_refusal_like());
+        assert!(StopDetails::new("content_filter").is_refusal_like());
+        // 其他类型（普通错误细节）不算 refusal。
+        assert!(!StopDetails::new("other").is_refusal_like());
+        assert!(!StopDetails::new("").is_refusal_like());
+    }
+
+    fn asst(stop_reason: Option<StopReason>, stop_details: Option<StopDetails>) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::Text { text: "x".into() }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason,
+            stop_details,
+        }
+    }
+
+    #[test]
+    fn is_provider_refusal_requires_error_and_refusal_like_details() {
+        // Error + refusal → 真。
+        assert!(asst(Some(StopReason::Error), Some(StopDetails::new("refusal"))).is_provider_refusal());
+        assert!(asst(
+            Some(StopReason::Error),
+            Some(StopDetails::new("content_filter"))
+        )
+        .is_provider_refusal());
+        // 非 Error 停止原因 → 假（即使带 refusal 详情）。
+        assert!(!asst(Some(StopReason::Stop), Some(StopDetails::new("refusal"))).is_provider_refusal());
+        // Error 但无 refusal-like 详情 → 假（普通错误，仍可重放）。
+        assert!(!asst(Some(StopReason::Error), None).is_provider_refusal());
+        assert!(!asst(Some(StopReason::Error), Some(StopDetails::new("timeout"))).is_provider_refusal());
+    }
+
+    #[test]
+    fn stop_details_serde_roundtrip_preserves_type_field() {
+        // wire 格式：JSON 字段名为 "type"（对齐 oh-my-pi stopDetails.type）。
+        let json = serde_json::json!({ "type": "sensitive" });
+        let sd: StopDetails = serde_json::from_value(json).unwrap();
+        assert_eq!(sd.kind, "sensitive");
+        assert!(sd.is_refusal_like());
+        let rep = serde_json::to_value(&sd).unwrap();
+        assert_eq!(rep["type"], "sensitive");
+    }
+
+    #[test]
+    fn assistant_message_serde_back_compat_missing_stop_details() {
+        // 旧持久化无 stop_details 字段 → 反序列化回退 None（#[serde(default)]）。
+        let json = serde_json::json!({
+            "content": [{"type":"text","text":"hi"}],
+            "usage": {"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.0},
+            "model": "m",
+            "stop_reason": "stop"
+        });
+        let msg: AssistantMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(msg.stop_details, None);
+        assert!(!msg.is_provider_refusal());
+    }
 }

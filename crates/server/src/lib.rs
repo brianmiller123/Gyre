@@ -2309,6 +2309,7 @@ mod tests {
             usage: Usage::default(),
             model: "test".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let line = serde_json::to_string(&msg).unwrap();
         {

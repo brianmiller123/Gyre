@@ -361,6 +361,9 @@ async fn main() -> Result<()> {
     let context_guard = cfg.agent.context_window_guard;
     let enable_thinking = cfg.agent.enable_thinking;
     let reasoning_budget = cfg.agent.reasoning_budget;
+    // P1-K：自适应思考配置（closure 内按 mode 重建时复用）。
+    let auto_thinking = cfg.agent.auto_thinking;
+    let auto_thinking_model = cfg.agent.auto_thinking_model.clone();
     let auto_consolidate = cfg.memory.auto_consolidate;
     // 子 Agent 配置（[subagent]：开关 / 并发护栏 / 继承父 temperature·thinking / 独立 token 预算）
     let subagent_enabled = cfg.subagent.enabled;
@@ -494,11 +497,28 @@ async fn main() -> Result<()> {
             builder
         };
         if enable_thinking {
-            builder
-                .thinking(agent_core::ThinkingConfig::new(
-                    reasoning_budget.unwrap_or(16_000),
-                ))
-                .build()
+            let static_cfg = agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000));
+            if auto_thinking {
+                if let Some(tiny_id) = auto_thinking_model.clone() {
+                    // P1-K：tiny 模型分类 prompt 难度 → Effort → 钳位 budget（移植 oh-my-pi
+                    // auto-thinking）。分类失败回退 static_cfg；模型不支持思考 → 本轮不思考。
+                    let mut tiny = model.clone();
+                    tiny.id = tiny_id;
+                    let classifier = Arc::new(agent_llm::LlmThinkingClassifier::new(
+                        Arc::clone(&provider),
+                        tiny,
+                        provider_ctx.clone(),
+                    ));
+                    builder
+                        .thinking_policy(agent_core::ThinkingPolicy::auto(classifier, static_cfg))
+                        .build()
+                } else {
+                    tracing::warn!("auto_thinking 已启用但 auto_thinking_model 未配置，回退静态思考预算");
+                    builder.thinking(static_cfg).build()
+                }
+            } else {
+                builder.thinking(static_cfg).build()
+            }
         } else {
             builder.build()
         }

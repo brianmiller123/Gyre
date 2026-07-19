@@ -572,16 +572,23 @@ fn build_glm_message(
         };
         content.push(ContentBlock::ToolCall { id, name, arguments });
     }
-    let stop_reason = finish.as_deref().map(|f| match f {
-        "length" => StopReason::Length,
-        "tool_calls" | "function_call" => StopReason::ToolUse,
-        _ => StopReason::Stop,
-    });
+    // P2-P：content_filter → Error + sensitive（GLM/Z.ai OpenAI 兼容，含 content_filter）。
+    let (stop_reason, stop_details) = match finish.as_deref() {
+        Some("length") => (Some(StopReason::Length), None),
+        Some("tool_calls") | Some("function_call") => (Some(StopReason::ToolUse), None),
+        Some("content_filter") => (
+            Some(StopReason::Error),
+            Some(agent_core::StopDetails::new("sensitive")),
+        ),
+        Some(_) => (Some(StopReason::Stop), None),
+        None => (None, None),
+    };
     agent_core::AssistantMessage {
         content,
         usage: usage.clone(),
         model: model_id.to_string(),
         stop_reason,
+        stop_details,
     }
 }
 

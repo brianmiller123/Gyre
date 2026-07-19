@@ -157,6 +157,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "fake".into(),
                 stop_reason: Some(StopReason::Stop),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 AssistantEvent::TextDelta(text.to_string()),
@@ -248,6 +249,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "chunked".into(),
                 stop_reason: Some(StopReason::Stop),
+                stop_details: None,
             }));
             Ok(Box::pin(futures::stream::iter(evs)))
         }

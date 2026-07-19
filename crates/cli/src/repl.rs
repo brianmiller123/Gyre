@@ -1254,6 +1254,7 @@ mod tests {
             usage: agent_core::Usage::default(),
             model: "test".into(),
             stop_reason: None,
+            stop_details: None,
         };
         {
             let mut f = std::fs::File::create(&path).unwrap();

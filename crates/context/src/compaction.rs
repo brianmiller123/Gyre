@@ -901,6 +901,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         })
     }
 
@@ -936,6 +937,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "m".into(),
                 stop_reason: None,
+                stop_details: None,
             })
         };
         let res = |id: &str, text: &str| {
@@ -971,6 +973,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let result = AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: "call-1".into(),
@@ -1000,6 +1003,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let result = AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: "call-1".into(),
@@ -1035,6 +1039,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let log = vec![empty, assistant("real")];
         let out = Compactor::shake(&log);
@@ -1264,6 +1269,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let big = "x".repeat(4000);
         let res = AgentMessage::ToolResult(ToolResultMessage {

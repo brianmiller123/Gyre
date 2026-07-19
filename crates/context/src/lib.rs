@@ -650,9 +650,18 @@ fn convert_to_llm(log: &[AgentMessage]) -> Vec<ProviderMessage> {
             AgentMessage::User(u) => Some(ProviderMessage::User {
                 content: u.content.clone(),
             }),
-            AgentMessage::Assistant(a) => Some(ProviderMessage::Assistant {
-                content: a.content.clone(),
-            }),
+            AgentMessage::Assistant(a) => {
+                // P2-P：API 级 refusal 不重放（移植 replay-policy.ts filterProviderReplayMessages）。
+                // refusal assistant 消息是终态错误（content_filter / sensitive），重放会把 refusal
+                // 文本反复喂回模型；过滤后任何紧跟的孤立 tool 消息由 sanitize_provider_messages 清理。
+                if a.is_provider_refusal() {
+                    None
+                } else {
+                    Some(ProviderMessage::Assistant {
+                        content: a.content.clone(),
+                    })
+                }
+            }
             AgentMessage::ToolResult(t) => {
                 // 多模态工具结果：把 ToolResult::Image 编码为 base64 ToolImage，
                 // 让支持多模态的 provider（Anthropic）真正"看到"图像。
@@ -804,6 +813,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         }))
         .await;
 
@@ -812,6 +822,61 @@ mod tests {
         assert_eq!(built.messages.len(), 2);
         assert!(!built.fingerprint.is_empty());
         assert!(built.tokens.current > 0);
+    }
+
+    /// P2-P：API 级 refusal assistant 消息不重放（移植 replay-policy.ts filterProviderReplayMessages）。
+    /// refusal（Error + sensitive 详情）从 provider 上下文过滤；普通 Error（无 refusal 详情）保留。
+    #[tokio::test]
+    async fn build_filters_provider_refusal_assistant() {
+        let ctx = InMemoryContext::new(vec!["sys".into()]);
+        ctx.append(AgentMessage::user_text("q1")).await;
+        // refusal 消息：Error + sensitive → 应被过滤。
+        ctx.append(AgentMessage::Assistant(AssistantMessage {
+            content: vec![agent_core::ContentBlock::Text { text: "I can't help with that".into() }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: Some(agent_core::StopReason::Error),
+            stop_details: Some(agent_core::StopDetails::new("sensitive")),
+        }))
+        .await;
+        ctx.append(AgentMessage::user_text("q2")).await;
+        // 普通 Error（无 refusal 详情）→ 应保留。
+        ctx.append(AgentMessage::Assistant(AssistantMessage {
+            content: vec![agent_core::ContentBlock::Text { text: "partial".into() }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: Some(agent_core::StopReason::Error),
+            stop_details: None,
+        }))
+        .await;
+
+        let model = Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let built = ctx.build_provider_context(&model, &[]).await.unwrap();
+        // 期望：user(q1) 被过滤的 refusal user(q2) 普通Error assistant = 3 条
+        // （refusal assistant 不出现在 provider 消息中）。
+        // 逐条提取首文本块：user 取 UserContent::Text，assistant 取 ContentBlock::Text。
+        let texts: Vec<String> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::Assistant { content } => {
+                    content.iter().find_map(|b| b.as_text().map(String::from))
+                }
+                agent_core::ProviderMessage::User { content } => content.iter().find_map(|c| {
+                    if let agent_core::UserContent::Text { text } = c {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["q1".to_string(), "q2".to_string(), "partial".to_string()]);
+        assert!(
+            !texts.iter().any(|t| t.contains("can't help")),
+            "refusal 文本不应重放"
+        );
     }
 
     /// P0-A：连续 append 时，第二次 build 的稳定前缀应覆盖上次全部消息
@@ -914,6 +979,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: Some(agent_core::StopReason::ToolUse),
+            stop_details: None,
         }))
         .await;
         ctx.append(AgentMessage::ToolResult(agent_core::ToolResultMessage {
@@ -981,6 +1047,7 @@ mod tests {
             },
             model: "m".into(),
             stop_reason: Some(agent_core::StopReason::Stop),
+            stop_details: None,
         }))
         .await;
         ctx.append(AgentMessage::user_text("again")).await;
@@ -995,6 +1062,7 @@ mod tests {
             },
             model: "m".into(),
             stop_reason: Some(agent_core::StopReason::Stop),
+            stop_details: None,
         }))
         .await;
         let acc = ctx.accumulated_usage();
@@ -1050,6 +1118,7 @@ mod tests {
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
+            stop_details: None,
         });
         let res = AgentMessage::ToolResult(agent_core::ToolResultMessage {
             tool_call_id: "c1".into(),

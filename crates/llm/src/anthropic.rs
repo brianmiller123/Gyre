@@ -383,6 +383,8 @@ fn build_message(model_id: &str, blocks: &[BlockState], stop: &Option<String>, u
             content.push(ContentBlock::Text { text: b.text.clone() });
         }
     }
+    // Anthropic 的 stop_reason 取值：end_turn / max_tokens / stop_sequence / tool_use。
+    // 无 content_filter 直映射；refusal 由 message 层错误（非 stop_reason）承载，此处不臆造。
     let stop_reason = stop.as_deref().map(|s| match s {
         "max_tokens" => StopReason::Length,
         "tool_use" | "tool_calls" => StopReason::ToolUse,
@@ -393,6 +395,7 @@ fn build_message(model_id: &str, blocks: &[BlockState], stop: &Option<String>, u
         usage: usage.clone(),
         model: model_id.to_string(),
         stop_reason,
+        stop_details: None,
     }
 }
 

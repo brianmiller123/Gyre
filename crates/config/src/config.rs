@@ -229,6 +229,14 @@ pub struct AgentConfig {
     /// 思考 token 预算（None 表示用模型默认）。
     #[serde(default)]
     pub reasoning_budget: Option<usize>,
+    /// P1-K：自适应思考——每轮按用户 prompt 难度经 tiny 模型分类，动态调整思考预算
+    ///（简单问题省 token/降延迟，难题深度推理）。需配合 `auto_thinking_model`。
+    #[serde(default)]
+    pub auto_thinking: bool,
+    /// P1-K：自适应思考用的 tiny 模型 id（如 "gpt-4o-mini" / "glm-4-flash"）。
+    /// 复用当前 profile 的 provider/api。`None` 时 auto_thinking 不生效（回退静态预算）。
+    #[serde(default)]
+    pub auto_thinking_model: Option<String>,
     /// 逐工具审批覆盖。
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -247,6 +255,8 @@ impl Default for AgentConfig {
             context_window_guard: default_guard(),
             enable_thinking: false,
             reasoning_budget: None,
+            auto_thinking: false,
+            auto_thinking_model: None,
             tools: ToolsConfig::default(),
             commands: CommandRules::default(),
         }

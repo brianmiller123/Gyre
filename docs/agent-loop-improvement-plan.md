@@ -563,6 +563,269 @@ Gyre 已正确移植的核心能力（保持，不列入改进）：
 
 ---
 
+---
+
+## 第四轮深度对比（2026-07 第四次）：跳出 agent-loop.ts，看 coding-agent 产品层 + snapcompact
+
+> 前三轮聚焦 [`third/oh-my-pi/packages/agent`](../third/oh-my-pi/packages/agent/src) 的循环本体（`agent-loop.ts` / `append-only-context.ts` / `compaction/`）。
+> 本轮把视角**抬高一层**——逐目录扫描 [`third/oh-my-pi/packages`](../third/oh-my-pi/packages)（`snapcompact` / `coding-agent`）与
+> [`packages/agent/src`](../third/oh-my-pi/packages/agent/src) 中此前未逐行精读的 `proxy.ts` / `thinking.ts` / `replay-policy.ts`，
+> 对照 Gyre 全部 23 个 crate，识别出 **9 项前三轮计划完全未涵盖**的产品级 / 成本级差距。
+>
+> 核心结论：Gyre 已把 oh-my-pi 的 **循环引擎**（执行 / 压缩 / 分支 / 中断 / 并发）基本吃透，但 oh-my-pi 真正的差异化能力
+> 在 **引擎之上的智能层**：图像化压缩、自适应思考预算、双代理评审、目标预算、跨会话学习、计划审批、多工具配置互操作。
+> 其中 **P0-L（snapcompact 图像压缩）** 直接把昂贵的 LLM summarize 替换为本地 PNG 渲染，长会话压缩成本可降一个数量级，ROI 最高。
+
+### 🔴 P0-L：snapcompact 图像化压缩（本地 PNG 帧，替换昂贵 summarize）
+
+**问题**：Gyre [`Compactor::summarize`](../crates/context/src/compaction.rs) 走**本地 LLM 请求**压缩——慢、贵、可能失败、丢精度。oh-my-pi
+[`snapcompact`](../third/oh-my-pi/packages/snapcompact/src/snapcompact.ts) 把被丢弃的历史序列化为紧凑文本，渲染成 **bitmap-font PNG 帧**，
+视觉模型直接读图回放——**完全本地、确定性、无 LLM 调用、零 API key**。栅格化与 PNG 编码在 native 代码（[`pi-natives`](../third/oh-my-pi/crates/pi-natives)）。
+
+**差距清单**：
+
+| 能力 | Gyre | oh-my-pi |
+|---|---|---|
+| 本地 PNG 帧渲染（无 LLM 调用） | ❌（LLM summarize） | ✅ `render` / `renderMany` |
+| Provider 感知帧形状（按计费 eval 选） | ❌ | ✅ Anthropic `6x12-dim` / Google `doc-8on16-sent-dim` / OpenAI `8on16-bw` |
+| 图像预算护栏（防网关丢帧） | ❌ | ✅ `providerImageBudget` / `MAX_FRAMES_DEFAULT` |
+| `preserveData` 持久化帧归档 | ❌ | ✅ 压缩条目内挂载，rebuild 时重附 |
+| 高分辨率边缘帧（HQ） | ❌ | ✅ `HQ_EDGE_FRAMES`（1932px Claude 高清行） |
+
+**实施前置条件**（2026-07 评估，本轮未落地——需独立攻关会话）：
+
+> 经核查，Gyre 工作区**当前无 PNG / 字体 / DEFLATE 依赖**（`Cargo.lock` 无 `image`/`png`/`ab_glyph`/`flate2`），
+> 且 assistant [`ContentBlock`](../crates/core/src/message.rs) **无 `Image` 变体**（仅 Text/Thinking/ToolCall；`Image` 仅存在于 `UserContent`/`ToolImage`）。
+> 因此 P0-L 不是「移植 13 行」级别，而是涉及：
+>
+> 1. **新增依赖**：PNG 编码（`image` 或 `png` crate）+ 字体（`ab_glyph` + 等宽 TTF，或内嵌 8x16 bitmap 字体 ~2KB）。
+> 2. **assistant 图像块贯通**：`ContentBlock::Image` + 各 provider transform（Anthropic image block / OpenAI `image_url` / GLM），
+>    否则压缩后摘要消息的图像块会触发 400。
+> 3. **栅格化质量 + eval**：oh-my-pi 的帧形状经 SQuAD recall eval 调优（stopword dimming、多栏布局、provider 计费感知）；
+>    朴素渲染的文本密度不足 → 视觉模型误读 → 比文本 summarize 更差。**必须用真实视觉模型验证召回率**才能上线。
+>
+> 前置 1-2 可在一个攻关会话完成；前置 3 是成败关键，需 eval 数据集。建议作为独立里程碑，不与其他改动混排。
+
+**任务**：
+
+- [ ] 在 [`crates/context`](../crates/context/src/compaction.rs) 引入 `ImageCompactor`（独立模块，不替换现有 `summarize`，作为可选 backend）：
+  序列化丢弃历史 → 文本归一化（剥 ANSI / 折叠空白 / 换行折叠为全块字符保留行结构）→ 栅格化为 PNG 帧。
+- [ ] 栅格化用 Rust 原生实现（`image` + 内嵌 6x12/8x16 bitmap 字体，或 `ab_glyph` + 等宽字体），无需 Node 依赖。
+- [ ] 帧形状按 [`Model`](../crates/core/src/model.rs) provider 分流：Anthropic / OpenAI / Google / Unknown 四档（移植 [`resolveShape`](../third/oh-my-pi/packages/snapcompact/src/snapcompact.ts)）。
+- [ ] [`ProviderMessage`](../crates/core/src/message.rs) 内容块支持 `ContentBlock::Image { data: Vec<u8>, media_type: "image/png", .. }`（若已有则复用）；
+  压缩后摘要消息挂载多帧 image 块。
+- [ ] [`Compactor`](../crates/context/src/compaction.rs) 加 `compaction_backend: Summarize | Snapcompact | Hybrid` 配置，默认 `Summarize`（向后兼容），
+  视觉模型（Claude / GPT-4o / Gemini）opt-in `Snapcompact`。
+- [ ] 帧数预算 + 网关丢帧护栏（移植 `providerImageBudget`）。
+
+**验收**：含大型历史的会话经 snapcompact 压缩后，摘要消息含 image 块、token 估算显著低于 summarize、信息可由视觉模型回读；
+非视觉模型回退 `Summarize` backend。
+
+**参考实现**：[`snapcompact.ts`](../third/oh-my-pi/packages/snapcompact/src/snapcompact.ts) `compact` / `renderMany` / `resolveShape` / `serializeConversation`；
+[`pi-natives`](../third/oh-my-pi/crates/pi-natives)（Rust 栅格化）。
+
+---
+
+### 🟡 P1-K：auto-thinking 自适应思考预算（按 prompt 难度调档）
+
+**问题**：Gyre [`AgentBuilder::thinking`](../crates/agent/src/lib.rs) 是**静态**配置——整个 run 用同一 `ThinkingConfig`（budget_tokens）。
+oh-my-pi [`auto-thinking/classifier.ts`](../third/oh-my-pi/packages/coding-agent/src/auto-thinking/classifier.ts) 在 `thinking: "auto"` 模式下，
+**每个 prompt** 用 tiny/smol 模型分类难度（`trivial|moderate|hard` 或 `low|medium|high|xhigh`），映射为 `Effort` 并钳到当前模型支持范围
+（不低于 `Effort.Low`）。简单问题少思考省 token / 降延迟，难题深度推理。
+
+**差距清单**：
+
+| 能力 | Gyre | oh-my-pi |
+|---|---|---|
+| 静态 thinking budget（per-run） | ✅ | ✅ |
+| per-prompt 难度分类 | ❌ | ✅ `classifyDifficulty` |
+| 在线（smol 模型）/ 本地（on-device）双后端 | ❌ | ✅ |
+| Effort 钳到模型支持范围 | ❌ | ✅ `clampAutoThinkingEffort` |
+| 分类失败回退（不阻断 turn） | ❌ | ✅ |
+
+**任务**：
+
+- [x] [`crates/core/src/llm.rs`](../crates/core/src/llm.rs) 新增 [`Effort`](../crates/core/src/llm.rs) 档位（Minimal/Low/Medium/High/XHigh，含 `default_budget` / `budget_clamped` / `parse`）+ [`ThinkingClassifier`](../crates/core/src/llm.rs) trait + [`ThinkingPolicy { Static | Auto }`](../crates/core/src/llm.rs)（`resolve()` 异步解析；Auto 调分类器、钳位、模型不支持→None、失败→fallback）。
+- [x] [`crates/llm/src/thinking.rs`](../crates/llm/src/thinking.rs) 实现 [`LlmThinkingClassifier`](../crates/llm/src/thinking.rs)：复用 `LlmProvider` + tiny `Model`，单次 8-token 补全（`ANSWER_MAX_TOKENS=8`），从 `MessageEnd` 权威文本解析 `Effort`。
+- [x] 输入截断保护：[`truncate_classifier_input`](../crates/core/src/llm.rs)（head 4000 + tail 2000，移植 `HEAD_CHARS/TAIL_CHARS`）。
+- [x] 分类失败 / provider 错误 / 不可解析 → 返回 `None`（`ThinkingPolicy::Auto` 回退 fallback，不抛、不阻断 turn）。
+- [x] [`AgentBuilder::thinking_policy`](../crates/agent/src/lib.rs) + run_loop 解析：在 user_msg move 进 context 前提取 prompt 文本，循环前 `policy.resolve(&prompt_text, &model).await` 一次/run（难度恒定，分类器成本 ≤ 一次 tiny 调用）。
+- [x] CLI 装配（[`main.rs`](../crates/cli/src/main.rs)）：`[agent].auto_thinking` + `auto_thinking_model` 配置；启用时复用当前 provider/api + tiny id 构造分类器，未配 tiny 模型回退静态 + 告警。
+- [ ] *后续*：server 装配（`assemble` 需传入 model 参数，待签名调整）；本地 on-device 分类器后端（移植 `classifyLocal` 3-class）。
+
+**验收**（通过，`cargo test -p agent-core` 19/19、`-p agent-llm` 59/59、`-p agent` 19/19；全 workspace 全绿）：
+
+- [x] 单元测试：[`effort_default_budget_monotonic`](../crates/core/src/llm.rs) / `effort_budget_clamped_respects_bounds` / `effort_parse_recognizes_aliases`（档位单调、钳位、别名解析）。
+- [x] 单元测试：[`truncate_classifier_input_*`](../crates/core/src/llm.rs)（短文本原样、长文本 head+tail）。
+- [x] 分类器测试（[`thinking.rs`](../crates/llm/src/thinking.rs)）：`classify_parses_effort_from_provider_text`（low/Medium/high/xhigh 容错解析）、`classify_returns_none_on_unparsable_output`、`classify_returns_none_on_provider_error`。
+- [x] 集成测试（[`lib.rs`](../crates/agent/src/lib.rs)）：[`auto_thinking_resolves_budget_from_classifier`](../crates/agent/src/lib.rs)（High 分类 → 下发 32_000 预算）、[`auto_thinking_returns_none_when_model_unsupported`](../crates/agent/src/lib.rs)（supports_thinking=false → 本轮不思考）。
+
+**参考实现**：[`classifier.ts`](../third/oh-my-pi/packages/coding-agent/src/auto-thinking/classifier.ts)；[`thinking.ts`](../third/oh-my-pi/packages/agent/src/thinking.ts) `ThinkingLevel`。
+
+---
+
+### 🟡 P1-L：advisor 双代理评审（只读观察者 + emission-guard）
+
+**问题**：Gyre [`supervisor`](../crates/supervisor/src/lib.rs) 只观测 **TaskTool 派生的子 Agent**（spawn/finish/log），
+**没有**一个独立的「评审 Agent」持续看主 Agent transcript 并提建议。oh-my-pi [`advisor`](../third/oh-my-pi/packages/coding-agent/src/advisor)
+是一个**只读第二 Agent**：快照主 transcript（经 secret obfuscator 脱敏）→ 用独立 model（近窗口时自动 promote 到更大 sibling）→
+经 `advise` 工具下发 `nit|concern|blocker` 级别建议到主 Agent 的 yield queue。配套 [`emission-guard`](../third/oh-my-pi/packages/coding-agent/src/advisor/emission-guard.ts)
+在代码层 dedupe 重复建议（真实 advisor 模型会 spam "Stop." 114 次，issue #3520）、过滤无内容 filler。
+[`watchdog.ts`](../third/oh-my-pi/packages/coding-agent/src/advisor/watchdog.ts) 发现 `WATCHDOG.md`（仓库/用户级评审准则）注入 advisor system prompt。
+
+**差距清单**：
+
+| 能力 | Gyre | oh-my-pi |
+|---|---|---|
+| 只读评审 Agent（独立 context/model） | ❌（仅子 Agent 执行） | ✅ `AdvisorAgent` |
+| secret 脱敏后喂评审模型 | ❌ | ✅ `SecretObfuscator` |
+| 近窗口自动 promote 到更大 model | ❌ | ✅ `maintainContext` |
+| 三级 severity（nit/concern/blocker） | ❌ | ✅ |
+| 代码层 dedupe / filler 过滤 | ❌ | ✅ `AdvisorEmissionGuard` |
+| WATCHDOG.md 评审准则发现 | ❌ | ✅ |
+
+**任务**：
+
+- [ ] 新建 [`crates/advisor`](../crates) crate（依赖 `agent`/`llm`/`core`，不引入循环依赖）：`Advisor` 包装一个独立 `Agent`（只读工具集 + 独立 provider/model）。
+- [ ] `AdvisorHost` trait：`snapshot_messages()` / `enqueue_advice(severity, note)` / `obfuscator` / `maintain_context(tokens) -> bool`。
+- [ ] 主 [`run_loop`](../crates/agent/src/lib.rs) 每轮结束（或每 N 轮）触发 advisor 增量评审；advice 经现有 [`steer_rx`](../crates/agent/src/lib.rs)
+  或新增 `advice_rx` 注入主上下文（与 steering 同语义但带 severity 标记）。
+- [ ] `EmissionGuard`：normalize（NFKC + 折叠标点 + 小写）后 dedupe + filler 黑名单（移植 [`normalizeAdvisorNote`](../third/oh-my-pi/packages/coding-agent/src/advisor/emission-guard.ts)）。
+- [ ] `WATCHDOG.md` 发现（cwd walkup + `~/.gyre/` + 项目 `.gyre/`）注入 advisor system prompt。
+
+**验收**：advisor 在主 Agent 跑偏时下发 blocker 建议被注入；重复 "Stop." 仅入队一次；secret 不泄露到 advisor model。
+
+**参考实现**：[`advisor/runtime.ts`](../third/oh-my-pi/packages/coding-agent/src/advisor/runtime.ts) / [`emission-guard.ts`](../third/oh-my-pi/packages/coding-agent/src/advisor/emission-guard.ts) / [`watchdog.ts`](../third/oh-my-pi/packages/coding-agent/src/advisor/watchdog.ts)。
+
+---
+
+### 🟡 P1-M：goals 目标 + token/时间预算追踪
+
+**问题**：Gyre 有 [`deadline`](../crates/agent/src/lib.rs)（ wall-clock 上限）和 [`max_turns`](../crates/agent/src/lib.rs)，但**没有**「目标对象 + 预算追踪」概念——
+用户无法说「花最多 50k token 解决这个问题」。oh-my-pi [`goals`](../third/oh-my-pi/packages/coding-agent/src/goals) 维护
+[`Goal`](../third/oh-my-pi/packages/coding-agent/src/goals/state.ts)（id / objective / status / `tokenBudget` / `tokensUsed` / `timeUsedSeconds`），
+状态机 `active → paused | budget-limited | complete | dropped`，超预算时经隐藏消息（`deliverAs: steer|followUp|nextTurn`）
+注入 `goal-budget-limit.md` 提示让模型收尾，配套 continuation prompt。
+
+**差距清单**：
+
+| 能力 | Gyre | oh-my-pi |
+|---|---|---|
+| deadline（wall-clock） | ✅ | ✅ |
+| max_turns | ✅ | ✅（loop-limit） |
+| Goal 对象（objective + token/time budget） | ❌ | ✅ `GoalModeState` |
+| 预算耗尽 → 收尾提示注入 | ❌ | ✅ `goal-budget-limit.md` |
+| goal 状态机（pause/resume/complete/drop） | ❌ | ✅ |
+| 用户 `/loop 10` / `/loop 10m` 命令 | ❌ | ✅ [`loop-limit.ts`](../third/oh-my-pi/packages/coding-agent/src/modes/loop-limit.ts) |
+
+**任务**：
+
+- [ ] [`crates/core`](../crates/core/src/context.rs) 加 `Goal` / `GoalModeState` 类型；[`AgentBuilder`](../crates/agent/src/lib.rs) 加 `.goal(Goal)`。
+- [ ] [`run_loop`](../crates/agent/src/lib.rs) 每轮累加 `tokens_used` / `time_used`，超 `token_budget` 时注入 budget-limit 隐藏消息（经 steering 通道）。
+- [ ] 新增 `goal` 工具（create/get/complete/resume/drop）让模型自管理目标（移植 [`goal-tool`](../third/oh-my-pi/packages/coding-agent/src/goals/tools)）。
+- [ ] [`crates/cli`](../crates/cli/src/repl.rs) / [`crates/server`](../crates/server/src/lib.rs) 加 `/loop <count|duration>` 命令解析（移植 [`parseLoopLimitArgs`](../third/oh-my-pi/packages/coding-agent/src/modes/loop-limit.ts)）。
+
+**验收**：设定 50k token 预算，耗尽时模型收到收尾提示并主动 complete；`/loop 10` 跑 10 轮自停。
+
+**参考实现**：[`goals/runtime.ts`](../third/oh-my-pi/packages/coding-agent/src/goals/runtime.ts) / [`state.ts`](../third/oh-my-pi/packages/coding-agent/src/goals/state.ts)；[`loop-limit.ts`](../third/oh-my-pi/packages/coding-agent/src/modes/loop-limit.ts)。
+
+---
+
+### 🟢 P2-L：hindsight 跨会话学习库 + mental models
+
+**问题**：Gyre [`memory`](../crates/memory/src/structured.rs) 是 **per-session BM25** 词项重叠，无跨会话积累、无「心智模型」层。
+oh-my-pi [`hindsight`](../third/oh-my-pi/packages/coding-agent/src/hindsight) 是独立学习后端：
+[`bank.ts`](../third/oh-my-pi/packages/coding-agent/src/hindsight/bank.ts) 三种作用域（`global` / `per-project` / `per-project-tagged`），
+[`mental-models.ts`](../third/oh-my-pi/packages/coding-agent/src/hindsight/mental-models.ts) 在 bank 首次启动时 seed 一组策划模型（idempotent），
+后台 reflect 填充、consolidation 时自动 refresh；mental models 作为 `<mental_models>` 块注入 developer 指令（**绕过每轮 recall HTTP 成本**），
+带 anti-feedback wrapper 防模型把它当命令。
+
+**差距清单**：
+
+| 能力 | Gyre | oh-my-pi |
+|---|---|---|
+| per-session 记忆（BM25） | ✅ | ✅ |
+| 跨会话 / 跨项目学习库 | ❌ | ✅ hindsight bank |
+| 三种作用域（global / per-project / tagged） | ❌ | ✅ |
+| mental models（命名摘要 + 自动 refresh） | ❌ | ✅ |
+| seed 模型（首次启动 idempotent 植入） | ❌ | ✅ `seeds.json` |
+| 注入 developer 指令（免每轮 recall） | ❌ | ✅ |
+
+**任务**：与已计划 [`P2-1 向量记忆`](#p2-1记忆语义检索向量) 合并设计——向量 recall 解决「同义不同词」，
+hindsight mental models 解决「跨会话沉淀」。优先级低于循环引擎项；需先决定存储后端（JSONL vs SQLite vs 独立服务）。
+
+**参考实现**：[`hindsight/`](../third/oh-my-pi/packages/coding-agent/src/hindsight) 全模块；[`mnemopi`](../third/oh-my-pi/packages/mnemopi)（独立记忆服务 + MCP）。
+
+---
+
+### 🟢 P2-M：plan-mode 计划审批流（写保护 + handoff）
+
+**问题**：Gyre 有 [`Mode`](../crates/core/src/lib.rs)（architect/code/ask/debug）切换，但**没有**「计划审批」语义——
+architect 模式只改 system prompt，不阻止写、不强制先出计划。oh-my-pi [`plan-mode`](../third/oh-my-pi/packages/coding-agent/src/plan-mode)：
+`PlanModeState`（enabled / planFilePath / workflow: parallel|iterative / reentry），[`plan-protection.ts`](../third/oh-my-pi/packages/coding-agent/src/plan-protection.ts)
+经 compaction protection matcher 保证 plan 文件的 read 结果在 prune/shake 中存活，[`plan-handoff.ts`](../third/oh-my-pi/packages/coding-agent/src/plan-mode/plan-handoff.ts) 切换模式时把批准计划注入新模式。
+
+**任务**：
+
+- [ ] [`Mode`](../crates/core/src/lib.rs) 加 `Plan` 变体：启用时所有写工具（write_file / apply_hashline / run_command）经 [`ApprovalPolicy`](../crates/core/src/tool.rs) 强制 Deny + 提示「先出计划」。
+- [ ] 计划落盘到 `local://PLAN.md`（或 `.gyre/plans/<slug>.md`），read 结果在 [`compact_active_path`](../crates/context/src/lib.rs) 经 protection matcher 保留。
+- [ ] 用户审批后切到 `Code` 模式，计划路径经 handoff 注入 system prompt。
+- [ ] [`crates/cli`](../crates/cli/src/repl.rs) `/plan` 命令 + Web UI 入口。
+
+**参考实现**：[`plan-mode/`](../third/oh-my-pi/packages/coding-agent/src/plan-mode) 全模块。
+
+---
+
+### 🟢 P2-N：discovery 多工具配置互操作（agents.md / .claude / cursor / codex …）
+
+**问题**：Gyre [`skills`](../crates/skills) 只发现原生 `.gyre/skills` + agentskills.io 规范，**不读**其他 Agent 工具的配置。
+oh-my-pi [`discovery`](../third/oh-my-pi/packages/coding-agent/src/discovery) 经统一 capability registry 发现并转换 **12 种**外来配置源：
+`agents.md` / `.claude` / `claude-plugins` / `cline` / `codex` / `cursor` / `gemini` / `opencode` / `github` / `mcp-json` / `vscode` / `windsurf`，
+统一映射到 capability（context-file / extension / hook / instruction / mcp / prompt / rule / skill / slash-command / tool）。
+
+**任务**：在 [`crates/skills`](../crates/skills) 旁新建 `crates/discovery`（或扩 skills），按 capability 分类转换主流外来配置（优先 `agents.md` / `.claude` / `cursor` / `codex`）。
+让 Gyre 开箱即用继承用户既有 Agent 工具配置，降低迁移成本。
+
+**参考实现**：[`discovery/index.ts`](../third/oh-my-pi/packages/coding-agent/src/discovery/index.ts) + 12 个 provider 文件。
+
+---
+
+### 🟢 P2-O：proxy 流式透传 + scrubPartialJson
+
+**问题**：oh-my-pi [`proxy.ts`](../third/oh-my-pi/packages/agent/src/proxy.ts) 提供「代理流」模式：把上游 provider 事件透传下游，
+对进行中的 tool_call 维护 `partialJson` side-channel（按 `contentIndex` 累积），在 `toolcall_end` 清除、`done`/`error` 时
+[`scrubPartialJson`](../third/oh-my-pi/packages/agent/src/proxy.ts) 兜底清理未闭合块——使最终 `AssistantMessage` 不再读作「仍在流」。
+Gyre 有自己的流式（[`AgentEvent`](../crates/core/src/message.rs)），但无此「透传代理」语义（用于 ACP / HTTP 中继 / 网关场景）。
+
+**任务**（低优先，按需）：若 Gyre 要做 provider 网关 / ACP 中继，参考 `scrubPartialJson` 在流终点清理未闭合 tool_call 块。
+Gyre 的 [`persist_interrupted`](../crates/agent/src/lib.rs) 已部分覆盖「中断兜底」，可与之合并设计。
+
+**参考实现**：[`proxy.ts`](../third/oh-my-pi/packages/agent/src/proxy.ts) `scrubPartialJson` / `processProxyEvent`。
+
+---
+
+### 🟢 P2-P：replay-policy refusal 过滤（细化 P2-J）✅ 已完成
+
+**问题**：oh-my-pi [`replay-policy.ts`](../third/oh-my-pi/packages/agent/src/replay-policy.ts)（仅 13 行）检测 API 级 refusal
+（`stopReason=error` + `stopDetails.type=refusal|sensitive`），从 provider replay 过滤——避免 refusal 文本被反复重放。
+Gyre 无 refusal 识别（与普通 error 混同）。此为已计划 [`P2-J`](#p2-jprovider-refusal-过滤--流中断保留已完成-tool_call) 的最小子集，
+可独立速修：[`StopReason`](../crates/core/src/message.rs) 加 `stop_details` 字段 + [`build_provider_context`](../crates/context/src/lib.rs) 过滤 refusal assistant 消息。
+
+**任务**（已完成）：
+
+- [x] [`crates/core/src/message.rs`](../crates/core/src/message.rs) 新增 [`StopDetails { kind }`](../crates/core/src/message.rs)（serde 字段名 `type`，对齐 oh-my-pi wire）+ [`AssistantMessage.stop_details`](../crates/core/src/message.rs)（`#[serde(default)]` 向后兼容）+ [`is_provider_refusal`](../crates/core/src/message.rs)（Error + refusal-like 详情）。
+- [x] Provider 端填充：[`openai.rs`](../crates/llm/src/openai.rs) / [`glm.rs`](../crates/llm/src/glm.rs) / [`deepseek.rs`](../crates/llm/src/deepseek.rs) 把 `content_filter` → `StopReason::Error` + `StopDetails::new("sensitive")`；[`anthropic.rs`](../crates/llm/src/anthropic.rs) `stop_details: None`（无直映射）。
+- [x] Replay 过滤：[`convert_to_llm`](../crates/context/src/lib.rs) 对 `is_provider_refusal()` 的 assistant 消息返回 `None`；孤立 tool 消息由既有 [`sanitize_provider_messages`](../crates/context/src/lib.rs) 清理。
+
+**验收**（通过，`cargo test -p agent-core` 19/19、`-p agent-context` 58/58、`-p agent-llm` 59/59；全 workspace 全绿）：
+
+- [x] 单元测试（[`message.rs`](../crates/core/src/message.rs)）：`stop_details_refusal_like_detection` / `is_provider_refusal_requires_error_and_refusal_like_details` / `stop_details_serde_roundtrip_preserves_type_field` / `assistant_message_serde_back_compat_missing_stop_details`（旧持久化无字段→None）。
+- [x] 集成测试（[`lib.rs`](../crates/context/src/lib.rs)）：[`build_filters_provider_refusal_assistant`](../crates/context/src/lib.rs)（refusal assistant 被过滤、普通 Error 保留、refusal 文本不重放）。
+
+**参考实现**：[`replay-policy.ts`](../third/oh-my-pi/packages/agent/src/replay-policy.ts)（完整 13 行，已移植）。
+
+---
+
 ## 排期建议
 
 | 阶段 | 项 | 预估 | 状态 / 说明 |
@@ -584,8 +847,19 @@ Gyre 已正确移植的核心能力（保持，不列入改进）：
 | **第三轮** | **P2-I 扩展钩子（before 拦截 / after 改写）** | **小** | ✅ 已完成（`Hook::before_tool_intercept` + `after_tool_override`（带默认实现）+ run_pending_task 接入 + 2 测试，agent 16/16） |
 | **第三轮** | **P2-K run-collector（最小版）** | **小** | ✅ 已完成（`AgentRunSummary` + `ToolCounters` 工具 ok/error 分桶 + available/invoked coverage + `unused_tools`，workspace 全绿；OTEL/chats 分桶仍跳过） |
 | **第三轮** | P2-G partial-result 流式回调、P2-H 工具元数据、P2-J refusal 过滤/中断保留 | 中 | 🟢 工具接口/健壮性增强，按需排期 |
+| **第四轮** | **P0-L snapcompact 图像化压缩** | **大** | 🟡 **已设计，延后独立攻关**：工作区无 PNG/字体依赖 + assistant ContentBlock 无 Image 变体，需新增依赖 + 跨 provider 图像块贯通 + 真实视觉模型 eval（朴素渲染召回率不足会比 summarize 更差）。详见章节「实施前置条件」 |
+| **第四轮** | **P1-K auto-thinking 自适应思考预算** | **中** | ✅ 已完成（`Effort` + `ThinkingPolicy` + `LlmThinkingClassifier` + run_loop 解析 + CLI 装配；core 19/llm 59/agent 19 测试全绿；server 装配待 model 参数签名调整） |
+| **第四轮** | P1-L advisor 双代理评审 | 大 | 🟡 独立评审 Agent + emission-guard + WATCHDOG.md；新 crate，工作量大但差异化价值高 |
+| **第四轮** | P1-M goals 目标 + token/时间预算 + `/loop` 命令 | 中 | 🟡 Goal 对象 + 预算耗尽收尾 + 用户命令；用户体验提升明显 |
+| **第四轮** | P2-L hindsight 跨会话学习 + mental models | 大 | 🟢 与 P2-1 向量记忆合并设计；需定存储后端 |
+| **第四轮** | P2-M plan-mode 计划审批流 | 中 | 🟢 Mode::Plan + 写保护 + handoff；架构师模式增强 |
+| **第四轮** | P2-N discovery 多工具配置互操作 | 中 | 🟢 继承 agents.md / .claude / cursor / codex 配置；降低迁移成本 |
+| **第四轮** | P2-O proxy 流式透传 + scrubPartialJson | 小 | 🟢 仅在做 provider 网关 / ACP 中继时需要；按需 |
+| **第四轮** | **P2-P replay-policy refusal 过滤（P2-J 最小子集）** | **极小** | ✅ 已完成（`StopDetails` + `is_provider_refusal` + provider content_filter→sensitive + convert_to_llm 过滤；core 19/context 58/llm 59 测试全绿） |
 
 **明确的高回报切入点**：
 
 - **第一/二轮已验证**：P0-A（字节级稳定前缀）省去长会话每轮数万 token 重复 prefill；P0-B（length + 残缺 tool_call 占位）修正「执行参数被截断的工具调用」正确性 bug。
 - **第三轮首选**：**P0-G（结构化 handoff 提示词）**——一处提示词改动即可显著提升 summarize 压缩与分支切换 handoff 的恢复质量（模型不再丢线索/重复工作），改动极小、零风险、立即可见。**P1-G（停止边界 steering 再检查）**——修复「用户在最后一轮期间发消息被搁置到下次 prompt」的 UX 缺陷，改动小。两者建议作为第三轮首批落地。
+- **第四轮首选**：**P0-L（snapcompact 图像化压缩）**——把昂贵的本地 LLM summarize 替换为本地 PNG 渲染，长会话压缩成本与延迟降一个数量级，且信息以图像形式保留（视觉模型直接读图回放，比文本摘要丢信息少）。工作量大（Rust 栅格化 + bitmap 字体 + provider 感知帧形状）但 ROI 最高，建议作为本轮攻关首选。**P1-K（auto-thinking）** 与 **P2-P（refusal 过滤）** 改动小、立即可见，可作为本批「速修暖身」与 P0-L 并行。
+- **第四轮差异化**：**P1-L（advisor 双代理评审）** 与 **P1-M（goals 目标预算）** 是 oh-my-pi 真正区别于普通 Agent 循环的「智能层」——Gyre 已把循环引擎吃透，下一步竞争力于此。建议 P0-L 落地后启动。

@@ -15,7 +15,7 @@ use agent_core::{
     AgentEvent, AgentRunSummary, AgentState, ApprovalDecision, ApprovalPolicy, AskKind, AskMessage,
     AgentMessage, AskResponse, AssistantEvent, AssistantMessage, CompactionStrategy, CompletionRequest,
     ContextManager, ContentBlock, Hook, HookEvent, LlmProvider, MemoryStore, Mode, ProviderCallContext,
-    ResourceResolver, SoftToolRequirement, StatusKind, StatusMessage, StopReason, ThinkingConfig, ToolResult, ToolResultMessage,
+    ResourceResolver, SoftToolRequirement, StatusKind, StatusMessage, StopReason, ThinkingConfig, ThinkingPolicy, ToolResult, ToolResultMessage,
     ToolChoice, ToolChoiceDirective, Usage, Workspace, WriteEffect,
 };
 use agent_prompt::PromptCatalog;
@@ -59,6 +59,8 @@ pub struct Agent {
     max_output_tokens: usize,
     temperature: Option<f32>,
     thinking: Option<ThinkingConfig>,
+    /// P1-K：思考策略（Static/Auto）。`None` 走 `thinking` 静态；`Some` 覆盖之并按 prompt 难度解析。
+    thinking_policy: Option<ThinkingPolicy>,
     cancel: CancellationToken,
     /// Skill 目录（可选；注入后 system prompt 追加 `<skills>` 段）。
     catalog: Option<Arc<SkillCatalog>>,
@@ -101,6 +103,7 @@ impl Agent {
             max_output_tokens: 4096,
             temperature: None,
             thinking: None,
+            thinking_policy: None,
             cancel: CancellationToken::new(),
             catalog: None,
             context_files: Vec::new(),
@@ -179,6 +182,8 @@ pub struct AgentBuilder {
     max_output_tokens: usize,
     temperature: Option<f32>,
     thinking: Option<ThinkingConfig>,
+    /// P1-K：思考策略（Static/Auto），优先级高于 `thinking`。
+    thinking_policy: Option<ThinkingPolicy>,
     cancel: CancellationToken,
     /// Skill 目录（可选）。
     catalog: Option<Arc<SkillCatalog>>,
@@ -331,6 +336,14 @@ impl AgentBuilder {
         self
     }
 
+    /// P1-K：设置自适应思考策略（每轮按用户 prompt 难度经 [`ThinkingClassifier`] 解析 budget，
+    /// 钳到模型范围；移植 oh-my-pi `auto-thinking`）。设置后覆盖 `.thinking()` 静态配置。
+    #[must_use]
+    pub fn thinking_policy(mut self, policy: ThinkingPolicy) -> Self {
+        self.thinking_policy = Some(policy);
+        self
+    }
+
     /// 设置取消令牌（默认新建一个）。用于把外部/父级取消信号接入本 Agent——
     /// 子 Agent 委派时应传入 `parent_cancel.child_token()` 以级联取消，否则子 Agent
     /// 将无法被父任务取消（详见 task_tool 的递归委派）。
@@ -361,6 +374,7 @@ impl AgentBuilder {
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
             thinking: self.thinking,
+            thinking_policy: self.thinking_policy,
             cancel: self.cancel,
             catalog: self.catalog,
             context_files: self.context_files,
@@ -436,6 +450,17 @@ fn run_loop(
     let max_tokens = agent.max_output_tokens;
     let temperature = agent.temperature;
     let thinking = agent.thinking.clone();
+    let thinking_policy = agent.thinking_policy.clone();
+    // P1-K：提取本轮用户 prompt 文本（须在 user_msg move 进 context 前），供自适应思考分类。
+    let prompt_text: String = user_msg
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            agent_core::UserContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let catalog = agent.catalog.clone();
     let context_files = agent.context_files.clone();
     let hooks = agent.hooks.clone();
@@ -471,6 +496,16 @@ fn run_loop(
         context.set_system(system, &specs0).await;
         context.append(agent_core::AgentMessage::User(user_msg)).await;
         yield AgentEvent::StateChanged(AgentState::Running);
+
+        // P1-K：自适应思考预算——按本轮 prompt 难度解析 ThinkingConfig（移植 oh-my-pi
+        // auto-thinking）。Auto 策略经分类器决定 Effort → budget，钳到模型范围；分类失败 →
+        // fallback；模型不支持思考 → None（本轮不思考）。Static/None → 沿用静态 thinking。
+        // 每轮 prompt 难度恒定，解析一次/run 即可（分类器成本 ≤ 一次 tiny 模型调用）。
+        let thinking: Option<ThinkingConfig> = if let Some(policy) = &thinking_policy {
+            policy.resolve(&prompt_text, &model).await
+        } else {
+            thinking
+        };
 
         let mut summary = AgentRunSummary::default();
         // P2-K：coverage——注册的可用工具名（排序），用于结束时计算「注册但从未调用」。
@@ -1333,6 +1368,7 @@ async fn persist_interrupted(
             usage: usage.clone(),
             model: model.id.clone(),
             stop_reason: None,
+            stop_details: None,
         }))
         .await;
 }
@@ -1594,6 +1630,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "stub".into(),
                 stop_reason: Some(StopReason::Stop),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 agent_core::AssistantEvent::MessageEnd(msg),
@@ -1636,6 +1673,7 @@ mod tests {
             usage: Usage::default(),
             model: "stub".into(),
             stop_reason: None,
+            stop_details: None,
         }))
         .await;
         let big = "x".repeat(100_000); // 启发式 ≈ 25_000 token（可被 shake 归档）
@@ -1719,6 +1757,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "loop".into(),
                 stop_reason: Some(StopReason::ToolUse),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 agent_core::AssistantEvent::MessageEnd(msg),
@@ -1797,6 +1836,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "pausing".into(),
                 stop_reason: Some(StopReason::Pause),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 agent_core::AssistantEvent::MessageEnd(msg),
@@ -1875,6 +1915,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "stop-boundary".into(),
                 stop_reason: Some(StopReason::Stop),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 AssistantEvent::MessageEnd(msg),
@@ -2016,6 +2057,7 @@ mod tests {
                     usage: Usage::default(),
                     model: "trunc-tool".into(),
                     stop_reason: Some(StopReason::Length),
+                    stop_details: None,
                 }
             } else {
                 AssistantMessage {
@@ -2023,6 +2065,7 @@ mod tests {
                     usage: Usage::default(),
                     model: "trunc-tool".into(),
                     stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
                 }
             };
             Ok(Box::pin(futures::stream::iter(vec![
@@ -2130,6 +2173,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "err-tool".into(),
                 stop_reason: Some(StopReason::Error),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 agent_core::AssistantEvent::MessageEnd(msg),
@@ -2234,6 +2278,7 @@ mod tests {
                 usage: Usage::default(),
                 model: "detour".into(),
                 stop_reason: Some(StopReason::ToolUse),
+                stop_details: None,
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 agent_core::AssistantEvent::MessageEnd(msg),
@@ -2393,6 +2438,7 @@ mod tests {
                     usage: Usage::default(),
                     model: "block-call".into(),
                     stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
                 }
             } else {
                 AssistantMessage {
@@ -2402,6 +2448,7 @@ mod tests {
                     usage: Usage::default(),
                     model: "block-call".into(),
                     stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
                 }
             };
             Ok(Box::pin(futures::stream::iter(vec![
@@ -2682,5 +2729,128 @@ mod tests {
         assert!(!s.tools_invoked.contains("c"), "c 未调用，不应在 invoked");
         // coverage：unused = available − invoked = [c]
         assert_eq!(s.unused_tools(), vec!["c".to_string()], "unused 应为 [c]");
+    }
+
+    // ── P1-K：自适应思考预算（auto-thinking）──────────────────────────────
+
+    /// 桩 Provider：记录收到的 thinking.budget_tokens，立即返回停止消息。
+    struct ThinkingRecordingProvider {
+        recorded: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for ThinkingRecordingProvider {
+        fn id(&self) -> &'static str {
+            "thinking-rec"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            *self.recorded.lock().unwrap() = req.thinking.as_ref().map(|t| t.budget_tokens);
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text { text: "done".into() }],
+                usage: Usage::default(),
+                model: "stub".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 桩分类器：恒返回固定 Effort。
+    struct FixedEffortClassifier(agent_core::Effort);
+    #[async_trait]
+    impl agent_core::ThinkingClassifier for FixedEffortClassifier {
+        async fn classify(
+            &self,
+            _prompt: &str,
+            _model: &agent_core::Model,
+        ) -> Option<agent_core::Effort> {
+            Some(self.0)
+        }
+    }
+
+    /// run_loop 经 ThinkingPolicy::Auto + 分类器解析 budget 并下发到 provider。
+    #[tokio::test]
+    async fn auto_thinking_resolves_budget_from_classifier() {
+        let recorded = Arc::new(std::sync::Mutex::new(None::<usize>));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        model.supports_thinking = true;
+        model.max_input_tokens = 200_000;
+        let policy = agent_core::ThinkingPolicy::auto(
+            Arc::new(FixedEffortClassifier(agent_core::Effort::High)),
+            agent_core::ThinkingConfig::new(1_000),
+        );
+        let agent = Agent::builder(model)
+            .provider(Arc::new(ThinkingRecordingProvider {
+                recorded: recorded.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .thinking_policy(policy)
+            .build();
+        let stream = agent.run("重构这个模块");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let budget = recorded.lock().unwrap().take();
+        assert_eq!(
+            budget,
+            Some(agent_core::Effort::High.default_budget()),
+            "Auto + High 分类 → 下发 High 默认预算（32_000）"
+        );
+    }
+
+    /// 模型不支持思考时，Auto 策略解析为 None（本轮不思考）。
+    #[tokio::test]
+    async fn auto_thinking_returns_none_when_model_unsupported() {
+        let recorded = Arc::new(std::sync::Mutex::new(None::<usize>));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        // supports_thinking 保持默认 false。
+        model.max_input_tokens = 200_000;
+        let policy = agent_core::ThinkingPolicy::auto(
+            Arc::new(FixedEffortClassifier(agent_core::Effort::High)),
+            agent_core::ThinkingConfig::new(1_000),
+        );
+        let agent = Agent::builder(model)
+            .provider(Arc::new(ThinkingRecordingProvider {
+                recorded: recorded.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .thinking_policy(policy)
+            .build();
+        let stream = agent.run("any prompt");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let budget = recorded.lock().unwrap().take();
+        assert_eq!(
+            budget, None,
+            "模型不支持思考 → Auto 解析为 None，本轮不思考"
+        );
     }
 }

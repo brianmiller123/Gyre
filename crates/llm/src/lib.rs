@@ -14,6 +14,7 @@ pub mod inband;
 mod openai;
 mod plugin;
 mod registry;
+pub mod thinking;
 pub mod transform;
 
 pub use anthropic::AnthropicMessagesAdapter;
@@ -24,6 +25,7 @@ pub use inband::{wrap_inband_if, InbandProvider};
 pub use openai::OpenAiCompletionsAdapter;
 pub use plugin::{collect_providers, LlmProviderPlugin};
 pub use registry::ProviderRegistry;
+pub use thinking::LlmThinkingClassifier;
 pub use transform::{
     anthropic_apply_cache, anthropic_system_blocks, count_cache_breakpoints, inject_ephemeral_cache,
     normalize_tool_schema, CacheStrategy,

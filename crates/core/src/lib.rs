@@ -39,12 +39,13 @@ pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
 pub use hook::{Hook, HookEvent};
 pub use memory::{MemoryNote, MemoryStore};
 pub use llm::{
-    AssistantEvent, AssistantEventStream, CompletionRequest, LlmProvider, ProviderCallContext, ThinkingConfig,
+    AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider, ProviderCallContext,
+    ThinkingClassifier, ThinkingConfig, ThinkingPolicy,
 };
 pub use message::{
     AgentEvent, AgentMessage, AgentRunSummary, AgentState, AskKind, AskMessage, AskResponse,
-    AssistantMessage, ContentBlock, Mode, ProviderMessage, StatusKind, StatusMessage, StopReason,
-    ToolCounters, ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, Mode, ProviderMessage, StatusKind, StatusMessage, StopDetails,
+    StopReason, ToolCounters, ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use model::{Api, Model};
 pub use platform::{config_dir, forced_utf8_locale};

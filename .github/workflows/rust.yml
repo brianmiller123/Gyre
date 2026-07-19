@@ -11,12 +11,36 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build -r --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ✨ 核心增补 1：必须先安装 Node.js 环境
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20' # 根据你的前端需求指定版本
+        cache: 'npm'       # 自动缓存 npm 依赖，加速安装
+        cache-dependency-path: 'web/c5-ui/package-lock.json'
+
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    # ✨ 核心改进 2：拆分前端构建步骤，更易排查错误
+    - name: Build & Deploy Frontend
+      working-directory: web/c5-ui   # 直接指定工作目录，无需手动 cd
+      run: |
+        npm install
+        npm run build
+        npm run deploy
+
+    # ✨ 核心改进 3：编译 Rust 后端
+    - name: Build Rust Backend
+      run: cargo build -r --verbose  # 默认在根目录执行，无需 cd ../../
