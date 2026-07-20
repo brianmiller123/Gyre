@@ -489,7 +489,8 @@ pub enum AgentEvent {
     TextDelta(String),
     /// 思考增量（reasoning / thinking）。
     ThinkingDelta(String),
-    /// 工具执行进度。
+    /// 工具执行进度（兼容别名；细粒度生命周期见 [`AgentEvent::ToolExecutionStart`] /
+    /// [`AgentEvent::ToolExecutionEnd`]）。
     ToolExec {
         /// 工具名。
         name: String,
@@ -502,6 +503,66 @@ pub enum AgentEvent {
     Done(AgentRunSummary),
     /// 错误。
     Error(String),
+
+    // ── 三层生命周期事件（移植 oh-my-pi turn / message / tool_execution）────
+    //
+    // 既有的增量事件（`TextDelta`/`ThinkingDelta`/`Usage`/`ToolExec`）保持不变以向后兼容；
+    // 此处补齐「轮次 / 消息 / 工具执行」三层边界，让消费者（前端 / 编排器）能精确划界与
+    // 渲染状态机，而不必从增量流里反推边界。
+    //
+    // 与 oh-my-pi `agent-loop.ts` 的对应：`turn_start`/`turn_end`、`message_start`/
+    // `message_end`、`tool_execution_start`/`tool_execution_update`/`tool_execution_end`。
+    // `MessageUpdate` 在本设计里复用 `TextDelta`/`ThinkingDelta` 增量（避免每 delta 整条
+    // partial 快照的克隆开销），故不单列变体。
+
+    /// 轮次开始：每轮模型调用前（steering / 软需求 / 压缩等预处理完成后、构造 provider
+    /// 请求时）。与 [`AgentEvent::TurnEnd`] 配对，消费者据此划分轮次边界。
+    TurnStart,
+    /// 轮次结束：携带本轮最终 assistant 消息、工具结果、是否继续下一轮。
+    TurnEnd {
+        /// 本轮最终化的 assistant 消息。
+        message: AssistantMessage,
+        /// 本轮产出的工具结果（含实际执行与占位 skipped，按回填顺序）。
+        tool_results: Vec<ToolResultMessage>,
+        /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / max_turns）。
+        will_continue: bool,
+    },
+
+    /// assistant 消息开始：流式首个增量前。标记边界；消息体见后续增量与
+    /// [`AgentEvent::MessageEnd`]。
+    MessageStart,
+    /// assistant 消息最终化：流式结束，携带完整消息快照。
+    MessageEnd(AssistantMessage),
+
+    /// 工具执行开始（已通过审批，即将执行）。
+    ToolExecutionStart {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 工具参数。
+        args: serde_json::Value,
+    },
+    /// 工具执行流式 partial（预留；待后续接入 `partialResult` 回调，当前循环不触发）。
+    ToolExecutionUpdate {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 阶段性输出。
+        partial: String,
+    },
+    /// 工具执行结束。
+    ToolExecutionEnd {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 工具结果。
+        result: ToolResult,
+        /// 是否为错误结果。
+        is_error: bool,
+    },
 }
 
 #[cfg(test)]

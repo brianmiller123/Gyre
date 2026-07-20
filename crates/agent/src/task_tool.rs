@@ -251,7 +251,16 @@ impl TaskTool {
                         s.log(id, agent_supervisor::LogLevel::Error, &e).await;
                     }
                 }
-                AgentEvent::ThinkingDelta(_) | AgentEvent::Ask(_) | AgentEvent::Assistant(_) => {}
+                AgentEvent::ThinkingDelta(_)
+                | AgentEvent::Ask(_)
+                | AgentEvent::Assistant(_)
+                | AgentEvent::TurnStart
+                | AgentEvent::TurnEnd { .. }
+                | AgentEvent::MessageStart
+                | AgentEvent::MessageEnd(_)
+                | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionUpdate { .. }
+                | AgentEvent::ToolExecutionEnd { .. } => {}
             }
         }
 

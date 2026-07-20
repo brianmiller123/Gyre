@@ -1229,7 +1229,15 @@ where
                     )
                 );
             }
-            AgentEvent::Ask(_) | AgentEvent::Assistant(_) => {}
+            AgentEvent::Ask(_)
+            | AgentEvent::Assistant(_)
+            | AgentEvent::TurnStart
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::MessageStart
+            | AgentEvent::MessageEnd(_)
+            | AgentEvent::ToolExecutionStart { .. }
+            | AgentEvent::ToolExecutionUpdate { .. }
+            | AgentEvent::ToolExecutionEnd { .. } => {}
         }
     }
     Ok(success)

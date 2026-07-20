@@ -672,6 +672,11 @@ fn run_loop(
                 return;
             }
 
+            // P1-E：轮次开始边界（turn 层生命周期）。在 max_turns 硬上限检查之后、provider
+            // 调用之前——未真正进入轮次的提前 return（cancel/deadline/max_turns）不发
+            // TurnStart，保证 TurnStart 与 TurnEnd 严格配对。
+            yield AgentEvent::TurnStart;
+
             let mut event_stream = match provider.stream(req, &provider_ctx).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -689,6 +694,9 @@ fn run_loop(
                 }
             };
             yield AgentEvent::StateChanged(AgentState::Streaming);
+            // P1-E：消息开始边界（message 层生命周期）。流式首个增量前；消息体见后续
+            // TextDelta/ThinkingDelta 增量与 MessageEnd。
+            yield AgentEvent::MessageStart;
 
             // 累积流式事件，以 MessageEnd 为权威结束。流式阶段同样响应取消，
             // 避免上游挂起时取消信号无法中断（仅靠 loop 顶部检查不足以打断 await）。
@@ -743,6 +751,11 @@ fn run_loop(
             };
             mistakes = 0;
             summary.usage.add(&assistant.usage);
+            // P1-E：消息结束边界（message 层生命周期）。携带完整 assistant 消息快照，
+            // 消费者无需自行拼接增量即可获得最终消息。同时开启本轮工具结果累积器
+            // （供 TurnEnd 携带，含实际执行与占位 skipped）。
+            yield AgentEvent::MessageEnd(assistant.clone());
+            let mut turn_tool_results: Vec<agent_core::ToolResultMessage> = Vec::new();
 
             let tool_calls: Vec<(String, String, serde_json::Value)> = assistant
                 .content
@@ -783,6 +796,12 @@ fn run_loop(
                         "（你的上一条回复因输出达到长度上限被截断或流异常中断，请直接从中断处继续输出剩余内容，不要重复已生成的部分。）",
                     ))
                     .await;
+                // P1-E：截断续写（无工具），turn 结束 → 继续。
+                yield AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: std::mem::take(&mut turn_tool_results),
+                    will_continue: true,
+                };
                 continue;
             } else if truncated && !tool_calls.is_empty() {
                 // P0-B：输出被截断但已含 ToolCall —— 参数可能残缺（JSON 被截断），**不执行**：
@@ -799,14 +818,16 @@ fn run_loop(
                     kind: StatusKind::Warning,
                 });
                 for (id, _name, _args) in &tool_calls {
+                    let msg = ToolResultMessage {
+                        tool_call_id: id.clone(),
+                        result: ToolResult::Error {
+                            recoverable: true,
+                            message: "输出被截断，工具参数可能不完整，未执行；请重新发起完整的工具调用".into(),
+                        },
+                    };
+                    turn_tool_results.push(msg.clone());
                     context
-                        .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
-                            tool_call_id: id.clone(),
-                            result: ToolResult::Error {
-                                recoverable: true,
-                                message: "输出被截断，工具参数可能不完整，未执行；请重新发起完整的工具调用".into(),
-                            },
-                        }))
+                        .append(agent_core::AgentMessage::ToolResult(msg))
                         .await;
                 }
                 context
@@ -814,6 +835,12 @@ fn run_loop(
                         "（你的上一条回复因输出达到长度上限被截断或流异常中断，含未完成的工具调用，均已回滚未执行。请直接从中断处继续输出剩余内容，不要重复已生成的部分，也不要重复未完成的工具调用。）",
                     ))
                     .await;
+                // P1-E：截断续写（含未完成工具占位），turn 结束 → 继续。
+                yield AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: std::mem::take(&mut turn_tool_results),
+                    will_continue: true,
+                };
                 continue;
             } else if matches!(assistant.stop_reason, Some(StopReason::Error) | Some(StopReason::Aborted))
                 && !tool_calls.is_empty()
@@ -830,16 +857,24 @@ fn run_loop(
                     kind: StatusKind::Warning,
                 });
                 for (id, _name, _args) in &tool_calls {
+                    let msg = ToolResultMessage {
+                        tool_call_id: id.clone(),
+                        result: ToolResult::Error {
+                            recoverable: false,
+                            message: "助手消息以错误中止，工具调用未执行".into(),
+                        },
+                    };
+                    turn_tool_results.push(msg.clone());
                     context
-                        .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
-                            tool_call_id: id.clone(),
-                            result: ToolResult::Error {
-                                recoverable: false,
-                                message: "助手消息以错误中止，工具调用未执行".into(),
-                            },
-                        }))
+                        .append(agent_core::AgentMessage::ToolResult(msg))
                         .await;
                 }
+                // P1-E：error/aborted 终止，turn 结束 → 停止（will_continue: false）。
+                yield AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: std::mem::take(&mut turn_tool_results),
+                    will_continue: false,
+                };
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 summary.success = false;
                 for h in &hooks {
@@ -859,6 +894,12 @@ fn run_loop(
                         text: "模型未结束本轮（pause），继续采样…".into(),
                         kind: StatusKind::Info,
                     });
+                    // P1-E：pause 续写，turn 结束 → 继续。
+                    yield AgentEvent::TurnEnd {
+                        message: assistant.clone(),
+                        tool_results: std::mem::take(&mut turn_tool_results),
+                        will_continue: true,
+                    };
                     continue;
                 }
                 yield AgentEvent::Say(StatusMessage {
@@ -902,10 +943,23 @@ fn run_loop(
                             text: "已注入停止边界 steering 消息，继续…".into(),
                             kind: StatusKind::Info,
                         });
+                        // P1-E：停止边界 steering 续跑，turn 结束 → 继续。
+                        yield AgentEvent::TurnEnd {
+                            message: assistant.clone(),
+                            tool_results: std::mem::take(&mut turn_tool_results),
+                            will_continue: true,
+                        };
                         continue;
                     }
                 }
 
+                // P1-E：正常停止，turn 结束 → 停止（will_continue: false）。本轮无工具调用，
+                // turn_tool_results 为空。
+                yield AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: std::mem::take(&mut turn_tool_results),
+                    will_continue: false,
+                };
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 summary.success = true;
 
@@ -940,18 +994,26 @@ fn run_loop(
                             kind: StatusKind::Warning,
                         });
                         for (id, name, _args) in &tool_calls {
+                            let msg = ToolResultMessage {
+                                tool_call_id: id.clone(),
+                                result: ToolResult::Error {
+                                    recoverable: true,
+                                    message: format!(
+                                        "软需求 '{req}' 未满足，{name} 未执行（中止）"
+                                    ),
+                                },
+                            };
+                            turn_tool_results.push(msg.clone());
                             context
-                                .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
-                                    tool_call_id: id.clone(),
-                                    result: ToolResult::Error {
-                                        recoverable: true,
-                                        message: format!(
-                                            "软需求 '{req}' 未满足，{name} 未执行（中止）"
-                                        ),
-                                    },
-                                }))
+                                .append(agent_core::AgentMessage::ToolResult(msg))
                                 .await;
                         }
+                        // P1-E：软需求达上限中止，turn 结束 → 停止。
+                        yield AgentEvent::TurnEnd {
+                            message: assistant.clone(),
+                            tool_results: std::mem::take(&mut turn_tool_results),
+                            will_continue: false,
+                        };
                         yield AgentEvent::StateChanged(AgentState::Idle);
                         summary.success = false;
                         for h in &hooks {
@@ -967,19 +1029,27 @@ fn run_loop(
                         kind: StatusKind::Info,
                     });
                     for (id, name, _args) in &tool_calls {
+                        let msg = ToolResultMessage {
+                            tool_call_id: id.clone(),
+                            result: ToolResult::Error {
+                                recoverable: true,
+                                message: format!(
+                                    "请先调用所需工具 '{req}'（detour '{name}' 未执行）"
+                                ),
+                            },
+                        };
+                        turn_tool_results.push(msg.clone());
                         context
-                            .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
-                                tool_call_id: id.clone(),
-                                result: ToolResult::Error {
-                                    recoverable: true,
-                                    message: format!(
-                                        "请先调用所需工具 '{req}'（detour '{name}' 未执行）"
-                                    ),
-                                },
-                            }))
+                            .append(agent_core::AgentMessage::ToolResult(msg))
                             .await;
                     }
                     escalate_soft = true;
+                    // P1-E：软需求非合规跳过，turn 结束 → 继续。
+                    yield AgentEvent::TurnEnd {
+                        message: assistant.clone(),
+                        tool_results: std::mem::take(&mut turn_tool_results),
+                        will_continue: true,
+                    };
                     continue;
                 }
             }
@@ -1057,6 +1127,14 @@ fn run_loop(
                     ApprovalDecision::Allow => {}
                 }
 
+                // P1-E：工具执行开始（已通过审批，即将执行）。审批拒绝 / Ask 拒绝 / 未知工具
+                // 等未执行路径不发 ToolExecution 事件（它们有 Say/Error 信号）；消费者见
+                // ToolExecutionStart→ToolExecutionEnd 即表示工具真实执行。
+                yield AgentEvent::ToolExecutionStart {
+                    tool_call_id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                };
                 runnable.push(PendingTask {
                     order,
                     id,
@@ -1111,16 +1189,27 @@ fn run_loop(
                 }
                 // P2-K：按工具名记录执行结果（ok/error 计数 + invoked 集合）。
                 summary.record_tool(&name, &result);
+                // P1-E：工具执行结束（tool 层生命周期）。先判定 is_error 并构造持久化消息，
+                // 再发射事件 + 回填上下文（消息 move 进 context；事件与 turn 累积器持 clone）。
+                let is_error = matches!(&result, ToolResult::Error { .. });
+                let msg = ToolResultMessage {
+                    tool_call_id: id.clone(),
+                    result: result.clone(),
+                };
+                turn_tool_results.push(msg.clone());
+                yield AgentEvent::ToolExecutionEnd {
+                    tool_call_id: id.clone(),
+                    name: name.clone(),
+                    result: result.clone(),
+                    is_error,
+                };
                 let preview = result.to_llm_text();
                 yield AgentEvent::ToolExec {
                     name,
                     output: preview.chars().take(200).collect(),
                 };
                 context
-                    .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
-                        tool_call_id: id,
-                        result,
-                    }))
+                    .append(agent_core::AgentMessage::ToolResult(msg))
                     .await;
             }
 
@@ -1132,10 +1221,22 @@ fn run_loop(
             }
 
             if mistakes >= max_mistakes {
+                // P1-E：连续错误达上限，turn 结束 → 停止。
+                yield AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: std::mem::take(&mut turn_tool_results),
+                    will_continue: false,
+                };
                 yield AgentEvent::Error(format!("连续错误达到上限 {max_mistakes}，停止"));
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 return;
             }
+            // P1-E：工具执行完毕，turn 结束 → 继续（工具结果已回填，模型再次推理）。
+            yield AgentEvent::TurnEnd {
+                message: assistant.clone(),
+                tool_results: std::mem::take(&mut turn_tool_results),
+                will_continue: true,
+            };
             // 继续下一轮（工具结果已回填，模型再次推理）
         }
     }
@@ -2852,5 +2953,125 @@ mod tests {
             budget, None,
             "模型不支持思考 → Auto 解析为 None，本轮不思考"
         );
+    }
+
+    // ── P1-E：三层生命周期事件（turn / message / tool_execution）──────────────
+
+    /// 两轮 Provider：第 1 轮返回 `probe` 工具调用，第 2 轮返回纯文本（自然结束）。
+    struct TwoTurnProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for TwoTurnProvider {
+        fn id(&self) -> &'static str {
+            "two-turn"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "probe".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "two-turn".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "two-turn".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 验证三层生命周期事件被发射且顺序严格正确：
+    /// 每轮 `TurnStart → MessageStart → … → MessageEnd`；工具轮额外发
+    /// `ToolExecutionStart/End`；每轮以 `TurnEnd` 收尾（will_continue 在工具轮为 true、
+    /// 停止轮为 false）。
+    #[tokio::test]
+    async fn lifecycle_events_three_layers_in_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model =
+            agent_core::Model::with_defaults("two-turn", "two-turn", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TwoTurnProvider { calls: calls.clone() }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build();
+
+        // 收集事件为「种类标签」序列，便于断言顺序（忽略负载细节）。
+        #[derive(Debug, PartialEq)]
+        enum Tag {
+            TurnStart,
+            MessageStart,
+            MessageEnd,
+            ToolStart,
+            ToolEnd,
+            TurnEnd(bool),
+        }
+        let mut seq = Vec::new();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::TurnStart => seq.push(Tag::TurnStart),
+                AgentEvent::MessageStart => seq.push(Tag::MessageStart),
+                AgentEvent::MessageEnd(_) => seq.push(Tag::MessageEnd),
+                AgentEvent::ToolExecutionStart { .. } => seq.push(Tag::ToolStart),
+                AgentEvent::ToolExecutionEnd { .. } => seq.push(Tag::ToolEnd),
+                AgentEvent::TurnEnd { will_continue, .. } => seq.push(Tag::TurnEnd(will_continue)),
+                _ => {}
+            }
+        }
+
+        // 第 1 轮（工具）：TurnStart → MessageStart → MessageEnd → ToolStart → ToolEnd → TurnEnd(true)
+        // 第 2 轮（停止）：TurnStart → MessageStart → MessageEnd → TurnEnd(false)
+        let expected = vec![
+            Tag::TurnStart,
+            Tag::MessageStart,
+            Tag::MessageEnd,
+            Tag::ToolStart,
+            Tag::ToolEnd,
+            Tag::TurnEnd(true),
+            Tag::TurnStart,
+            Tag::MessageStart,
+            Tag::MessageEnd,
+            Tag::TurnEnd(false),
+        ];
+        assert_eq!(seq, expected, "三层生命周期事件顺序应严格匹配");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "应正好 2 轮模型调用");
     }
 }

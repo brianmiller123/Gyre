@@ -15,7 +15,22 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ✨ Matrix：同时构建 Linux 与 Windows 二进制
+    # 两个平台并行跑，fail-fast=false 保证一个失败不影响另一个继续跑完，便于排查
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: agent                       # cargo build 产物名（Linux 无后缀）
+            artifact: agent-linux-amd64         # 上传到 Release 的最终文件名
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: agent.exe                   # Windows 产物带 .exe
+            artifact: agent-windows-amd64.exe
+
+    runs-on: ${{ matrix.os }}
 
     # 赋予工作流创建 Release 的写入权限
     permissions:
@@ -33,17 +48,28 @@ jobs:
         cache: 'npm'       # 自动缓存 npm 依赖，加速安装
         cache-dependency-path: 'web/c5-ui/package-lock.json'
 
+    # ✨ Windows 专用：package.json 的 deploy 脚本用了 rm -rf / cp -r（Unix 命令）
+    # 让 npm 用 Git Bash 执行 scripts，避免在 cmd.exe 下报 "'rm' 不是内部命令"
+    - name: Set npm script-shell to bash (Windows only)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: npm config set script-shell bash
+
     - name: Set up Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
+        target: ${{ matrix.target }}
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}   # 按平台分桶缓存，避免不同 target 的缓存互相污染
 
     # ✨ 核心改进 2：拆分前端构建步骤，更易排查错误
     - name: Build & Deploy Frontend
       working-directory: web/c5-ui   # 直接指定工作目录，无需手动 cd
+      shell: bash                    # 统一用 bash，保证跨平台行为一致
       run: |
         npm install
         npm run build
@@ -52,34 +78,40 @@ jobs:
     # ✨ 核心改进 3：编译 Rust 后端
     - name: Build Rust Backend
       run: cargo build -r --verbose  # 默认在根目录执行，无需 cd ../../
-    
-    # ✨ 核心增补 1：整理二进制文件（方便用户下载）
+
+    # ✨ 核心增补：整理二进制文件 —— 不打包，直接重命名为带平台后缀的裸二进制上传
+    # 用户下载后即可直接运行（Linux: ./agent-linux-amd64，Windows: agent-windows-amd64.exe）
     # 二进制名 agent 来自 crates/cli 的 [[bin]] name = "agent"
     - name: Prepare Artifacts
       if: startsWith(github.ref, 'refs/tags/')
+      shell: bash
       run: |
         set -euo pipefail
+        SRC="target/release/${{ matrix.binary }}"
         # 显式校验：二进制不存在就直接失败，避免后面建出"只有源码"的空 release
-        test -f target/release/agent || {
-          echo "❌ target/release/agent 不存在：请确认 cargo build -r 成功，且 crates/cli 配置了 [[bin]] name=\"agent\""
+        test -f "$SRC" || {
+          echo "❌ $SRC 不存在：请确认 cargo build -r 成功，且 crates/cli 配置了 [[bin]] name=\"agent\""
           exit 1
         }
         mkdir -p dist
-        cp target/release/agent dist/
-        # 用 -C 指定打包目录，比 cd + 通配符 * 更稳健（不丢 dotfile、不受 shell 展开影响）
-        tar -czvf backend-linux-amd64.tar.gz -C dist .
-        echo "✅ 产物已生成："; ls -lh backend-linux-amd64.tar.gz
+        cp "$SRC" "dist/${{ matrix.artifact }}"
+        echo "✅ 产物已生成："; ls -lh dist/
 
-    # ✨ 核心增补 2：自动创建 Release 并上传文件
+    # ✨ 自动创建 Release 并上传裸二进制文件（非压缩包）
+    # softprops/action-gh-release@v2 对并发上传是幂等的：两个 matrix job 同时跑时，
+    # 后到的会复用已存在的 release 并追加自己的文件，无需额外协调
     - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: backend-linux-amd64.tar.gz # 要上传的压缩包路径
+        files: dist/${{ matrix.artifact }}
         # 关键：files 没匹配到任何文件时让 Action 直接失败，而不是静默建一个只有源码的 release
         fail_on_unmatched_files: true
         body: |
           Automated Release by GitHub Actions.
           - Commit: ${{ github.sha }}
+          - Binaries (download & run directly):
+              - Linux x86_64:   `agent-linux-amd64`
+              - Windows x86_64: `agent-windows-amd64.exe`
         draft: false
         prerelease: false

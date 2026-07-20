@@ -44,7 +44,16 @@ pub fn server_frame_to_acp(frame: ServerFrame) -> Option<SessionUpdate> {
         | ServerFrame::Usage(_)
         | ServerFrame::UsageSnapshot(_)
         | ServerFrame::SubAgents { .. }
-        | ServerFrame::Heartbeat => return None,
+        | ServerFrame::Heartbeat
+        // P1-E：三层生命周期帧（turn/message/tool_execution）暂无对应 ACP update 类型，
+        // 与 Heartbeat 同策略跳过；后续 ACP 扩展 SessionUpdate 后可精细映射。
+        | ServerFrame::TurnStart
+        | ServerFrame::TurnEnd { .. }
+        | ServerFrame::MessageStart
+        | ServerFrame::MessageEnd { .. }
+        | ServerFrame::ToolExecutionStart { .. }
+        | ServerFrame::ToolExecutionUpdate { .. }
+        | ServerFrame::ToolExecutionEnd { .. } => return None,
     })
 }
 

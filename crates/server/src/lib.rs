@@ -15,8 +15,9 @@ use agent_supervisor::{SubAgentStatus, Supervisor};
 use agent_config::{discover_commands, Config, ModelProfile, RulesEngine};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
-    AskResponse, CompactionStrategy, ContextManager, LlmProvider, Mode, ProviderCallContext,
-    SkillLevel, ToolError, Usage, UserContent, UserMessage, Workspace,
+    AskResponse, AssistantMessage, CompactionStrategy, ContextManager, LlmProvider, Mode,
+    ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage, Usage, UserContent,
+    UserMessage, Workspace,
 };
 use axum::{
     Router,
@@ -177,6 +178,55 @@ pub enum ServerFrame {
     ///    `lastActivityRef`，避免在慢速生成阶段误判后端静默终止。前端 `parseFrame`
     ///    对未知 `type` 返回 null，故本帧被静默忽略，不影响 transcript。
     Heartbeat,
+
+    // ── 三层生命周期帧（镜像 AgentEvent 的 turn/message/tool_execution）──
+    /// 轮次开始。
+    TurnStart,
+    /// 轮次结束：携带本轮最终 assistant 消息、工具结果、是否继续。
+    TurnEnd {
+        /// 本轮最终化的 assistant 消息。
+        message: AssistantMessage,
+        /// 本轮工具结果（按回填顺序）。
+        tool_results: Vec<ToolResultMessage>,
+        /// 是否继续下一轮。
+        will_continue: bool,
+    },
+    /// assistant 消息开始。
+    MessageStart,
+    /// assistant 消息最终化。
+    MessageEnd {
+        /// 完整 assistant 消息快照。
+        message: AssistantMessage,
+    },
+    /// 工具执行开始。
+    ToolExecutionStart {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 工具参数。
+        args: serde_json::Value,
+    },
+    /// 工具执行流式 partial（预留）。
+    ToolExecutionUpdate {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 阶段性输出。
+        partial: String,
+    },
+    /// 工具执行结束。
+    ToolExecutionEnd {
+        /// 工具调用 id。
+        tool_call_id: String,
+        /// 工具名。
+        name: String,
+        /// 工具结果。
+        result: ToolResult,
+        /// 是否为错误结果。
+        is_error: bool,
+    },
 }
 
 fn to_server_frame(ev: AgentEvent) -> ServerFrame {
@@ -194,6 +244,47 @@ fn to_server_frame(ev: AgentEvent) -> ServerFrame {
             success: s.success,
         },
         AgentEvent::Error(m) => ServerFrame::Error { message: m },
+        AgentEvent::TurnStart => ServerFrame::TurnStart,
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            will_continue,
+        } => ServerFrame::TurnEnd {
+            message,
+            tool_results,
+            will_continue,
+        },
+        AgentEvent::MessageStart => ServerFrame::MessageStart,
+        AgentEvent::MessageEnd(message) => ServerFrame::MessageEnd { message },
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            name,
+            args,
+        } => ServerFrame::ToolExecutionStart {
+            tool_call_id,
+            name,
+            args,
+        },
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            name,
+            partial,
+        } => ServerFrame::ToolExecutionUpdate {
+            tool_call_id,
+            name,
+            partial,
+        },
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            name,
+            result,
+            is_error,
+        } => ServerFrame::ToolExecutionEnd {
+            tool_call_id,
+            name,
+            result,
+            is_error,
+        },
         AgentEvent::Assistant(_) => ServerFrame::TextDelta {
             delta: String::new(),
         },
