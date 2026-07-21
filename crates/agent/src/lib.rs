@@ -39,6 +39,24 @@ pub enum InterruptMode {
     Immediate,
 }
 
+/// 运行时配置覆盖（每轮 LLM 调用前解析，移植 oh-my-pi `getReasoning` / `getDisableReasoning`
+/// 等动态解析器）。host 实现此 trait 经 [`AgentBuilder::runtime_overrides`] 注入，可在 run
+/// 中途改变 thinking / temperature 等配置而**无需重建 Agent**。
+///
+/// 解析发生在每轮请求构造前；返回 `None` 的字段沿用静态 / [`ThinkingPolicy`] 解析结果，
+/// 故只覆盖 host 明确给出的项。设计为 trait（而非多个独立闭包）便于后续按 oh-my-pi 同源
+/// 扩展 `api_key` / `base_url` / `cwd` / `service_tier` 等动态解析器。
+pub trait RuntimeOverrides: Send + Sync {
+    /// 覆盖本轮 thinking 配置；返回 `None` 沿用启动期 policy / 静态解析结果。
+    fn thinking(&self, _model: &agent_core::Model) -> Option<agent_core::ThinkingConfig> {
+        None
+    }
+    /// 覆盖本轮 temperature；返回 `None` 沿用 [`AgentBuilder::temperature`] 静态值。
+    fn temperature(&self) -> Option<f32> {
+        None
+    }
+}
+
 /// 智能体（Ports & Adapters：所有依赖以 trait 注入）。
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
@@ -76,6 +94,16 @@ pub struct Agent {
     soft_requirement: Arc<std::sync::Mutex<Option<SoftToolRequirement>>>,
     /// steering 接收端（外部中途注入消息）。
     steer_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    /// aside 接收端（外部注入**被动、非中断**通知——后台任务完成、延迟 LSP diagnostics 等）。
+    /// 与 steering 的区别：aside **永不**打断在途工具（不走 Immediate 批级 cancel），只在
+    /// 轮次边界（下一轮模型调用前 / 停止边界）折叠注入。移植 oh-my-pi `getAsideMessages`。
+    aside_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新，移植 oh-my-pi
+    /// `getReasoning` 等动态解析器）。
+    runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
+    /// assistant 消息改写钩子（最终化后、入 context / MessageEnd / 工具分发前原地改写，
+    /// 移植 oh-my-pi `transformAssistantMessage`）。单一真相源：所有下游看改写后。
+    transform_assistant: Option<Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>>,
     /// 写入效果（编辑后 LSP format/diagnostics 钩子；装配层注入 `LspWriteEffect`）。
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// 工具执行期的 steering 中断策略（默认 [`InterruptMode::Immediate`]）。
@@ -112,6 +140,9 @@ impl Agent {
             resources: None,
             soft_requirement: None,
             steer_rx: None,
+            aside_rx: None,
+            runtime_overrides: None,
+            transform_assistant: None,
             write_effect: None,
             interrupt_mode: InterruptMode::default(),
         }
@@ -199,6 +230,12 @@ pub struct AgentBuilder {
     soft_requirement: Option<SoftToolRequirement>,
     /// steering 信道：外部中途注入消息打断当前任务。
     steer_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
+    /// aside 信道：外部注入被动、非中断通知（后台完成 / 延迟 diagnostics 等）。
+    aside_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
+    /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新）。
+    runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
+    /// assistant 消息改写钩子（最终化后、入 context/UI/tools 前）。
+    transform_assistant: Option<Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>>,
     /// 写入效果（编辑后 LSP format/diagnostics）。
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// 工具执行期的 steering 中断策略。
@@ -221,6 +258,42 @@ impl AgentBuilder {
     /// 注入 steering 接收端（外部经返回的发送端中途打断）。
     pub fn steer_rx(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<AgentMessage>) -> Self {
         self.steer_rx = Some(rx);
+        self
+    }
+
+    /// 注入 aside 接收端（外部经返回的发送端注入**被动、非中断**通知）。
+    ///
+    /// 与 [`AgentBuilder::steer_rx`] 的区别：aside **永不**触发批级 cancel 中断在途工具
+    /// （不走 Immediate 中断轮询），只在轮次边界（下一轮模型调用前 / 停止边界）折叠注入
+    /// context。用于后台任务完成、延迟 LSP diagnostics、定时器等应让模型在步骤间隙知晓、
+    /// 但不应打断当前工具的被动信号。移植 oh-my-pi `getAsideMessages`。
+    pub fn aside_rx(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<AgentMessage>) -> Self {
+        self.aside_rx = Some(rx);
+        self
+    }
+
+    /// 注入运行时配置覆盖（每轮 LLM 调用前解析，mid-run 热更新 thinking / temperature）。
+    ///
+    /// 移植 oh-my-pi `getReasoning` / `getDisableReasoning` 等动态解析器：host 实现的
+    /// [`RuntimeOverrides`] 在每轮请求构造前被调用，返回 `Some` 的字段覆盖静态 /
+    /// [`ThinkingPolicy`] 解析结果，返回 `None` 沿用原值。故可在 run 中途切换思考档位、
+    /// 温度等，而**无需重建 Agent**。后续可按需扩展 `api_key` / `base_url` / `cwd` 等。
+    pub fn runtime_overrides(mut self, overrides: Arc<dyn RuntimeOverrides>) -> Self {
+        self.runtime_overrides = Some(overrides);
+        self
+    }
+
+    /// 注入 assistant 消息改写钩子（每轮最终化后、入 context / UI / 工具分发前原地改写）。
+    ///
+    /// 移植 oh-my-pi `transformAssistantMessage`：用于宏展开（如 `@[[runtime.name(args)]]`）、
+    /// 脱敏、归一化。改写对 **context 持久化、MessageEnd 事件、工具参数分发** 三者一致生效
+    /// （单一真相源——在所有下游消费前 apply）。同步闭包：宏展开等本地计算用；若需异步
+    /// 改写（调外部服务解析宏），后续可升级为 trait + async 方法。
+    pub fn transform_assistant(
+        mut self,
+        tf: Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>,
+    ) -> Self {
+        self.transform_assistant = Some(tf);
         self
     }
 
@@ -385,6 +458,9 @@ impl AgentBuilder {
             interrupt_mode: self.interrupt_mode,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
+            aside_rx: tokio::sync::Mutex::new(self.aside_rx),
+            runtime_overrides: self.runtime_overrides,
+            transform_assistant: self.transform_assistant,
         }
     }
 }
@@ -425,6 +501,26 @@ const MAX_PAUSED_CONTINUATIONS: usize = 8;
 /// 软工具需求升级上限：模型连续这么多轮仍不调用所需工具（或持续 detour）则中止，
 /// 避免无限强制循环。移植 oh-my-pi `MAX_SOFT_TOOL_ESCALATIONS`。
 const MAX_SOFT_TOOL_ESCALATIONS: usize = 3;
+
+/// 发射 `on_turn_end` 钩子（per-turn 程序化副作用）。与 `AgentEvent::TurnEnd` 事件配对，
+/// 但面向**不经事件流**的程序化 hook（审计 / 指标 / memory 更新 / telemetry span 等）。
+/// 事件消费者（如 server 的 `to_server_frame`）已能从 TurnEnd 事件观测；本钩子供 agent
+/// 内部 / 装配层注入的程序化副作用使用。移植 oh-my-pi `onTurnEnd`。
+async fn fire_on_turn_end(
+    hooks: &[Arc<dyn Hook>],
+    message: &AssistantMessage,
+    tool_results: &[ToolResultMessage],
+    will_continue: bool,
+) {
+    let ctx = agent_core::TurnEndContext {
+        message,
+        tool_results,
+        will_continue,
+    };
+    for h in hooks {
+        h.on_turn_end(&ctx).await;
+    }
+}
 
 /// 执行循环本体（async_stream 生成器）。
 fn run_loop(
@@ -468,6 +564,11 @@ fn run_loop(
     let resources = agent.resources.clone();
     let soft_requirement = Arc::clone(&agent.soft_requirement);
     let steer_rx = &agent.steer_rx;
+    let aside_rx = &agent.aside_rx;
+    // RuntimeOverrides：Arc clone（廉价），stream! 内每轮 `.as_ref()` 解析。
+    let runtime_overrides = agent.runtime_overrides.clone();
+    // transform_assistant：Arc clone（廉价），每轮最终化后调用。
+    let transform_assistant = agent.transform_assistant.clone();
 
     async_stream::stream! {
         // 设置稳定前缀（system prompt + tool spec 指纹冻结）。
@@ -550,6 +651,23 @@ fn run_loop(
                         context.append(msg).await;
                         yield AgentEvent::Say(StatusMessage {
                             text: "已注入 steering 消息".into(),
+                            kind: StatusKind::Info,
+                        });
+                    }
+                }
+            }
+
+            // aside：被动、非中断通知——每轮模型调用前折叠注入（mid-work 边界）。
+            // 与 steering 的关键区别：aside **不**触发批级 cancel、不走 Immediate 中断轮询，
+            // 只在轮次边界消费，故不打断在途工具。典型来源：后台任务完成、延迟 LSP
+            // diagnostics、定时器。移植 oh-my-pi `getAsideMessages`（mid-work 折叠）。
+            {
+                let mut guard_aside = aside_rx.lock().await;
+                if let Some(rx) = guard_aside.as_mut() {
+                    while let Ok(msg) = rx.try_recv() {
+                        context.append(msg).await;
+                        yield AgentEvent::Say(StatusMessage {
+                            text: "已注入 aside 消息".into(),
                             kind: StatusKind::Info,
                         });
                     }
@@ -647,6 +765,19 @@ fn run_loop(
                     kind: StatusKind::Warning,
                 });
             }
+
+            // P3-A：运行时覆盖（mid-run 热更新，移植 oh-my-pi getReasoning/getDisableReasoning）。
+            // 每轮请求构造前解析 host 注入的 RuntimeOverrides：返回 Some 的字段覆盖静态 /
+            // ThinkingPolicy 解析结果，None 沿用。故可在 run 中途切换思考档位 / 温度，无需重建
+            // Agent。shadow 本轮 temperature / thinking，供下方 req 使用。
+            let temperature = runtime_overrides
+                .as_ref()
+                .and_then(|ro| ro.temperature())
+                .or(temperature);
+            let thinking = runtime_overrides
+                .as_ref()
+                .and_then(|ro| ro.thinking(&model))
+                .or_else(|| thinking.clone());
 
             let req = CompletionRequest {
                 model: model.clone(),
@@ -751,6 +882,13 @@ fn run_loop(
             };
             mistakes = 0;
             summary.usage.add(&assistant.usage);
+            // P1-M：transform assistant（最终化后、入 context/MessageEnd/工具分发前）。
+            // 移植 oh-my-pi `transformAssistantMessage`：host 闭包原地改写 text / tool_call
+            // args（宏展开、脱敏、归一化）。单一真相源——下游 context/UI/tools 都看改写后。
+            let mut assistant = assistant;
+            if let Some(tf) = &transform_assistant {
+                tf(&mut assistant);
+            }
             // P1-E：消息结束边界（message 层生命周期）。携带完整 assistant 消息快照，
             // 消费者无需自行拼接增量即可获得最终消息。同时开启本轮工具结果累积器
             // （供 TurnEnd 携带，含实际执行与占位 skipped）。
@@ -870,6 +1008,7 @@ fn run_loop(
                         .await;
                 }
                 // P1-E：error/aborted 终止，turn 结束 → 停止（will_continue: false）。
+                fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
                 yield AgentEvent::TurnEnd {
                     message: assistant.clone(),
                     tool_results: std::mem::take(&mut turn_tool_results),
@@ -951,10 +1090,39 @@ fn run_loop(
                         };
                         continue;
                     }
+                    // aside：停止边界若无 steering，再探测被动通知。aside 也触发续跑
+                    //（让模型响应后台完成 / 延迟 diagnostics），但优先级低于 steering；
+                    // 同样不打断在途工具（此处已无在途工具——tool_calls 为空才到停止边界）。
+                    let mut pending_aside = false;
+                    {
+                        let mut guard_aside = aside_rx.lock().await;
+                        if let Some(rx) = guard_aside.as_mut() {
+                            if let Ok(msg) = rx.try_recv() {
+                                context.append(msg).await;
+                                pending_aside = true;
+                                while let Ok(more) = rx.try_recv() {
+                                    context.append(more).await;
+                                }
+                            }
+                        }
+                    }
+                    if pending_aside {
+                        yield AgentEvent::Say(StatusMessage {
+                            text: "已注入停止边界 aside 消息，继续…".into(),
+                            kind: StatusKind::Info,
+                        });
+                        yield AgentEvent::TurnEnd {
+                            message: assistant.clone(),
+                            tool_results: std::mem::take(&mut turn_tool_results),
+                            will_continue: true,
+                        };
+                        continue;
+                    }
                 }
 
                 // P1-E：正常停止，turn 结束 → 停止（will_continue: false）。本轮无工具调用，
                 // turn_tool_results 为空。
+                fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
                 yield AgentEvent::TurnEnd {
                     message: assistant.clone(),
                     tool_results: std::mem::take(&mut turn_tool_results),
@@ -1154,6 +1322,11 @@ fn run_loop(
                 && runnable
                     .iter()
                     .any(|t| matches!(tools.get(&t.name), Some(tool) if tool.interruptible()));
+            // P1-F：工具流式 partial 回调 channel。工具 execute 内经 tcx.update_tx 推送
+            // ToolUpdate；下方 select! 边执行边 drain，发射 ToolExecutionUpdate 事件。
+            // 移植 oh-my-pi `AgentToolUpdateCallback` 的 partialResult。
+            let (update_tx, mut update_rx) =
+                tokio::sync::mpsc::unbounded_channel::<agent_tools::ToolUpdate>();
             let tcx = ToolContext {
                 workspace: workspace_ref,
                 approval: approval_ref.as_ref(),
@@ -1168,20 +1341,50 @@ fn run_loop(
                     .as_ref()
                     .map(|r| r.as_ref() as &dyn agent_core::ResourceResolver),
                 write_effect: write_effect.as_ref().map(std::sync::Arc::as_ref),
+                update_tx: Some(&update_tx),
             };
             // 调度执行（Shared 并发 / Exclusive 屏障串行），结果按原始顺序返回。
             // Immediate 模式 + batch 含 interruptible 工具时，边执行边轮询 steering 队列，
             // 命中即 batch_token.cancel() 中断在途工具（移植 oh-my-pi `watchSteeringWhileRunning`）。
-            let completed = if need_steering_poll {
-                poll_and_run(
-                    schedule_and_run(runnable, &tools, &tcx, &hooks),
-                    &batch_token,
-                    steer_rx,
-                )
-                .await
-            } else {
-                schedule_and_run(runnable, &tools, &tcx, &hooks).await
+            // 用 async 块统一两分支的 future 类型，便于下方 select! 边等边 drain partial。
+            let run_fut = async {
+                if need_steering_poll {
+                    poll_and_run(
+                        schedule_and_run(runnable, &tools, &tcx, &hooks),
+                        &batch_token,
+                        steer_rx,
+                    )
+                    .await
+                } else {
+                    schedule_and_run(runnable, &tools, &tcx, &hooks).await
+                }
             };
+            tokio::pin!(run_fut);
+            // P1-F：边执行边 drain 工具流式 partial。biased 先轮询 run_fut（完成即 break），
+            // 否则收 update → 发射 ToolExecutionUpdate；循环至 batch 完成。
+            let completed = loop {
+                tokio::select! {
+                    biased;
+                    out = &mut run_fut => break out,
+                    update = update_rx.recv() => {
+                        if let Some(u) = update {
+                            yield AgentEvent::ToolExecutionUpdate {
+                                tool_call_id: u.tool_call_id,
+                                name: u.name,
+                                partial: u.partial,
+                            };
+                        }
+                    }
+                }
+            };
+            // 兜底 drain：batch 完成与最后一次 update 入队存在竞态，break 后可能仍有 buffered。
+            while let Ok(u) = update_rx.try_recv() {
+                yield AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: u.tool_call_id,
+                    name: u.name,
+                    partial: u.partial,
+                };
+            }
             // 按原始调用顺序回填结果 + 发射事件（确定性顺序，便于观测与重放）。
             for (_order, id, name, result, mistake_inc) in completed {
                 if mistake_inc {
@@ -1232,6 +1435,7 @@ fn run_loop(
                 return;
             }
             // P1-E：工具执行完毕，turn 结束 → 继续（工具结果已回填，模型再次推理）。
+            fire_on_turn_end(&hooks, &assistant, &turn_tool_results, true).await;
             yield AgentEvent::TurnEnd {
                 message: assistant.clone(),
                 tool_results: std::mem::take(&mut turn_tool_results),
@@ -1580,6 +1784,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: None,
+            update_tx: None,
         }
     }
 
@@ -3073,5 +3278,577 @@ mod tests {
         ];
         assert_eq!(seq, expected, "三层生命周期事件顺序应严格匹配");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "应正好 2 轮模型调用");
+    }
+
+    // ── aside 双通道（P2-A：被动、非中断通知）──────────────────────────────
+
+    /// 停止边界 aside：每轮返回纯文本（触发停止边界），第 1 轮经 `aside_tx` 注入一条 aside。
+    /// 停止边界应检测到 aside 并续跑（而非结束）——provider 被调用 2 次。
+    struct AsideStopBoundaryProvider {
+        calls: Arc<AtomicUsize>,
+        aside_tx: tokio::sync::mpsc::UnboundedSender<AgentMessage>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for AsideStopBoundaryProvider {
+        fn id(&self) -> &'static str {
+            "aside-stop"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let _ = self
+                    .aside_tx
+                    .send(AgentMessage::user_text("[aside] 后台任务完成"));
+            }
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: format!("reply #{n}"),
+                }],
+                usage: Usage::default(),
+                model: "aside-stop".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 停止边界 aside 触发续跑：agent 本该停止，但停止边界 drain 到 aside → 续跑一轮。
+    #[tokio::test]
+    async fn aside_at_stop_boundary_continues_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (aside_tx, aside_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "aside-stop",
+            "aside-stop",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model)
+            .provider(Arc::new(AsideStopBoundaryProvider {
+                calls: calls.clone(),
+                aside_tx,
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .aside_rx(aside_rx)
+            .build();
+
+        let mut injected = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = ev {
+                if s.text.contains("停止边界 aside") {
+                    injected = true;
+                }
+            }
+        }
+        assert!(injected, "应发出停止边界 aside 注入提示");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "停止边界 aside 应触发续跑（2 轮），而非搁置后仅 1 轮"
+        );
+    }
+
+    /// mid-work aside：第 1 轮返回 probe 工具调用并注入 aside；工具执行完毕后下一轮顶部
+    ///（mid-work 边界）drain aside。验证 aside 在工具轮后被注入，且 probe 正常完成
+    ///（不被 cancel——aside 不走 Immediate 批级中断）。
+    struct MidWorkAsideProvider {
+        calls: Arc<AtomicUsize>,
+        aside_tx: tokio::sync::mpsc::UnboundedSender<AgentMessage>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for MidWorkAsideProvider {
+        fn id(&self) -> &'static str {
+            "aside-midwork"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let _ = self
+                    .aside_tx
+                    .send(AgentMessage::user_text("[aside] 延迟 LSP diagnostics"));
+            }
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "probe".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "aside-midwork".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "aside-midwork".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// mid-work aside 在工具批次完成后、下一轮模型调用前注入；probe 工具正常完成
+    ///（不被 cancel）。
+    #[tokio::test]
+    async fn aside_mid_work_injected_after_tool_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (aside_tx, aside_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model = agent_core::Model::with_defaults(
+            "aside-midwork",
+            "aside-midwork",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(MidWorkAsideProvider {
+                calls: calls.clone(),
+                aside_tx,
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .aside_rx(aside_rx)
+            .build();
+
+        let mut injected = false;
+        let mut tool_ok = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Say(s) if s.text.contains("已注入 aside 消息") => injected = true,
+                AgentEvent::ToolExecutionEnd {
+                    name, is_error, ..
+                } if name == "probe" => {
+                    tool_ok = !is_error;
+                }
+                _ => {}
+            }
+        }
+        assert!(injected, "mid-work aside 应在工具批次后注入（Say 提示）");
+        assert!(tool_ok, "probe 工具应正常完成（aside 不打断在途工具）");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "应正好 2 轮模型调用");
+    }
+
+    // ── RuntimeOverrides（P3-A：mid-run 配置热更新）─────────────────────────
+
+    /// 记录每轮 provider 收到的 `(thinking 是否存在, temperature)`，并按轮次返回不同消息
+    ///（第 1 轮 tool_call、第 2 轮纯文本），使循环正好 2 轮。
+    struct RecordingProvider {
+        calls: Arc<AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<(bool, Option<f32>)>>>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for RecordingProvider {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.thinking.is_some(), req.temperature));
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "probe".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "recording".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "recording".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 按调用次数切换：第 1 次返回 None（沿用静态），第 2 次起返回 Some（覆盖）。
+    struct SwitchingOverrides {
+        thinking_call: Arc<AtomicUsize>,
+        temp_call: Arc<AtomicUsize>,
+    }
+    impl RuntimeOverrides for SwitchingOverrides {
+        fn thinking(&self, _model: &agent_core::Model) -> Option<agent_core::ThinkingConfig> {
+            let n = self.thinking_call.fetch_add(1, Ordering::SeqCst);
+            (n >= 1).then(|| agent_core::ThinkingConfig::new(2_000))
+        }
+        fn temperature(&self) -> Option<f32> {
+            let n = self.temp_call.fetch_add(1, Ordering::SeqCst);
+            (n >= 1).then_some(0.5)
+        }
+    }
+
+    /// RuntimeOverrides 每轮解析：第 1 轮无覆盖（沿用静态 None），第 2 轮覆盖为
+    /// `thinking=Some` / `temperature=Some(0.5)`——provider 应观测到覆盖值生效。
+    #[tokio::test]
+    async fn runtime_overrides_apply_per_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<(bool, Option<f32>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model =
+            agent_core::Model::with_defaults("recording", "recording", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(RecordingProvider {
+                calls: calls.clone(),
+                seen: seen.clone(),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .runtime_overrides(Arc::new(SwitchingOverrides {
+                thinking_call: Arc::new(AtomicUsize::new(0)),
+                temp_call: Arc::new(AtomicUsize::new(0)),
+            }))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let guard = seen.lock().unwrap();
+        assert_eq!(guard.len(), 2, "应正好 2 轮 provider 调用");
+        assert_eq!(
+            guard[0],
+            (false, None),
+            "第 1 轮无覆盖，沿用静态 None（thinking/temperature 均未设）"
+        );
+        assert_eq!(
+            guard[1],
+            (true, Some(0.5)),
+            "第 2 轮 RuntimeOverrides 覆盖生效（thinking=Some, temperature=0.5）"
+        );
+    }
+
+    // ── 工具流式 partial（P1-F：partialResult 回调）─────────────────────────
+
+    /// 流式工具：execute 内经 `ctx.update_tx` 推 3 条 partial，每条间 sleep 让 agent 端
+    /// select! 有机会 drain。最终返回聚合结果。模拟 bash 边输出边显示、job 轮询进度。
+    struct StreamingTool;
+    #[async_trait]
+    impl Tool for StreamingTool {
+        fn name(&self) -> &str {
+            "streaming"
+        }
+        fn description(&self) -> &str {
+            "streaming"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability(&self) -> CapabilityTier {
+            CapabilityTier::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            for partial in ["chunk-1", "chunk-2", "chunk-3"] {
+                if let Some(tx) = ctx.update_tx {
+                    let _ = tx.send(agent_tools::ToolUpdate {
+                        tool_call_id: "c1".into(),
+                        name: "streaming".into(),
+                        partial: partial.into(),
+                    });
+                }
+                // 让出控制权，使 agent 端 select! 能在工具完成前 drain partial。
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            Ok(ToolResult::text("final-result"))
+        }
+    }
+
+    /// 两轮 Provider：第 1 轮返回 `streaming` 工具调用，第 2 轮纯文本。
+    struct StreamingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for StreamingProvider {
+        fn id(&self) -> &'static str {
+            "streaming-prov"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "streaming".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "streaming-prov".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "streaming-prov".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 工具流式 partial 在执行期间被 drain 为 ToolExecutionUpdate 事件，顺序正确、不丢失。
+    #[tokio::test]
+    async fn tool_streaming_updates_emitted_during_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(StreamingTool));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model = agent_core::Model::with_defaults(
+            "streaming-prov",
+            "streaming-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(StreamingProvider { calls: calls.clone() }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build();
+
+        let mut updates: Vec<String> = Vec::new();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::ToolExecutionUpdate { partial, .. } = ev {
+                updates.push(partial);
+            }
+        }
+        assert_eq!(
+            updates,
+            vec!["chunk-1".to_string(), "chunk-2".into(), "chunk-3".into()],
+            "应按序收到 3 条流式 partial（select! 边执行边 drain + 兜底 drain 保证不丢失）"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "应正好 2 轮模型调用");
+    }
+
+    // ── transform_assistant（P1-M：最终化后改写钩子）─────────────────────────
+
+    /// 返回含宏占位符的 assistant 文本，供 transform 改写。
+    struct TransformProvider;
+    #[async_trait]
+    impl agent_core::LlmProvider for TransformProvider {
+        fn id(&self) -> &'static str {
+            "transform"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "a @[[x]] b".into(),
+                }],
+                usage: Usage::default(),
+                model: "transform".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// transform 在 MessageEnd / context.append / 工具分发前改写（单一真相源）：
+    /// 把 `@[[x]]` 宏展开为 `[expanded]`，下游事件应携带改写后文本。
+    #[tokio::test]
+    async fn transform_assistant_rewrites_before_downstream() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("transform", "transform", agent_core::Api::OpenAiCompletions);
+        let tf: Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync> = Arc::new(|m| {
+            for b in &mut m.content {
+                if let agent_core::ContentBlock::Text { text } = b {
+                    *text = text.replace("@[[x]]", "[expanded]");
+                }
+            }
+        });
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TransformProvider))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .transform_assistant(tf)
+            .build();
+
+        let mut event_text = String::new();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::MessageEnd(msg) = ev {
+                event_text = msg.text();
+            }
+        }
+        assert_eq!(
+            event_text, "a [expanded] b",
+            "MessageEnd 应携带改写后文本（transform 在事件前 apply）"
+        );
+        assert!(
+            !event_text.contains("@[[x]]"),
+            "改写后不应含原始宏占位符"
+        );
+    }
+
+    // ── on_turn_end 钩子（P6-A：per-turn 程序化副作用）───────────────────────
+
+    /// 记录 on_turn_end 调用的 will_continue 序列。
+    struct TurnEndRecorder {
+        calls: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    #[async_trait]
+    impl Hook for TurnEndRecorder {
+        async fn on_event(&self, _: &HookEvent) {}
+        async fn on_turn_end(&self, ctx: &agent_core::TurnEndContext<'_>) {
+            self.calls.lock().unwrap().push(ctx.will_continue);
+        }
+    }
+
+    /// on_turn_end 在每个 turn 结束被调用，携带正确的 will_continue：
+    /// 工具轮（true，继续）→ 停止轮（false）。
+    #[tokio::test]
+    async fn on_turn_end_hook_fires_with_will_continue() {
+        let prov_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model =
+            agent_core::Model::with_defaults("two-turn", "two-turn", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TwoTurnProvider { calls: prov_calls }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .hooks(vec![Arc::new(TurnEndRecorder { calls: hook_calls.clone() })])
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let guard = hook_calls.lock().unwrap();
+        assert_eq!(
+            *guard, vec![true, false],
+            "on_turn_end 应在工具轮（will_continue=true）与停止轮（false）各调一次"
+        );
     }
 }

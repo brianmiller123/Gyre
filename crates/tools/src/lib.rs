@@ -26,7 +26,7 @@ use agent_core::{
 pub use ast_tool::{AstRewriteTool, AstSearchTool, ReplaceBlockTool};
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use fuzzy_match::{
-    find_unique_match, set_fuzzy_opts, FuzzyOpts, MatchError, MatchMethod, MatchOutcome,
+    FuzzyOpts, MatchError, MatchMethod, MatchOutcome, find_unique_match, set_fuzzy_opts,
 };
 pub use github::{GithubTool, PROMPT_SECTION};
 pub use image::{ImageGenTool, ReadImageTool};
@@ -35,7 +35,20 @@ pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunCommandTool;
-pub use write::{render_diagnostics, write_with_effects, NoopWriteEffect, WriteReport};
+pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
+
+/// 工具流式 partial 更新（工具 execute 内经 [`ToolContext::update_tx`] 推送，agent 循环端
+/// 发射为 `AgentEvent::ToolExecutionUpdate`）。移植 oh-my-pi `AgentToolUpdateCallback` 的
+/// partialResult。最终结果仍由 [`Tool::execute`] 返回值决定；partial 仅用于中途观测。
+#[derive(Debug, Clone)]
+pub struct ToolUpdate {
+    /// 对应工具调用 id（与 `ToolExecutionStart` / `ToolExecutionEnd` 配对）。
+    pub tool_call_id: String,
+    /// 工具名。
+    pub name: String,
+    /// 阶段性输出文本（工具自定格式）。
+    pub partial: String,
+}
 
 /// 工具执行上下文：工作区、审批策略、取消令牌，及内部协议解析器。
 pub struct ToolContext<'a> {
@@ -53,6 +66,10 @@ pub struct ToolContext<'a> {
     pub resources: Option<&'a dyn agent_core::ResourceResolver>,
     /// 写入效果（可选；写工具经 `write_with_effects` 在写盘后触发 LSP format/diagnostics）。
     pub write_effect: Option<&'a dyn WriteEffect>,
+    /// 流式 partial 回调通道（可选）。工具 execute 内 `send(ToolUpdate)` 推送阶段性输出；
+    /// agent 循环端在执行批次时 select! 接收并发射 `ToolExecutionUpdate` 事件。移植 oh-my-pi
+    /// `AgentToolUpdateCallback`。`None` 时工具无流式能力（默认，既有工具零改动）。
+    pub update_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<ToolUpdate>>,
 }
 
 /// 工具并发模式（决定同一轮多工具调用的调度）。
@@ -364,8 +381,16 @@ mod tests {
         }
         // 每条提示词以 <key>…</key> 包裹，便于注入时识别
         for p in OPTIONAL_TOOL_PROMPTS {
-            assert!(p.prompt.starts_with(&format!("<{}>", p.key)), "{} 头标记", p.key);
-            assert!(p.prompt.ends_with(&format!("</{}>", p.key)), "{} 尾标记", p.key);
+            assert!(
+                p.prompt.starts_with(&format!("<{}>", p.key)),
+                "{} 头标记",
+                p.key
+            );
+            assert!(
+                p.prompt.ends_with(&format!("</{}>", p.key)),
+                "{} 尾标记",
+                p.key
+            );
         }
     }
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use agent_core::{DiagnosticSeverity, WriteDiagnostic, WriteEffect, WriteOutcome};
 use agent_lsp::client::DiagnosticSeverity as LspDiagnosticSeverity;
 use agent_lsp::client::LspDiagnostic;
-use agent_lsp::{detect_servers, DiagnosticsLedger, LspManager};
+use agent_lsp::{DiagnosticsLedger, LspManager, detect_servers};
 use tokio::sync::Mutex;
 use url::Url;
 

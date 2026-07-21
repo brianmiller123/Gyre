@@ -6,7 +6,7 @@ use agent_core::{CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::{write_with_effects, Tool, ToolContext};
+use crate::{Tool, ToolContext, write_with_effects};
 
 /// 用 tree-sitter 解析文件，将某行起始的句法块整体替换为新内容。
 pub struct ReplaceBlockTool;
@@ -309,6 +309,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: None,
+            update_tx: None,
         }
     }
 

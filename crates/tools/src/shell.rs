@@ -117,9 +117,7 @@ struct CmdOutput {
 ///
 /// 注意：[`read_capped`] 达上限后会继续**丢弃式读取**直到 EOF（仅保留前 `max` 字节），
 /// 确保子进程不会因管道写满而阻塞——否则 `child.wait()` 将死锁，只能靠墙钟超时兜底。
-async fn run_command_capped(
-    mut cmd: tokio::process::Command,
-) -> Result<CmdOutput, std::io::Error> {
+async fn run_command_capped(mut cmd: tokio::process::Command) -> Result<CmdOutput, std::io::Error> {
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

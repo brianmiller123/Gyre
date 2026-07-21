@@ -36,7 +36,7 @@ pub mod workspace;
 
 pub use context::{CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode, TokenUsage};
 pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
-pub use hook::{Hook, HookEvent};
+pub use hook::{Hook, HookEvent, TurnEndContext};
 pub use memory::{MemoryNote, MemoryStore};
 pub use llm::{
     AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider, ProviderCallContext,

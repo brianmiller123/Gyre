@@ -3,6 +3,7 @@
 //! Hook 仅观察事件（不阻止执行），用于日志、通知、指标、审计等副作用。
 //! 装配层（cli/server）注入具体实现（如写入审计日志、推送 webhook）。
 
+use crate::message::{AssistantMessage, ToolResultMessage};
 use crate::ToolResult;
 
 /// Hook 事件。
@@ -29,11 +30,30 @@ pub enum HookEvent {
     },
 }
 
+/// turn 结束钩子上下文：每轮模型响应 + 工具处理完毕后的快照（移植 oh-my-pi `onTurnEnd`）。
+///
+/// 与 [`crate::AgentEvent::TurnEnd`] 事件配对，但面向**不经事件流的程序化 hook**
+///（审计、指标、memory 更新、telemetry span 等）。事件消费者（如 server 的 to_server_frame）
+/// 已能从 TurnEnd 事件观测；本钩子供 agent 内部 / 装配层注入的程序化副作用使用。
+#[derive(Debug)]
+pub struct TurnEndContext<'a> {
+    /// 本轮最终化的 assistant 消息。
+    pub message: &'a AssistantMessage,
+    /// 本轮工具结果（含实际执行与占位 skipped）。
+    pub tool_results: &'a [ToolResultMessage],
+    /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / max_turns）。
+    pub will_continue: bool,
+}
+
 /// Hook 端口：观察 agent 执行事件，并可选地拦截/改写工具执行（P2-I）。
 #[async_trait::async_trait]
 pub trait Hook: Send + Sync {
     /// 事件回调（不阻止执行，仅副作用）。
     async fn on_event(&self, event: &HookEvent);
+
+    /// 每轮结束（assistant 消息 + 工具处理完毕，即将 continue 或 stop）。移植 oh-my-pi
+    /// `onTurnEnd`。默认空实现（既有 Hook 实现无需改动）。
+    async fn on_turn_end(&self, _ctx: &TurnEndContext<'_>) {}
 
     /// 工具执行前拦截（P2-I）：返回 `Some(reason)` 则阻止执行——回填可恢复错误给模型，
     /// **不调用** `Tool::execute`。默认 `None`（不阻止，与既有观察语义兼容，现有实现无需改动）。

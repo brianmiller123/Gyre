@@ -44,10 +44,7 @@ impl FuzzyOpts {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|t| (0.0..=1.0).contains(t))
             .unwrap_or(0.9);
-        Self {
-            enabled,
-            threshold,
-        }
+        Self { enabled, threshold }
     }
 }
 
@@ -190,8 +187,7 @@ fn find_normalized_lines_unique(haystack: &str, needle: &str) -> Option<(usize, 
     let starts = line_byte_starts(haystack);
     let mut hit: Option<usize> = None;
     for s in 0..=h_lines.len() - n_lines.len() {
-        let ok = (0..n_lines.len())
-            .all(|i| normalize_for_fuzzy(h_lines[s + i]) == n_norm[i]);
+        let ok = (0..n_lines.len()).all(|i| normalize_for_fuzzy(h_lines[s + i]) == n_norm[i]);
         if ok {
             if hit.is_some() {
                 return None; // 不唯一
@@ -240,7 +236,8 @@ fn find_fuzzy_lines_unique(haystack: &str, needle: &str, threshold: f64) -> Opti
         return None;
     }
     let (s, avg) = best?;
-    let (byte_start, byte_end) = line_range_bytes(&starts, s, s + n_lines.len() - 1, haystack.len());
+    let (byte_start, byte_end) =
+        line_range_bytes(&starts, s, s + n_lines.len() - 1, haystack.len());
     Some(MatchOutcome {
         byte_start,
         byte_end,
@@ -250,7 +247,12 @@ fn find_fuzzy_lines_unique(haystack: &str, needle: &str, threshold: f64) -> Opti
 }
 
 /// 由行号区间计算字节范围（不含区间末尾行之后的 `\n`）。
-fn line_range_bytes(starts: &[usize], start_line: usize, end_line: usize, total_len: usize) -> (usize, usize) {
+fn line_range_bytes(
+    starts: &[usize],
+    start_line: usize,
+    end_line: usize,
+    total_len: usize,
+) -> (usize, usize) {
     let byte_start = starts[start_line];
     let byte_end = if end_line + 1 < starts.len() {
         starts[end_line + 1] - 1
@@ -269,9 +271,15 @@ fn normalize_for_fuzzy(line: &str) -> String {
     let mut s = String::with_capacity(trimmed.len());
     for ch in trimmed.chars() {
         match ch {
-            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{00AB}' | '\u{00BB}' => s.push('"'),
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{0060}' | '\u{00B4}' => s.push('\''),
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}' => s.push('-'),
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{00AB}' | '\u{00BB}' => {
+                s.push('"')
+            }
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{0060}' | '\u{00B4}' => {
+                s.push('\'')
+            }
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}' => {
+                s.push('-')
+            }
             ' ' | '\t' => {
                 if !s.ends_with(' ') {
                     s.push(' ');
@@ -313,11 +321,7 @@ fn similarity(a: &str, b: &str) -> f64 {
     }
     let d = levenshtein(a, b) as f64;
     let max = a.chars().count().max(b.chars().count()) as f64;
-    if max == 0.0 {
-        1.0
-    } else {
-        1.0 - d / max
-    }
+    if max == 0.0 { 1.0 } else { 1.0 - d / max }
 }
 
 // ── 缩进自适应（移植 oh-my-pi normalize.ts adjustIndentation）──────────────
@@ -427,7 +431,11 @@ fn uniform_indent_delta(old_p: &IndentProfile, actual_p: &IndentProfile) -> Opti
         deltas.push(count_leading_whitespace(a) as isize - count_leading_whitespace(o) as isize);
     }
     let d = deltas.first().copied()?;
-    if deltas.iter().all(|&x| x == d) { Some(d) } else { None }
+    if deltas.iter().all(|&x| x == d) {
+        Some(d)
+    } else {
+        None
+    }
 }
 
 fn apply_indent_delta(text: &str, delta: isize, indent_char: char) -> String {

@@ -118,7 +118,9 @@ pub async fn write_with_effects(
     // 4. 格式化重写（仅当返回不同文本时才重写，避免无意义 IO）。
     let (final_text, formatted) = match outcome.formatted_text.as_deref() {
         Some(fmt) if fmt != text => {
-            tokio::fs::write(full_path, fmt).await.map_err(ToolError::Io)?;
+            tokio::fs::write(full_path, fmt)
+                .await
+                .map_err(ToolError::Io)?;
             (fmt.to_string(), true)
         }
         _ => (text.to_string(), false),
@@ -164,10 +166,7 @@ mod tests {
     struct Allow;
     #[async_trait::async_trait]
     impl agent_core::ApprovalPolicy for Allow {
-        fn decide(
-            &self,
-            _r: &agent_core::ApprovalRequest<'_>,
-        ) -> agent_core::ApprovalDecision {
+        fn decide(&self, _r: &agent_core::ApprovalRequest<'_>) -> agent_core::ApprovalDecision {
             agent_core::ApprovalDecision::Allow
         }
         async fn prompt(
@@ -207,6 +206,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: None,
+            update_tx: None,
         };
         let p = dir.join("a.txt");
         let report = write_with_effects(&p, "hi\n", &ctx).await.unwrap();
@@ -237,6 +237,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: Some(&effect),
+            update_tx: None,
         };
         let p = dir.join("b.txt");
         let report = write_with_effects(&p, "ok\n", &ctx).await.unwrap();
@@ -268,6 +269,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: Some(&effect),
+            update_tx: None,
         };
         let p = dir.join("c.txt");
         let report = write_with_effects(&p, "raw\n", &ctx).await.unwrap();
@@ -300,6 +302,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: Some(&effect),
+            update_tx: None,
         };
         let p = dir.join("d.txt");
         let report = write_with_effects(&p, "stable\n", &ctx).await.unwrap();

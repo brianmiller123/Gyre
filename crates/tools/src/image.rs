@@ -215,6 +215,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: None,
+            update_tx: None,
         }
     }
 

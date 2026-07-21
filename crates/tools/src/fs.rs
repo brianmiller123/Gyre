@@ -4,12 +4,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use agent_ast::{summarize_code, SegmentKind, SummaryOptions, SupportLang};
+use agent_ast::{SegmentKind, SummaryOptions, SupportLang, summarize_code};
 use agent_core::{CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::{write_with_effects, Tool, ToolContext};
+use crate::{Tool, ToolContext, write_with_effects};
 
 /// 读取文件（带行号）。
 pub struct ReadFileTool;
@@ -102,7 +102,9 @@ fn render_summary(text: &str, lang: SupportLang) -> String {
                     "     ⋯⋯ (折叠第 {}-{} 行，共 {} 行) ⋯⋯\n",
                     seg.start_line,
                     seg.end_line,
-                    seg.end_line.saturating_sub(seg.start_line).saturating_add(1),
+                    seg.end_line
+                        .saturating_sub(seg.start_line)
+                        .saturating_add(1),
                 ));
             }
         }
@@ -124,7 +126,9 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
         // 注意：`SkillResolver::resolve` 内部会再次剥离 `skill://` 前缀（见 skills/registry.rs），
         // 故此处传入完整 path，无需手动剥离。
         let Some(resolver) = ctx.skills else {
-            return Err(ToolError::Execution("skill:// 解析不可用（未注入 Skill 目录）".into()));
+            return Err(ToolError::Execution(
+                "skill:// 解析不可用（未注入 Skill 目录）".into(),
+            ));
         };
         let file = resolver
             .resolve(path)
@@ -166,7 +170,9 @@ async fn resolve_artifact(id: &str, ctx: &ToolContext<'_>) -> Result<String, Too
 /// `memory://` 路由：`` / `summary` → 启动摘要；`full` → 完整 MEMORY.md。
 async fn resolve_memory(rest: &str, ctx: &ToolContext<'_>) -> Result<String, ToolError> {
     let Some(memory) = ctx.memory else {
-        return Err(ToolError::Execution("memory:// 解析不可用（未启用跨会话记忆）".into()));
+        return Err(ToolError::Execution(
+            "memory:// 解析不可用（未启用跨会话记忆）".into(),
+        ));
     };
     match rest.trim_end_matches('/') {
         "" | "summary" => memory
@@ -188,13 +194,17 @@ async fn resolve_memory(rest: &str, ctx: &ToolContext<'_>) -> Result<String, Too
 /// `mcp://<server>/<uri>` 路由：经 MCP `resources/read` 读取。
 async fn resolve_mcp(rest: &str, ctx: &ToolContext<'_>) -> Result<String, ToolError> {
     let Some(resolver) = ctx.resources else {
-        return Err(ToolError::Execution("mcp:// 解析不可用（未注入 MCP）".into()));
+        return Err(ToolError::Execution(
+            "mcp:// 解析不可用（未注入 MCP）".into(),
+        ));
     };
     let (server, uri) = rest
         .split_once('/')
         .ok_or_else(|| ToolError::Execution("mcp:// 需形式 `mcp://<server>/<uri>`".into()))?;
     if server.is_empty() || uri.is_empty() {
-        return Err(ToolError::Execution("mcp:// 的 server 与 uri 均不可为空".into()));
+        return Err(ToolError::Execution(
+            "mcp:// 的 server 与 uri 均不可为空".into(),
+        ));
     }
     resolver
         .read_resource(server, uri)
@@ -218,8 +228,8 @@ async fn fetch_http(url: &str) -> Result<String, ToolError> {
     ssrf_guard(url)?;
     let client = fetch_client();
 
-    let mut current = url::Url::parse(url)
-        .map_err(|e| ToolError::Execution(format!("非法 URL: {e}")))?;
+    let mut current =
+        url::Url::parse(url).map_err(|e| ToolError::Execution(format!("非法 URL: {e}")))?;
     let mut resp = client
         .get(current.as_str())
         .send()
@@ -275,8 +285,7 @@ async fn fetch_http(url: &str) -> Result<String, ToolError> {
 
 /// 基础 SSRF 防护：仅允许 http/https，拒绝回环/私有/链路本地 IP 字面量与已知元数据主机名。
 fn ssrf_guard(raw: &str) -> Result<(), ToolError> {
-    let url = url::Url::parse(raw)
-        .map_err(|e| ToolError::Execution(format!("非法 URL: {e}")))?;
+    let url = url::Url::parse(raw).map_err(|e| ToolError::Execution(format!("非法 URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ToolError::Execution(format!(
             "不允许的 scheme: {}",
@@ -287,10 +296,7 @@ fn ssrf_guard(raw: &str) -> Result<(), ToolError> {
         .host_str()
         .ok_or_else(|| ToolError::Execution("URL 缺少主机".into()))?;
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if ip.is_loopback()
-            || ip.is_unspecified()
-            || is_private_or_link_local(&ip)
-        {
+        if ip.is_loopback() || ip.is_unspecified() || is_private_or_link_local(&ip) {
             return Err(ToolError::Execution(format!(
                 "SSRF 防护：禁止访问内网地址 {host}"
             )));
@@ -304,9 +310,7 @@ fn ssrf_guard(raw: &str) -> Result<(), ToolError> {
         "metadata.azure.com",
     ];
     if BLOCKED_HOSTS.iter().any(|b| h == *b) {
-        return Err(ToolError::Execution(format!(
-            "SSRF 防护：禁止访问 {host}"
-        )));
+        return Err(ToolError::Execution(format!("SSRF 防护：禁止访问 {host}")));
     }
     Ok(())
 }
@@ -496,6 +500,7 @@ mod tests {
             memory: None,
             resources: None,
             write_effect: None,
+            update_tx: None,
         }
     }
 
@@ -538,7 +543,9 @@ mod tests {
         // 回归：IPv4-mapped IPv6 地址必须降级为 IPv4 检查。
         // ::ffff:169.254.169.254（AWS/GCP 元数据）必须被拦截。
         assert!(is_private_or_link_local(
-            &"::ffff:169.254.169.254".parse::<std::net::IpAddr>().unwrap()
+            &"::ffff:169.254.169.254"
+                .parse::<std::net::IpAddr>()
+                .unwrap()
         ));
         // ::ffff:127.0.0.1（回环）必须被拦截。
         assert!(is_private_or_link_local(
@@ -550,7 +557,9 @@ mod tests {
         ));
         // ::ffff:100.100.100.200（CGNAT）必须被拦截。
         assert!(is_private_or_link_local(
-            &"::ffff:100.100.100.200".parse::<std::net::IpAddr>().unwrap()
+            &"::ffff:100.100.100.200"
+                .parse::<std::net::IpAddr>()
+                .unwrap()
         ));
         // 公网 IPv4-mapped 不应被拦截。
         assert!(!is_private_or_link_local(

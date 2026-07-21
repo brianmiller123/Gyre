@@ -10,7 +10,7 @@ use std::time::Duration;
 use agent_core::{ApprovalRequest, CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use reqwest::RequestBuilder;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
 
@@ -148,11 +148,7 @@ impl Tool for GithubTool {
         }
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let action = input
             .get("action")
             .and_then(Value::as_str)
@@ -190,7 +186,9 @@ fn validate_repo(repo: &str) -> Result<(), ToolError> {
         .split_once('/')
         .ok_or_else(|| ToolError::InvalidArgs("`repo` 须为 `owner/repo` 形式".into()))?;
     if owner.is_empty() || name.is_empty() {
-        return Err(ToolError::InvalidArgs("`owner` 与 `repo` 均不得为空".into()));
+        return Err(ToolError::InvalidArgs(
+            "`owner` 与 `repo` 均不得为空".into(),
+        ));
     }
     if !owner.chars().all(is_repo_char) || !name.chars().all(is_repo_char) {
         return Err(ToolError::InvalidArgs(
@@ -291,7 +289,10 @@ fn build_request(
         "graphql" => {
             let query = require_str(input, "query", "graphql")?;
             let variables = input.get("variables").cloned().unwrap_or(Value::Null);
-            Ok(common_post("/graphql", json!({ "query": query, "variables": variables })))
+            Ok(common_post(
+                "/graphql",
+                json!({ "query": query, "variables": variables }),
+            ))
         }
         "create_pr" => {
             let title = require_str(input, "title", "create_pr")?;
@@ -354,9 +355,9 @@ fn build_client() -> Result<&'static reqwest::Client, ToolError> {
             .expect("构建 GitHub HTTP 客户端失败")
     });
     // OnceLock::get 在 init 后必定返回 Some。
-    CLIENT.get().ok_or_else(|| {
-        ToolError::Execution("GitHub HTTP 客户端初始化失败".into())
-    })
+    CLIENT
+        .get()
+        .ok_or_else(|| ToolError::Execution("GitHub HTTP 客户端初始化失败".into()))
 }
 
 /// 读取鉴权 token（`GH_TOKEN` 优先于 `GITHUB_TOKEN`），空值视为无。
@@ -432,7 +433,12 @@ async fn read_capped_bytes(mut resp: reqwest::Response) -> Result<Vec<u8>, ToolE
 
 /// 是否为文本/JSON 类响应（可安全转字符串）。
 fn is_text_content_type(ct: &str) -> bool {
-    let ct = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
     ct.is_empty()
         || ct.contains("json")
         || ct.contains("text")
@@ -484,7 +490,10 @@ mod tests {
             endpoint_path("get_pr", "o/r", Some(7)).unwrap(),
             "/repos/o/r/pulls/7"
         );
-        assert_eq!(endpoint_path("list_prs", "o/r", None).unwrap(), "/repos/o/r/pulls");
+        assert_eq!(
+            endpoint_path("list_prs", "o/r", None).unwrap(),
+            "/repos/o/r/pulls"
+        );
         assert_eq!(
             endpoint_path("get_run_logs", "o/r", Some(9)).unwrap(),
             "/repos/o/r/actions/runs/9/logs"
@@ -508,7 +517,8 @@ mod tests {
         let tool = GithubTool::new(true);
         let read = json!({"action": "get_pr", "repo": "o/r", "number": 1});
         assert_eq!(tool.describe(&read).capability, CapabilityTier::Network);
-        let write = json!({"action": "create_pr", "repo": "o/r", "title": "t", "head": "h", "base": "b"});
+        let write =
+            json!({"action": "create_pr", "repo": "o/r", "title": "t", "head": "h", "base": "b"});
         assert_eq!(tool.describe(&write).capability, CapabilityTier::Write);
     }
 
@@ -533,7 +543,14 @@ mod tests {
         let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("enum array");
-        for a in ["get_pr", "graphql", "create_pr", "merge_pr", "comment", "get_run_logs"] {
+        for a in [
+            "get_pr",
+            "graphql",
+            "create_pr",
+            "merge_pr",
+            "comment",
+            "get_run_logs",
+        ] {
             assert!(actions.iter().any(|v| v == a), "缺 action {a}");
         }
     }
