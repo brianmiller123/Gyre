@@ -18,5 +18,5 @@
 mod model;
 mod registry;
 
-pub use model::{LogLine, LogLevel, SubAgentPhase, SubAgentStatus};
+pub use model::{LogLevel, LogLine, SubAgentPhase, SubAgentStatus};
 pub use registry::{Supervisor, SupervisorEvent};

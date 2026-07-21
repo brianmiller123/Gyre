@@ -31,17 +31,19 @@ pub mod platform;
 pub mod resource;
 pub mod skill;
 pub mod tool;
-pub mod write_effect;
 pub mod workspace;
+pub mod write_effect;
 
-pub use context::{CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode, TokenUsage};
+pub use context::{
+    CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode, TokenUsage,
+};
 pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
 pub use hook::{Hook, HookEvent, TurnEndContext};
-pub use memory::{MemoryNote, MemoryStore};
 pub use llm::{
-    AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider, ProviderCallContext,
-    ThinkingClassifier, ThinkingConfig, ThinkingPolicy,
+    AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider,
+    ProviderCallContext, ThinkingClassifier, ThinkingConfig, ThinkingPolicy,
 };
+pub use memory::{MemoryNote, MemoryStore};
 pub use message::{
     AgentEvent, AgentMessage, AgentRunSummary, AgentState, AskKind, AskMessage, AskResponse,
     AssistantMessage, ContentBlock, Mode, ProviderMessage, StatusKind, StatusMessage, StopDetails,
@@ -54,10 +56,10 @@ pub use skill::{
     Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillResolver, SkillSource,
 };
 pub use tool::{
-    ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest, CapabilityTier, SoftToolRequirement,
-    ToolChoice, ToolChoiceDirective, ToolResult, ToolSpec,
+    ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest, CapabilityTier,
+    SoftToolRequirement, ToolChoice, ToolChoiceDirective, ToolResult, ToolSpec,
 };
+pub use workspace::Workspace;
 pub use write_effect::{
     DeferredDiagnosticsHandle, DiagnosticSeverity, WriteDiagnostic, WriteEffect, WriteOutcome,
 };
-pub use workspace::Workspace;

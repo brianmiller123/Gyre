@@ -139,7 +139,8 @@ impl StructuredMemoryStore {
     }
 
     fn bank_dir(&self, bank: &str) -> PathBuf {
-        self.root.join(if bank.is_empty() { DEFAULT_BANK } else { bank })
+        self.root
+            .join(if bank.is_empty() { DEFAULT_BANK } else { bank })
     }
 
     fn records_path(&self, bank: &str) -> PathBuf {
@@ -211,7 +212,8 @@ impl StructuredMemoryStore {
             .map(|record| {
                 let content_tokens = tokenize(&record.content);
                 let relevance = bm25_relevance(&query_tokens, &content_tokens);
-                let recency = 2f64.powf(-((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours));
+                let recency = 2f64
+                    .powf(-((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours));
                 let importance = f64::from(record.importance.min(5)) / 5.0;
                 let score = opts.fts_weight * relevance
                     + opts.importance_weight * importance
@@ -229,7 +231,11 @@ impl StructuredMemoryStore {
                     .then_with(|| b.record.ts.cmp(&a.record.ts))
             });
         } else {
-            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             hits.retain(|h| h.score > 0.0);
         }
         hits.truncate(opts.limit.max(1));
@@ -250,9 +256,19 @@ impl StructuredMemoryStore {
             .read_bank(bank)
             .into_iter()
             .filter(|r| r.valid_until.is_none_or(|v| v >= now))
-            .filter(|r| filter.source.as_ref().is_none_or(|s| r.source.starts_with(s)))
+            .filter(|r| {
+                filter
+                    .source
+                    .as_ref()
+                    .is_none_or(|s| r.source.starts_with(s))
+            })
             .filter(|r| filter.scope.as_ref().is_none_or(|s| &r.scope == s))
-            .filter(|r| filter.contains.as_ref().is_none_or(|c| r.content.contains(c)))
+            .filter(|r| {
+                filter
+                    .contains
+                    .as_ref()
+                    .is_none_or(|c| r.content.contains(c))
+            })
             .filter(|r| {
                 filter.tags.is_empty()
                     || filter.tags.iter().any(|t| r.tags.iter().any(|rt| rt == t))
@@ -281,7 +297,10 @@ impl StructuredMemoryStore {
         if remaining.len() == records.len() {
             return Ok(false);
         }
-        rewrite_records(&path, &remaining.iter().map(|r| (*r).clone()).collect::<Vec<_>>())?;
+        rewrite_records(
+            &path,
+            &remaining.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+        )?;
         Ok(true)
     }
 
@@ -300,7 +319,11 @@ impl StructuredMemoryStore {
                 last_ts = Some(last_ts.map_or(r.ts, |t| t.max(r.ts)));
             }
         }
-        MemoryStats { total, banks, last_ts }
+        MemoryStats {
+            total,
+            banks,
+            last_ts,
+        }
     }
 
     /// 把命中/记录渲染为 Markdown 列表（供 system prompt 注入）。
@@ -465,7 +488,11 @@ mod tests {
     use super::*;
 
     fn store() -> StructuredMemoryStore {
-        let d = std::env::temp_dir().join(format!("agent-mnemopi-{}-{:#x}", std::process::id(), nano()));
+        let d = std::env::temp_dir().join(format!(
+            "agent-mnemopi-{}-{:#x}",
+            std::process::id(),
+            nano()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         StructuredMemoryStore::with_root(d.join("mem"))
     }

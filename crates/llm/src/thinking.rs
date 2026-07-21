@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AssistantEvent, CompletionRequest, Effort, LlmProvider, Model, ProviderCallContext, ProviderMessage,
-    ThinkingClassifier, UserContent,
+    AssistantEvent, CompletionRequest, Effort, LlmProvider, Model, ProviderCallContext,
+    ProviderMessage, ThinkingClassifier, UserContent,
 };
 
 /// 分类器输出的最大 token（单词回答，移植 oh-my-pi `ANSWER_MAX_TOKENS`）。
@@ -51,7 +51,11 @@ impl LlmThinkingClassifier {
     ///
     /// `classifier_model` 应为廉价 tiny 模型（低成本、低延迟）；`ctx` 携带鉴权与 base URL。
     #[must_use]
-    pub fn new(provider: Arc<dyn LlmProvider>, classifier_model: Model, ctx: ProviderCallContext) -> Self {
+    pub fn new(
+        provider: Arc<dyn LlmProvider>,
+        classifier_model: Model,
+        ctx: ProviderCallContext,
+    ) -> Self {
         Self {
             provider,
             classifier_model,
@@ -68,7 +72,9 @@ impl ThinkingClassifier for LlmThinkingClassifier {
             model: self.classifier_model.clone(),
             system: vec![DIFFICULTY_SYSTEM_PROMPT.to_string()],
             messages: vec![ProviderMessage::User {
-                content: vec![UserContent::Text { text: prompt.to_string() }],
+                content: vec![UserContent::Text {
+                    text: prompt.to_string(),
+                }],
             }],
             tools: Vec::new(),
             tool_choice: None,
@@ -76,6 +82,7 @@ impl ThinkingClassifier for LlmThinkingClassifier {
             temperature: Some(0.0),
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let mut stream = self.provider.stream(req, &self.ctx).await.ok()?;
         // 仅取 MessageEnd 的权威完整文本（TextDelta 为增量，二者叠加会重复；分类只需最终单词）。
@@ -118,7 +125,9 @@ mod tests {
             let evs: Vec<AssistantEvent> = vec![
                 AssistantEvent::TextDelta(answer.to_string()),
                 AssistantEvent::MessageEnd(AssistantMessage {
-                    content: vec![agent_core::ContentBlock::Text { text: answer.to_string() }],
+                    content: vec![agent_core::ContentBlock::Text {
+                        text: answer.to_string(),
+                    }],
                     usage: Usage::default(),
                     model: "stub".into(),
                     stop_reason: Some(agent_core::StopReason::Stop),
@@ -154,7 +163,9 @@ mod tests {
     #[tokio::test]
     async fn classify_returns_none_on_unparsable_output() {
         let clf = LlmThinkingClassifier::new(
-            Arc::new(StubClassifierProvider { answer: "也许吧" }),
+            Arc::new(StubClassifierProvider {
+                answer: "也许吧"
+            }),
             tiny_model(),
             ProviderCallContext::default(),
         );

@@ -6,8 +6,9 @@
 use std::pin::Pin;
 
 use agent_core::{
-    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError, LlmProvider,
-    ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective, Usage, UserContent,
+    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError,
+    LlmProvider, ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective,
+    Usage, UserContent,
 };
 use async_stream::stream;
 use futures::StreamExt;
@@ -26,7 +27,11 @@ impl OpenAiCompletionsAdapter {
     }
 }
 
-const SUPPORTED: &[Api] = &[Api::OpenAiCompletions, Api::OllamaChat, Api::OpenAiResponses];
+const SUPPORTED: &[Api] = &[
+    Api::OpenAiCompletions,
+    Api::OllamaChat,
+    Api::OpenAiResponses,
+];
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompletionsAdapter {
@@ -116,7 +121,11 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
                 }
             }
             ProviderMessage::Assistant { content } => {
-                let text: String = content.iter().filter_map(|b| b.as_text()).collect::<Vec<_>>().join("");
+                let text: String = content
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("");
                 let tool_calls: Vec<serde_json::Value> = content
                     .iter()
                     .filter_map(|b| match b {
@@ -143,13 +152,19 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
                 messages.push(entry);
             }
             ProviderMessage::Tool {
-                tool_call_id, content, images, ..
+                tool_call_id,
+                content,
+                images,
+                ..
             } => {
                 // OpenAI tool role 仅支持文本；图像降级为占位提示（Anthropic 端可真实多模态）。
                 let final_content = if images.is_empty() {
                     content.clone()
                 } else {
-                    format!("{content}\n[附 {} 张图像，当前 provider 的 tool role 不支持工具结果多模态]", images.len())
+                    format!(
+                        "{content}\n[附 {} 张图像，当前 provider 的 tool role 不支持工具结果多模态]",
+                        images.len()
+                    )
                 };
                 messages.push(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": final_content }));
             }
@@ -219,7 +234,8 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any) | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any)
+        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -431,9 +447,14 @@ fn build_message(
         let arguments = if tc.args.is_empty() {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_str(&tc.args).unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
+            serde_json::from_str(&tc.args)
+                .unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
         };
-        content.push(ContentBlock::ToolCall { id, name, arguments });
+        content.push(ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        });
     }
     // P2-P：content_filter → StopReason::Error + sensitive 详情（移植 replay-policy.ts）。
     // replay 时 build_provider_context 据此过滤，避免 refusal 文本反复喂回模型。
@@ -464,19 +485,22 @@ mod tests {
     #[test]
     fn body_includes_system_and_user() {
         let req = CompletionRequest {
-            model: agent_core::Model::with_defaults("gpt-4o-mini", "openai", Api::OpenAiCompletions),
+            model: agent_core::Model::with_defaults(
+                "gpt-4o-mini",
+                "openai",
+                Api::OpenAiCompletions,
+            ),
             system: vec!["You are helpful.".into()],
-            messages: vec![
-                ProviderMessage::User {
-                    content: vec![agent_core::UserContent::Text { text: "hi".into() }],
-                },
-            ],
+            messages: vec![ProviderMessage::User {
+                content: vec![agent_core::UserContent::Text { text: "hi".into() }],
+            }],
             tools: vec![],
             tool_choice: None,
             max_tokens: 16,
             temperature: Some(0.0),
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         let messages = body["messages"].as_array().unwrap();
@@ -493,12 +517,17 @@ mod tests {
             model: agent_core::Model::with_defaults("m", "openai", Api::OpenAiCompletions),
             system: vec![],
             messages: vec![],
-            tools: vec![ToolSpec::new("read_file", "read", serde_json::json!({"type": "object"}))],
+            tools: vec![ToolSpec::new(
+                "read_file",
+                "read",
+                serde_json::json!({"type": "object"}),
+            )],
             tool_choice: Some(ToolChoiceDirective::Hard(ToolChoice::Auto)),
             max_tokens: 16,
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
@@ -511,9 +540,18 @@ mod tests {
         tc.id = Some("call_1".into());
         tc.name = Some("read_file".into());
         tc.args = r#"{"path":"a.rs"}"#.into();
-        let msg = build_message("m", "", &[tc], &Some("tool_calls".into()), &Usage::default());
+        let msg = build_message(
+            "m",
+            "",
+            &[tc],
+            &Some("tool_calls".into()),
+            &Usage::default(),
+        );
         let block = &msg.content[0];
-        let ContentBlock::ToolCall { name, arguments, .. } = block else {
+        let ContentBlock::ToolCall {
+            name, arguments, ..
+        } = block
+        else {
             panic!("应为 ToolCall");
         };
         assert_eq!(*name, "read_file");
@@ -538,6 +576,7 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         // extra_body 的键应出现在请求体顶层
@@ -559,6 +598,7 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         // 无 extra_body 时不引入意外字段

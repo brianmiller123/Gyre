@@ -89,6 +89,7 @@ impl LocalMemoryStore {
             temperature: Some(0.0),
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let mut stream = provider
             .stream(req, provider_ctx)
@@ -243,7 +244,8 @@ mod tests {
     }
 
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agent-mem-{}-{:#x}", std::process::id(), nano()));
+        let d =
+            std::env::temp_dir().join(format!("agent-mem-{}-{:#x}", std::process::id(), nano()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -278,7 +280,10 @@ mod tests {
         let root = tmp();
         let store = LocalMemoryStore::with_root(root.clone());
         store
-            .append_note(&MemoryNote { content: "x".into(), source: "s".into() })
+            .append_note(&MemoryNote {
+                content: "x".into(),
+                source: "s".into(),
+            })
             .await
             .unwrap();
         std::fs::write(store.summary_path(), "summary").unwrap();
@@ -292,7 +297,10 @@ mod tests {
 
     #[test]
     fn consolidation_prompt_formats() {
-        let notes = vec![MemoryNote { content: "事实 A".into(), source: "src".into() }];
+        let notes = vec![MemoryNote {
+            content: "事实 A".into(),
+            source: "src".into(),
+        }];
         let p = consolidation_prompt(&notes, "旧记忆");
         assert!(p.contains("旧记忆"));
         assert!(p.contains("事实 A"));

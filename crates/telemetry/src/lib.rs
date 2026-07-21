@@ -35,7 +35,9 @@ pub fn init(endpoint: Option<&str>) -> Result<TelemetryGuard, String> {
         // 任何非协议行（如 tracing 日志）会破坏握手（客户端报 Parse error）。
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
             .with_target(false)
             .try_init()
             .ok();
@@ -44,9 +46,7 @@ pub fn init(endpoint: Option<&str>) -> Result<TelemetryGuard, String> {
     Ok(TelemetryGuard { provider })
 }
 
-fn build_otlp_exporter(
-    endpoint: &str,
-) -> Result<opentelemetry_otlp::SpanExporter, String> {
+fn build_otlp_exporter(endpoint: &str) -> Result<opentelemetry_otlp::SpanExporter, String> {
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     SpanExporter::builder()
         .with_tonic()
@@ -56,7 +56,7 @@ fn build_otlp_exporter(
 }
 
 fn register_subscriber(tracer: opentelemetry_sdk::trace::Tracer) {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))

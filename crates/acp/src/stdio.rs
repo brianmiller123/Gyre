@@ -58,14 +58,22 @@ pub async fn run_stdio(state: SessionManager) -> Result<(), AcpError> {
         match dispatch_rpc(&state, &req).await {
             Ok(result) => {
                 if let Some(id) = id {
-                    let resp = JsonRpcResponse { jsonrpc: "2.0".into(), id: Some(id), result };
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: Some(id),
+                        result,
+                    };
                     write_line(&serde_json::to_string(&resp).unwrap_or_default());
                 }
                 // 通知（无 id）只处理副作用，不返回响应。
             }
             Err(err) => {
                 if let Some(id) = id {
-                    let resp = JsonRpcError { jsonrpc: "2.0".into(), id: Some(id), error: err };
+                    let resp = JsonRpcError {
+                        jsonrpc: "2.0".into(),
+                        id: Some(id),
+                        error: err,
+                    };
                     write_line(&serde_json::to_string(&resp).unwrap_or_default());
                 }
             }
@@ -102,11 +110,14 @@ async fn handle_prompt_turn<R>(
     let Some(sid) = session_id else {
         if let Some(id) = id {
             let err = crate::rpc::rpc_error(-32602, "缺少必填参数 sessionId");
-            write_line(&serde_json::to_string(&JsonRpcError {
-                jsonrpc: "2.0".into(),
-                id: Some(id),
-                error: err,
-            }).unwrap_or_default());
+            write_line(
+                &serde_json::to_string(&JsonRpcError {
+                    jsonrpc: "2.0".into(),
+                    id: Some(id),
+                    error: err,
+                })
+                .unwrap_or_default(),
+            );
         }
         return;
     };
@@ -139,7 +150,11 @@ async fn handle_prompt_turn<R>(
         }
         Err(err) => {
             if let Some(id) = id {
-                let resp = JsonRpcError { jsonrpc: "2.0".into(), id: Some(id), error: err };
+                let resp = JsonRpcError {
+                    jsonrpc: "2.0".into(),
+                    id: Some(id),
+                    error: err,
+                };
                 write_line(&serde_json::to_string(&resp).unwrap_or_default());
             }
         }

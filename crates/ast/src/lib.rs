@@ -11,9 +11,7 @@ mod pattern;
 pub mod summary;
 
 pub use pattern::{AstMatch, AstMatchStrictness, rewrite, rewrite_rust, search, search_rust};
-pub use summary::{
-    summarize_code, SegmentKind, SummaryOptions, SummaryResult, SummarySegment,
-};
+pub use summary::{SegmentKind, SummaryOptions, SummaryResult, SummarySegment, summarize_code};
 
 use std::collections::BTreeSet;
 
@@ -237,7 +235,11 @@ fn normalize_ranges(ranges: &[LineRange]) -> Vec<LineRange> {
         .copied()
         .filter(|r| r.start_line > 0 && r.end_line >= r.start_line)
         .collect();
-    v.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.end_line.cmp(&b.end_line)));
+    v.sort_by(|a, b| {
+        a.start_line
+            .cmp(&b.start_line)
+            .then(a.end_line.cmp(&b.end_line))
+    });
     let mut merged: Vec<LineRange> = Vec::with_capacity(v.len());
     for range in v {
         if let Some(last) = merged.last_mut() {
@@ -373,21 +375,25 @@ mod tests {
     #[test]
     fn enclosing_empty_when_no_ranges_or_empty_code() {
         let none: [LineRange; 0] = [];
-        assert!(enclosing_block_boundaries("fn x() {\n}\n", SupportLang::Rust, &none)
+        assert!(
+            enclosing_block_boundaries("fn x() {\n}\n", SupportLang::Rust, &none)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            enclosing_block_boundaries(
+                "",
+                SupportLang::Rust,
+                &[LineRange {
+                    start_line: 1,
+                    end_line: 3,
+                }]
+            )
             .unwrap()
             .unwrap()
-            .is_empty());
-        assert!(enclosing_block_boundaries(
-            "",
-            SupportLang::Rust,
-            &[LineRange {
-                start_line: 1,
-                end_line: 3,
-            }]
-        )
-        .unwrap()
-        .unwrap()
-        .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]

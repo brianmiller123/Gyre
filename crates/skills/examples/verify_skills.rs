@@ -8,7 +8,10 @@ use agent_skills::SkillRegistry;
 async fn main() {
     let cwd = std::env::current_dir().expect("无法获取 cwd");
     let opts = SkillLoadOptions::default();
-    let cat = SkillRegistry::native(cwd.clone()).load(&opts).await.expect("加载失败");
+    let cat = SkillRegistry::native(cwd.clone())
+        .load(&opts)
+        .await
+        .expect("加载失败");
 
     println!("cwd: {}", cwd.display());
     if cat.is_empty() {

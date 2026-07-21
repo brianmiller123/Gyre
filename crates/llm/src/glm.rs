@@ -18,8 +18,9 @@
 use std::pin::Pin;
 
 use agent_core::{
-    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError, LlmProvider,
-    ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective, Usage, UserContent,
+    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError,
+    LlmProvider, ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective,
+    Usage, UserContent,
 };
 use async_stream::stream;
 use futures::StreamExt;
@@ -143,7 +144,8 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
     if thinking_model {
         if let Some(thinking) = &req.thinking {
             body["thinking"] = serde_json::json!({ "type": "enabled" });
-            body["reasoning_effort"] = serde_json::json!(normalize_glm_reasoning_effort(thinking.budget_tokens));
+            body["reasoning_effort"] =
+                serde_json::json!(normalize_glm_reasoning_effort(thinking.budget_tokens));
         } else {
             body["thinking"] = serde_json::json!({ "type": "disabled" });
         }
@@ -153,14 +155,16 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
         let tools: Vec<serde_json::Value> = req
             .tools
             .iter()
-            .map(|t| serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": crate::transform::normalize_tool_schema(&t.schema)
-                }
-            }))
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": crate::transform::normalize_tool_schema(&t.schema)
+                    }
+                })
+            })
             .collect();
         body["tools"] = serde_json::Value::Array(tools);
         if let Some(tc) = &req.tool_choice {
@@ -179,7 +183,8 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any) | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any)
+        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -218,7 +223,9 @@ pub fn convert_to_zai_format(
                 out.push(serde_json::json!({ "role": "system", "content": s }));
             }
             ProviderMessage::User { content } => {
-                let has_image = content.iter().any(|c| matches!(c, UserContent::Image { .. }));
+                let has_image = content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::Image { .. }));
                 if has_image {
                     let parts: Vec<serde_json::Value> = content
                         .iter()
@@ -255,7 +262,11 @@ pub fn convert_to_zai_format(
                 }
             }
             ProviderMessage::Assistant { content } => {
-                let text: String = content.iter().filter_map(|b| b.as_text()).collect::<Vec<_>>().join("");
+                let text: String = content
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("");
                 // reasoning_content：聚合 Thinking 块（preserveReasoning 回传）。
                 let reasoning: String = content
                     .iter()
@@ -295,7 +306,9 @@ pub fn convert_to_zai_format(
                 out.push(entry);
             }
             ProviderMessage::Tool {
-                tool_call_id, content, ..
+                tool_call_id,
+                content,
+                ..
             } => {
                 out.push(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content }));
             }
@@ -560,7 +573,9 @@ fn build_glm_message(
         });
     }
     if !text_buf.is_empty() {
-        content.push(ContentBlock::Text { text: text_buf.to_string() });
+        content.push(ContentBlock::Text {
+            text: text_buf.to_string(),
+        });
     }
     for (i, tc) in tool_calls.iter().enumerate() {
         let id = tc.id.clone().unwrap_or_else(|| format!("call_{i}"));
@@ -568,9 +583,14 @@ fn build_glm_message(
         let arguments = if tc.args.is_empty() {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_str(&tc.args).unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
+            serde_json::from_str(&tc.args)
+                .unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
         };
-        content.push(ContentBlock::ToolCall { id, name, arguments });
+        content.push(ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        });
     }
     // P2-P：content_filter → Error + sensitive（GLM/Z.ai OpenAI 兼容，含 content_filter）。
     let (stop_reason, stop_details) = match finish.as_deref() {
@@ -610,12 +630,17 @@ fn map_transport_error(e: reqwest::Error, provider: &str) -> LlmError {
 fn map_glm_error(status: u16, body: &str) -> LlmError {
     match status {
         401 | 403 => LlmError::Auth(format!("GLM 鉴权失败（{status}）: {body}")),
-        429 => LlmError::RateLimit { retry_after_ms: 5000 },
+        429 => LlmError::RateLimit {
+            retry_after_ms: 5000,
+        },
         s if (500..600).contains(&s) => LlmError::Http {
             status,
             body: format!("GLM 服务端错误: {body}"),
         },
-        _ => LlmError::Http { status, body: body.to_string() },
+        _ => LlmError::Http {
+            status,
+            body: body.to_string(),
+        },
     }
 }
 
@@ -654,13 +679,19 @@ mod tests {
     #[test]
     fn extract_reasoning_prefers_reasoning_content() {
         let delta = serde_json::json!({"reasoning_content":"thinking...","reasoning":"fallback"});
-        assert_eq!(extract_reasoning_from_delta(&delta), Some("thinking...".into()));
+        assert_eq!(
+            extract_reasoning_from_delta(&delta),
+            Some("thinking...".into())
+        );
     }
 
     #[test]
     fn extract_reasoning_falls_back_to_reasoning() {
         let delta = serde_json::json!({"reasoning":"fallback"});
-        assert_eq!(extract_reasoning_from_delta(&delta), Some("fallback".into()));
+        assert_eq!(
+            extract_reasoning_from_delta(&delta),
+            Some("fallback".into())
+        );
     }
 
     #[test]
@@ -681,6 +712,7 @@ mod tests {
             temperature: Some(0.6),
             thinking: Some(ThinkingConfig::new(1000)),
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -702,6 +734,7 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         // GLM 思考模型默认开启思考，禁用时须显式 disabled 且不发 reasoning_effort。
@@ -721,6 +754,7 @@ mod tests {
             temperature: None,
             thinking: Some(ThinkingConfig::new(40_000)),
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -739,6 +773,7 @@ mod tests {
             temperature: None,
             thinking: Some(ThinkingConfig::new(1000)),
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         // 非思考模型不识别 thinking 字段。
@@ -750,8 +785,13 @@ mod tests {
     fn zai_format_serializes_reasoning_content() {
         let messages = vec![ProviderMessage::Assistant {
             content: vec![
-                ContentBlock::Thinking { text: "先分析需求".into(), signature: None },
-                ContentBlock::Text { text: "我来实现".into() },
+                ContentBlock::Thinking {
+                    text: "先分析需求".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "我来实现".into(),
+                },
                 ContentBlock::ToolCall {
                     id: "call_1".into(),
                     name: "read_file".into(),
@@ -786,7 +826,9 @@ mod tests {
                 images: vec![],
             },
             ProviderMessage::User {
-                content: vec![UserContent::Text { text: "environment_details".into() }],
+                content: vec![UserContent::Text {
+                    text: "environment_details".into(),
+                }],
             },
         ];
         let out = convert_to_zai_format(&[], &messages, true);
@@ -810,7 +852,9 @@ mod tests {
                 images: vec![],
             },
             ProviderMessage::User {
-                content: vec![UserContent::Text { text: "note".into() }],
+                content: vec![UserContent::Text {
+                    text: "note".into(),
+                }],
             },
         ];
         let out = convert_to_zai_format(&[], &messages, false);
@@ -845,7 +889,10 @@ mod tests {
     #[test]
     fn glm_error_mapping() {
         assert!(matches!(map_glm_error(401, "bad key"), LlmError::Auth(_)));
-        assert!(matches!(map_glm_error(429, "slow down"), LlmError::RateLimit { .. }));
+        assert!(matches!(
+            map_glm_error(429, "slow down"),
+            LlmError::RateLimit { .. }
+        ));
         match map_glm_error(500, "server") {
             LlmError::Http { status, .. } => assert_eq!(status, 500),
             _ => panic!("应为 Http"),

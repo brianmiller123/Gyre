@@ -13,7 +13,10 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json, Response, sse::{Event, KeepAlive, Sse}},
+    response::{
+        IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -56,9 +59,21 @@ async fn handle_rpc(
     match dispatch_rpc(&state, &req).await {
         Ok(result) => id.map_or_else(
             || StatusCode::ACCEPTED.into_response(),
-            |id| Json(JsonRpcResponse { jsonrpc: "2.0".into(), id: Some(id), result }).into_response(),
+            |id| {
+                Json(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: Some(id),
+                    result,
+                })
+                .into_response()
+            },
         ),
-        Err(err) => Json(JsonRpcError { jsonrpc: "2.0".into(), id, error: err }).into_response(),
+        Err(err) => Json(JsonRpcError {
+            jsonrpc: "2.0".into(),
+            id,
+            error: err,
+        })
+        .into_response(),
     }
 }
 
@@ -103,26 +118,28 @@ async fn handle_http_prompt(
     let mut rx = match rx_result {
         Ok(rx) => rx,
         Err(err) => {
-            return Json(JsonRpcError { jsonrpc: "2.0".into(), id, error: err }).into_response();
+            return Json(JsonRpcError {
+                jsonrpc: "2.0".into(),
+                id,
+                error: err,
+            })
+            .into_response();
         }
     };
 
     let stop_reason;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(600),
-        async {
-            loop {
-                match rx.recv().await {
-                    Ok(frame) if is_terminal_frame(&frame) => {
-                        return crate::rpc::stop_reason(&frame);
-                    }
-                    Ok(_) => {}
-                    Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => return "end_turn",
+    let result = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        loop {
+            match rx.recv().await {
+                Ok(frame) if is_terminal_frame(&frame) => {
+                    return crate::rpc::stop_reason(&frame);
                 }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return "end_turn",
             }
-        },
-    )
+        }
+    })
     .await;
     match result {
         Ok(reason) => stop_reason = reason,
@@ -182,7 +199,9 @@ async fn handle_sse(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// 从 `Authorization: Bearer <token>` 头提取 token。

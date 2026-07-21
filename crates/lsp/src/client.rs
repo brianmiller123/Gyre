@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 诊断严重级别。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DiagnosticSeverity { Error, Warning, Information, Hint }
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
 
 /// 单个诊断。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,13 +169,19 @@ impl LspClient {
         });
 
         let id = client.next_id();
-        let response = client.transport.request(id, "initialize", init_params, DEFAULT_TIMEOUT)
-            .await.map_err(LspError::Transport)?;
+        let response = client
+            .transport
+            .request(id, "initialize", init_params, DEFAULT_TIMEOUT)
+            .await
+            .map_err(LspError::Transport)?;
 
         client.server_info = response;
 
-        client.transport.notify("initialized", serde_json::json!({}))
-            .await.map_err(LspError::Transport)?;
+        client
+            .transport
+            .notify("initialized", serde_json::json!({}))
+            .await
+            .map_err(LspError::Transport)?;
 
         info!(server = %server.name, "LSP 服务器已初始化");
         Ok(client)
@@ -178,7 +189,12 @@ impl LspClient {
 
     // ── 文档生命周期 ─────────────────────────────────────────────────
 
-    pub async fn open_document(&mut self, uri: &Url, text: &str, language_id: &str) -> Result<(), LspError> {
+    pub async fn open_document(
+        &mut self,
+        uri: &Url,
+        text: &str,
+        language_id: &str,
+    ) -> Result<(), LspError> {
         let params = serde_json::json!({
             "textDocument": {
                 "uri": uri.to_string(),
@@ -219,7 +235,12 @@ impl LspClient {
 
     pub async fn diagnostics(&mut self, uri: &Url) -> Vec<LspDiagnostic> {
         self.collect_notifications().await;
-        self.diagnostics.lock().await.get(&uri.to_string()).cloned().unwrap_or_default()
+        self.diagnostics
+            .lock()
+            .await
+            .get(&uri.to_string())
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
@@ -228,38 +249,59 @@ impl LspClient {
 
     // ── 跳转定义 ─────────────────────────────────────────────────────
 
-    pub async fn goto_definition(&self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspLocation>, LspError> {
+    pub async fn goto_definition(
+        &self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>, LspError> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri.to_string() },
             "position": { "line": line, "character": character }
         });
         let response = self.request("textDocument/definition", params).await?;
-        if response.is_null() { return Ok(vec![]); }
+        if response.is_null() {
+            return Ok(vec![]);
+        }
         Ok(parse_locations(&response))
     }
 
     // ── 查找引用 ─────────────────────────────────────────────────────
 
-    pub async fn find_references(&self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspLocation>, LspError> {
+    pub async fn find_references(
+        &self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>, LspError> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri.to_string() },
             "position": { "line": line, "character": character },
             "context": { "includeDeclaration": true }
         });
         let response = self.request("textDocument/references", params).await?;
-        if response.is_null() { return Ok(vec![]); }
+        if response.is_null() {
+            return Ok(vec![]);
+        }
         Ok(parse_locations(&response))
     }
 
     // ── 悬停信息 ─────────────────────────────────────────────────────
 
-    pub async fn hover(&self, uri: &Url, line: u32, character: u32) -> Result<Option<LspHover>, LspError> {
+    pub async fn hover(
+        &self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<LspHover>, LspError> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri.to_string() },
             "position": { "line": line, "character": character }
         });
         let response = self.request("textDocument/hover", params).await?;
-        if response.is_null() { return Ok(None); }
+        if response.is_null() {
+            return Ok(None);
+        }
         Ok(Some(parse_hover(&response)))
     }
 
@@ -268,7 +310,9 @@ impl LspClient {
     pub async fn document_symbols(&self, uri: &Url) -> Result<Vec<LspSymbol>, LspError> {
         let params = serde_json::json!({ "textDocument": { "uri": uri.to_string() } });
         let response = self.request("textDocument/documentSymbol", params).await?;
-        if response.is_null() { return Ok(vec![]); }
+        if response.is_null() {
+            return Ok(vec![]);
+        }
         Ok(parse_symbols(&response, uri))
     }
 
@@ -277,13 +321,21 @@ impl LspClient {
     pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<LspSymbol>, LspError> {
         let params = serde_json::json!({ "query": query });
         let response = self.request("workspace/symbol", params).await?;
-        if response.is_null() { return Ok(vec![]); }
+        if response.is_null() {
+            return Ok(vec![]);
+        }
         Ok(parse_symbols(&response, &Url::parse("file:///").unwrap()))
     }
 
     // ── 重命名 ────────────────────────────────────────────────────────
 
-    pub async fn rename(&self, uri: &Url, line: u32, character: u32, new_name: &str) -> Result<Vec<LspRenameEdit>, LspError> {
+    pub async fn rename(
+        &self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Vec<LspRenameEdit>, LspError> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri.to_string() },
             "position": { "line": line, "character": character },
@@ -295,7 +347,12 @@ impl LspClient {
 
     // ── 代码操作 ─────────────────────────────────────────────────────
 
-    pub async fn code_actions(&self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspCodeAction>, LspError> {
+    pub async fn code_actions(
+        &self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspCodeAction>, LspError> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri.to_string() },
             "range": {
@@ -305,7 +362,9 @@ impl LspClient {
             "context": { "diagnostics": [] }
         });
         let response = self.request("textDocument/codeAction", params).await?;
-        if response.is_null() { return Ok(vec![]); }
+        if response.is_null() {
+            return Ok(vec![]);
+        }
         Ok(parse_code_actions(&response))
     }
 
@@ -356,23 +415,41 @@ impl LspClient {
 
     // ── 公共访问器 ────────────────────────────────────────────────────
 
-    #[must_use] pub fn root(&self) -> &Path { &self.root }
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     pub async fn shutdown(self) -> Result<(), LspError> {
-        self.transport.shutdown(Duration::from_secs(10)).await.map_err(LspError::Transport)
+        self.transport
+            .shutdown(Duration::from_secs(10))
+            .await
+            .map_err(LspError::Transport)
     }
 
     // ── 内部方法 ──────────────────────────────────────────────────────
 
-    fn next_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
 
-    async fn request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, LspError> {
+    async fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, LspError> {
         let id = self.next_id();
-        self.transport.request(id, method, params, DEFAULT_TIMEOUT).await.map_err(LspError::Transport)
+        self.transport
+            .request(id, method, params, DEFAULT_TIMEOUT)
+            .await
+            .map_err(LspError::Transport)
     }
 
     async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), LspError> {
-        self.transport.notify(method, params).await.map_err(LspError::Transport)
+        self.transport
+            .notify(method, params)
+            .await
+            .map_err(LspError::Transport)
     }
 
     async fn collect_notifications(&mut self) {
@@ -395,7 +472,8 @@ fn try_parse_diagnostics(payload: &str) -> Option<(String, Vec<LspDiagnostic>)> 
     }
     let params = v.get("params")?;
     let uri = params.get("uri")?.as_str()?.to_string();
-    let diags: Vec<LspDiagnostic> = params.get("diagnostics")?
+    let diags: Vec<LspDiagnostic> = params
+        .get("diagnostics")?
         .as_array()?
         .iter()
         .map(|d| LspDiagnostic {
@@ -406,14 +484,32 @@ fn try_parse_diagnostics(payload: &str) -> Option<(String, Vec<LspDiagnostic>)> 
                 4 => DiagnosticSeverity::Hint,
                 _ => DiagnosticSeverity::Information,
             }),
-            message: d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-            line: d.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-            character: d.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+            message: d
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string(),
+            line: d
+                .get("range")
+                .and_then(|r| r.get("start"))
+                .and_then(|s| s.get("line"))
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as u32,
+            character: d
+                .get("range")
+                .and_then(|r| r.get("start"))
+                .and_then(|s| s.get("character"))
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0) as u32,
             source: d.get("source").and_then(|s| s.as_str()).map(String::from),
             code: d.get("code").and_then(|c| {
-                if let Some(s) = c.as_str() { Some(s.to_string()) }
-                else if let Some(n) = c.as_i64() { Some(n.to_string()) }
-                else { None }
+                if let Some(s) = c.as_str() {
+                    Some(s.to_string())
+                } else if let Some(n) = c.as_i64() {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
             }),
         })
         .collect();
@@ -430,7 +526,10 @@ fn parse_locations(v: &serde_json::Value) -> Vec<LspLocation> {
 
 fn parse_single_location(v: &serde_json::Value) -> Option<LspLocation> {
     // 可能是 Location 或 LocationLink
-    let uri = v.get("uri").or_else(|| v.get("targetUri")).and_then(|u| u.as_str())?;
+    let uri = v
+        .get("uri")
+        .or_else(|| v.get("targetUri"))
+        .and_then(|u| u.as_str())?;
     let range = v.get("range").or_else(|| v.get("targetSelectionRange"))?;
     let start = range.get("start")?;
     Some(LspLocation {
@@ -453,10 +552,15 @@ fn parse_text_edits(v: &serde_json::Value) -> Vec<LspTextEdit> {
             let end = range.get("end")?;
             Some(LspTextEdit {
                 start_line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                start_character: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                start_character: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0)
+                    as u32,
                 end_line: end.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
                 end_character: end.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                new_text: e.get("newText").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                new_text: e
+                    .get("newText")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             })
         })
         .collect()
@@ -518,25 +622,45 @@ pub fn apply_text_edits(text: &str, edits: &[LspTextEdit]) -> String {
 }
 
 fn parse_hover(v: &serde_json::Value) -> LspHover {
-    let contents = v.get("contents").map(|c| {
-        match c {
+    let contents = v
+        .get("contents")
+        .map(|c| match c {
             serde_json::Value::String(s) => vec![s.clone()],
-            serde_json::Value::Array(arr) => arr.iter().filter_map(|e| {
-                if let Some(s) = e.as_str() { Some(s.to_string()) }
-                else { e.get("value").and_then(|v| v.as_str()).map(String::from) }
-            }).collect(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| {
+                    if let Some(s) = e.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        e.get("value").and_then(|v| v.as_str()).map(String::from)
+                    }
+                })
+                .collect(),
             serde_json::Value::Object(obj) => {
-                vec![obj.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string()]
+                vec![
+                    obj.get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ]
             }
             _ => vec![],
-        }
-    }).unwrap_or_default();
+        })
+        .unwrap_or_default();
 
     let range = v.get("range");
     LspHover {
         contents,
-        line: range.and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|l| l.as_u64()).map(|n| n as u32),
-        character: range.and_then(|r| r.get("start")).and_then(|s| s.get("character")).and_then(|c| c.as_u64()).map(|n| n as u32),
+        line: range
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("line"))
+            .and_then(|l| l.as_u64())
+            .map(|n| n as u32),
+        character: range
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("character"))
+            .and_then(|c| c.as_u64())
+            .map(|n| n as u32),
     }
 }
 
@@ -553,12 +677,28 @@ fn parse_symbols(v: &serde_json::Value, file_uri: &Url) -> Vec<LspSymbol> {
                     let uri = loc.get("uri").and_then(|u| u.as_str()).unwrap_or("");
                     let start = loc.get("range").and_then(|r| r.get("start"));
                     result.push(LspSymbol {
-                        name: elem.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                        kind: format!("{:?}", elem.get("kind").and_then(|k| k.as_u64()).unwrap_or(0)),
+                        name: elem
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        kind: format!(
+                            "{:?}",
+                            elem.get("kind").and_then(|k| k.as_u64()).unwrap_or(0)
+                        ),
                         uri: uri.to_string(),
-                        line: start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                        character: start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                        container: elem.get("containerName").and_then(|c| c.as_str()).map(String::from),
+                        line: start
+                            .and_then(|s| s.get("line"))
+                            .and_then(|l| l.as_u64())
+                            .unwrap_or(0) as u32,
+                        character: start
+                            .and_then(|s| s.get("character"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0) as u32,
+                        container: elem
+                            .get("containerName")
+                            .and_then(|c| c.as_str())
+                            .map(String::from),
                     });
                 }
             }
@@ -567,7 +707,12 @@ fn parse_symbols(v: &serde_json::Value, file_uri: &Url) -> Vec<LspSymbol> {
     result
 }
 
-fn flatten_symbol(v: &serde_json::Value, file_uri: &Url, container: Option<String>, result: &mut Vec<LspSymbol>) {
+fn flatten_symbol(
+    v: &serde_json::Value,
+    file_uri: &Url,
+    container: Option<String>,
+    result: &mut Vec<LspSymbol>,
+) {
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let kind = format!("{:?}", v.get("kind").and_then(|k| k.as_u64()).unwrap_or(0));
     let start = v.get("selectionRange").and_then(|r| r.get("start"));
@@ -575,8 +720,14 @@ fn flatten_symbol(v: &serde_json::Value, file_uri: &Url, container: Option<Strin
         name: name.to_string(),
         kind,
         uri: file_uri.to_string(),
-        line: start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-        character: start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+        line: start
+            .and_then(|s| s.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0) as u32,
+        character: start
+            .and_then(|s| s.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as u32,
         container: container.clone(),
     });
     if let Some(children) = v.get("children").and_then(|c| c.as_array()) {
@@ -595,9 +746,19 @@ fn parse_workspace_edit(v: &serde_json::Value) -> Vec<LspRenameEdit> {
                     let start = edit.get("range").and_then(|r| r.get("start"));
                     edits.push(LspRenameEdit {
                         uri: uri.clone(),
-                        line: start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                        character: start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                        new_text: edit.get("newText").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                        line: start
+                            .and_then(|s| s.get("line"))
+                            .and_then(|l| l.as_u64())
+                            .unwrap_or(0) as u32,
+                        character: start
+                            .and_then(|s| s.get("character"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0) as u32,
+                        new_text: edit
+                            .get("newText")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         old_text: String::new(),
                     });
                 }
@@ -612,43 +773,74 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
         Some(a) => a,
         None => return vec![],
     };
-    arr.iter().filter_map(|action| {
-        let title = action.get("title").and_then(|t| t.as_str())?.to_string();
-        let kind = action.get("kind").and_then(|k| k.as_str()).map(String::from);
-        let is_preferred = action.get("isPreferred").and_then(|b| b.as_bool()).unwrap_or(false);
-        let mut edits = Vec::new();
-        if let Some(edit) = action.get("edit") {
-            if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
-                for (uri, text_edits) in changes {
-                    if let Some(arr) = text_edits.as_array() {
-                        for e in arr {
-                            let start = e.get("range").and_then(|r| r.get("start"));
-                            edits.push(LspRenameEdit {
-                                uri: uri.clone(),
-                                line: start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                                character: start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                                new_text: e.get("newText").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-                                old_text: String::new(),
-                            });
+    arr.iter()
+        .filter_map(|action| {
+            let title = action.get("title").and_then(|t| t.as_str())?.to_string();
+            let kind = action
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .map(String::from);
+            let is_preferred = action
+                .get("isPreferred")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let mut edits = Vec::new();
+            if let Some(edit) = action.get("edit") {
+                if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
+                    for (uri, text_edits) in changes {
+                        if let Some(arr) = text_edits.as_array() {
+                            for e in arr {
+                                let start = e.get("range").and_then(|r| r.get("start"));
+                                edits.push(LspRenameEdit {
+                                    uri: uri.clone(),
+                                    line: start
+                                        .and_then(|s| s.get("line"))
+                                        .and_then(|l| l.as_u64())
+                                        .unwrap_or(0)
+                                        as u32,
+                                    character: start
+                                        .and_then(|s| s.get("character"))
+                                        .and_then(|c| c.as_u64())
+                                        .unwrap_or(0)
+                                        as u32,
+                                    new_text: e
+                                        .get("newText")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    old_text: String::new(),
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
-        Some(LspCodeAction { title, kind, is_preferred, edits })
-    }).collect()
+            Some(LspCodeAction {
+                title,
+                kind,
+                is_preferred,
+                edits,
+            })
+        })
+        .collect()
 }
 
 // ── 错误类型 ───────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
-    #[error("传输错误: {0}")] Transport(#[from] TransportError),
-    #[error("序列化失败: {0}")] Serialize(String),
-    #[error("反序列化失败: {0}")] Deserialize(String),
-    #[error("无效 URI: {0}")] InvalidUri(String),
-    #[error("文档未打开: {0}")] DocumentNotOpen(String),
-    #[error("服务器不支持: {0}")] Unsupported(String),
+    #[error("传输错误: {0}")]
+    Transport(#[from] TransportError),
+    #[error("序列化失败: {0}")]
+    Serialize(String),
+    #[error("反序列化失败: {0}")]
+    Deserialize(String),
+    #[error("无效 URI: {0}")]
+    InvalidUri(String),
+    #[error("文档未打开: {0}")]
+    DocumentNotOpen(String),
+    #[error("服务器不支持: {0}")]
+    Unsupported(String),
 }
 
 #[cfg(test)]
@@ -732,7 +924,7 @@ mod tests {
     #[ignore = "需 rust-analyzer: cargo test -p agent-lsp -- --ignored format_end_to_end"]
     #[tokio::test]
     async fn format_end_to_end() {
-        use crate::{detect_servers, LspManager};
+        use crate::{LspManager, detect_servers};
         let root = std::env::current_dir().expect("cwd");
         let servers = detect_servers(&root);
         if servers.is_empty() {

@@ -147,7 +147,9 @@ fn parse_inline_array(value: &str) -> Vec<String> {
 fn unquote(s: &str) -> String {
     let s = s.trim();
     let n = s.len();
-    if n >= 2 && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\''))) {
+    if n >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         s[1..n - 1].to_string()
     } else {
         s.to_string()
@@ -212,14 +214,20 @@ mod tests {
     fn parses_quoted_description_with_colon() {
         let content = "---\ndescription: \"Has: colon\"\n---\nbody";
         let parsed = parse_skill_file(content);
-        assert_eq!(parsed.frontmatter.description.as_deref(), Some("Has: colon"));
+        assert_eq!(
+            parsed.frontmatter.description.as_deref(),
+            Some("Has: colon")
+        );
     }
 
     #[test]
     fn parses_inline_modes_array() {
         let content = "---\nmodes: [code, debug]\n---\nbody";
         let parsed = parse_skill_file(content);
-        assert_eq!(parsed.frontmatter.modes, Some(vec![Mode::Code, Mode::Debug]));
+        assert_eq!(
+            parsed.frontmatter.modes,
+            Some(vec![Mode::Code, Mode::Debug])
+        );
     }
 
     #[test]
@@ -235,8 +243,16 @@ mod tests {
     #[test]
     fn hide_and_disable_model_invocation() {
         assert!(parse_skill_file("---\nhide: true\n---\nx").frontmatter.hide);
-        assert!(parse_skill_file("---\ndisable-model-invocation: true\n---\nx").frontmatter.hide);
-        assert!(!parse_skill_file("---\nhide: false\n---\nx").frontmatter.hide);
+        assert!(
+            parse_skill_file("---\ndisable-model-invocation: true\n---\nx")
+                .frontmatter
+                .hide
+        );
+        assert!(
+            !parse_skill_file("---\nhide: false\n---\nx")
+                .frontmatter
+                .hide
+        );
     }
 
     #[test]

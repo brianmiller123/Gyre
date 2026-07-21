@@ -67,8 +67,10 @@ impl Config {
             if !path.exists() {
                 continue;
             }
-            let text = std::fs::read_to_string(path)
-                .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
+            let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
             let value: toml::Value = toml::from_str(&text)
                 .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
             match &mut merged {
@@ -83,7 +85,9 @@ impl Config {
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(ConfigError::Invalid(format!("未找到配置文件（已查找: {searched}）")));
+            return Err(ConfigError::Invalid(format!(
+                "未找到配置文件（已查找: {searched}）"
+            )));
         };
 
         // round-trip 通过字符串完成 toml::Value → Config（加载时一次性，开销可忽略）。
@@ -112,9 +116,7 @@ impl Config {
         }
         for m in std::iter::once(&self.default_model).chain(&self.models) {
             if matches!(m.max_input_tokens, Some(0)) {
-                return Err(ConfigError::Invalid(
-                    "max_input_tokens 必须 > 0".into(),
-                ));
+                return Err(ConfigError::Invalid("max_input_tokens 必须 > 0".into()));
             }
         }
         Ok(())
@@ -130,7 +132,8 @@ impl Config {
                 .models
                 .iter()
                 .find(|m| m.alias.as_deref() == Some(alias) || m.id == alias)
-                .or(Some(&self.default_model).filter(|m| m.alias.as_deref() == Some(alias) || m.id == alias))
+                .or(Some(&self.default_model)
+                    .filter(|m| m.alias.as_deref() == Some(alias) || m.id == alias))
                 .ok_or_else(|| ConfigError::ModelNotFound(alias.into()));
         }
         Ok(&self.default_model)
@@ -449,7 +452,11 @@ impl SkillsConfig {
     pub fn to_load_options(&self) -> agent_core::SkillLoadOptions {
         agent_core::SkillLoadOptions {
             enabled: self.enabled,
-            custom_directories: self.custom_directories.iter().map(|s| expand_tilde_path(s)).collect(),
+            custom_directories: self
+                .custom_directories
+                .iter()
+                .map(|s| expand_tilde_path(s))
+                .collect(),
             ignored: self.ignored.clone(),
             included: self.included.clone(),
         }
@@ -586,7 +593,10 @@ fn split_command_frontmatter(content: &str) -> (String, String) {
             idx += 1;
         }
         if idx < lines.len() {
-            let body = lines[idx + 1..].join("\n").trim_start_matches('\n').to_string();
+            let body = lines[idx + 1..]
+                .join("\n")
+                .trim_start_matches('\n')
+                .to_string();
             return (desc, body);
         }
     }
@@ -737,7 +747,10 @@ pub struct AcpConfig {
 
 impl Default for AcpConfig {
     fn default() -> Self {
-        Self { enabled: false, transport: default_acp_transport() }
+        Self {
+            enabled: false,
+            transport: default_acp_transport(),
+        }
     }
 }
 
@@ -758,9 +771,14 @@ mod tests {
 
     #[test]
     fn discovers_project_agents_md() {
-        let root = std::env::temp_dir().join(format!("agent-cf-{}-{:#x}", std::process::id(), nano()));
+        let root =
+            std::env::temp_dir().join(format!("agent-cf-{}-{:#x}", std::process::id(), nano()));
         std::fs::create_dir_all(root.join(".agent")).unwrap();
-        std::fs::write(root.join(".agent").join("AGENTS.md"), "use rust 2024 edition").unwrap();
+        std::fs::write(
+            root.join(".agent").join("AGENTS.md"),
+            "use rust 2024 edition",
+        )
+        .unwrap();
         let files = discover_context_files(&root);
         assert!(
             files.iter().any(|f| f.contains("use rust 2024 edition")),
@@ -772,24 +790,36 @@ mod tests {
     #[test]
     fn missing_agents_md_yields_only_user_level_at_most() {
         // 无 AGENTS.md 的目录：项目级贡献为空（用户级可能存在，不阻断）
-        let root = std::env::temp_dir().join(format!("agent-cf-empty-{}-{:#x}", std::process::id(), nano()));
+        let root = std::env::temp_dir().join(format!(
+            "agent-cf-empty-{}-{:#x}",
+            std::process::id(),
+            nano()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let files = discover_context_files(&root);
         let project_files: Vec<_> = files.iter().filter(|f| f.contains(".agent")).collect();
-        assert!(project_files.is_empty(), "无 .agent/AGENTS.md 时不应有项目级条目");
+        assert!(
+            project_files.is_empty(),
+            "无 .agent/AGENTS.md 时不应有项目级条目"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn discovers_custom_commands_with_frontmatter() {
-        let root = std::env::temp_dir().join(format!("agent-cmd-{}-{:#x}", std::process::id(), nano()));
+        let root =
+            std::env::temp_dir().join(format!("agent-cmd-{}-{:#x}", std::process::id(), nano()));
         std::fs::create_dir_all(root.join(".agent").join("commands")).unwrap();
         std::fs::write(
             root.join(".agent").join("commands").join("test.md"),
             "---\ndescription: 运行测试\n---\n请执行 cargo test",
         )
         .unwrap();
-        std::fs::write(root.join(".agent").join("commands").join("review.md"), "审查代码").unwrap();
+        std::fs::write(
+            root.join(".agent").join("commands").join("review.md"),
+            "审查代码",
+        )
+        .unwrap();
         let cmds = discover_commands(&root);
         // 不断言总数：discover_commands 会合并用户级全局 commands 目录
         // （config_dir()/commands），运行环境可能存在额外命令文件，故此处只
@@ -891,16 +921,13 @@ pattern = "docker *"
 "#;
 
         // 第一步：解析成 toml::Value（模拟 load 的第一段）
-        let value: toml::Value =
-            toml::from_str(toml_src).expect("第一步：解析原始 TOML 应成功");
+        let value: toml::Value = toml::from_str(toml_src).expect("第一步：解析原始 TOML 应成功");
 
         // 第二步：序列化回字符串（模拟 load 的 round-trip）
-        let merged_str =
-            toml::to_string(&value).expect("第二步：序列化 toml::Value 应成功");
+        let merged_str = toml::to_string(&value).expect("第二步：序列化 toml::Value 应成功");
 
         // 第三步：反序列化成 Config（模拟 load 的最后一步）
-        let cfg: Config =
-            toml::from_str(&merged_str).expect("第三步：反序列化成 Config 应成功");
+        let cfg: Config = toml::from_str(&merged_str).expect("第三步：反序列化成 Config 应成功");
 
         // 验证命令规则正确保留
         assert_eq!(cfg.agent.commands.allow.len(), 5);

@@ -121,14 +121,19 @@ fn scan(root: &Path, include_hidden: bool, use_gitignore: bool) -> Vec<FsEntry> 
         if path == root {
             continue;
         }
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         let is_file = ft.is_file();
         let is_dir = ft.is_dir();
         if !is_file && !is_dir {
             continue;
         }
         let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-        out.push(FsEntry { rel_path: rel, is_file });
+        out.push(FsEntry {
+            rel_path: rel,
+            is_file,
+        });
     }
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     out
@@ -192,7 +197,11 @@ mod tests {
         assert!(entries.iter().any(|e| e.rel_path == Path::new("a.rs")));
         assert!(entries.iter().any(|e| e.rel_path == Path::new("sub/b.rs")));
         // 目录条目也在（is_file=false）
-        assert!(entries.iter().any(|e| e.rel_path == Path::new("sub") && !e.is_file));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.rel_path == Path::new("sub") && !e.is_file)
+        );
     }
 
     #[test]

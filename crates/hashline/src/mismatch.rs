@@ -71,7 +71,9 @@ pub fn parse_tag(tag: &str) -> Result<u32, String> {
         )
     })?;
     if line < 1 {
-        return Err(format!("Line number must be >= 1, got {line} in \"{tag}\"."));
+        return Err(format!(
+            "Line number must be >= 1, got {line} in \"{tag}\"."
+        ));
     }
     Ok(line)
 }
@@ -193,10 +195,7 @@ pub fn format_anchored_context(anchor_lines: &[u32], file_lines: &[&str]) -> Vec
         } else {
             " "
         };
-        let text = file_lines
-            .get(line_num as usize - 1)
-            .copied()
-            .unwrap_or("");
+        let text = file_lines.get(line_num as usize - 1).copied().unwrap_or("");
         rows.push(format!("{marker}{line_num}:{text}"));
     }
     rows

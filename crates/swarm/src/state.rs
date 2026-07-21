@@ -155,7 +155,11 @@ impl StateTracker {
     }
 
     /// 局部更新单代理状态。
-    pub async fn update_agent(&self, name: &str, update: AgentStateUpdate) -> Result<(), std::io::Error> {
+    pub async fn update_agent(
+        &self,
+        name: &str,
+        update: AgentStateUpdate,
+    ) -> Result<(), std::io::Error> {
         {
             let mut state = self.state.lock().await;
             if let Some(agent) = state.agents.get_mut(name) {
@@ -176,14 +180,22 @@ impl StateTracker {
 
     /// 追加逐代理日志。
     pub async fn append_log(&self, agent_name: &str, message: &str) -> Result<(), std::io::Error> {
-        self.append(self.swarm_dir.join("logs").join(format!("{agent_name}.log")), message)
-            .await
+        self.append(
+            self.swarm_dir
+                .join("logs")
+                .join(format!("{agent_name}.log")),
+            message,
+        )
+        .await
     }
 
     /// 追加编排日志。
     pub async fn append_orchestrator_log(&self, message: &str) -> Result<(), std::io::Error> {
-        self.append(self.swarm_dir.join("logs").join("orchestrator.log"), message)
-            .await
+        self.append(
+            self.swarm_dir.join("logs").join("orchestrator.log"),
+            message,
+        )
+        .await
     }
 
     /// 从磁盘恢复状态（无则 `None`）。

@@ -149,9 +149,7 @@ pub trait ContextManager: Send + Sync {
     /// # Errors
     /// 不支持删除或内部错误时返回 [`ContextError`]。
     async fn delete_message_at(&self, _index: usize) -> Result<usize, ContextError> {
-        Err(ContextError::Compaction(
-            "此上下文不支持删除消息".into(),
-        ))
+        Err(ContextError::Compaction("此上下文不支持删除消息".into()))
     }
 
     /// 当前 token 用量。
@@ -197,10 +195,7 @@ pub trait ContextManager: Send + Sync {
     ///
     /// # Errors
     /// 摘要生成失败时返回 [`ContextError`]。
-    async fn switch_branch_with_handoff(
-        &self,
-        _new_leaf: &NodeId,
-    ) -> Result<bool, ContextError> {
+    async fn switch_branch_with_handoff(&self, _new_leaf: &NodeId) -> Result<bool, ContextError> {
         Ok(false)
     }
 

@@ -895,7 +895,11 @@ fn pass1(group: &ReplaceGroup, file_lines: &[&str], delta: DelimiterBalance) -> 
             start: group.start,
             end: group.end,
             body,
-            warning: Some(describe_boundary_echo_repair(group.start, leading, trailing)),
+            warning: Some(describe_boundary_echo_repair(
+                group.start,
+                leading,
+                trailing,
+            )),
         };
     }
     if delta.is_zero() {
@@ -1061,8 +1065,7 @@ pub(crate) fn repair_replacement_boundaries(
     }
     for (s, e) in deletes {
         let deleted: Vec<&str> = file_lines[*s as usize - 1..*e as usize].to_vec();
-        remaining = remaining
-            .sum(compute_delimiter_balance(&deleted).negate());
+        remaining = remaining.sum(compute_delimiter_balance(&deleted).negate());
     }
     for bodies in before.values() {
         for body in bodies {
@@ -1099,7 +1102,12 @@ pub(crate) fn repair_replacement_boundaries(
                     file_lines,
                     *delta,
                     remaining,
-                    net_deleted_prefix_balance(group, &deleted_lines, &inserted_by_line, file_lines),
+                    net_deleted_prefix_balance(
+                        group,
+                        &deleted_lines,
+                        &inserted_by_line,
+                        file_lines,
+                    ),
                     &deleted_lines,
                     &inserted_by_line,
                     &maps,

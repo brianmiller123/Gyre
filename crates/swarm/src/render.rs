@@ -49,9 +49,18 @@ pub fn render_swarm_progress(state: &SwarmState) -> Vec<String> {
 
     lines.push(String::new());
     let total = agents.len();
-    let completed = agents.iter().filter(|a| a.status == AgentStatus::Completed).count();
-    let failed = agents.iter().filter(|a| a.status == AgentStatus::Failed).count();
-    let running = agents.iter().filter(|a| a.status == AgentStatus::Running).count();
+    let completed = agents
+        .iter()
+        .filter(|a| a.status == AgentStatus::Completed)
+        .count();
+    let failed = agents
+        .iter()
+        .filter(|a| a.status == AgentStatus::Failed)
+        .count();
+    let running = agents
+        .iter()
+        .filter(|a| a.status == AgentStatus::Running)
+        .count();
 
     let mut parts = vec![format!("{completed}/{total} done")];
     if running > 0 {
@@ -60,7 +69,10 @@ pub fn render_swarm_progress(state: &SwarmState) -> Vec<String> {
     if failed > 0 {
         parts.push(format!("{failed} failed"));
     }
-    parts.push(format!("elapsed: {}", format_duration(now.saturating_sub(state.started_at))));
+    parts.push(format!(
+        "elapsed: {}",
+        format_duration(now.saturating_sub(state.started_at))
+    ));
     lines.push(format!("  {}", parts.join(" | ")));
 
     // 终态额外提示

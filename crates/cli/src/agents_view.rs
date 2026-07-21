@@ -126,10 +126,17 @@ fn render_card(a: &SubAgentStatus) -> String {
         String::new()
     };
     let mut s = format!("│ {phase} {} {bar}\x1b[K\n", ellipsis(&a.label, 34));
-    s.push_str(&format!("│   {}: {}\x1b[K\n", t!("agents.task"), ellipsis(&a.task, 52)));
+    s.push_str(&format!(
+        "│   {}: {}\x1b[K\n",
+        t!("agents.task"),
+        ellipsis(&a.task, 52)
+    ));
     s.push_str(&format!(
         "│   {} {} · {} {} · tokens {tokens}{cost}",
-        t!("agents.turns"), a.turns, t!("agents.tools"), a.tool_calls
+        t!("agents.turns"),
+        a.turns,
+        t!("agents.tools"),
+        a.tool_calls
     ));
     if let Some(act) = &a.current_activity {
         s.push_str(&format!(" · {act}"));

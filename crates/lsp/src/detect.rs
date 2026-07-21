@@ -189,5 +189,7 @@ pub fn find_server_for_file<'a>(
     file_path: &Path,
 ) -> Option<&'a LspServerInfo> {
     let lang_id = language_id_from_path(file_path)?;
-    servers.iter().find(|s| s.languages.iter().any(|l| l == lang_id))
+    servers
+        .iter()
+        .find(|s| s.languages.iter().any(|l| l == lang_id))
 }

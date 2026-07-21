@@ -18,13 +18,13 @@
 #![warn(clippy::pedantic)]
 
 pub mod apply;
-mod repair;
 pub mod format;
 pub mod mismatch;
 pub mod normalize;
 pub mod parser;
 pub mod preview;
 pub mod recovery;
+mod repair;
 pub mod snapshots;
 pub mod tool;
 pub mod types;
@@ -32,16 +32,17 @@ pub mod types;
 pub use apply::apply_section;
 pub use format::{compute_file_hash, format_numbered_lines};
 pub use mismatch::{
-    anchor_lines_of, format_anchored_context, format_display_message, format_full_anchor_requirement,
-    parse_tag, rejection_header, validate_line_ref, MismatchDetails, MISMATCH_CONTEXT,
+    MISMATCH_CONTEXT, MismatchDetails, anchor_lines_of, format_anchored_context,
+    format_display_message, format_full_anchor_requirement, parse_tag, rejection_header,
+    validate_line_ref,
 };
 pub use normalize::{
-    detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom, BomResult, LineEnding,
+    BomResult, LineEnding, detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom,
 };
-pub use recovery::{recover, RecoveryResult, RECOVERY_SESSION_REPLAY_WARNING};
-pub use snapshots::{InMemorySnapshotStore, Snapshot};
 pub use parser::parse_hashline;
-pub use preview::{build_compact_diff, CompactDiffPreview};
+pub use preview::{CompactDiffPreview, build_compact_diff};
+pub use recovery::{RECOVERY_SESSION_REPLAY_WARNING, RecoveryResult, recover};
+pub use snapshots::{InMemorySnapshotStore, Snapshot};
 pub use tool::HashlineTool;
 pub use types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk, PatchReport};
 

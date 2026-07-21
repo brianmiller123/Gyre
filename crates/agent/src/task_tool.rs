@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::{
-    AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage, AskResponse,
-    CapabilityTier, ContextManager, LlmProvider, Mode, Model, ProviderCallContext, StatusKind,
-    ThinkingConfig, ToolError, ToolResult, Workspace,
+    AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
+    AskResponse, CapabilityTier, ContextManager, LlmProvider, Mode, Model, ProviderCallContext,
+    StatusKind, ThinkingConfig, ToolError, ToolResult, Workspace,
 };
 use agent_prompt::PromptCatalog;
 use agent_tools::{Tool, ToolContext, ToolRegistry};
@@ -370,7 +370,9 @@ impl Tool for TaskTool {
         // 在途委派护栏：经共享 `depth` 计数器追踪整棵递归树，拦截指数级递归委派。
         // 计数器在函数返回时（含所有早退路径）由 guard 自动递减。
         let prev_inflight = self.depth.fetch_add(1, Ordering::SeqCst);
-        let _inflight_guard = InflightGuard { counter: Arc::clone(&self.depth) };
+        let _inflight_guard = InflightGuard {
+            counter: Arc::clone(&self.depth),
+        };
         if prev_inflight >= MAX_INFLIGHT_TASKS {
             return Err(ToolError::Execution(format!(
                 "task 委派在途数超限（{MAX_INFLIGHT_TASKS}），疑似递归委派失控"
@@ -380,7 +382,10 @@ impl Tool for TaskTool {
         // 单任务：直接同步执行。子 Agent 取父级 cancel 的 child，级联取消。
         if tasks.len() == 1 {
             let out = self
-                .run_one(tasks.into_iter().next().expect("non-empty"), _ctx.cancel.child_token())
+                .run_one(
+                    tasks.into_iter().next().expect("non-empty"),
+                    _ctx.cancel.child_token(),
+                )
                 .await;
             return finish_single(out);
         }
@@ -391,9 +396,11 @@ impl Tool for TaskTool {
         // 克隆父级 cancel 句柄，便于在每个 spawn 任务内派生独立 child token。
         let parent_cancel = _ctx.cancel.clone();
         for task in tasks {
-            let permit = sem.clone().acquire_owned().await.map_err(|e| {
-                ToolError::Execution(format!("并发信号量已关闭: {e}"))
-            })?;
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| ToolError::Execution(format!("并发信号量已关闭: {e}")))?;
             // 在 move 前 derive 独立 child token（child_token 取 &self，不 move 父句柄）。
             let sub_cancel = parent_cancel.child_token();
             let this = self.clone();

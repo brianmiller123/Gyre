@@ -56,9 +56,7 @@ impl Workspace {
     #[must_use]
     pub fn current_dir() -> Self {
         Self {
-            root: Mutex::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
+            root: Mutex::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
             iso: Mutex::new(None),
         }
     }
@@ -108,11 +106,7 @@ impl Workspace {
     /// 故指向根之外的绝对路径会被映射到根下（读得到 not-found，写被限制在根内）。
     #[must_use]
     pub fn resolve(&self, relative: &Path) -> PathBuf {
-        let root = self
-            .root
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let root = self.root.lock().unwrap_or_else(|e| e.into_inner()).clone();
         sandbox_within(&root, relative)
     }
 
@@ -125,7 +119,9 @@ impl Workspace {
     pub async fn diff(&self) -> Option<Result<agent_iso::Diff, agent_iso::IsoError>> {
         let handle = {
             let guard = self.iso.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().map(|h| (h.lower.clone(), h.merged.clone(), h.kind))
+            guard
+                .as_ref()
+                .map(|h| (h.lower.clone(), h.merged.clone(), h.kind))
         };
         let (lower, merged, kind) = handle?;
         let backend = agent_iso::backend(kind);
@@ -235,7 +231,10 @@ fn resolve_symlinks_within(base: &Path, candidate: &Path) -> PathBuf {
         out.push(&name);
         // 逐级检查：若某一级是符号链接，则可能指向 base 外（即使目标不存在），
         // fail-safe 钳制到根，杜绝写入跟随符号链接逃逸。
-        if out.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+        if out
+            .symlink_metadata()
+            .map_or(false, |m| m.file_type().is_symlink())
+        {
             return base.to_path_buf();
         }
     }
@@ -274,7 +273,12 @@ mod tests {
         let root = w.root();
         // `../../etc/passwd` 不得逃出根
         let got = w.resolve(Path::new("../../etc/passwd"));
-        assert!(got.starts_with(&root), "{} 逃出了根 {}", got.display(), root.display());
+        assert!(
+            got.starts_with(&root),
+            "{} 逃出了根 {}",
+            got.display(),
+            root.display()
+        );
         // 结果应被钳制到根内（passwd 作为根下普通文件名）
         assert!(got.ends_with("passwd"));
     }

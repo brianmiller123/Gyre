@@ -315,7 +315,9 @@ mod tests {
     fn large_body_is_elided() {
         // 一个 10 行函数体应被折叠
         let body: String = "fn big() {\n".to_string()
-            + &(0..10).map(|i| format!("    let v{i} = {i};\n")).collect::<String>()
+            + &(0..10)
+                .map(|i| format!("    let v{i} = {i};\n"))
+                .collect::<String>()
             + "}\n";
         let r = summarize(&body);
         assert!(r.parsed);
@@ -323,16 +325,18 @@ mod tests {
         // 至少存在一个 elided 段
         assert!(r.segments.iter().any(|s| s.kind == SegmentKind::Elided));
         // kept 段仍含函数签名首行
-        assert!(r
-            .segments
-            .iter()
-            .any(|s| s.kind == SegmentKind::Kept && s.text.as_deref().unwrap_or("").contains("fn big")));
+        assert!(
+            r.segments.iter().any(|s| s.kind == SegmentKind::Kept
+                && s.text.as_deref().unwrap_or("").contains("fn big"))
+        );
     }
 
     #[test]
     fn segments_cover_full_range() {
         let body: String = "fn big() {\n".to_string()
-            + &(0..20).map(|i| format!("    let v{i} = {i};\n")).collect::<String>()
+            + &(0..20)
+                .map(|i| format!("    let v{i} = {i};\n"))
+                .collect::<String>()
             + "}\n";
         let r = summarize(&body);
         // kept/elided 段首尾应连续覆盖 1..total，无空洞、无重叠
@@ -348,7 +352,9 @@ mod tests {
     #[test]
     fn unfold_reveals_more_lines() {
         let body: String = "fn big() {\n".to_string()
-            + &(0..30).map(|i| format!("    let v{i} = {i};\n")).collect::<String>()
+            + &(0..30)
+                .map(|i| format!("    let v{i} = {i};\n"))
+                .collect::<String>()
             + "}\n";
         let folded = summarize_code(
             &body,

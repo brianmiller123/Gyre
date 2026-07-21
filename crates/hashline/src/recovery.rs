@@ -14,13 +14,11 @@ use crate::mismatch::anchor_lines_of;
 use crate::types::FileSection;
 
 /// 会话链回放成功时的告警。
-pub const RECOVERY_SESSION_REPLAY_WARNING: &str =
-    "Recovered via in-session replay (stale hash from a prior edit this session). \
+pub const RECOVERY_SESSION_REPLAY_WARNING: &str = "Recovered via in-session replay (stale hash from a prior edit this session). \
      Verify the resulting diff — a coincidental insert+delete pair could land the edit on a duplicate row.";
 
 /// 3-way 合并成功时的告警。
-pub const RECOVERY_EXTERNAL_WARNING: &str =
-    "Recovered via 3-way merge onto the live file (hash drifted from the version the edit was anchored to). \
+pub const RECOVERY_EXTERNAL_WARNING: &str = "Recovered via 3-way merge onto the live file (hash drifted from the version the edit was anchored to). \
      Verify the resulting diff.";
 
 /// 恢复结果。
@@ -75,8 +73,8 @@ pub fn recover(previous: &str, current: &str, section: &FileSection) -> Option<R
             let replay = apply_section(current, section);
             if let Some(new_text) = replay.text {
                 if new_text != current {
-                    let first_changed = find_first_changed_line(current, &new_text)
-                        .or(replay.first_changed_line);
+                    let first_changed =
+                        find_first_changed_line(current, &new_text).or(replay.first_changed_line);
                     let mut warnings = Vec::with_capacity(replay.warnings.len() + 1);
                     if first_changed.is_some() {
                         warnings.push(RECOVERY_SESSION_REPLAY_WARNING.to_string());
@@ -224,8 +222,7 @@ mod tests {
         // 外部在顶部插入了一行注释（行数变化，锚行行号已漂移）
         let current = "// header comment\nfn a() {\n    let x = 1;\n}\n";
         // 模型带 stale hash，把（先前版本中的）第 2 行改为 2
-        let section =
-            section_of("[src/a.rs#AAAA]\nSWAP 2.=2:\n+    let x = 2;\n");
+        let section = section_of("[src/a.rs#AAAA]\nSWAP 2.=2:\n+    let x = 2;\n");
         let rec = recover(previous, current, &section).expect("应 3-way 合并成功");
         assert_eq!(rec.text, "// header comment\nfn a() {\n    let x = 2;\n}\n");
         // current 第 3 行（let x = 1）→ 结果第 3 行（let x = 2）

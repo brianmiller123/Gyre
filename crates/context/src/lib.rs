@@ -18,21 +18,22 @@ pub mod persistence;
 pub mod token;
 pub mod tree;
 
-pub use persistence::{SessionInfo, SessionStore};
 pub use persistence::delete_message_in_file;
+pub use persistence::{SessionInfo, SessionStore};
 pub use tree::{
-    branch_messages, branch_path_ids, branch_path_nodes, children_of, collect_entries_for_branch_summary,
-    common_ancestor, leaves, new_node_id, node_index, path_to_root, wrap_linear_as_nodes,
+    branch_messages, branch_path_ids, branch_path_nodes, children_of,
+    collect_entries_for_branch_summary, common_ancestor, leaves, new_node_id, node_index,
+    path_to_root, wrap_linear_as_nodes,
 };
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use agent_core::{
-    AgentMessage, CompactionStrategy, ContentBlock, ContextError, ContextManager, Model,
-    NodeId, ProviderContext, ProviderMessage, SessionNode, TokenUsage, ToolSpec, Usage,
+    AgentMessage, CompactionStrategy, ContentBlock, ContextError, ContextManager, Model, NodeId,
+    ProviderContext, ProviderMessage, SessionNode, TokenUsage, ToolSpec, Usage,
 };
 
 pub use persistence::PersistentContext;
@@ -109,10 +110,11 @@ impl Inner {
         self.prefix_digests.clear();
         // 旧活跃路径（根→叶）：(id, 原 parent, msg)。
         let active: Vec<(NodeId, Option<NodeId>, AgentMessage)> = {
-            let mut v: Vec<(NodeId, Option<NodeId>, AgentMessage)> = tree::branch_path_nodes(&self.nodes, old_leaf)
-                .into_iter()
-                .map(|n| (n.id.clone(), n.parent_id.clone(), n.message.clone()))
-                .collect();
+            let mut v: Vec<(NodeId, Option<NodeId>, AgentMessage)> =
+                tree::branch_path_nodes(&self.nodes, old_leaf)
+                    .into_iter()
+                    .map(|n| (n.id.clone(), n.parent_id.clone(), n.message.clone()))
+                    .collect();
             // branch_path_nodes 已是根→叶顺序。
             let _ = &mut v;
             v
@@ -341,10 +343,7 @@ impl InMemoryContext {
     ///
     /// # Errors
     /// 摘要生成失败返回 [`ContextError::Compaction`]。
-    pub async fn switch_branch_with_handoff(
-        &self,
-        new_leaf: &str,
-    ) -> Result<bool, ContextError> {
+    pub async fn switch_branch_with_handoff(&self, new_leaf: &str) -> Result<bool, ContextError> {
         // 阶段一（锁内）：校验 + 收集独有后缀 + 取出 summarizer。
         let (entries, summarizer) = {
             let mut inner = self.inner.lock().await;
@@ -459,7 +458,9 @@ impl ContextManager for InMemoryContext {
         inner.last_model_id = model.id.clone();
         // P2-F：按 model 族选 BPE（gpt-4o/o 系列 o200k_base，其余 cl100k_base），
         // 精确计数直接影响压缩触发时机（near_limit）与 shake 保护窗口。
-        let current = self.counter.count_context_for(&inner.system, &messages, &model.id);
+        let current = self
+            .counter
+            .count_context_for(&inner.system, &messages, &model.id);
 
         // P0-A：计算与上次发送序列的最长字节稳定前缀。digest 命中 ⇒ ProviderMessage
         // 逻辑内容相同 ⇒ provider 端序列化字节相同 ⇒ 前缀缓存可命中到此索引。移植 oh-my-pi
@@ -510,7 +511,12 @@ impl ContextManager for InMemoryContext {
                     .shake_sink
                     .clone()
                     .unwrap_or_else(|| Arc::new(compaction::NullSink));
-                match compaction::Compactor::shake_with(&path, &config, &self.counter, sink.as_ref()) {
+                match compaction::Compactor::shake_with(
+                    &path,
+                    &config,
+                    &self.counter,
+                    sink.as_ref(),
+                ) {
                     Ok((new_log, stats)) => {
                         if stats.saved > 0 {
                             tracing::info!(
@@ -547,7 +553,8 @@ impl ContextManager for InMemoryContext {
                 let original = path.clone();
                 // 阶段二（锁外）：释放锁后执行 LLM summarize。
                 drop(inner);
-                let outcome = compaction::Compactor::summarize(path, keep, summarizer.as_ref()).await;
+                let outcome =
+                    compaction::Compactor::summarize(path, keep, summarizer.as_ref()).await;
                 let (new_log, result) = match outcome {
                     Ok(new_log) => (new_log, Ok::<(), ContextError>(())),
                     Err(e) => (original, Err(ContextError::Compaction(e))),
@@ -576,13 +583,11 @@ impl ContextManager for InMemoryContext {
     fn token_usage(&self) -> TokenUsage {
         match self.inner.try_lock() {
             Ok(inner) => TokenUsage {
-                current: self
-                    .counter
-                    .count_context_for(
-                        &inner.system,
-                        &convert_to_llm(&inner.active_path_messages()),
-                        &inner.last_model_id,
-                    ),
+                current: self.counter.count_context_for(
+                    &inner.system,
+                    &convert_to_llm(&inner.active_path_messages()),
+                    &inner.last_model_id,
+                ),
                 limit: inner.model_limit,
             },
             Err(_) => TokenUsage::default(),
@@ -691,7 +696,9 @@ fn convert_to_llm(log: &[AgentMessage]) -> Vec<ProviderMessage> {
                     images,
                 })
             }
-            AgentMessage::Status(_) | AgentMessage::Ask(_) | AgentMessage::SoftRequirement(_) => None,
+            AgentMessage::Status(_) | AgentMessage::Ask(_) | AgentMessage::SoftRequirement(_) => {
+                None
+            }
         })
         .collect();
     sanitize_provider_messages(raw)
@@ -809,7 +816,9 @@ mod tests {
         }))
         .await;
         ctx.append(AgentMessage::Assistant(AssistantMessage {
-            content: vec![agent_core::ContentBlock::Text { text: "hi back".into() }],
+            content: vec![agent_core::ContentBlock::Text {
+                text: "hi back".into(),
+            }],
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: None,
@@ -832,7 +841,9 @@ mod tests {
         ctx.append(AgentMessage::user_text("q1")).await;
         // refusal 消息：Error + sensitive → 应被过滤。
         ctx.append(AgentMessage::Assistant(AssistantMessage {
-            content: vec![agent_core::ContentBlock::Text { text: "I can't help with that".into() }],
+            content: vec![agent_core::ContentBlock::Text {
+                text: "I can't help with that".into(),
+            }],
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: Some(agent_core::StopReason::Error),
@@ -842,7 +853,9 @@ mod tests {
         ctx.append(AgentMessage::user_text("q2")).await;
         // 普通 Error（无 refusal 详情）→ 应保留。
         ctx.append(AgentMessage::Assistant(AssistantMessage {
-            content: vec![agent_core::ContentBlock::Text { text: "partial".into() }],
+            content: vec![agent_core::ContentBlock::Text {
+                text: "partial".into(),
+            }],
             usage: Usage::default(),
             model: "m".into(),
             stop_reason: Some(agent_core::StopReason::Error),
@@ -872,7 +885,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts, vec!["q1".to_string(), "q2".to_string(), "partial".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["q1".to_string(), "q2".to_string(), "partial".to_string()]
+        );
         assert!(
             !texts.iter().any(|t| t.contains("can't help")),
             "refusal 文本不应重放"
@@ -896,7 +912,10 @@ mod tests {
         ctx.append(AgentMessage::user_text("second")).await;
         let b2 = ctx.build_provider_context(&model, &[]).await.unwrap();
         // 追加后：前 first_len 条与上次字节相同 → 全命中。
-        assert_eq!(b2.stable_prefix_len, first_len, "追加后稳定前缀应等于上次消息数");
+        assert_eq!(
+            b2.stable_prefix_len, first_len,
+            "追加后稳定前缀应等于上次消息数"
+        );
         assert_eq!(b2.messages.len(), first_len + 1);
     }
 
@@ -1037,7 +1056,9 @@ mod tests {
         let ctx = InMemoryContext::new(vec!["sys".into()]);
         ctx.append(AgentMessage::user_text("hi")).await;
         ctx.append(AgentMessage::Assistant(AssistantMessage {
-            content: vec![agent_core::ContentBlock::Text { text: "hello".into() }],
+            content: vec![agent_core::ContentBlock::Text {
+                text: "hello".into(),
+            }],
             usage: Usage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -1052,7 +1073,9 @@ mod tests {
         .await;
         ctx.append(AgentMessage::user_text("again")).await;
         ctx.append(AgentMessage::Assistant(AssistantMessage {
-            content: vec![agent_core::ContentBlock::Text { text: "world".into() }],
+            content: vec![agent_core::ContentBlock::Text {
+                text: "world".into(),
+            }],
             usage: Usage {
                 input_tokens: 200,
                 output_tokens: 30,
@@ -1327,7 +1350,10 @@ mod tests {
         ctx.set_active_leaf(&n_main).await;
         ctx.append(AgentMessage::user_text("main2")).await;
         let model = Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
-        assert_eq!(user_texts(&ctx, &model).await, vec!["root", "main", "main2"]);
+        assert_eq!(
+            user_texts(&ctx, &model).await,
+            vec!["root", "main", "main2"]
+        );
 
         // alt 分支仅 root, alt。
         ctx.set_active_leaf(&n_alt).await;
@@ -1350,7 +1376,12 @@ mod tests {
         // 回主分支末梢 m4。
         let m4 = {
             let nodes = ctx.snapshot_nodes().await;
-            nodes.iter().find(|n| matches!(&n.message, AgentMessage::User(u) if user_text_of(u)=="m4")).unwrap().id.clone()
+            nodes
+                .iter()
+                .find(|n| matches!(&n.message, AgentMessage::User(u) if user_text_of(u)=="m4"))
+                .unwrap()
+                .id
+                .clone()
         };
         ctx.set_active_leaf(&m4).await;
         // 主分支 prune keep_recent=2：m0..m2 被裁。
@@ -1404,10 +1435,8 @@ mod tests {
         let leaf_c1 = ctx.active_leaf().await.unwrap();
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        ctx.set_summarizer(Box::new(StaticSummary {
-            seen: seen.clone(),
-        }))
-        .await;
+        ctx.set_summarizer(Box::new(StaticSummary { seen: seen.clone() }))
+            .await;
 
         // 当前在 C（c1）；切到 B（b1）并要求 handoff：被离开的是 C 的独有后缀 c1。
         // 先回到 B，再从 B 切到 C 触发 B 独有后缀 b1 的摘要。这里测：从 c1 切到 b1。
@@ -1418,7 +1447,11 @@ mod tests {
         // 摘要器被调用一次，输入含 c1。
         let calls = seen.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "handoff 应调用一次摘要器");
-        assert!(calls[0].contains("c1"), "摘要输入应含被离开分支的 c1，实际: {}", calls[0]);
+        assert!(
+            calls[0].contains("c1"),
+            "摘要输入应含被离开分支的 c1，实际: {}",
+            calls[0]
+        );
 
         // 活跃路径：a → b → b1 → [handoff]。handoff 消息在末尾。
         let model = Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
@@ -1426,7 +1459,11 @@ mod tests {
         assert!(texts.len() >= 3);
         assert_eq!(&texts[..2], &["a", "b"]);
         // 最后一条是 handoff 注入消息。
-        assert!(texts.last().unwrap().contains("SUM["), "末尾应为 handoff 摘要: {:?}", texts);
+        assert!(
+            texts.last().unwrap().contains("SUM["),
+            "末尾应为 handoff 摘要: {:?}",
+            texts
+        );
     }
 
     /// `snapshot_nodes` / `restore_nodes` 往返：分支结构完整保留。

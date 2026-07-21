@@ -61,7 +61,11 @@ pub struct ToolSpec {
 impl ToolSpec {
     /// 构造工具规格。
     #[must_use]
-    pub fn new(name: impl Into<String>, description: impl Into<String>, schema: serde_json::Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        schema: serde_json::Value,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),

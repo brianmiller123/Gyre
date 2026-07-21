@@ -131,9 +131,6 @@ mod tests {
 
     #[test]
     fn numbered_lines_start_offset() {
-        assert_eq!(
-            format_numbered_lines("a\nb", 10),
-            "10:a\n11:b"
-        );
+        assert_eq!(format_numbered_lines("a\nb", 10), "10:a\n11:b");
     }
 }

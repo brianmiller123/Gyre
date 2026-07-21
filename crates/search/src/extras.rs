@@ -23,7 +23,9 @@ pub fn highlight_to_ansi(code: &str, extension: &str) -> Result<String, String> 
     let mut h = HighlightLines::new(syntax, &state.theme_set.themes["base16-ocean.dark"]);
     let mut out = String::new();
     for line in code.lines() {
-        let regions: Vec<(Style, &str)> = h.highlight_line(line, &state.syntax_set).map_err(|e| e.to_string())?;
+        let regions: Vec<(Style, &str)> = h
+            .highlight_line(line, &state.syntax_set)
+            .map_err(|e| e.to_string())?;
         out.push_str(&as_24_bit_terminal_escaped(&regions[..], false));
         out.push('\n');
     }
@@ -42,7 +44,10 @@ fn syntax_state() -> Result<&'static SyntaxState, String> {
     }
     let syntax_set = SyntaxSet::load_defaults_newlines();
     let theme_set = ThemeSet::load_defaults();
-    let _ = STATE.set(SyntaxState { syntax_set, theme_set });
+    let _ = STATE.set(SyntaxState {
+        syntax_set,
+        theme_set,
+    });
     Ok(STATE.get().ok_or("初始化失败")?)
 }
 
@@ -50,8 +55,16 @@ fn syntax_state() -> Result<&'static SyntaxState, String> {
 ///
 /// # Errors
 /// 根目录读取失败时返回错误。
-pub fn find_files(root: &Path, name_query: Option<&str>, extension: Option<&str>, max: usize) -> Result<Vec<PathBuf>, String> {
-    let walker = ignore::WalkBuilder::new(root).hidden(true).git_ignore(true).build();
+pub fn find_files(
+    root: &Path,
+    name_query: Option<&str>,
+    extension: Option<&str>,
+    max: usize,
+) -> Result<Vec<PathBuf>, String> {
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
     let mut out = Vec::new();
     for entry in walker.flatten() {
         if out.len() >= max {
@@ -91,7 +104,13 @@ mod tests {
 
     #[test]
     fn find_files_by_extension() {
-        let dir = std::env::temp_dir().join(format!("agent-fd-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "agent-fd-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "x").unwrap();
         std::fs::write(dir.join("b.txt"), "y").unwrap();

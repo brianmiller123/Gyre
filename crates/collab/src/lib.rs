@@ -21,7 +21,7 @@ pub mod frame;
 pub mod relay;
 pub mod room;
 
-pub use codec::{generate_room_key, open, seal, RoomKey, KEY_LEN, NONCE_LEN};
+pub use codec::{KEY_LEN, NONCE_LEN, RoomKey, generate_room_key, open, seal};
 pub use error::CollabError;
 pub use frame::WireFrame;
 pub use relay::{CollabClient, Relay};

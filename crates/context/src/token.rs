@@ -95,7 +95,9 @@ impl TokenCounter {
                 ProviderMessage::User { content } => {
                     for c in content {
                         match c {
-                            UserContent::Text { text } => total += self.count_text_for(text, model_id),
+                            UserContent::Text { text } => {
+                                total += self.count_text_for(text, model_id)
+                            }
                             UserContent::Image { mime, data } => {
                                 total += self.count_text_for(mime, model_id) + data.len() / 4;
                             }
@@ -105,11 +107,15 @@ impl TokenCounter {
                 ProviderMessage::Assistant { content } => {
                     for b in content {
                         match b {
-                            ContentBlock::Text { text } => total += self.count_text_for(text, model_id),
+                            ContentBlock::Text { text } => {
+                                total += self.count_text_for(text, model_id)
+                            }
                             ContentBlock::Thinking { text, .. } => {
                                 total += self.count_text_for(text, model_id);
                             }
-                            ContentBlock::ToolCall { name, arguments, .. } => {
+                            ContentBlock::ToolCall {
+                                name, arguments, ..
+                            } => {
                                 total += self.count_text_for(name, model_id)
                                     + self.count_text_for(&arguments.to_string(), model_id);
                             }

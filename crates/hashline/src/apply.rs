@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::format::compute_file_hash;
 use crate::mismatch::MismatchDetails;
-use crate::repair::{repair_replacement_boundaries, ReplaceGroup};
+use crate::repair::{ReplaceGroup, repair_replacement_boundaries};
 use crate::types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk};
 
 /// 把一个区段应用到 `text`，返回结果（含告警）。
@@ -82,7 +82,9 @@ pub fn apply_section(text: &str, section: &FileSection) -> ApplyResult {
             Hunk::Replace { start, end, body } => {
                 validate_bounds(*start, *end, n, &mut warnings);
                 if !occupied.insert(*start) {
-                    warnings.push(format!("行 {start} 已被前一个区间覆盖，后到 Replace 被丢弃"));
+                    warnings.push(format!(
+                        "行 {start} 已被前一个区间覆盖，后到 Replace 被丢弃"
+                    ));
                     continue;
                 }
                 note(&mut first_changed, *start);
@@ -200,9 +202,7 @@ fn flush_bucket(map: &BTreeMap<Anchor, Vec<Vec<String>>>, line: Anchor, out: &mu
 
 fn validate_bounds(start: Anchor, end: Anchor, n: usize, warnings: &mut Vec<String>) {
     if start == 0 || (end as usize) > n {
-        warnings.push(format!(
-            "区间 {start}.={end} 越界（文件共 {n} 行）"
-        ));
+        warnings.push(format!("区间 {start}.={end} 越界（文件共 {n} 行）"));
     }
 }
 
@@ -211,7 +211,6 @@ fn validate_anchor(a: Anchor, n: usize, warnings: &mut Vec<String>) {
         warnings.push(format!("锚点行 {a} 越界（文件共 {n} 行）"));
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -362,12 +361,27 @@ mod tests {
 
     #[test]
     fn drops_single_duplicated_closer() {
-        let file = j(&["it('a', () => {", "\tsetup();", "\trun();", "});", "after();"]);
+        let file = j(&[
+            "it('a', () => {",
+            "\tsetup();",
+            "\trun();",
+            "});",
+            "after();",
+        ]);
         let patch = p(&["SWAP 2.=3:", "+\tsetup2();", "+\trun2();", "+});"]);
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&["it('a', () => {", "\tsetup2();", "\trun2();", "});", "after();"]).as_str())
+            Some(
+                j(&[
+                    "it('a', () => {",
+                    "\tsetup2();",
+                    "\trun2();",
+                    "});",
+                    "after();"
+                ])
+                .as_str()
+            )
         );
         assert!(warn_any(&r, "delimiter-balance"));
     }
@@ -396,18 +410,21 @@ mod tests {
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "class Foo {",
-                "\t/** doc */",
-                "\tplanRender(",
-                "\t\ta: string[],",
-                "\t\tb: boolean,",
-                "\t\tc: number,",
-                "\t): Intent {",
-                "\t\treturn x;",
-                "\t}",
-                "}",
-            ]).as_str())
+            Some(
+                j(&[
+                    "class Foo {",
+                    "\t/** doc */",
+                    "\tplanRender(",
+                    "\t\ta: string[],",
+                    "\t\tb: boolean,",
+                    "\t\tc: number,",
+                    "\t): Intent {",
+                    "\t\treturn x;",
+                    "\t}",
+                    "}",
+                ])
+                .as_str()
+            )
         );
         assert_eq!(r.text.as_ref().unwrap().matches("\tplanRender(").count(), 1);
         assert!(warn_any(&r, "delimiter-balance"));
@@ -437,21 +454,30 @@ mod tests {
 
     #[test]
     fn spares_omitted_closer() {
-        let file = j(&["const handlers = {", "\ta() {", "\t\treturn 1;", "\t},", "};"]);
+        let file = j(&[
+            "const handlers = {",
+            "\ta() {",
+            "\t\treturn 1;",
+            "\t},",
+            "};",
+        ]);
         let patch = p(&["SWAP 5.=5:", "+\tb() {", "+\t\treturn 2;", "+\t},"]);
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "const handlers = {",
-                "\ta() {",
-                "\t\treturn 1;",
-                "\t},",
-                "\tb() {",
-                "\t\treturn 2;",
-                "\t},",
-                "};",
-            ]).as_str())
+            Some(
+                j(&[
+                    "const handlers = {",
+                    "\ta() {",
+                    "\t\treturn 1;",
+                    "\t},",
+                    "\tb() {",
+                    "\t\treturn 2;",
+                    "\t},",
+                    "};",
+                ])
+                .as_str()
+            )
         );
         assert!(warn_any(&r, "delimiter-balance"));
     }
@@ -461,7 +487,10 @@ mod tests {
         let file = j(&["class Foo {", "\tok();", "\t}", "}"]);
         let patch = p(&["SWAP 1.=4:", "+class Foo {", "+\tok();", "+}"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["class Foo {", "\tok();", "}"]).as_str()));
+        assert_eq!(
+            r.text.as_deref(),
+            Some(j(&["class Foo {", "\tok();", "}"]).as_str())
+        );
         assert_eq!(r.text.as_ref().unwrap().matches('}').count(), 1);
         assert!(r.warnings.is_empty());
     }
@@ -484,14 +513,24 @@ mod tests {
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "func _cmd_travel_homeworld():",
-                "\tvar destination = find_homeworld()",
-                "\ttravel_to(destination)",
-                "\tprint_status()",
-            ]).as_str())
+            Some(
+                j(&[
+                    "func _cmd_travel_homeworld():",
+                    "\tvar destination = find_homeworld()",
+                    "\ttravel_to(destination)",
+                    "\tprint_status()",
+                ])
+                .as_str()
+            )
         );
-        assert_eq!(r.text.as_ref().unwrap().matches("func _cmd_travel_homeworld():").count(), 1);
+        assert_eq!(
+            r.text
+                .as_ref()
+                .unwrap()
+                .matches("func _cmd_travel_homeworld():")
+                .count(),
+            1
+        );
         assert!(warn_any(&r, "boundary echo"));
     }
 
@@ -500,7 +539,10 @@ mod tests {
         let file = j(&["A", "B", "old", "C", "D"]);
         let patch = p(&["SWAP 3.=3:", "+A", "+B", "+C", "+D"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["A", "B", "A", "B", "C", "D", "C", "D"]).as_str()));
+        assert_eq!(
+            r.text.as_deref(),
+            Some(j(&["A", "B", "A", "B", "C", "D", "C", "D"]).as_str())
+        );
         assert!(r.warnings.is_empty());
     }
 
@@ -530,7 +572,10 @@ mod tests {
         let file = j(&["function f() {", "old();", "}"]);
         let patch = p(&["SWAP 2.=2:", "+function f() {", "+fresh();", "+}"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["function f() {", "fresh();", "}"]).as_str()));
+        assert_eq!(
+            r.text.as_deref(),
+            Some(j(&["function f() {", "fresh();", "}"]).as_str())
+        );
         assert!(warn_any(&r, "boundary echo"));
     }
 
@@ -551,7 +596,10 @@ mod tests {
         let file = j(&["a = 1;", "b = 2;", "c = 3;"]);
         let patch = p(&["SWAP 1.=1:", "+a = 1;", "+b = 2;"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["a = 1;", "b = 2;", "b = 2;", "c = 3;"]).as_str()));
+        assert_eq!(
+            r.text.as_deref(),
+            Some(j(&["a = 1;", "b = 2;", "b = 2;", "c = 3;"]).as_str())
+        );
         assert!(r.warnings.is_empty());
     }
 
@@ -581,27 +629,43 @@ mod tests {
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "function f() {",
-                "  a2();",
-                "  b2();",
-                "  const out = [];",
-                "  return out;",
-                "}",
-            ]).as_str())
+            Some(
+                j(&[
+                    "function f() {",
+                    "  a2();",
+                    "  b2();",
+                    "  const out = [];",
+                    "  return out;",
+                    "}",
+                ])
+                .as_str()
+            )
         );
         assert!(warn_any(&r, "boundary echo"));
     }
 
     #[test]
     fn drops_one_sided_jsx_closer_echo() {
-        let file = j(&["const view = (", "  <section>", "    <Old />", "  </section>", ");"]);
+        let file = j(&[
+            "const view = (",
+            "  <section>",
+            "    <Old />",
+            "  </section>",
+            ");",
+        ]);
         let patch = p(&["SWAP 3.=3:", "+    <New />", "+  </section>"]);
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
             Some(
-                j(&["const view = (", "  <section>", "    <New />", "  </section>", ");"]).as_str()
+                j(&[
+                    "const view = (",
+                    "  <section>",
+                    "    <New />",
+                    "  </section>",
+                    ");"
+                ])
+                .as_str()
             )
         );
         assert_eq!(r.text.as_ref().unwrap().matches("  </section>").count(), 1);
@@ -621,18 +685,26 @@ mod tests {
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "const view = (",
-                "<section className=\"outer\">",
-                "<section>",
-                "new text",
-                "</section>",
-                "</section>",
-                ");",
-            ]).as_str())
+            Some(
+                j(&[
+                    "const view = (",
+                    "<section className=\"outer\">",
+                    "<section>",
+                    "new text",
+                    "</section>",
+                    "</section>",
+                    ");",
+                ])
+                .as_str()
+            )
         );
         assert_eq!(
-            r.text.as_ref().unwrap().lines().filter(|l| l.trim() == "</section>").count(),
+            r.text
+                .as_ref()
+                .unwrap()
+                .lines()
+                .filter(|l| l.trim() == "</section>")
+                .count(),
             2
         );
         assert!(r.warnings.is_empty());
@@ -643,7 +715,10 @@ mod tests {
         let file = j(&["setup();", "a();", "b();", "c();"]);
         let patch = p(&["SWAP 3.=4:", "+a();", "+B();", "+C();"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["setup();", "a();", "B();", "C();"]).as_str()));
+        assert_eq!(
+            r.text.as_deref(),
+            Some(j(&["setup();", "a();", "B();", "C();"]).as_str())
+        );
         assert!(warn_any(&r, "boundary echo"));
     }
 
@@ -665,9 +740,15 @@ mod tests {
         let file = j(&["if (a) {", "\told();", "}"]);
         let patch = p(&["SWAP 1.=1:", "+if (b) {", "SWAP 2.=3:", "+\tnew();"]);
         let r = apply(&patch, &file);
-        assert_eq!(r.text.as_deref(), Some(j(&["if (b) {", "\tnew();", "}"]).as_str()));
         assert_eq!(
-            r.warnings.iter().filter(|w| w.contains("structural closing line")).count(),
+            r.text.as_deref(),
+            Some(j(&["if (b) {", "\tnew();", "}"]).as_str())
+        );
+        assert_eq!(
+            r.warnings
+                .iter()
+                .filter(|w| w.contains("structural closing line"))
+                .count(),
             1
         );
     }
@@ -682,7 +763,10 @@ mod tests {
             Some(j(&["class C {", "\tnewMethod() {", "\t\treturn 1;", "\t}", "}"]).as_str())
         );
         assert_eq!(
-            r.warnings.iter().filter(|w| w.contains("structural closing line")).count(),
+            r.warnings
+                .iter()
+                .filter(|w| w.contains("structural closing line"))
+                .count(),
             1
         );
     }
@@ -711,18 +795,21 @@ mod tests {
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
-            Some(j(&[
-                "addEventListener(\"click\", () => {",
-                "\tsetup();",
-                "\tfoo();",
-                "\tbar();",
-                "});",
-                "",
-                "const config = {",
-                "\ta: 1,",
-                "\tb: 2,",
-                "};",
-            ]).as_str())
+            Some(
+                j(&[
+                    "addEventListener(\"click\", () => {",
+                    "\tsetup();",
+                    "\tfoo();",
+                    "\tbar();",
+                    "});",
+                    "",
+                    "const config = {",
+                    "\ta: 1,",
+                    "\tb: 2,",
+                    "};",
+                ])
+                .as_str()
+            )
         );
         assert!(warn_any(&r, "trailing payload line"));
         assert!(warn_any(&r, "structural closing line"));
@@ -730,8 +817,20 @@ mod tests {
 
     #[test]
     fn does_not_let_unterminated_template_mask() {
-        let file = j(&["const log = makeLog(`", "prefix", "`);", "const obj = {", "\ta: 1", "};"]);
-        let patch = p(&["SWAP 1.=1:", "+const log = createLog(`", "SWAP 5.=6:", "+\ta: 2"]);
+        let file = j(&[
+            "const log = makeLog(`",
+            "prefix",
+            "`);",
+            "const obj = {",
+            "\ta: 1",
+            "};",
+        ]);
+        let patch = p(&[
+            "SWAP 1.=1:",
+            "+const log = createLog(`",
+            "SWAP 5.=6:",
+            "+\ta: 2",
+        ]);
         let r = apply(&patch, &file);
         assert_eq!(
             r.text.as_deref(),
@@ -748,7 +847,10 @@ mod tests {
             )
         );
         assert_eq!(
-            r.warnings.iter().filter(|w| w.contains("structural closing line")).count(),
+            r.warnings
+                .iter()
+                .filter(|w| w.contains("structural closing line"))
+                .count(),
             1
         );
     }

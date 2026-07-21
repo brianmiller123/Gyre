@@ -15,8 +15,9 @@
 use std::pin::Pin;
 
 use agent_core::{
-    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError, LlmProvider,
-    ProviderCallContext, ProviderMessage, StopReason, ThinkingConfig, ToolChoice, ToolChoiceDirective, Usage,
+    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError,
+    LlmProvider, ProviderCallContext, ProviderMessage, StopReason, ThinkingConfig, ToolChoice,
+    ToolChoiceDirective, Usage,
 };
 use async_stream::stream;
 use futures::StreamExt;
@@ -173,7 +174,8 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any) | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any)
+        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -221,7 +223,13 @@ pub fn convert_to_r1_format(
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                push_or_merge(&mut out, &mut last_role, "user", &text, merge_tool_result_text);
+                push_or_merge(
+                    &mut out,
+                    &mut last_role,
+                    "user",
+                    &text,
+                    merge_tool_result_text,
+                );
             }
             ProviderMessage::Assistant { content } => {
                 let mut entry = serde_json::json!({"role":"assistant"});
@@ -250,7 +258,9 @@ pub fn convert_to_r1_format(
                 last_role = Some("assistant".to_string());
             }
             ProviderMessage::Tool {
-                tool_call_id, content, ..
+                tool_call_id,
+                content,
+                ..
             } => {
                 out.push(serde_json::json!({"role":"tool","tool_call_id":tool_call_id,"content":content}));
                 last_role = Some("tool".to_string());
@@ -516,7 +526,9 @@ fn build_deepseek_message(
 ) -> agent_core::AssistantMessage {
     let mut content = Vec::new();
     if !text_buf.is_empty() {
-        content.push(ContentBlock::Text { text: text_buf.to_string() });
+        content.push(ContentBlock::Text {
+            text: text_buf.to_string(),
+        });
     }
     for (i, tc) in tool_calls.iter().enumerate() {
         let id = tc.id.clone().unwrap_or_else(|| format!("call_{i}"));
@@ -524,9 +536,14 @@ fn build_deepseek_message(
         let arguments = if tc.args.is_empty() {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_str(&tc.args).unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
+            serde_json::from_str(&tc.args)
+                .unwrap_or_else(|_| serde_json::Value::String(tc.args.clone()))
         };
-        content.push(ContentBlock::ToolCall { id, name, arguments });
+        content.push(ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        });
     }
     // P2-P：content_filter → Error + sensitive（DeepSeek OpenAI 兼容，含 content_filter）。
     let (stop_reason, stop_details) = match finish.as_deref() {
@@ -568,13 +585,18 @@ fn map_deepseek_error(status: u16, body: &str) -> LlmError {
         401 | 403 => LlmError::Auth(format!("DeepSeek 鉴权失败（{status}）: {body}")),
         429 => {
             // 尝试解析 retry-after
-            LlmError::RateLimit { retry_after_ms: 5000 }
+            LlmError::RateLimit {
+                retry_after_ms: 5000,
+            }
         }
         s if (500..600).contains(&s) => LlmError::Http {
             status,
             body: format!("DeepSeek 服务端错误: {body}"),
         },
-        _ => LlmError::Http { status, body: body.to_string() },
+        _ => LlmError::Http {
+            status,
+            body: body.to_string(),
+        },
     }
 }
 
@@ -598,13 +620,19 @@ mod tests {
     #[test]
     fn extract_reasoning_prefers_reasoning_content() {
         let delta = serde_json::json!({"reasoning_content":"thinking...","reasoning":"fallback"});
-        assert_eq!(extract_reasoning_from_delta(&delta), Some("thinking...".into()));
+        assert_eq!(
+            extract_reasoning_from_delta(&delta),
+            Some("thinking...".into())
+        );
     }
 
     #[test]
     fn extract_reasoning_falls_back_to_reasoning() {
         let delta = serde_json::json!({"reasoning":"fallback"});
-        assert_eq!(extract_reasoning_from_delta(&delta), Some("fallback".into()));
+        assert_eq!(
+            extract_reasoning_from_delta(&delta),
+            Some("fallback".into())
+        );
     }
 
     #[test]
@@ -616,8 +644,16 @@ mod tests {
     #[test]
     fn r1_format_merges_consecutive_user() {
         let messages = vec![
-            ProviderMessage::User { content: vec![UserContent::Text { text: "hello".into() }] },
-            ProviderMessage::User { content: vec![UserContent::Text { text: "world".into() }] },
+            ProviderMessage::User {
+                content: vec![UserContent::Text {
+                    text: "hello".into(),
+                }],
+            },
+            ProviderMessage::User {
+                content: vec![UserContent::Text {
+                    text: "world".into(),
+                }],
+            },
         ];
         // 不带 system，验证两条连续 user 合并为 1 条
         let r1 = convert_to_r1_format(&[], &messages, false);
@@ -630,9 +666,15 @@ mod tests {
     #[test]
     fn r1_format_preserves_alternating_roles() {
         let messages = vec![
-            ProviderMessage::User { content: vec![UserContent::Text { text: "q".into() }] },
-            ProviderMessage::Assistant { content: vec![ContentBlock::Text { text: "a".into() }] },
-            ProviderMessage::User { content: vec![UserContent::Text { text: "q2".into() }] },
+            ProviderMessage::User {
+                content: vec![UserContent::Text { text: "q".into() }],
+            },
+            ProviderMessage::Assistant {
+                content: vec![ContentBlock::Text { text: "a".into() }],
+            },
+            ProviderMessage::User {
+                content: vec![UserContent::Text { text: "q2".into() }],
+            },
         ];
         let r1 = convert_to_r1_format(&[], &messages, false);
         assert_eq!(r1.len(), 3);
@@ -653,6 +695,7 @@ mod tests {
             temperature: Some(0.5),
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req, false);
         assert_eq!(body["temperature"], 0.5);
@@ -672,6 +715,7 @@ mod tests {
             temperature: Some(0.7),
             thinking: Some(ThinkingConfig::new(40_000)),
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req, true);
         // deepseek-reasoner 自动思考：不发 temperature、不发 thinking/reasoning_effort 字段
@@ -692,6 +736,7 @@ mod tests {
             temperature: None,
             thinking: Some(ThinkingConfig::new(1000)),
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req, true);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -700,8 +745,14 @@ mod tests {
 
     #[test]
     fn deepseek_error_mapping() {
-        assert!(matches!(map_deepseek_error(401, "bad key"), LlmError::Auth(_)));
-        assert!(matches!(map_deepseek_error(429, "slow down"), LlmError::RateLimit { .. }));
+        assert!(matches!(
+            map_deepseek_error(401, "bad key"),
+            LlmError::Auth(_)
+        ));
+        assert!(matches!(
+            map_deepseek_error(429, "slow down"),
+            LlmError::RateLimit { .. }
+        ));
         match map_deepseek_error(500, "server") {
             LlmError::Http { status, .. } => assert_eq!(status, 500),
             _ => panic!("应为 Http"),
@@ -715,10 +766,14 @@ mod tests {
             model: Model::with_defaults("deepseek-chat", "deepseek", Api::DeepSeek),
             system: vec![],
             messages: vec![
-                ProviderMessage::User { content: vec![UserContent::Text { text: "hi".into() }] },
+                ProviderMessage::User {
+                    content: vec![UserContent::Text { text: "hi".into() }],
+                },
                 ProviderMessage::Assistant {
                     content: vec![
-                        ContentBlock::Text { text: "calling".into() },
+                        ContentBlock::Text {
+                            text: "calling".into(),
+                        },
                         ContentBlock::ToolCall {
                             id: "call_1".into(),
                             name: "list_files".into(),
@@ -726,7 +781,12 @@ mod tests {
                         },
                     ],
                 },
-                ProviderMessage::Tool { tool_call_id: "call_1".into(), content: "result".into(), is_error: false, images: vec![] },
+                ProviderMessage::Tool {
+                    tool_call_id: "call_1".into(),
+                    content: "result".into(),
+                    is_error: false,
+                    images: vec![],
+                },
             ],
             tools: vec![],
             tool_choice: None,
@@ -734,13 +794,20 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req, false);
         let msgs = body["messages"].as_array().unwrap();
-        let assistant = msgs.iter().find(|m| m["role"] == "assistant").expect("应有 assistant");
+        let assistant = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("应有 assistant");
         let tc = &assistant["tool_calls"][0];
         assert_eq!(tc["id"], "call_1", "tool_call 必须含 id");
-        assert!(tc["function"]["arguments"].is_string(), "arguments 必须为 JSON 字符串");
+        assert!(
+            tc["function"]["arguments"].is_string(),
+            "arguments 必须为 JSON 字符串"
+        );
         assert_eq!(tc["function"]["name"], "list_files");
     }
 }

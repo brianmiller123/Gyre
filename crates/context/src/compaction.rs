@@ -7,8 +7,8 @@
 //!   保护最近 token 窗口、节省阈值门控。移植 oh-my-pi `shake`。
 //! - **Prune**：保留最近 N 条（tool-protection：工具结果不被裁剪）。
 
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -29,7 +29,10 @@ pub trait SummaryProvider: Send + Sync {
     ///
     /// # Errors
     /// 生成失败时返回错误字符串。
-    fn summarize(&self, old: &[String]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>;
+    fn summarize(
+        &self,
+        old: &[String],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>;
 }
 
 /// 用 LLM 生成摘要的 [`SummaryProvider`] 实现（handoff 摘要）。
@@ -96,7 +99,7 @@ impl SummaryProvider for LlmSummaryProvider {
                 temperature: Some(0.0),
                 thinking: None,
                 cache_key: None,
-            };
+                stable_prefix_len: 0,            };
             let mut stream = self
                 .provider
                 .stream(req, &self.provider_ctx)
@@ -488,7 +491,12 @@ fn shake_with_estimator(
 
     // 1. ToolResult 整体归档：保留 tool_call_id（配对完整），仅替换 result 内容为占位符。
     for r in &regions {
-        if let ShakeRegion::ToolResult { index, tokens, label } = r {
+        if let ShakeRegion::ToolResult {
+            index,
+            tokens,
+            label,
+        } = r
+        {
             let Some(AgentMessage::ToolResult(t)) = out.get_mut(*index) else {
                 continue;
             };
@@ -516,7 +524,14 @@ fn shake_with_estimator(
         } = r
         {
             let id = sink.offload(text, "block")?;
-            block_splice(&mut out, *index, *slot, *start, *end, &block_placeholder(*tokens, &id));
+            block_splice(
+                &mut out,
+                *index,
+                *slot,
+                *start,
+                *end,
+                &block_placeholder(*tokens, &id),
+            );
             stats.blocks_elided += 1;
         }
     }
@@ -590,10 +605,7 @@ fn push_block_regions(
 fn block_sort_key(r: &ShakeRegion) -> (usize, usize, usize, usize) {
     match r {
         ShakeRegion::Block {
-            index,
-            slot,
-            start,
-            ..
+            index, slot, start, ..
         } => {
             let (slot_rank, block) = match slot {
                 BlockSlot::Assistant { block } => (0, *block),
@@ -641,7 +653,10 @@ fn block_splice(
 
 /// 原地拼接 `text[start..end)` 为 `replacement`。`start`/`end` 为字节偏移，须在字符边界。
 fn splice_in_place(text: &mut String, start: usize, end: usize, replacement: &str) {
-    if end > text.len() || start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end)
+    if end > text.len()
+        || start > end
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
     {
         return;
     }
@@ -653,15 +668,11 @@ fn splice_in_place(text: &mut String, start: usize, end: usize, replacement: &st
 }
 
 fn tool_result_placeholder(tokens: usize, id: &str) -> String {
-    format!(
-        "[已归档：工具结果（约 {tokens} token），用 read_file artifact://{id} 回读原始内容]"
-    )
+    format!("[已归档：工具结果（约 {tokens} token），用 read_file artifact://{id} 回读原始内容]")
 }
 
 fn block_placeholder(tokens: usize, id: &str) -> String {
-    format!(
-        "[已归档：代码/XML 片段（约 {tokens} token），用 read_file artifact://{id} 回读]"
-    )
+    format!("[已归档：代码/XML 片段（约 {tokens} token），用 read_file artifact://{id} 回读]")
 }
 
 /// 扫描文本中的围栏代码块（``` / ~~~）与顶层 XML 元素，返回字节区间 `[start, end)`
@@ -687,8 +698,7 @@ fn scan_block_ranges(text: &str) -> Vec<Range<usize>> {
         // 当前行 = [line_start, i)（不含换行）。
         let line = text.get(line_start..i).unwrap_or("");
         let trimmed_start = line.trim_start();
-        let is_fence_line =
-            trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~");
+        let is_fence_line = trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~");
         if is_fence_line {
             if !in_fence {
                 in_fence = true;
@@ -804,10 +814,18 @@ fn supersede_read_results(log: &[AgentMessage]) -> Vec<AgentMessage> {
             continue;
         };
         for block in &a.content {
-            if let ContentBlock::ToolCall { id, name, arguments } = block {
+            if let ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } = block
+            {
                 if name == "read_file" {
                     if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
-                        reads_by_path.entry(path.to_string()).or_default().push(id.clone());
+                        reads_by_path
+                            .entry(path.to_string())
+                            .or_default()
+                            .push(id.clone());
                     }
                 }
             }
@@ -838,7 +856,12 @@ fn skill_read_call_ids(log: &[AgentMessage]) -> std::collections::HashSet<String
             continue;
         };
         for block in &a.content {
-            if let ContentBlock::ToolCall { id, name, arguments } = block {
+            if let ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } = block
+            {
                 if name == "read_file"
                     && arguments
                         .get("path")
@@ -983,9 +1006,10 @@ mod tests {
         let log = vec![call, result, recent];
         // keep_recent=1：仅尾部 recent + 受保护的 skill 结果
         let out = Compactor::prune(&log, 1);
-        assert!(out
-            .iter()
-            .any(|m| matches!(m, AgentMessage::ToolResult(t) if t.tool_call_id == "call-1")));
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, AgentMessage::ToolResult(t) if t.tool_call_id == "call-1"))
+        );
         assert!(out.iter().any(|m| matches!(m, AgentMessage::User(_))));
     }
 
@@ -1013,9 +1037,10 @@ mod tests {
         let log = vec![call, result, recent];
         let out = Compactor::prune(&log, 1);
         // 受保护的 skill 结果保留，且其发起 ToolCall 的助手消息一并保留（不孤立）。
-        assert!(out
-            .iter()
-            .any(|m| matches!(m, AgentMessage::ToolResult(t) if t.tool_call_id == "call-1")));
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, AgentMessage::ToolResult(t) if t.tool_call_id == "call-1"))
+        );
         assert!(out.iter().any(|m| matches!(
             m,
             AgentMessage::Assistant(a) if a
@@ -1048,7 +1073,11 @@ mod tests {
 
     struct StaticSummary;
     impl SummaryProvider for StaticSummary {
-        fn summarize(&self, _old: &[String]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>> {
+        fn summarize(
+            &self,
+            _old: &[String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
+        {
             Box::pin(async { Ok("已总结 3 条".into()) })
         }
     }
@@ -1081,8 +1110,14 @@ mod tests {
         assert!(prompt.contains("## 下一步"), "缺下一步段: {prompt}");
         assert!(prompt.contains("## 关键上下文"), "缺关键上下文段: {prompt}");
         // 强约束：保留精确路径/函数名 + 未答问题。
-        assert!(prompt.contains("精确的文件路径"), "缺路径保留约束: {prompt}");
-        assert!(prompt.contains("尚未回答的问题"), "缺未答问题保留约束: {prompt}");
+        assert!(
+            prompt.contains("精确的文件路径"),
+            "缺路径保留约束: {prompt}"
+        );
+        assert!(
+            prompt.contains("尚未回答的问题"),
+            "缺未答问题保留约束: {prompt}"
+        );
         // 对话历史被内嵌。
         assert!(
             prompt.contains("用户问 X") && prompt.contains("助手答 Y"),
@@ -1178,7 +1213,8 @@ mod tests {
             fence_min_tokens: 400,
             tool_result_min_tokens: 10,
         };
-        let (out, stats) = Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
+        let (out, stats) =
+            Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
         assert_eq!(stats.tool_results_elided, 1);
         assert!(stats.saved > 0);
         let AgentMessage::ToolResult(t) = &out[1] else {
@@ -1205,7 +1241,8 @@ mod tests {
             fence_min_tokens: 400,
             tool_result_min_tokens: 10,
         };
-        let (out, stats) = Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
+        let (out, stats) =
+            Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
         assert_eq!(stats.tool_results_elided, 0);
         let AgentMessage::ToolResult(t) = &out[0] else {
             panic!()
@@ -1227,7 +1264,8 @@ mod tests {
             fence_min_tokens: 400,
             tool_result_min_tokens: 10,
         };
-        let (out, stats) = Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
+        let (out, stats) =
+            Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
         assert_eq!(stats.tool_results_elided, 0);
         let AgentMessage::ToolResult(t) = &out[0] else {
             panic!()
@@ -1246,7 +1284,8 @@ mod tests {
             fence_min_tokens: 10,
             tool_result_min_tokens: 400,
         };
-        let (out, stats) = Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
+        let (out, stats) =
+            Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
         assert_eq!(stats.blocks_elided, 1);
         let AgentMessage::Assistant(a) = &out[0] else {
             panic!()
@@ -1283,7 +1322,8 @@ mod tests {
             fence_min_tokens: 400,
             tool_result_min_tokens: 10,
         };
-        let (out, stats) = Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
+        let (out, stats) =
+            Compactor::shake_with(&log, &cfg, &heuristic_counter(), &NullSink).unwrap();
         assert_eq!(stats.tool_results_elided, 1);
         assert_eq!(out.len(), 2, "消息数不变（仅替换内容）");
         let AgentMessage::ToolResult(t) = &out[1] else {
@@ -1329,8 +1369,7 @@ mod tests {
         // 归档目录恰好一份文件，内容 == 原始大文本（可回读）。
         let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
         assert_eq!(entries.len(), 1, "应落盘一份 artifact");
-        let content =
-            std::fs::read_to_string(entries.pop().unwrap().unwrap().path()).unwrap();
+        let content = std::fs::read_to_string(entries.pop().unwrap().unwrap().path()).unwrap();
         assert_eq!(content, big);
         // 占位符引用 artifact://<id>。
         let AgentMessage::ToolResult(t) = &out[0] else {

@@ -30,13 +30,15 @@ impl PromptCatalog {
     /// 按模式返回 system prompt（稳定前缀主体，来自静态 .md）。
     #[must_use]
     pub fn system(&self, mode: Mode) -> Vec<String> {
-        vec![match mode {
-            Mode::Code => SYSTEM_CODE,
-            Mode::Architect => SYSTEM_ARCHITECT,
-            Mode::Ask => SYSTEM_ASK,
-            Mode::Debug => SYSTEM_DEBUG,
-        }
-        .to_string()]
+        vec![
+            match mode {
+                Mode::Code => SYSTEM_CODE,
+                Mode::Architect => SYSTEM_ARCHITECT,
+                Mode::Ask => SYSTEM_ASK,
+                Mode::Debug => SYSTEM_DEBUG,
+            }
+            .to_string(),
+        ]
     }
 
     /// 检测当前操作系统与架构，生成平台感知系统提示词段落。
@@ -125,7 +127,10 @@ mod tests {
     #[test]
     fn render_replaces_vars() {
         let cat = PromptCatalog::new();
-        assert_eq!(cat.render("hello {{name}}!", &[("name", "world")]), "hello world!");
+        assert_eq!(
+            cat.render("hello {{name}}!", &[("name", "world")]),
+            "hello world!"
+        );
     }
 
     #[test]

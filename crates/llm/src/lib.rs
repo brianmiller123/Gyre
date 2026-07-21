@@ -7,8 +7,8 @@
 #![warn(clippy::pedantic)]
 
 mod anthropic;
-pub mod dialect;
 mod deepseek;
+pub mod dialect;
 mod glm;
 pub mod inband;
 mod openai;
@@ -18,17 +18,17 @@ pub mod thinking;
 pub mod transform;
 
 pub use anthropic::AnthropicMessagesAdapter;
-pub use dialect::Dialect;
 pub use deepseek::DeepSeekProvider;
+pub use dialect::Dialect;
 pub use glm::GlmProvider;
-pub use inband::{wrap_inband_if, InbandProvider};
+pub use inband::{InbandProvider, wrap_inband_if};
 pub use openai::OpenAiCompletionsAdapter;
-pub use plugin::{collect_providers, LlmProviderPlugin};
+pub use plugin::{LlmProviderPlugin, collect_providers};
 pub use registry::ProviderRegistry;
 pub use thinking::LlmThinkingClassifier;
 pub use transform::{
-    anthropic_apply_cache, anthropic_system_blocks, count_cache_breakpoints, inject_ephemeral_cache,
-    normalize_tool_schema, CacheStrategy,
+    CacheStrategy, anthropic_apply_cache, anthropic_system_blocks, count_cache_breakpoints,
+    inject_ephemeral_cache, normalize_tool_schema,
 };
 
 /// 读取错误响应体为字符串，限制在 4 KiB 以内（防止异常上游用超大错误体撑爆内存）。
@@ -134,10 +134,7 @@ mod tests {
         buf.extend_from_slice(suffix);
         let line = drain_line(&mut buf).unwrap();
         let text = String::from_utf8(line).unwrap();
-        assert!(
-            text.contains("你好"),
-            "跨 chunk 的中文被损坏: {text:?}"
-        );
+        assert!(text.contains("你好"), "跨 chunk 的中文被损坏: {text:?}");
     }
 
     #[test]

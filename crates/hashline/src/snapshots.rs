@@ -66,7 +66,10 @@ impl InMemorySnapshotStore {
     pub fn record(&mut self, path: &str, full_text: &str) -> String {
         let hash = compute_file_hash(full_text);
         let entry = self.map.entry(path.to_string()).or_default();
-        if entry.last().is_some_and(|s| s.hash.eq_ignore_ascii_case(&hash)) {
+        if entry
+            .last()
+            .is_some_and(|s| s.hash.eq_ignore_ascii_case(&hash))
+        {
             // 内容未变：不新增版本
         } else {
             entry.push(Snapshot {

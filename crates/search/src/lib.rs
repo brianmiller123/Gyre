@@ -116,10 +116,7 @@ pub fn glob_match(root: &Path, pattern: &str, max: usize) -> Result<Vec<PathBuf>
         }
         // 同时匹配相对路径与文件名
         if matcher.is_match(&e.rel_path)
-            || e
-                .rel_path
-                .file_name()
-                .is_some_and(|n| matcher.is_match(n))
+            || e.rel_path.file_name().is_some_and(|n| matcher.is_match(n))
         {
             out.push(e.rel_path.clone());
         }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast};
 
-use crate::codec::{open, seal, RoomKey};
+use crate::codec::{RoomKey, open, seal};
 use crate::error::CollabError;
 use crate::frame::WireFrame;
 use crate::room::room_id;
@@ -160,10 +160,26 @@ impl CollabClient {
 fn stamp(frame: &mut WireFrame, client_id: &str) {
     let ts = now_ms();
     match frame {
-        WireFrame::Chat { client_id: c, ts: t, .. }
-        | WireFrame::Tool { client_id: c, ts: t, .. }
-        | WireFrame::Presence { client_id: c, ts: t, .. }
-        | WireFrame::Sync { client_id: c, ts: t, .. } => {
+        WireFrame::Chat {
+            client_id: c,
+            ts: t,
+            ..
+        }
+        | WireFrame::Tool {
+            client_id: c,
+            ts: t,
+            ..
+        }
+        | WireFrame::Presence {
+            client_id: c,
+            ts: t,
+            ..
+        }
+        | WireFrame::Sync {
+            client_id: c,
+            ts: t,
+            ..
+        } => {
             *c = client_id.to_string();
             *t = ts;
         }
@@ -205,7 +221,9 @@ mod tests {
         let sealed = rx.recv().await.unwrap();
         let frame = b.decode(&sealed).unwrap();
         match frame {
-            WireFrame::Chat { client_id, text, .. } => {
+            WireFrame::Chat {
+                client_id, text, ..
+            } => {
                 assert_eq!(client_id, "alice");
                 assert_eq!(text, "hello");
             }

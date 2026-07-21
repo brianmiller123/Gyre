@@ -175,7 +175,9 @@ impl SwarmAgentRunner for AgentSwarmRunner {
         cancel: &CancellationToken,
         on_progress: Option<&ProgressFn>,
     ) -> SwarmAgentResult {
-        let model = model_override.cloned().unwrap_or_else(|| self.model.clone());
+        let model = model_override
+            .cloned()
+            .unwrap_or_else(|| self.model.clone());
         let sub_context = (self.context_factory)();
         let role_prompt = build_role_prompt(agent);
         // 子代理审批：注入了父级策略则尊重其 Deny（仅 prompt 自动放行），否则全自动放行。

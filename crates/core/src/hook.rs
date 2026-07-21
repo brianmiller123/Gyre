@@ -3,8 +3,8 @@
 //! Hook 仅观察事件（不阻止执行），用于日志、通知、指标、审计等副作用。
 //! 装配层（cli/server）注入具体实现（如写入审计日志、推送 webhook）。
 
-use crate::message::{AssistantMessage, ToolResultMessage};
 use crate::ToolResult;
+use crate::message::{AssistantMessage, ToolResultMessage};
 
 /// Hook 事件。
 #[derive(Debug, Clone)]

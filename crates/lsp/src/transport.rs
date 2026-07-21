@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// 内部 JSON-RPC 消息。
@@ -92,7 +92,11 @@ impl LspTransport {
     ///
     /// # Errors
     /// 子进程无法启动时返回 [`TransportError::Spawn`]。
-    pub fn spawn(command: &str, args: &[&str], cwd: Option<&std::path::Path>) -> Result<Self, TransportError> {
+    pub fn spawn(
+        command: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Self, TransportError> {
         let mut cmd = Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -158,7 +162,8 @@ impl LspTransport {
             "params": params,
         });
 
-        let payload = serde_json::to_string(&request).map_err(|e| TransportError::Frame(e.to_string()))?;
+        let payload =
+            serde_json::to_string(&request).map_err(|e| TransportError::Frame(e.to_string()))?;
 
         debug!(method = %method, id = id, "LSP 请求发送");
 
@@ -218,7 +223,10 @@ impl LspTransport {
                 }
 
                 // 返回 result 字段
-                Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                Ok(response
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
             }
             Err(e) => Err(e),
         }
@@ -228,15 +236,19 @@ impl LspTransport {
     ///
     /// # Errors
     /// 写入失败时返回 [`TransportError::Write`]。
-    pub async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), TransportError> {
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(), TransportError> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         });
 
-        let payload =
-            serde_json::to_string(&notification).map_err(|e| TransportError::Frame(e.to_string()))?;
+        let payload = serde_json::to_string(&notification)
+            .map_err(|e| TransportError::Frame(e.to_string()))?;
 
         self.request_tx
             .send(OutboundRequest {
@@ -277,7 +289,14 @@ impl LspTransport {
     /// 优雅关闭：发送 shutdown + exit，等待进程退出。
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), TransportError> {
         info!("正在关闭 LSP 传输...");
-        let _ = self.request(9999, "shutdown", serde_json::Value::Null, Duration::from_secs(5)).await;
+        let _ = self
+            .request(
+                9999,
+                "shutdown",
+                serde_json::Value::Null,
+                Duration::from_secs(5),
+            )
+            .await;
         let _ = self.notify("exit", serde_json::Value::Null).await;
 
         match tokio::time::timeout(timeout, self.child.wait()).await {
@@ -301,7 +320,10 @@ impl LspTransport {
 // ── 后台任务 ───────────────────────────────────────────────────────────
 
 /// 后台写任务：从信道接收出站消息，以 Content-Length 帧写入 stdin。
-async fn write_loop(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiver<OutboundRequest>) {
+async fn write_loop(
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: mpsc::Receiver<OutboundRequest>,
+) {
     while let Some(req) = rx.recv().await {
         let frame = format_frame(&req.payload);
         debug!(len = frame.len(), "写入帧");

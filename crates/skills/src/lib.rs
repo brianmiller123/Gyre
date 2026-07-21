@@ -19,5 +19,5 @@ mod registry;
 mod render;
 
 pub use native::NativeSkillProvider;
-pub use registry::{resolve_skill_url, SkillCatalog, SkillRegistry};
+pub use registry::{SkillCatalog, SkillRegistry, resolve_skill_url};
 pub use render::render_skills_section;

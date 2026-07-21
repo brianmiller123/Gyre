@@ -17,7 +17,11 @@ pub type DependencyGraph = BTreeMap<String, BTreeSet<String>>;
 /// 构建依赖图。
 #[must_use]
 pub fn build_dependency_graph(def: &SwarmDefinition) -> DependencyGraph {
-    let mut deps: DependencyGraph = def.agents.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
+    let mut deps: DependencyGraph = def
+        .agents
+        .keys()
+        .map(|k| (k.clone(), BTreeSet::new()))
+        .collect();
 
     // 显式 waits_for
     for agent in def.agents.values() {
@@ -44,7 +48,8 @@ pub fn build_dependency_graph(def: &SwarmDefinition) -> DependencyGraph {
     }
 
     // pipeline/sequential 无显式依赖时，按声明顺序串链
-    if matches!(def.mode, SwarmMode::Pipeline | SwarmMode::Sequential) && !has_explicit_deps(&deps) {
+    if matches!(def.mode, SwarmMode::Pipeline | SwarmMode::Sequential) && !has_explicit_deps(&deps)
+    {
         for i in 1..def.agent_order.len() {
             if let Some(entry) = deps.get_mut(&def.agent_order[i]) {
                 entry.insert(def.agent_order[i - 1].clone());
@@ -128,11 +133,7 @@ pub fn build_execution_waves(deps: &DependencyGraph) -> Result<Vec<Vec<String>>,
         if wave.is_empty() {
             return Err(format!(
                 "Deadlock: agents [{}] cannot make progress — undetected cycle",
-                remaining
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                remaining.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
         }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use agent_core::{CapabilityTier, ToolError, ToolResult};
-use agent_tools::{render_diagnostics, write_with_effects, Tool, ToolContext, WriteReport};
+use agent_tools::{Tool, ToolContext, WriteReport, render_diagnostics, write_with_effects};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -70,7 +70,11 @@ impl Tool for HashlineTool {
         CapabilityTier::Write
     }
 
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let patch = input
             .get("patch")
             .and_then(serde_json::Value::as_str)
@@ -104,7 +108,9 @@ impl Tool for HashlineTool {
                 .any(|h| matches!(h, crate::types::Hunk::File(FileOp::Remove)));
             if is_rem {
                 if target.exists() {
-                    tokio::fs::remove_file(&target).await.map_err(ToolError::Io)?;
+                    tokio::fs::remove_file(&target)
+                        .await
+                        .map_err(ToolError::Io)?;
                 }
                 summary.push(format!("{}: REM（已删除）", section.path));
                 continue;
@@ -172,9 +178,12 @@ impl Tool for HashlineTool {
                     all_diagnostics.extend(report.diagnostics);
                 }
                 if target.exists() && target != dest_path {
-                    tokio::fs::remove_file(&target).await.map_err(ToolError::Io)?;
+                    tokio::fs::remove_file(&target)
+                        .await
+                        .map_err(ToolError::Io)?;
                 }
-                let diff = build_compact_diff(&original, result.text.as_deref().unwrap_or(&original));
+                let diff =
+                    build_compact_diff(&original, result.text.as_deref().unwrap_or(&original));
                 summary.push(format!(
                     "{} → {dest}: MV（+{} / -{}）",
                     section.path, diff.added_lines, diff.removed_lines
@@ -218,7 +227,9 @@ async fn write_ensure_parent(
 ) -> Result<WriteReport, ToolError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(ToolError::Io)?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(ToolError::Io)?;
         }
     }
     write_with_effects(path, content, ctx).await

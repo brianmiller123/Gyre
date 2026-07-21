@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::executor::{ProgressFn, SwarmAgentResult, SwarmAgentRunner};
 use crate::schema::SwarmDefinition;
-use crate::state::{AgentStatus, AgentStateUpdate, PipelineStateUpdate, PipelineStatus, StateTracker};
+use crate::state::{
+    AgentStateUpdate, AgentStatus, PipelineStateUpdate, PipelineStatus, StateTracker,
+};
 
 /// 流水线进度快照。
 #[derive(Debug, Clone)]
@@ -134,11 +136,22 @@ impl PipelineController {
                 .await;
             let _ = self
                 .state
-                .append_orchestrator_log(&format!("--- Iteration {}/{} ---", iteration + 1, target_count))
+                .append_orchestrator_log(&format!(
+                    "--- Iteration {}/{} ---",
+                    iteration + 1,
+                    target_count
+                ))
                 .await;
 
             let iteration_results = self
-                .run_iteration(runner, iteration, &cancel, model_override.as_ref(), on_progress.as_ref(), max_concurrent)
+                .run_iteration(
+                    runner,
+                    iteration,
+                    &cancel,
+                    model_override.as_ref(),
+                    on_progress.as_ref(),
+                    max_concurrent,
+                )
                 .await;
 
             for (agent_name, result) in iteration_results {
@@ -265,7 +278,13 @@ impl PipelineController {
                 let handle = tokio::spawn(async move {
                     let _permit = permit; // 持有至任务结束，归还许可
                     runner
-                        .run(&agent, &agent.task, model_override.as_ref(), &cancel, progress.as_ref())
+                        .run(
+                            &agent,
+                            &agent.task,
+                            model_override.as_ref(),
+                            &cancel,
+                            progress.as_ref(),
+                        )
                         .await
                 });
                 // 将 agent 名与句柄配对：panic 时仍能归属到真实 agent（而非固定 __panic__ 键）。
@@ -340,7 +359,12 @@ impl PipelineController {
         results
     }
 
-    async fn emit_progress(&self, iteration: usize, wave_idx: usize, on_progress: Option<&ProgressFn>) {
+    async fn emit_progress(
+        &self,
+        iteration: usize,
+        wave_idx: usize,
+        on_progress: Option<&ProgressFn>,
+    ) {
         if on_progress.is_none() {
             return;
         }
@@ -359,7 +383,10 @@ impl PipelineController {
         };
         // 进度回调仅做通知；详细渲染见 render 模块（由调用方拉取 snapshot）。
         if let Some(f) = on_progress {
-            f("__wave__", &format!("iteration={iteration} wave={wave_idx}"));
+            f(
+                "__wave__",
+                &format!("iteration={iteration} wave={wave_idx}"),
+            );
         }
     }
 }
@@ -380,8 +407,8 @@ mod tests {
     use crate::state::{PipelineStatus, StateTracker};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// 记录峰值并发的 mock runner：进入时自增、退出时自减，并追踪历史峰值。

@@ -87,7 +87,10 @@ pub(crate) fn finalize_tool_calls(
 /// 解析单个调用块内联 JSON：`{"name":"...","arguments":{...}}`。
 pub(crate) fn parse_tool_call_json(inner: &str, idx: usize) -> Option<ContentBlock> {
     let v: serde_json::Value = serde_json::from_str(inner.trim()).ok()?;
-    let name = v.get("name").and_then(serde_json::Value::as_str)?.to_string();
+    let name = v
+        .get("name")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
     let arguments = v
         .get("arguments")
         .cloned()
@@ -188,7 +191,10 @@ mod tests {
     fn render_lists_tools_and_format() {
         let s = Dialect::Xml.render_tools(&[spec("read_file"), spec("grep")]);
         assert!(s.contains("<tool_call>"), "应包含调用格式说明");
-        assert!(s.contains("read_file") && s.contains("grep"), "应列出工具名");
+        assert!(
+            s.contains("read_file") && s.contains("grep"),
+            "应列出工具名"
+        );
         assert!(s.contains("参数 schema"), "应含 schema 标注");
     }
 
@@ -198,14 +204,21 @@ mod tests {
         let (calls, cleaned) = Dialect::Xml.parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            ContentBlock::ToolCall { id, name, arguments } => {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 assert!(id.starts_with("inband_"), "id 应为 inband 前缀: {id}");
                 assert_eq!(name, "read_file");
                 assert_eq!(arguments, &json!({"path":"a.txt"}));
             }
             other => panic!("应为 ToolCall: {other:?}"),
         }
-        assert!(cleaned.contains("let me read it"), "周边文本应保留: {cleaned}");
+        assert!(
+            cleaned.contains("let me read it"),
+            "周边文本应保留: {cleaned}"
+        );
         assert!(!cleaned.contains("<tool_call>"), "标签应被移除: {cleaned}");
     }
 
@@ -214,8 +227,20 @@ mod tests {
         let text = "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\nmid\n<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
         let (calls, cleaned) = Dialect::Xml.parse_tool_calls(text);
         assert_eq!(calls.len(), 2);
-        assert_eq!(match &calls[0] { ContentBlock::ToolCall { name, .. } => name.clone(), _ => String::new() }, "a");
-        assert_eq!(match &calls[1] { ContentBlock::ToolCall { name, .. } => name.clone(), _ => String::new() }, "b");
+        assert_eq!(
+            match &calls[0] {
+                ContentBlock::ToolCall { name, .. } => name.clone(),
+                _ => String::new(),
+            },
+            "a"
+        );
+        assert_eq!(
+            match &calls[1] {
+                ContentBlock::ToolCall { name, .. } => name.clone(),
+                _ => String::new(),
+            },
+            "b"
+        );
         assert_eq!(cleaned.trim(), "mid", "中间文本保留、标签移除: {cleaned}");
     }
 
@@ -233,7 +258,10 @@ mod tests {
         let text = "<tool_call>{\"arguments\":{}}</tool_call>";
         let (calls, cleaned) = Dialect::Xml.parse_tool_calls(text);
         assert!(calls.is_empty(), "非法调用不应产出 ToolCall");
-        assert!(cleaned.contains("<tool_call>"), "非法块应保留可见: {cleaned}");
+        assert!(
+            cleaned.contains("<tool_call>"),
+            "非法块应保留可见: {cleaned}"
+        );
     }
 
     #[test]
@@ -251,7 +279,10 @@ mod tests {
         assert_eq!(calls.len(), 1);
         match &calls[0] {
             ContentBlock::ToolCall { arguments, .. } => {
-                assert_eq!(arguments, &serde_json::Value::Object(serde_json::Map::new()));
+                assert_eq!(
+                    arguments,
+                    &serde_json::Value::Object(serde_json::Map::new())
+                );
             }
             _ => panic!(),
         }

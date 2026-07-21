@@ -11,14 +11,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent::{Agent, AgentBuilder};
-use agent_supervisor::{SubAgentStatus, Supervisor};
-use agent_config::{discover_commands, Config, ModelProfile, RulesEngine};
+use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
     AskResponse, AssistantMessage, CompactionStrategy, ContextManager, LlmProvider, Mode,
     ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage, Usage, UserContent,
     UserMessage, Workspace,
 };
+use agent_supervisor::{SubAgentStatus, Supervisor};
+use agent_tools::Tool;
 use axum::{
     Router,
     body::Body,
@@ -27,7 +28,6 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
-use agent_tools::Tool;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -79,22 +79,21 @@ impl ContentInput {
     /// `ImageRef` 据 `uploads` 句柄表解析为真实 base64；句柄缺失（已过期/未知）返回
     /// `None`，由调用方决定跳过或告警。
     #[must_use]
-    fn to_user_content(
-        &self,
-        uploads: &HashMap<String, (String, String)>,
-    ) -> Option<UserContent> {
+    fn to_user_content(&self, uploads: &HashMap<String, (String, String)>) -> Option<UserContent> {
         match self {
             Self::Text { text } => Some(UserContent::Text { text: text.clone() }),
             Self::Image { mime, data } => Some(UserContent::Image {
                 mime: mime.clone(),
                 data: data.clone(),
             }),
-            Self::ImageRef { upload_id } => uploads.get(upload_id).map(|(mime, data)| {
-                UserContent::Image {
-                    mime: mime.clone(),
-                    data: data.clone(),
-                }
-            }),
+            Self::ImageRef { upload_id } => {
+                uploads
+                    .get(upload_id)
+                    .map(|(mime, data)| UserContent::Image {
+                        mime: mime.clone(),
+                        data: data.clone(),
+                    })
+            }
         }
     }
 }
@@ -467,8 +466,7 @@ impl SessionManager {
         // 直接返回该会话 id——跳过「重建→覆盖」，否则会杀掉该会话正在运行的任务
         // （前端切换会话后原循环停止的核心修复）。mode 覆盖（switchMode 需应用新
         // system prompt）仍走重建路径。
-        if resume.is_some() && mode_override.is_none()
-            && self.inner.lock().await.contains_key(&id)
+        if resume.is_some() && mode_override.is_none() && self.inner.lock().await.contains_key(&id)
         {
             return Ok(id);
         }
@@ -754,7 +752,9 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
                     }
                     d.running.store(false, Ordering::SeqCst);
                     // 补偿状态：若 Agent 流异常终止未发送 Idle/Done，此处兜底确保前端脱离 running 态。
-                    if let Err(e) = d.tx.send(ServerFrame::StateChanged { state: AgentState::Idle }) {
+                    if let Err(e) = d.tx.send(ServerFrame::StateChanged {
+                        state: AgentState::Idle,
+                    }) {
                         tracing::warn!(?e, "广播补偿 Idle 状态失败");
                     }
                     let mut guard = d.current_cancel.lock().await;
@@ -903,9 +903,10 @@ async fn build_agent(
     let prompts = Arc::new(agent_prompt::PromptCatalog::new());
     // 持久化上下文（与 CLI 共享 <cwd>/.agent/sessions/<id>.jsonl）：resume 时自动加载历史。
     let session_path = agent_context::SessionStore::for_cwd(cwd).path_for(session_id);
-    let ctx = agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let ctx =
+        agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
+            .await
+            .map_err(|e| e.to_string())?;
     ctx.set_summarizer(Box::new(
         agent_context::compaction::LlmSummaryProvider::new(
             Arc::clone(&provider),
@@ -935,7 +936,9 @@ async fn build_agent(
     // 子 Agent 工具集（builtin + MCP，不含 task 以防递归）
     let mut sub_reg = agent_tools::builtin_tools();
     if config.github.enabled {
-        sub_reg = sub_reg.with(Box::new(agent_tools::GithubTool::new(config.github.allow_write)));
+        sub_reg = sub_reg.with(Box::new(agent_tools::GithubTool::new(
+            config.github.allow_write,
+        )));
     }
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
@@ -962,8 +965,9 @@ async fn build_agent(
     // 父 Agent 工具集 = builtin + MCP + task（task 受开关控制）
     let (mut tool_registry, lsp_pool) = agent_tools::builtin_tools_with_pool();
     if config.github.enabled {
-        tool_registry =
-            tool_registry.with(Box::new(agent_tools::GithubTool::new(config.github.allow_write)));
+        tool_registry = tool_registry.with(Box::new(agent_tools::GithubTool::new(
+            config.github.allow_write,
+        )));
     }
     for t in mcp.tools() {
         tool_registry = tool_registry.with(Box::new(t.clone()));
@@ -1084,18 +1088,15 @@ fn assemble(
     };
     // 编辑后 LSP writethrough：lsp 启用且 edit 开启时注入（与 CLI 一致）。
     let builder = if config.tools.effective("lsp", false)
-        && (config.agent.tools.edit.format_on_write
-            || config.agent.tools.edit.diagnostics_on_write)
+        && (config.agent.tools.edit.format_on_write || config.agent.tools.edit.diagnostics_on_write)
     {
-        builder.write_effect(std::sync::Arc::new(
-            agent_tools::LspWriteEffect::new(
-                workspace_root,
-                std::sync::Arc::clone(&lsp_pool),
-                config.agent.tools.edit.format_on_write,
-                config.agent.tools.edit.diagnostics_on_write,
-                config.agent.tools.edit.diagnostics_deduplicate,
-            ),
-        ) as std::sync::Arc<dyn agent_core::WriteEffect>)
+        builder.write_effect(std::sync::Arc::new(agent_tools::LspWriteEffect::new(
+            workspace_root,
+            std::sync::Arc::clone(&lsp_pool),
+            config.agent.tools.edit.format_on_write,
+            config.agent.tools.edit.diagnostics_on_write,
+            config.agent.tools.edit.diagnostics_deduplicate,
+        )) as std::sync::Arc<dyn agent_core::WriteEffect>)
     } else {
         builder
     };
@@ -1168,7 +1169,10 @@ pub fn app(state: SessionManager) -> Router {
     Router::new()
         .route("/api/sessions", get(create_session))
         .route("/api/sessions/list", get(list_sessions))
-        .route("/api/sessions/{id}", delete(delete_session).post(rename_session))
+        .route(
+            "/api/sessions/{id}",
+            delete(delete_session).post(rename_session),
+        )
         .route("/api/sessions/{id}/agents", get(list_agents))
         .route("/api/sessions/{id}/skills", get(list_skills))
         .route("/api/sessions/{id}/skill/{name}", get(skill_body))
@@ -1306,8 +1310,9 @@ async fn skill_body(
     match state.get(&id).await {
         Some(session) => match session.skills.find(&name) {
             Some(skill) => match tokio::fs::read_to_string(&skill.file_path).await {
-                Ok(body) => Json(serde_json::json!({ "name": skill.name, "body": body }))
-                    .into_response(),
+                Ok(body) => {
+                    Json(serde_json::json!({ "name": skill.name, "body": body })).into_response()
+                }
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("读取 skill 失败: {e}"),
@@ -1600,7 +1605,9 @@ struct SessionParams {
 fn is_safe_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// 解析一行会话 JSONL：优先按 [`agent_core::SessionNode`]（新会话树格式）解析取其
@@ -1699,7 +1706,9 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
                     .join("");
                 let tk = thinking.trim();
                 if !tk.is_empty() {
-                    out.push(serde_json::json!({ "kind": "thinking", "text": tk, "line": msg_index }));
+                    out.push(
+                        serde_json::json!({ "kind": "thinking", "text": tk, "line": msg_index }),
+                    );
                 }
                 let text: String = a
                     .content
@@ -1712,7 +1721,9 @@ fn read_history(path: &std::path::Path) -> Vec<serde_json::Value> {
                     .join("");
                 let t = text.trim();
                 if !t.is_empty() {
-                    out.push(serde_json::json!({ "kind": "assistant", "text": t, "line": msg_index }));
+                    out.push(
+                        serde_json::json!({ "kind": "assistant", "text": t, "line": msg_index }),
+                    );
                 }
             }
             _ => {}
@@ -1834,20 +1845,14 @@ async fn switch_branch(
     let leaf_id = body.leaf_id.trim().to_string();
     match state.get(&id).await {
         Some(session) => {
-            if session
-                .running
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if session.running.load(std::sync::atomic::Ordering::SeqCst) {
                 return (StatusCode::CONFLICT, "任务运行中，无法切换分支").into_response();
             }
             let ok = if body.handoff {
                 match session.context.switch_branch_with_handoff(&leaf_id).await {
                     Ok(b) => b,
                     Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("切换失败: {e}"),
-                        )
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("切换失败: {e}"))
                             .into_response();
                     }
                 }
@@ -1868,9 +1873,9 @@ async fn switch_branch(
                 return (StatusCode::NOT_FOUND, "会话不存在").into_response();
             }
             let tree = read_branch_tree(&path);
-            let exists = tree["nodes"]
-                .as_array()
-                .map_or(false, |a| a.iter().any(|n| n["id"].as_str() == Some(leaf_id.as_str())));
+            let exists = tree["nodes"].as_array().map_or(false, |a| {
+                a.iter().any(|n| n["id"].as_str() == Some(leaf_id.as_str()))
+            });
             if !exists {
                 return (StatusCode::NOT_FOUND, "目标叶子不存在").into_response();
             }
@@ -1947,17 +1952,27 @@ fn read_branch_tree(path: &std::path::Path) -> serde_json::Value {
 fn node_role_preview(msg: &agent_core::AgentMessage) -> (&'static str, String) {
     match msg {
         agent_core::AgentMessage::User(u) => {
-            let t: String = u.content.iter().filter_map(|c| match c {
-                agent_core::UserContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            }).collect::<Vec<_>>().join("");
+            let t: String = u
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    agent_core::UserContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
             ("user", preview_text(&t, 120))
         }
         agent_core::AgentMessage::Assistant(a) => {
-            let t: String = a.content.iter().filter_map(|b| match b {
-                agent_core::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            }).collect::<Vec<_>>().join("");
+            let t: String = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    agent_core::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
             ("assistant", preview_text(&t, 120))
         }
         agent_core::AgentMessage::ToolResult(t) => {
@@ -1990,19 +2005,13 @@ async fn delete_message(
     let removed: usize = match state.get(&id).await {
         // 活跃会话：内存上下文 + JSONL 一致删除。
         Some(session) => {
-            if session
-                .running
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if session.running.load(std::sync::atomic::Ordering::SeqCst) {
                 return (StatusCode::CONFLICT, "任务运行中，无法删除消息").into_response();
             }
             match session.context.delete_message_at(line).await {
                 Ok(n) => n,
                 Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("删除失败: {e}"),
-                    )
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {e}"))
                         .into_response();
                 }
             }
@@ -2017,10 +2026,7 @@ async fn delete_message(
             match agent_context::delete_message_in_file(&path, line).await {
                 Ok(n) => n,
                 Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("删除失败: {e}"),
-                    )
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {e}"))
                         .into_response();
                 }
             }
@@ -2059,11 +2065,7 @@ async fn delete_session(
     match store.delete(&id) {
         Ok(true) => Json(serde_json::json!({ "ok": true, "id": id })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "会话不存在").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("删除失败: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {e}")).into_response(),
     }
 }
 
@@ -2190,11 +2192,10 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: Arc<Sessio
 
     // 重连补帧：若该会话正有任务运行，先给本连接回推一帧 Running 态，使重连前端
     // 立即反映真实进度（而非误判 no_task、允许发起新任务而被驱动任务拒绝）。
-    if session
-        .running
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        if let Ok(text) = serde_json::to_string(&ServerFrame::StateChanged { state: AgentState::Running }) {
+    if session.running.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Ok(text) = serde_json::to_string(&ServerFrame::StateChanged {
+            state: AgentState::Running,
+        }) {
             let _ = sink
                 .send(axum::extract::ws::Message::Text(text.into()))
                 .await;
@@ -2370,9 +2371,13 @@ mod tests {
     /// 而非被 serde 展平为 `{"running": null}` 之类（newtype 包装 fieldless enum 的陷阱）。
     #[test]
     fn serialize_state_changed_emits_state_field() {
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&ServerFrame::StateChanged { state: AgentState::Running }).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&ServerFrame::StateChanged {
+                state: AgentState::Running,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["type"], "state_changed");
         assert_eq!(v["state"], "running");
         assert_eq!(v.get("running"), None, "不应残留 newtype 展平的 null 字段");
@@ -2394,8 +2399,13 @@ mod tests {
         ));
         let msg = agent_core::AgentMessage::Assistant(AssistantMessage {
             content: vec![
-                ContentBlock::Thinking { text: "先思考一下".into(), signature: None },
-                ContentBlock::Text { text: "最终回答".into() },
+                ContentBlock::Thinking {
+                    text: "先思考一下".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "最终回答".into(),
+                },
             ],
             usage: Usage::default(),
             model: "test".into(),
@@ -2431,10 +2441,26 @@ mod tests {
         ));
         // a → b → b1（叶子1）；a → b → c1（叶子2）。
         let nodes = vec![
-            SessionNode { id: "a".into(),  parent_id: None,             message: AgentMessage::user_text("a") },
-            SessionNode { id: "b".into(),  parent_id: Some("a".into()), message: AgentMessage::user_text("b") },
-            SessionNode { id: "b1".into(), parent_id: Some("b".into()), message: AgentMessage::user_text("b1") },
-            SessionNode { id: "c1".into(), parent_id: Some("b".into()), message: AgentMessage::user_text("c1") },
+            SessionNode {
+                id: "a".into(),
+                parent_id: None,
+                message: AgentMessage::user_text("a"),
+            },
+            SessionNode {
+                id: "b".into(),
+                parent_id: Some("a".into()),
+                message: AgentMessage::user_text("b"),
+            },
+            SessionNode {
+                id: "b1".into(),
+                parent_id: Some("b".into()),
+                message: AgentMessage::user_text("b1"),
+            },
+            SessionNode {
+                id: "c1".into(),
+                parent_id: Some("b".into()),
+                message: AgentMessage::user_text("c1"),
+            },
         ];
         {
             let mut f = std::fs::File::create(&path).unwrap();

@@ -4,9 +4,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::{
-    Mode, Skill, SkillError, SkillLoadOptions, SkillProvider, SkillResolver,
-};
+use agent_core::{Mode, Skill, SkillError, SkillLoadOptions, SkillProvider, SkillResolver};
 
 use crate::native::NativeSkillProvider;
 
@@ -206,7 +204,10 @@ fn from_hex(b: u8) -> Option<u8> {
 }
 
 fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
-    patterns.iter().filter_map(|p| glob::Pattern::new(p).ok()).collect()
+    patterns
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect()
 }
 
 fn matches_any(name: &str, patterns: &[glob::Pattern]) -> bool {

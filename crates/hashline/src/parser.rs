@@ -11,7 +11,10 @@
 //!
 //! 正文行以 `+` 起首；不以 `+` 起首的行结束当前 hunk 的正文收集。
 
-use crate::format::{HL_FILE_HASH_SEP, HL_FILE_PREFIX, HL_FILE_SUFFIX, HL_HEADER_COLON, HL_PAYLOAD_REPLACE, HL_RANGE_SEP, kw};
+use crate::format::{
+    HL_FILE_HASH_SEP, HL_FILE_PREFIX, HL_FILE_SUFFIX, HL_HEADER_COLON, HL_PAYLOAD_REPLACE,
+    HL_RANGE_SEP, kw,
+};
 use crate::types::{Anchor, Cursor, FileOp, FileSection, Hunk};
 
 /// 解析整个 patch 文本为区段列表。
@@ -40,7 +43,11 @@ pub fn parse_hashline(text: &str) -> Result<Vec<FileSection>, String> {
                 sections.push(prev);
             }
             let (path, hash) = split_path_hash(body);
-            current = Some(FileSection { path, hash, hunks: Vec::new() });
+            current = Some(FileSection {
+                path,
+                hash,
+                hunks: Vec::new(),
+            });
             continue;
         }
 
@@ -50,15 +57,16 @@ pub fn parse_hashline(text: &str) -> Result<Vec<FileSection>, String> {
                 push_body(hunk, rest);
             } else if current.is_some() {
                 // 有段但无打开的 hunk：正文悬空，忽略并告警
-                return Err(format!("line {line_no}: 正文行 `+...` 出现在任何 hunk 头之前"));
+                return Err(format!(
+                    "line {line_no}: 正文行 `+...` 出现在任何 hunk 头之前"
+                ));
             }
             continue;
         }
 
         // 否则视作 hunk 头：先关闭上一个 hunk
         close_hunk(&mut current, &mut open_hunk);
-        let hunk = parse_hunk_header(trimmed)
-            .map_err(|e| format!("line {line_no}: {e}"))?;
+        let hunk = parse_hunk_header(trimmed).map_err(|e| format!("line {line_no}: {e}"))?;
         // 文件级操作（REM/MV）立即落地，不收集正文
         if let Hunk::File(_) = hunk {
             if let Some(section) = current.as_mut() {
@@ -116,7 +124,11 @@ fn parse_hunk_header(s: &str) -> Result<Hunk, String> {
     match head {
         kw::SWAP => {
             let (start, end) = parse_range(rest)?;
-            Ok(Hunk::Replace { start, end, body: Vec::new() })
+            Ok(Hunk::Replace {
+                start,
+                end,
+                body: Vec::new(),
+            })
         }
         kw::DEL => {
             let (start, end) = parse_range(rest)?;
@@ -124,18 +136,26 @@ fn parse_hunk_header(s: &str) -> Result<Hunk, String> {
         }
         "INS.HEAD" => {
             require_empty(rest)?;
-            Ok(Hunk::Insert { cursor: Cursor::Bof, body: Vec::new() })
+            Ok(Hunk::Insert {
+                cursor: Cursor::Bof,
+                body: Vec::new(),
+            })
         }
         "INS.TAIL" => {
             require_empty(rest)?;
-            Ok(Hunk::Insert { cursor: Cursor::Eof, body: Vec::new() })
+            Ok(Hunk::Insert {
+                cursor: Cursor::Eof,
+                body: Vec::new(),
+            })
         }
-        "INS.PRE" => {
-            Ok(Hunk::Insert { cursor: Cursor::BeforeAnchor(parse_anchor(rest)?), body: Vec::new() })
-        }
-        "INS.POST" => {
-            Ok(Hunk::Insert { cursor: Cursor::AfterAnchor(parse_anchor(rest)?), body: Vec::new() })
-        }
+        "INS.PRE" => Ok(Hunk::Insert {
+            cursor: Cursor::BeforeAnchor(parse_anchor(rest)?),
+            body: Vec::new(),
+        }),
+        "INS.POST" => Ok(Hunk::Insert {
+            cursor: Cursor::AfterAnchor(parse_anchor(rest)?),
+            body: Vec::new(),
+        }),
         kw::REM => {
             require_empty(rest)?;
             Ok(Hunk::File(FileOp::Remove))
@@ -144,7 +164,9 @@ fn parse_hunk_header(s: &str) -> Result<Hunk, String> {
             if rest.is_empty() {
                 return Err("MV 缺少目标路径".to_string());
             }
-            Ok(Hunk::File(FileOp::Move { dest: rest.to_string() }))
+            Ok(Hunk::File(FileOp::Move {
+                dest: rest.to_string(),
+            }))
         }
         other => Err(format!("无法识别的 hunk 头 `{other}`")),
     }
@@ -159,15 +181,18 @@ fn require_empty(s: &str) -> Result<(), String> {
 }
 
 fn parse_anchor(s: &str) -> Result<Anchor, String> {
-    s.parse::<Anchor>()
-        .map_err(|_| format!("非法行号 `{s}`"))
+    s.parse::<Anchor>().map_err(|_| format!("非法行号 `{s}`"))
 }
 
 /// 解析 `N` 或 `N.=M`；返回 `(start, end)`，单值时 `start==end`。
 fn parse_range(s: &str) -> Result<(Anchor, Anchor), String> {
     if let Some((a, b)) = s.split_once(HL_RANGE_SEP) {
-        let start = a.parse::<Anchor>().map_err(|_| format!("非法起始行 `{a}`"))?;
-        let end = b.parse::<Anchor>().map_err(|_| format!("非法结束行 `{b}`"))?;
+        let start = a
+            .parse::<Anchor>()
+            .map_err(|_| format!("非法起始行 `{a}`"))?;
+        let end = b
+            .parse::<Anchor>()
+            .map_err(|_| format!("非法结束行 `{b}`"))?;
         if end < start {
             return Err(format!("范围结束 {end} 小于起始 {start}"));
         }
@@ -184,7 +209,8 @@ mod tests {
 
     #[test]
     fn parses_swap_del_ins() {
-        let patch = "[a.txt#1A2B]\nSWAP 1.=1:\n+ALPHA\nDEL 3\nINS.POST 2:\n+middle\nINS.HEAD:\n+top\n";
+        let patch =
+            "[a.txt#1A2B]\nSWAP 1.=1:\n+ALPHA\nDEL 3\nINS.POST 2:\n+middle\nINS.HEAD:\n+top\n";
         let sections = parse_hashline(patch).unwrap();
         assert_eq!(sections.len(), 1);
         let s = &sections[0];

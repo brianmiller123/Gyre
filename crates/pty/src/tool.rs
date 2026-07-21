@@ -10,7 +10,7 @@ use agent_tools::{Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::session::{run_pty_command, PtyOptions};
+use crate::session::{PtyOptions, run_pty_command};
 
 /// 在 PTY 中执行 shell 命令。
 pub struct RunPtyTool;
@@ -49,14 +49,16 @@ impl Tool for RunPtyTool {
         }
     }
 
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let command = input
             .get("command")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `command` 参数".into()))?;
-        let timeout_ms = input
-            .get("timeout_ms")
-            .and_then(serde_json::Value::as_u64);
+        let timeout_ms = input.get("timeout_ms").and_then(serde_json::Value::as_u64);
         let rows = input
             .get("rows")
             .and_then(serde_json::Value::as_u64)
@@ -87,7 +89,11 @@ impl Tool for RunPtyTool {
         };
 
         let text = if result.timed_out {
-            format!("[timed out after {}ms]\n{}", opts.timeout_ms.unwrap_or(0), result.output)
+            format!(
+                "[timed out after {}ms]\n{}",
+                opts.timeout_ms.unwrap_or(0),
+                result.output
+            )
         } else {
             let code = result.exit_code.unwrap_or(-1);
             if code == 0 {

@@ -168,10 +168,7 @@ pub fn collect_entries_for_branch_summary(
 ///
 /// 返回 `Some(新森林)` 表示发生删除；`None` 表示索引越界。
 #[must_use]
-pub fn remove_node_with_orphans(
-    nodes: &[SessionNode],
-    index: usize,
-) -> Option<Vec<SessionNode>> {
+pub fn remove_node_with_orphans(nodes: &[SessionNode], index: usize) -> Option<Vec<SessionNode>> {
     if index >= nodes.len() {
         return None;
     }
@@ -199,7 +196,9 @@ pub fn remove_node_with_orphans(
                 if removed.contains(&n.id) {
                     continue;
                 }
-                let Some(p) = n.parent_id.as_ref() else { continue };
+                let Some(p) = n.parent_id.as_ref() else {
+                    continue;
+                };
                 if !removed.contains(p) {
                     continue;
                 }
@@ -217,7 +216,8 @@ pub fn remove_node_with_orphans(
     }
 
     // 2) 重建：跳过 removed 节点；其余节点的 parent 若落在 removed 集，则改挂到 target_parent。
-    let mut out: Vec<SessionNode> = Vec::with_capacity(nodes.len() - removed.len().min(nodes.len()));
+    let mut out: Vec<SessionNode> =
+        Vec::with_capacity(nodes.len() - removed.len().min(nodes.len()));
     for n in nodes {
         if removed.contains(&n.id) {
             continue;
@@ -276,7 +276,11 @@ mod tests {
         for (i, t) in texts.iter().enumerate() {
             out.push(SessionNode {
                 id: format!("n{i}"),
-                parent_id: if i == 0 { None } else { Some(format!("n{}", i - 1)) },
+                parent_id: if i == 0 {
+                    None
+                } else {
+                    Some(format!("n{}", i - 1))
+                },
                 message: user(t),
             });
         }

@@ -12,17 +12,22 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentEvent, AgentRunSummary, AgentState, ApprovalDecision, ApprovalPolicy, AskKind, AskMessage,
-    AgentMessage, AskResponse, AssistantEvent, AssistantMessage, CompactionStrategy, CompletionRequest,
-    ContextManager, ContentBlock, Hook, HookEvent, LlmProvider, MemoryStore, Mode, ProviderCallContext,
-    ResourceResolver, SoftToolRequirement, StatusKind, StatusMessage, StopReason, ThinkingConfig, ThinkingPolicy, ToolResult, ToolResultMessage,
-    ToolChoice, ToolChoiceDirective, Usage, Workspace, WriteEffect,
+    AgentEvent, AgentMessage, AgentRunSummary, AgentState, ApprovalDecision, ApprovalPolicy,
+    AskKind, AskMessage, AskResponse, AssistantEvent, AssistantMessage, CompactionStrategy,
+    CompletionRequest, ContentBlock, ContextManager, Hook, HookEvent, LlmProvider, MemoryStore,
+    Mode, ProviderCallContext, ResourceResolver, SoftToolRequirement, StatusKind, StatusMessage,
+    StopReason, ThinkingConfig, ThinkingPolicy, ToolChoice, ToolChoiceDirective, ToolResult,
+    ToolResultMessage, Usage, Workspace, WriteEffect,
 };
 use agent_prompt::PromptCatalog;
-use agent_skills::{render_skills_section, SkillCatalog};
+use agent_skills::{SkillCatalog, render_skills_section};
 use agent_tools::{Concurrency, ToolContext, ToolRegistry};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
+// P1-D：循环内 OpenTelemetry GenAI span 标注用。Instrument 给 Future 加 span（Send-safe），
+// 见下方 chat span 说明。agent stream 须 Send（server tokio::spawn 消费），故不能用
+// Span::enter() 的非 Send guard 跨 await。
+use tracing::Instrument;
 
 mod task_tool;
 pub use task_tool::{ContextFactory, TaskTool};
@@ -93,11 +98,13 @@ pub struct Agent {
     /// 软工具需求（运行期共享，便于外部更新）。
     soft_requirement: Arc<std::sync::Mutex<Option<SoftToolRequirement>>>,
     /// steering 接收端（外部中途注入消息）。
-    steer_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    steer_rx:
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
     /// aside 接收端（外部注入**被动、非中断**通知——后台任务完成、延迟 LSP diagnostics 等）。
     /// 与 steering 的区别：aside **永不**打断在途工具（不走 Immediate 批级 cancel），只在
     /// 轮次边界（下一轮模型调用前 / 停止边界）折叠注入。移植 oh-my-pi `getAsideMessages`。
-    aside_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    aside_rx:
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
     /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新，移植 oh-my-pi
     /// `getReasoning` 等动态解析器）。
     runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
@@ -156,7 +163,11 @@ impl Agent {
 
     /// 运行一个任务，产出事件流。取消作用域为 Agent 自身的 `cancel`。
     pub fn run(&self, task: &str) -> impl futures::Stream<Item = AgentEvent> + '_ {
-        run_loop(self, agent_core::UserMessage::from_text(task), self.cancel.clone())
+        run_loop(
+            self,
+            agent_core::UserMessage::from_text(task),
+            self.cancel.clone(),
+        )
     }
 
     /// 运行一个带内容块（可含图像等多模态）的用户消息任务，产出事件流。
@@ -571,6 +582,24 @@ fn run_loop(
     let transform_assistant = agent.transform_assistant.clone();
 
     async_stream::stream! {
+        // P1-D：GenAI invoke_agent span（OTel 语义规范）——agent run 的逻辑根 span。
+        // async_stream! 内 yield 不能放入嵌套 async block（无法 Instrument 覆盖含 yield 的整段），
+        // 且 stream 须 Send（server tokio::spawn 消费），enter guard 非 Send 跨 await 会破坏 Send，
+        // 故 invoke_agent 作为「属性载体 span」：chat/execute_tool 子 span 经 `parent: &invoke_span`
+        // 显式挂载；主停止点 record 终态（success/turns/usage/duration）。详见 [`record_run_end`]。
+        let invoke_span = tracing::info_span!(
+            "gen_ai.invoke_agent",
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.request.model = %model.id,
+            gen_ai.system = %model.provider,
+            gyre.mode = ?mode,
+            gyre.success = tracing::field::Empty,
+            gyre.turns = tracing::field::Empty,
+            gyre.duration = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        );
+        let run_start = std::time::Instant::now();
         // 设置稳定前缀（system prompt + tool spec 指纹冻结）。
         // 若注入了 Skill 目录，则追加 `<skills>` 段（仅当 read_file 工具可用时）。
         let specs0 = tools.specs();
@@ -640,6 +669,7 @@ fn run_loop(
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: false }).await;
                 }
+                record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 return;
@@ -791,8 +821,12 @@ fn run_loop(
                 temperature,
                 thinking: thinking.clone(),
                 // P0-A：前缀指纹透传为 cache_key，供 provider 观测/命中前缀缓存
-                //（fingerprint 含 system + tool spec；stable_prefix_len 见 built）。
+                //（fingerprint 含 system + tool spec）。
                 cache_key: Some(built.fingerprint.clone()),
+                // 稳定前缀长度：provider 据此精确放置 cache_control breakpoint（移植
+                // oh-my-pi longestStablePrefix）。压缩/分支切换/steering 后会缩短，
+                // provider 端 breakpoint 随之前移，避免浪费缓存配额。
+                stable_prefix_len: built.stable_prefix_len,
             };
             summary.turns += 1;
             // 轮次硬上限：防止模型陷入无限工具循环（即便每轮都「成功」）。0 表示不限制。
@@ -810,7 +844,27 @@ fn run_loop(
             // TurnStart，保证 TurnStart 与 TurnEnd 严格配对。
             yield AgentEvent::TurnStart;
 
-            let mut event_stream = match provider.stream(req, &provider_ctx).await {
+            // P1-D：GenAI chat span（OTel 语义规范）。用 Instrument 覆盖 provider 网络调用：
+            // agent stream 须 Send（server tokio::spawn 消费），enter guard 非 Send 跨 await 会
+            // 破坏 Send；Instrument 给 Future 加 span 是 Send-safe。流式消费（含 yield）无法被
+            // Instrument 覆盖（async_stream! 的 yield 不能入嵌套 block），故 chat span 精确覆盖
+            // 握手 + 初始流建立；usage/finish_reason 在消息最终化后 record。
+            let chat_span = tracing::info_span!(
+                parent: &invoke_span,
+                "gen_ai.chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.request.model = %model.id,
+                gen_ai.system = %model.provider,
+                gyre.turn = summary.turns,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.response.finish_reason = tracing::field::Empty,
+            );
+            let mut event_stream = match provider
+                .stream(req, &provider_ctx)
+                .instrument(chat_span.clone())
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     mistakes += 1;
@@ -884,6 +938,13 @@ fn run_loop(
             };
             mistakes = 0;
             summary.usage.add(&assistant.usage);
+            // P1-D：record 本轮 usage + finish_reason 到 chat span（OTel GenAI 约定）。
+            chat_span.record("gen_ai.usage.input_tokens", assistant.usage.input_tokens);
+            chat_span.record("gen_ai.usage.output_tokens", assistant.usage.output_tokens);
+            chat_span.record(
+                "gen_ai.response.finish_reason",
+                format!("{:?}", assistant.stop_reason),
+            );
             // P1-M：transform assistant（最终化后、入 context/MessageEnd/工具分发前）。
             // 移植 oh-my-pi `transformAssistantMessage`：host 闭包原地改写 text / tool_call
             // args（宏展开、脱敏、归一化）。单一真相源——下游 context/UI/tools 都看改写后。
@@ -1021,6 +1082,7 @@ fn run_loop(
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: false }).await;
                 }
+                record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
                 return;
             }
@@ -1144,6 +1206,7 @@ fn run_loop(
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: true }).await;
                 }
+                record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
                 return;
             }
@@ -1189,6 +1252,7 @@ fn run_loop(
                         for h in &hooks {
                             h.on_event(&HookEvent::Stop { success: false }).await;
                         }
+                        record_run_end(&invoke_span, &summary, run_start);
                         yield AgentEvent::Done(summary);
                         return;
                     }
@@ -1349,6 +1413,17 @@ fn run_loop(
             // Immediate 模式 + batch 含 interruptible 工具时，边执行边轮询 steering 队列，
             // 命中即 batch_token.cancel() 中断在途工具（移植 oh-my-pi `watchSteeringWhileRunning`）。
             // 用 async 块统一两分支的 future 类型，便于下方 select! 边等边 drain partial。
+            // P1-D：GenAI execute_tool span——覆盖整个工具批次执行（含 Immediate 模式的
+            // steering 轮询）。包在 async 块上 instrument（Send-safe，避免 enter guard 跨 await
+            // 破坏 stream 的 Send；server tokio::spawn 消费要求 Send）。
+            let tool_count = runnable.len();
+            let tool_span = tracing::info_span!(
+                parent: &invoke_span,
+                "gen_ai.execute_tool",
+                gen_ai.operation.name = "execute_tool",
+                gen_ai.tool.count = tool_count,
+                gyre.turn = summary.turns,
+            );
             let run_fut = async {
                 if need_steering_poll {
                     poll_and_run(
@@ -1360,7 +1435,8 @@ fn run_loop(
                 } else {
                     schedule_and_run(runnable, &tools, &tcx, &hooks).await
                 }
-            };
+            }
+            .instrument(tool_span);
             tokio::pin!(run_fut);
             // P1-F：边执行边 drain 工具流式 partial。biased 先轮询 run_fut（完成即 break），
             // 否则收 update → 发射 ToolExecutionUpdate；循环至 batch 完成。
@@ -1651,6 +1727,19 @@ where
     }
 }
 
+/// P1-D：把 agent run 终态 record 到 invoke_agent span（OTel GenAI 约定）。
+///
+/// 在每个 `yield AgentEvent::Done(summary)` 前调用，使 invoke_agent span 携带 success/
+/// turns/usage/duration。因 async_stream! 的 Send 约束无法用 enter guard 覆盖整段 run，
+/// invoke_agent 作为「属性载体 span」，chat/execute_tool 子 span 经 `parent` 链关联。
+fn record_run_end(span: &tracing::Span, summary: &AgentRunSummary, start: std::time::Instant) {
+    span.record("gyre.success", &summary.success);
+    span.record("gyre.turns", &summary.turns);
+    span.record("gen_ai.usage.input_tokens", &summary.usage.input_tokens);
+    span.record("gen_ai.usage.output_tokens", &summary.usage.output_tokens);
+    span.record("gyre.duration", &tracing::field::debug(start.elapsed()));
+}
+
 /// 流式中断兜底持久化：把已累积的文本增量作为一条被中断的 assistant 消息落盘。
 ///
 /// 仅在流式被取消或异常断开（未到达 [`AssistantEvent::MessageEnd`]）时调用，避免
@@ -1691,10 +1780,10 @@ mod tests {
     };
     use agent_tools::{Concurrency, DefaultToolRegistry, Tool, ToolContext, ToolRegistry};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
     use futures::StreamExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     /// 回归：流式中断（用户取消 / 流异常断开）时，已累积的文本必须兜底持久化为一条
@@ -1750,7 +1839,10 @@ mod tests {
             let cur = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
             let mut m = self.max_seen.load(Ordering::SeqCst);
             while cur > m {
-                match self.max_seen.compare_exchange(m, cur, Ordering::SeqCst, Ordering::SeqCst) {
+                match self
+                    .max_seen
+                    .compare_exchange(m, cur, Ordering::SeqCst, Ordering::SeqCst)
+                {
                     Ok(_) => break,
                     Err(v) => m = v,
                 }
@@ -1934,7 +2026,9 @@ mod tests {
             _ctx: &agent_core::ProviderCallContext,
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: "done".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 usage: Usage::default(),
                 model: "stub".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -1954,7 +2048,8 @@ mod tests {
         fn summarize(
             &self,
             _old: &[String],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
+        {
             let count = self.count.clone();
             Box::pin(async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -2036,7 +2131,11 @@ mod tests {
             !said.contains("summarize"),
             "shake 救回后不应进入 summarize 阶段: {said}"
         );
-        assert_eq!(summarize_calls.load(Ordering::SeqCst), 0, "不应调用 summarize");
+        assert_eq!(
+            summarize_calls.load(Ordering::SeqCst),
+            0,
+            "不应调用 summarize"
+        );
     }
 
     // ── 运行时限（P1-2 deadline）─────────────────────────────────────────
@@ -2114,7 +2213,11 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(done_success, Some(false), "deadline 停止应以 success=false 结束");
+        assert_eq!(
+            done_success,
+            Some(false),
+            "deadline 停止应以 success=false 结束"
+        );
         assert!(said_deadline, "应发出 deadline 警告");
     }
 
@@ -2140,7 +2243,9 @@ mod tests {
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: "thinking...".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "thinking...".into(),
+                }],
                 usage: Usage::default(),
                 model: "pausing".into(),
                 stop_reason: Some(StopReason::Pause),
@@ -2157,10 +2262,15 @@ mod tests {
     async fn pause_turn_resamples_then_caps() {
         let calls = Arc::new(AtomicUsize::new(0));
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
-        let model =
-            agent_core::Model::with_defaults("pausing", "pausing", agent_core::Api::OpenAiCompletions);
+        let model = agent_core::Model::with_defaults(
+            "pausing",
+            "pausing",
+            agent_core::Api::OpenAiCompletions,
+        );
         let agent = Agent::builder(model)
-            .provider(Arc::new(PausingProvider { calls: calls.clone() }))
+            .provider(Arc::new(PausingProvider {
+                calls: calls.clone(),
+            }))
             .tools(Arc::new(DefaultToolRegistry::new()))
             .context(ctx)
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -2211,7 +2321,9 @@ mod tests {
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if n == 1 {
-                let _ = self.tx.send(AgentMessage::user_text("[steering] 请接着做 Y"));
+                let _ = self
+                    .tx
+                    .send(AgentMessage::user_text("[steering] 请接着做 Y"));
                 if let Some(tok) = &self.cancel_on_first {
                     tok.cancel();
                 }
@@ -2369,7 +2481,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "trunc-tool".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -2407,7 +2521,9 @@ mod tests {
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(TruncatedToolCallProvider { calls: calls.clone() }))
+            .provider(Arc::new(TruncatedToolCallProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx.clone())
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -2514,7 +2630,9 @@ mod tests {
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(ErrorToolCallProvider { calls: calls.clone() }))
+            .provider(Arc::new(ErrorToolCallProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx.clone())
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -2548,9 +2666,9 @@ mod tests {
             "Error+tool_call 应以 success=false 停止"
         );
         let snapshot = ctx.snapshot().await;
-        let has_placeholder = snapshot
-            .iter()
-            .any(|m| matches!(m, agent_core::AgentMessage::ToolResult(t) if t.tool_call_id == "err1"));
+        let has_placeholder = snapshot.iter().any(
+            |m| matches!(m, agent_core::AgentMessage::ToolResult(t) if t.tool_call_id == "err1"),
+        );
         assert!(
             has_placeholder,
             "应回填占位 ToolResult 维持 tool_use/tool_result 配对"
@@ -2618,12 +2736,17 @@ mod tests {
         }));
         let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
 
-        let mut model =
-            agent_core::Model::with_defaults("detour", "detour", agent_core::Api::OpenAiCompletions);
+        let mut model = agent_core::Model::with_defaults(
+            "detour",
+            "detour",
+            agent_core::Api::OpenAiCompletions,
+        );
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(AlwaysDetourProvider { calls: calls.clone() }))
+            .provider(Arc::new(AlwaysDetourProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx.clone())
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -2704,7 +2827,13 @@ mod tests {
         let (result, mistake_inc) = run_pending_task(&t, &tools, &tcx, &[]).await;
 
         assert!(
-            matches!(result, ToolResult::Error { recoverable: false, .. }),
+            matches!(
+                result,
+                ToolResult::Error {
+                    recoverable: false,
+                    ..
+                }
+            ),
             "panic 应归一化为不可恢复 Error result，实际: {result:?}"
         );
         assert!(mistake_inc, "panic 应计为 mistake（不可恢复）");
@@ -2826,7 +2955,9 @@ mod tests {
         );
         model.max_input_tokens = 200_000;
         let agent = Agent::builder(model)
-            .provider(Arc::new(BlockCallProvider { calls: calls.clone() }))
+            .provider(Arc::new(BlockCallProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx)
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -2859,7 +2990,10 @@ mod tests {
             }
         })
         .await;
-        assert!(ran.is_ok(), "应在超时内完成（steering 中断阻塞工具而非跑满 30s）");
+        assert!(
+            ran.is_ok(),
+            "应在超时内完成（steering 中断阻塞工具而非跑满 30s）"
+        );
         assert!(done, "应正常结束");
         assert!(
             interrupted.load(Ordering::SeqCst),
@@ -2961,15 +3095,18 @@ mod tests {
         let (result, mistake_inc) = run_pending_task(&t, &tools, &tcx, &hooks).await;
 
         assert!(
-            matches!(result, ToolResult::Error { recoverable: true, .. }),
+            matches!(
+                result,
+                ToolResult::Error {
+                    recoverable: true,
+                    ..
+                }
+            ),
             "拦截应回填可恢复 Error，实际: {result:?}"
         );
         assert!(!mistake_inc, "拦截不应计 mistake");
         if let ToolResult::Error { message, .. } = &result {
-            assert!(
-                message.contains("钩子拦截"),
-                "消息应含拦截标识: {message}"
-            );
+            assert!(message.contains("钩子拦截"), "消息应含拦截标识: {message}");
         }
         // before 观察在拦截前触发；拦截后仍发 after 观察事件（结果为拦截 Error）。
         assert_eq!(hook.saw_before.load(Ordering::SeqCst), 1);
@@ -3060,7 +3197,9 @@ mod tests {
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
             *self.recorded.lock().unwrap() = req.thinking.as_ref().map(|t| t.budget_tokens);
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: "done".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 usage: Usage::default(),
                 model: "stub".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -3196,7 +3335,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "two-turn".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -3226,12 +3367,17 @@ mod tests {
             max_seen: Arc::new(AtomicUsize::new(0)),
         }));
         let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
-        let mut model =
-            agent_core::Model::with_defaults("two-turn", "two-turn", agent_core::Api::OpenAiCompletions);
+        let mut model = agent_core::Model::with_defaults(
+            "two-turn",
+            "two-turn",
+            agent_core::Api::OpenAiCompletions,
+        );
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(TwoTurnProvider { calls: calls.clone() }))
+            .provider(Arc::new(TwoTurnProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx)
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -3406,7 +3552,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "aside-midwork".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -3462,9 +3610,7 @@ mod tests {
         while let Some(ev) = stream.next().await {
             match ev {
                 AgentEvent::Say(s) if s.text.contains("已注入 aside 消息") => injected = true,
-                AgentEvent::ToolExecutionEnd {
-                    name, is_error, ..
-                } if name == "probe" => {
+                AgentEvent::ToolExecutionEnd { name, is_error, .. } if name == "probe" => {
                     tool_ok = !is_error;
                 }
                 _ => {}
@@ -3515,7 +3661,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "recording".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -3561,8 +3709,11 @@ mod tests {
             max_seen: Arc::new(AtomicUsize::new(0)),
         }));
         let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
-        let mut model =
-            agent_core::Model::with_defaults("recording", "recording", agent_core::Api::OpenAiCompletions);
+        let mut model = agent_core::Model::with_defaults(
+            "recording",
+            "recording",
+            agent_core::Api::OpenAiCompletions,
+        );
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
@@ -3673,7 +3824,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "streaming-prov".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -3702,7 +3855,9 @@ mod tests {
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(StreamingProvider { calls: calls.clone() }))
+            .provider(Arc::new(StreamingProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx)
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -3763,8 +3918,11 @@ mod tests {
     #[tokio::test]
     async fn transform_assistant_rewrites_before_downstream() {
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
-        let model =
-            agent_core::Model::with_defaults("transform", "transform", agent_core::Api::OpenAiCompletions);
+        let model = agent_core::Model::with_defaults(
+            "transform",
+            "transform",
+            agent_core::Api::OpenAiCompletions,
+        );
         let tf: Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync> = Arc::new(|m| {
             for b in &mut m.content {
                 if let agent_core::ContentBlock::Text { text } = b {
@@ -3794,10 +3952,7 @@ mod tests {
             event_text, "a [expanded] b",
             "MessageEnd 应携带改写后文本（transform 在事件前 apply）"
         );
-        assert!(
-            !event_text.contains("@[[x]]"),
-            "改写后不应含原始宏占位符"
-        );
+        assert!(!event_text.contains("@[[x]]"), "改写后不应含原始宏占位符");
     }
 
     // ── on_turn_end 钩子（P6-A：per-turn 程序化副作用）───────────────────────
@@ -3819,7 +3974,8 @@ mod tests {
     #[tokio::test]
     async fn on_turn_end_hook_fires_with_will_continue() {
         let prov_calls = Arc::new(AtomicUsize::new(0));
-        let hook_calls: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_calls: Arc<std::sync::Mutex<Vec<bool>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let mut reg = DefaultToolRegistry::new();
         reg.register(Box::new(ProbeTool {
@@ -3830,8 +3986,11 @@ mod tests {
             max_seen: Arc::new(AtomicUsize::new(0)),
         }));
         let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
-        let mut model =
-            agent_core::Model::with_defaults("two-turn", "two-turn", agent_core::Api::OpenAiCompletions);
+        let mut model = agent_core::Model::with_defaults(
+            "two-turn",
+            "two-turn",
+            agent_core::Api::OpenAiCompletions,
+        );
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
@@ -3841,7 +4000,9 @@ mod tests {
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
             .approval(Arc::new(YoloApproval))
             .workspace(Arc::new(Workspace::new(".")))
-            .hooks(vec![Arc::new(TurnEndRecorder { calls: hook_calls.clone() })])
+            .hooks(vec![Arc::new(TurnEndRecorder {
+                calls: hook_calls.clone(),
+            })])
             .build();
 
         let stream = agent.run("go");
@@ -3849,7 +4010,8 @@ mod tests {
         while stream.next().await.is_some() {}
         let guard = hook_calls.lock().unwrap();
         assert_eq!(
-            *guard, vec![true, false],
+            *guard,
+            vec![true, false],
             "on_turn_end 应在工具轮（will_continue=true）与停止轮（false）各调一次"
         );
     }

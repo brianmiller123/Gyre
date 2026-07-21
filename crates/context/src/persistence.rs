@@ -22,7 +22,10 @@ impl PersistentContext {
     ///
     /// # Errors
     /// 读取已有文件解析失败时返回错误。
-    pub async fn open(system: Vec<String>, path: impl Into<PathBuf>) -> Result<Self, agent_core::ContextError> {
+    pub async fn open(
+        system: Vec<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, agent_core::ContextError> {
         let path = path.into();
         let leaf_path = leaf_sidecar(&path);
         let inner = crate::InMemoryContext::new(system);
@@ -97,16 +100,16 @@ impl agent_core::ContextManager for PersistentContext {
         self.inner.build_provider_context(model, tools).await
     }
 
-    async fn compact(&self, strategy: agent_core::CompactionStrategy) -> Result<(), agent_core::ContextError> {
+    async fn compact(
+        &self,
+        strategy: agent_core::CompactionStrategy,
+    ) -> Result<(), agent_core::ContextError> {
         self.inner.compact(strategy).await?;
         self.persist_full().await;
         Ok(())
     }
 
-    async fn delete_message_at(
-        &self,
-        index: usize,
-    ) -> Result<usize, agent_core::ContextError> {
+    async fn delete_message_at(&self, index: usize) -> Result<usize, agent_core::ContextError> {
         let removed = self.inner.delete_at(index).await;
         if removed > 0 {
             self.persist_full().await;
@@ -495,9 +498,9 @@ pub async fn delete_message_in_file(
     path: &std::path::Path,
     index: usize,
 ) -> Result<usize, std::io::Error> {
-    let nodes = load_jsonl(path)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("加载会话失败: {e}")))?;
+    let nodes = load_jsonl(path).await.map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("加载会话失败: {e}"))
+    })?;
     let Some(new_nodes) = crate::tree::remove_node_with_orphans(&nodes, index) else {
         return Ok(0);
     };
@@ -612,14 +615,19 @@ mod tests {
     async fn append_and_reload_roundtrip() {
         let path = tmp_path();
         // 写入 2 条
-        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
         pc.append(AgentMessage::user_text("hello")).await;
         pc.append(AgentMessage::user_text("world")).await;
         drop(pc);
 
         // 重新打开恢复
-        let pc2 = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
-        let model = agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let pc2 = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
+        let model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
         let built = pc2.build_provider_context(&model, &[]).await.unwrap();
         assert_eq!(built.messages.len(), 2);
 
@@ -688,19 +696,25 @@ mod tests {
         let path = tmp_path();
         // 写入 3 条用户消息（每条 append 即落盘一行 SessionNode）。
         {
-            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            let pc = PersistentContext::open(vec!["sys".into()], &path)
+                .await
+                .unwrap();
             pc.append(AgentMessage::user_text("a")).await;
             pc.append(AgentMessage::user_text("b")).await;
             pc.append(AgentMessage::user_text("c")).await;
         }
         // 删除索引 1（"b"）：内存 + 原子重写 JSONL。
         {
-            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            let pc = PersistentContext::open(vec!["sys".into()], &path)
+                .await
+                .unwrap();
             let removed = pc.delete_message_at(1).await.unwrap();
             assert_eq!(removed, 1, "应删除 1 条");
         }
         // 重新从磁盘打开：应只剩 a、c（b 已持久移除）。
-        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
         let model =
             agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
         let built = pc.build_provider_context(&model, &[]).await.unwrap();
@@ -738,14 +752,17 @@ mod tests {
             writeln!(f, "{a}").unwrap();
             writeln!(f, "{b}").unwrap();
         }
-        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
         let nodes = pc.snapshot_nodes().await;
         assert_eq!(nodes.len(), 2, "应迁移为 2 个节点");
         // 单链：首节点根，次节点 parent 指向首节点。
         assert!(nodes[0].parent_id.is_none());
         assert_eq!(nodes[1].parent_id.as_ref(), Some(&nodes[0].id));
         // 活跃路径文本与原顺序一致。
-        let model = agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
         let built = pc.build_provider_context(&model, &[]).await.unwrap();
         let texts: Vec<String> = built
             .messages
@@ -771,7 +788,9 @@ mod tests {
     async fn fork_persists_across_reload() {
         let path = tmp_path();
         {
-            let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+            let pc = PersistentContext::open(vec!["sys".into()], &path)
+                .await
+                .unwrap();
             pc.append(AgentMessage::user_text("a")).await;
             let a = pc.active_leaf().await.unwrap();
             pc.append(AgentMessage::user_text("main")).await;
@@ -780,7 +799,9 @@ mod tests {
             pc.append(AgentMessage::user_text("alt")).await;
         }
         // reload：应有两个叶子。
-        let pc = PersistentContext::open(vec!["sys".into()], &path).await.unwrap();
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
         let leaves = pc.list_leaves().await;
         assert_eq!(leaves.len(), 2, "fork 产生的两个叶子应跨 reload 保留");
         let _ = std::fs::remove_file(&path);

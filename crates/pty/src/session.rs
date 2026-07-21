@@ -137,7 +137,9 @@ pub async fn run_pty_command(opts: &PtyOptions) -> Result<PtyResult, io::Error> 
         }
     } else {
         timed_out = false;
-        read_fut.await.map_err(|e| io::Error::other(format!("pty 读取失败: {e}")))?
+        read_fut
+            .await
+            .map_err(|e| io::Error::other(format!("pty 读取失败: {e}")))?
     };
 
     // 子进程退出状态（reader EOF 后通常已退出）
@@ -252,21 +254,22 @@ impl PtyShell {
         }
         // 墙钟超时：防止交互式命令（vim/top/挂起）永久阻塞读线程。
         // 超时即杀掉持久 shell（fail-closed），会话随后不可复用，需新建 PtyShell。
-        let (cleaned, exit) = match tokio::time::timeout(PTY_RUN_TIMEOUT, self.read_until_marker(&marker)).await {
-            Ok(res) => res?,
-            Err(_) => {
-                if let Ok(mut child) = self._child.lock() {
-                    let _ = child.kill();
+        let (cleaned, exit) =
+            match tokio::time::timeout(PTY_RUN_TIMEOUT, self.read_until_marker(&marker)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    if let Ok(mut child) = self._child.lock() {
+                        let _ = child.kill();
+                    }
+                    // 标记失效：防止后续 run 在 reader 锁上死锁。
+                    self.poisoned.store(true, Ordering::SeqCst);
+                    return Ok(PtyResult {
+                        output: String::new(),
+                        exit_code: None,
+                        timed_out: true,
+                    });
                 }
-                // 标记失效：防止后续 run 在 reader 锁上死锁。
-                self.poisoned.store(true, Ordering::SeqCst);
-                return Ok(PtyResult {
-                    output: String::new(),
-                    exit_code: None,
-                    timed_out: true,
-                });
-            }
-        };
+            };
         Ok(PtyResult {
             output: normalize_output(&cleaned),
             exit_code: exit,

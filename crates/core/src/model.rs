@@ -64,7 +64,9 @@ impl std::str::FromStr for Api {
             "zai" | "glm" => Ok(Self::Zai),
             "google-generative-ai" => Ok(Self::GoogleGenerativeAi),
             "ollama-chat" => Ok(Self::OllamaChat),
-            other => Err(crate::ConfigError::Invalid(format!("未知 Api 线协议: '{other}'"))),
+            other => Err(crate::ConfigError::Invalid(format!(
+                "未知 Api 线协议: '{other}'"
+            ))),
         }
     }
 }

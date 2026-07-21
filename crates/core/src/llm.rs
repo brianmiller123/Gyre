@@ -129,7 +129,10 @@ impl ThinkingPolicy {
 
     /// 构造自适应策略（使用默认钳位范围）。
     #[must_use]
-    pub fn auto(classifier: std::sync::Arc<dyn ThinkingClassifier>, fallback: ThinkingConfig) -> Self {
+    pub fn auto(
+        classifier: std::sync::Arc<dyn ThinkingClassifier>,
+        fallback: ThinkingConfig,
+    ) -> Self {
         Self::Auto {
             classifier,
             fallback,
@@ -183,7 +186,14 @@ fn truncate_classifier_input(s: &str) -> String {
         return s.to_string();
     }
     let head: String = s.chars().take(HEAD).collect();
-    let tail: String = s.chars().rev().take(TAIL).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(TAIL)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}\n…[截断]…\n{tail}")
 }
 
@@ -294,6 +304,16 @@ pub struct CompletionRequest {
     pub thinking: Option<ThinkingConfig>,
     /// 前缀缓存 key（sessionId 回退）。
     pub cache_key: Option<String>,
+    /// 与上次 [`crate::ContextManager::build_provider_context`] 相比，前缀字节稳定的消息数。
+    ///
+    /// `0` 表示无稳定前缀（首次构建 / 压缩 / 分支切换 / system 变更后）。provider 据此
+    /// **精确**放置 `cache_control` breakpoint：命中此索引之前的消息可复用 KV 缓存，
+    /// 避免每轮全量 re-prefill。移植 oh-my-pi `AppendOnlyContextManager.longestStablePrefix`。
+    ///
+    /// 例如 Anthropic 适配器把消息级 breakpoint 放在 `min(stable_prefix_len, len) - 1`
+    ///（且不超过倒数第二条），而非固定的「倒数第二条」启发式——压缩/分支切换后稳定前缀
+    /// 缩短，breakpoint 随之前移，避免把 cache 配额浪费在已失效的位置。
+    pub stable_prefix_len: usize,
 }
 
 /// 单次 Provider 调用的运行时上下文（鉴权、并发限流等）。

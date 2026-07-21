@@ -11,11 +11,11 @@ use std::path::Path;
 use agent_config::{Config, CustomCommand, ModelProfile};
 use agent_context::SessionStore;
 use agent_core::{ContextManager, Mode, Model, SkillLevel, Usage, UserContent};
+/// i18n 取词宏。
+use agent_i18n::t;
 use agent_mcp::McpRegistry;
 use agent_skills::SkillCatalog;
 use agent_tools::Tool;
-/// i18n 取词宏。
-use agent_i18n::t;
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -271,10 +271,7 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             match arg.and_then(parse_mode) {
                 Some(m) => CommandOutcome::SwitchMode(m),
                 None => {
-                    eprintln!(
-                        "{}",
-                        t!("mode.usage", current = mode_label(ctx.mode))
-                    );
+                    eprintln!("{}", t!("mode.usage", current = mode_label(ctx.mode)));
                     CommandOutcome::Handled
                 }
             }
@@ -452,7 +449,10 @@ fn print_help(ctx: &CommandContext<'_>) {
             if c.description.is_empty() {
                 eprintln!("  /{}", c.name);
             } else {
-                eprintln!("{}", t!("help.custom_entry", name = c.name, desc = c.description));
+                eprintln!(
+                    "{}",
+                    t!("help.custom_entry", name = c.name, desc = c.description)
+                );
             }
         }
     }
@@ -502,7 +502,10 @@ fn print_status(ctx: &CommandContext<'_>) {
     );
     eprintln!(
         "{}",
-        t!("status.cost", cost = format!("{:.6}", ctx.accumulated.cost_usd))
+        t!(
+            "status.cost",
+            cost = format!("{:.6}", ctx.accumulated.cost_usd)
+        )
     );
     eprintln!("{}", t!("status.footer"));
 }
@@ -520,17 +523,27 @@ fn print_github(ctx: &CommandContext<'_>) {
     eprintln!("{}", t!("github.title"));
     eprintln!(
         "{}",
-        t!("github.enabled_line", state = if ctx.github_enabled { "on" } else { "off" })
+        t!(
+            "github.enabled_line",
+            state = if ctx.github_enabled { "on" } else { "off" }
+        )
     );
     eprintln!(
         "{}",
-        t!("github.write_line", state = if ctx.github_allow_write { "on" } else { "off" })
+        t!(
+            "github.write_line",
+            state = if ctx.github_allow_write { "on" } else { "off" }
+        )
     );
     eprintln!(
         "{}",
         t!(
             "github.token_line",
-            state = if token_set { t!("github.token_set") } else { t!("github.token_unset") }
+            state = if token_set {
+                t!("github.token_set")
+            } else {
+                t!("github.token_unset")
+            }
         )
     );
     if !ctx.github_enabled {
@@ -709,7 +722,11 @@ fn print_profile(p: &ModelProfile, current_id: &str, is_default: bool) {
         .as_deref()
         .map(|a| t!("model.alias_suffix", alias = a))
         .unwrap_or_default();
-    let dft = if is_default { t!("model.default_mark") } else { String::new() };
+    let dft = if is_default {
+        t!("model.default_mark")
+    } else {
+        String::new()
+    };
     eprintln!(
         "{}",
         t!(
@@ -1118,10 +1135,22 @@ mod tests {
 
     #[test]
     fn parses_github_subcommand() {
-        assert!(matches!(parse_github_subcommand(None), GithubToggle::Status));
-        assert!(matches!(parse_github_subcommand(Some("")), GithubToggle::Status));
-        assert!(matches!(parse_github_subcommand(Some("   ")), GithubToggle::Status));
-        assert!(matches!(parse_github_subcommand(Some("on")), GithubToggle::Enable));
+        assert!(matches!(
+            parse_github_subcommand(None),
+            GithubToggle::Status
+        ));
+        assert!(matches!(
+            parse_github_subcommand(Some("")),
+            GithubToggle::Status
+        ));
+        assert!(matches!(
+            parse_github_subcommand(Some("   ")),
+            GithubToggle::Status
+        ));
+        assert!(matches!(
+            parse_github_subcommand(Some("on")),
+            GithubToggle::Enable
+        ));
         assert!(matches!(
             parse_github_subcommand(Some(" Enable ")),
             GithubToggle::Enable
@@ -1130,12 +1159,18 @@ mod tests {
             parse_github_subcommand(Some("ENABLED")),
             GithubToggle::Enable
         ));
-        assert!(matches!(parse_github_subcommand(Some("off")), GithubToggle::Disable));
+        assert!(matches!(
+            parse_github_subcommand(Some("off")),
+            GithubToggle::Disable
+        ));
         assert!(matches!(
             parse_github_subcommand(Some("DISABLED")),
             GithubToggle::Disable
         ));
-        assert!(matches!(parse_github_subcommand(Some("write")), GithubToggle::Write));
+        assert!(matches!(
+            parse_github_subcommand(Some("write")),
+            GithubToggle::Write
+        ));
         assert!(matches!(
             parse_github_subcommand(Some("bogus")),
             GithubToggle::Unknown(_)

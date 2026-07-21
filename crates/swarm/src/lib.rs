@@ -24,13 +24,16 @@ pub mod render;
 pub mod schema;
 pub mod state;
 
-pub use dag::{build_dependency_graph, build_execution_waves, detect_cycles, DependencyGraph};
+pub use dag::{DependencyGraph, build_dependency_graph, build_execution_waves, detect_cycles};
 pub use executor::{
-    build_role_prompt, AgentSwarmRunner, ContextFactory, ProgressFn, SwarmAgentResult, SwarmAgentRunner,
+    AgentSwarmRunner, ContextFactory, ProgressFn, SwarmAgentResult, SwarmAgentRunner,
+    build_role_prompt,
 };
 pub use pipeline::{PipelineController, PipelineOptions, PipelineProgress, PipelineResult};
 pub use render::render_swarm_progress;
-pub use schema::{parse_swarm_yaml, validate_swarm_definition, SwarmAgent, SwarmDefinition, SwarmMode};
+pub use schema::{
+    SwarmAgent, SwarmDefinition, SwarmMode, parse_swarm_yaml, validate_swarm_definition,
+};
 pub use state::{
     AgentState, AgentStateUpdate, AgentStatus, PipelineStateUpdate, PipelineStatus, StateTracker,
     SwarmState,

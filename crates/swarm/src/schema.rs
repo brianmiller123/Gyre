@@ -59,7 +59,8 @@ pub struct SwarmDefinition {
     pub agent_order: Vec<String>,
 }
 
-const VALID_SWARM_NAME: &str = "swarm.name may only contain letters, numbers, dot, underscore, and dash";
+const VALID_SWARM_NAME: &str =
+    "swarm.name may only contain letters, numbers, dot, underscore, and dash";
 
 /// 解析 swarm YAML 文本为归一化定义。
 ///
@@ -200,7 +201,9 @@ pub fn validate_swarm_definition(def: &SwarmDefinition) -> Vec<String> {
             if target == name {
                 errors.push(format!("Agent '{name}' cannot report to itself"));
             } else if !names.contains(target.as_str()) {
-                errors.push(format!("Agent '{name}' reports_to unknown agent '{target}'"));
+                errors.push(format!(
+                    "Agent '{name}' reports_to unknown agent '{target}'"
+                ));
             }
         }
     }

@@ -13,8 +13,8 @@ use agent_core::{
     Mode, ToolError,
 };
 
-use crate::config::{AgentConfig, CommandPattern, ToolApproval};
 use crate::PromptResolver;
+use crate::config::{AgentConfig, CommandPattern, ToolApproval};
 
 /// 纯规则引擎：仅做 `decide` 判定，不含交互。
 #[derive(Debug, Clone)]
@@ -127,9 +127,9 @@ impl ApprovalPolicy for RulesApprovalPolicy {
 /// deny 规则仍照常匹配（黑名单优先拦截）。
 fn matches_any(rules: &[CommandPattern], command: &str, is_deny: bool) -> bool {
     // 含危险元字符的复合命令：deny 规则正常匹配（拦截），allow/ask 规则永不放行。
-    let has_shell_meta = command.chars().any(|c| {
-        matches!(c, ';' | '|' | '&' | '$' | '`' | '\n' | '\r' | '>' | '<')
-    });
+    let has_shell_meta = command
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '$' | '`' | '\n' | '\r' | '>' | '<'));
     if has_shell_meta && !is_deny {
         return false;
     }
@@ -204,7 +204,11 @@ ask = []
     fn yolo_allows_execute() {
         let e = engine(ApprovalMode::Yolo);
         assert!(matches!(
-            e.decide(&req("run_command", CapabilityTier::Execute, Some("rm -rf x"))),
+            e.decide(&req(
+                "run_command",
+                CapabilityTier::Execute,
+                Some("rm -rf x")
+            )),
             ApprovalDecision::Allow
         ));
     }
@@ -228,7 +232,11 @@ ask = []
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
-            e.decide(&req("run_command", CapabilityTier::Execute, Some("git status"))),
+            e.decide(&req(
+                "run_command",
+                CapabilityTier::Execute,
+                Some("git status")
+            )),
             ApprovalDecision::Allow
         ));
     }
@@ -237,7 +245,9 @@ ask = []
     fn per_tool_deny_blocks() {
         let mut agent = AgentConfig::default();
         let mut tools = ToolsConfig::default();
-        tools.approval.insert("write_file".into(), ToolApproval::Deny);
+        tools
+            .approval
+            .insert("write_file".into(), ToolApproval::Deny);
         agent.tools = tools;
         agent.mode = Mode::Code;
         let e = RulesEngine::new(Arc::new(agent));
@@ -300,7 +310,9 @@ ask = []
         agent.mode = Mode::Code;
         agent.approval_mode = ApprovalMode::AlwaysAsk;
         let mut tools = ToolsConfig::default();
-        tools.approval.insert("write_file".into(), ToolApproval::Prompt);
+        tools
+            .approval
+            .insert("write_file".into(), ToolApproval::Prompt);
         agent.tools = tools;
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(

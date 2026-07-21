@@ -6,15 +6,16 @@
 use std::pin::Pin;
 
 use agent_core::{
-    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError, LlmProvider,
-    ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective, Usage, UserContent,
+    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError,
+    LlmProvider, ProviderCallContext, ProviderMessage, StopReason, ToolChoice, ToolChoiceDirective,
+    Usage, UserContent,
 };
 use async_stream::stream;
 use futures::StreamExt;
 use serde::Deserialize;
 
 use crate::transform::{
-    anthropic_apply_cache, anthropic_system_blocks, normalize_tool_schema, CacheStrategy,
+    CacheStrategy, anthropic_apply_cache, anthropic_system_blocks, normalize_tool_schema,
 };
 
 /// Anthropic Messages 适配器。
@@ -105,16 +106,29 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
                 let blocks: Vec<serde_json::Value> = content
                     .iter()
                     .map(|b| match b {
-                        ContentBlock::Text { text } => serde_json::json!({"type":"text","text":text}),
-                        ContentBlock::ToolCall { id, name, arguments } => serde_json::json!({
+                        ContentBlock::Text { text } => {
+                            serde_json::json!({"type":"text","text":text})
+                        }
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => serde_json::json!({
                             "type":"tool_use","id":id,"name":name,"input":arguments
                         }),
-                        ContentBlock::Thinking { text, .. } => serde_json::json!({"type":"thinking","thinking":text}),
+                        ContentBlock::Thinking { text, .. } => {
+                            serde_json::json!({"type":"thinking","thinking":text})
+                        }
                     })
                     .collect();
                 messages.push(serde_json::json!({"role":"assistant","content":blocks}));
             }
-            ProviderMessage::Tool { tool_call_id, content, is_error, images } => {
+            ProviderMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                images,
+            } => {
                 // Anthropic tool_result 支持多模态：有图像时 content 为 text + image block 数组。
                 let content_val = if images.is_empty() {
                     serde_json::Value::String(content.clone())
@@ -168,8 +182,9 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
             "budget_tokens": thinking.budget_tokens
         });
     }
-    // 统一缓存层：多点 cache_control（system + tools 末尾 + 倒数第二条消息），最大化前缀缓存命中。
-    anthropic_apply_cache(&mut body, CacheStrategy::MultiPoint);
+    // 统一缓存层：多点 cache_control（system + tools 末尾 + 稳定前缀边界消息），最大化前缀缓存命中。
+    // 用 req.stable_prefix_len 精确放置消息级 breakpoint（而非固定倒数第二条启发式）。
+    anthropic_apply_cache(&mut body, CacheStrategy::MultiPoint, req.stable_prefix_len);
     // per-model 额外请求体字段（如 vLLM chat_template_kwargs）合并到顶层
     crate::merge_extra_body(&mut body, req.model.extra_body.as_ref());
     body
@@ -178,7 +193,8 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
 fn anthropic_tool_choice(d: &ToolChoiceDirective) -> Option<serde_json::Value> {
     match d {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => Some(serde_json::json!({"type":"auto"})),
-        ToolChoiceDirective::Hard(ToolChoice::Any) | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any)
+        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
             Some(serde_json::json!({"type":"any"}))
         }
         ToolChoiceDirective::Hard(ToolChoice::None) => None,
@@ -365,14 +381,20 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
     Box::pin(s) as Pin<Box<dyn futures::Stream<Item = AssistantEvent> + Send>>
 }
 
-fn build_message(model_id: &str, blocks: &[BlockState], stop: &Option<String>, usage: &Usage) -> agent_core::AssistantMessage {
+fn build_message(
+    model_id: &str,
+    blocks: &[BlockState],
+    stop: &Option<String>,
+    usage: &Usage,
+) -> agent_core::AssistantMessage {
     let mut content = Vec::new();
     for b in blocks {
         if b.is_tool {
             let args = if b.tool_args.is_empty() {
                 serde_json::Value::Object(Default::default())
             } else {
-                serde_json::from_str(&b.tool_args).unwrap_or_else(|_| serde_json::Value::String(b.tool_args.clone()))
+                serde_json::from_str(&b.tool_args)
+                    .unwrap_or_else(|_| serde_json::Value::String(b.tool_args.clone()))
             };
             content.push(ContentBlock::ToolCall {
                 id: b.tool_id.clone().unwrap_or_else(|| "tool".into()),
@@ -380,7 +402,9 @@ fn build_message(model_id: &str, blocks: &[BlockState], stop: &Option<String>, u
                 arguments: args,
             });
         } else if !b.text.is_empty() {
-            content.push(ContentBlock::Text { text: b.text.clone() });
+            content.push(ContentBlock::Text {
+                text: b.text.clone(),
+            });
         }
     }
     // Anthropic 的 stop_reason 取值：end_turn / max_tokens / stop_sequence / tool_use。
@@ -412,12 +436,17 @@ mod tests {
             messages: vec![ProviderMessage::User {
                 content: vec![UserContent::Text { text: "hi".into() }],
             }],
-            tools: vec![agent_core::ToolSpec::new("read_file", "r", serde_json::json!({"type":"object"}))],
+            tools: vec![agent_core::ToolSpec::new(
+                "read_file",
+                "r",
+                serde_json::json!({"type":"object"}),
+            )],
             tool_choice: Some(ToolChoiceDirective::Hard(ToolChoice::Auto)),
             max_tokens: 16,
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
         let body = build_body(&req);
         // system 现为带 cache_control 的块数组

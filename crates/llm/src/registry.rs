@@ -1,6 +1,8 @@
 //! [`ProviderRegistry`] —— 单一分发入口，按 [`Api`](agent_core::Api) 路由到适配器。
 
-use agent_core::{Api, AssistantEventStream, CompletionRequest, LlmError, LlmProvider, ProviderCallContext};
+use agent_core::{
+    Api, AssistantEventStream, CompletionRequest, LlmError, LlmProvider, ProviderCallContext,
+};
 
 /// Provider 注册表：按模型 `api` 线协议族路由。
 pub struct ProviderRegistry {
@@ -11,7 +13,9 @@ impl ProviderRegistry {
     /// 空注册表。
     #[must_use]
     pub fn new() -> Self {
-        Self { adapters: Vec::new() }
+        Self {
+            adapters: Vec::new(),
+        }
     }
 
     /// 注册一个适配器。
@@ -45,7 +49,9 @@ impl ProviderRegistry {
         ctx: &ProviderCallContext,
     ) -> Result<AssistantEventStream, LlmError> {
         let api = request.model.api;
-        let adapter = self.route(api).ok_or_else(|| LlmError::Unsupported(format!("无支持 {api} 的 Provider")))?;
+        let adapter = self
+            .route(api)
+            .ok_or_else(|| LlmError::Unsupported(format!("无支持 {api} 的 Provider")))?;
         adapter.stream(request, ctx).await
     }
 }
@@ -100,8 +106,11 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         };
-        let err = reg.stream_simple(req, &ProviderCallContext::default()).await;
+        let err = reg
+            .stream_simple(req, &ProviderCallContext::default())
+            .await;
         assert!(err.is_err());
     }
 

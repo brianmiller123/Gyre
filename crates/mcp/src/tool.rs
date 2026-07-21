@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use agent_config::McpConfig;
 use agent_core::{
-    resource::{ResourceEntry, ResourceError, ResourceResolver},
     CapabilityTier, ToolError, ToolResult,
+    resource::{ResourceEntry, ResourceError, ResourceResolver},
 };
 use agent_tools::{Tool, ToolContext};
 use async_trait::async_trait;
@@ -161,7 +161,10 @@ impl ResourceResolver for McpRegistry {
 
     async fn read_resource(&self, server: &str, uri: &str) -> Result<String, ResourceError> {
         let client = self.client(server)?;
-        client.read_resource(uri).await.map_err(|e| classify(server, e))
+        client
+            .read_resource(uri)
+            .await
+            .map_err(|e| classify(server, e))
     }
 }
 

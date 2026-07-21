@@ -86,7 +86,10 @@ impl TextContent {
     /// 构造文本内容块。
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
-        Self { kind: "text", text: text.into() }
+        Self {
+            kind: "text",
+            text: text.into(),
+        }
     }
 }
 
@@ -213,7 +216,10 @@ mod tests {
         // camelCase: session_id → sessionId
         assert_eq!(v["params"]["sessionId"], "sess-1");
         // 鉴别器字段
-        assert_eq!(v["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            v["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         // 内容块
         assert_eq!(v["params"]["update"]["content"]["type"], "text");
         assert_eq!(v["params"]["update"]["content"]["text"], "hello");
@@ -229,7 +235,10 @@ mod tests {
         );
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&notif).unwrap()).unwrap();
-        assert_eq!(v["params"]["update"]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(
+            v["params"]["update"]["sessionUpdate"],
+            "agent_thought_chunk"
+        );
     }
 
     #[test]
@@ -259,7 +268,10 @@ mod tests {
     fn usage_update_serializes_correctly() {
         let notif = SessionNotification::new(
             "s",
-            SessionUpdate::UsageUpdate { used: 100, size: 1000 },
+            SessionUpdate::UsageUpdate {
+                used: 100,
+                size: 1000,
+            },
         );
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&notif).unwrap()).unwrap();

@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_config::McpServerConfig;
@@ -16,7 +16,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 /// MCP 客户端错误。
 #[derive(Debug, Error)]
@@ -115,7 +115,9 @@ impl McpClient {
                         buf.extend_from_slice(&tmp[..n]);
                         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
-                            let Ok(s) = std::str::from_utf8(&line_bytes) else { continue };
+                            let Ok(s) = std::str::from_utf8(&line_bytes) else {
+                                continue;
+                            };
                             let trimmed = s.trim();
                             if trimmed.is_empty() {
                                 continue;
@@ -252,7 +254,10 @@ impl McpClient {
     /// 通信/server error 时返回 [`McpError`]。
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<String, McpError> {
         let result = self
-            .request("tools/call", serde_json::json!({"name":name,"arguments":args}))
+            .request(
+                "tools/call",
+                serde_json::json!({"name":name,"arguments":args}),
+            )
             .await?;
         Ok(parse_text_content(&result))
     }
@@ -262,7 +267,9 @@ impl McpClient {
     /// # Errors
     /// 通信失败或 server 不支持 resources 时返回 [`McpError`]（调用方可据错误判断能力缺失）。
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
-        let result = self.request("resources/list", serde_json::json!({})).await?;
+        let result = self
+            .request("resources/list", serde_json::json!({}))
+            .await?;
         Ok(parse_resources(&result))
     }
 
@@ -338,9 +345,20 @@ fn parse_resources(result: &Value) -> Vec<McpResource> {
                 .and_then(|n| n.as_str())
                 .unwrap_or(&uri)
                 .to_string();
-            let description = r.get("description").and_then(|d| d.as_str()).map(str::to_string);
-            let mime_type = r.get("mimeType").and_then(|m| m.as_str()).map(str::to_string);
-            Some(McpResource { uri, name, description, mime_type })
+            let description = r
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string);
+            let mime_type = r
+                .get("mimeType")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+            Some(McpResource {
+                uri,
+                name,
+                description,
+                mime_type,
+            })
         })
         .collect()
 }

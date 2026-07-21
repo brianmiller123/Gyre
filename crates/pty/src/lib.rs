@@ -15,7 +15,7 @@
 pub mod session;
 pub mod tool;
 
-pub use session::{run_pty_command, PtyOptions, PtyResult, PtyShell};
+pub use session::{PtyOptions, PtyResult, PtyShell, run_pty_command};
 pub use tool::RunPtyTool;
 
 /// 注入 system prompt 的 PTY 工具使用指引（启用时由装配层追加）。

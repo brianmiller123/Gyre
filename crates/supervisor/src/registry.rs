@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast};
 
-use crate::model::{LogLine, LogLevel, SubAgentPhase, SubAgentStatus};
+use crate::model::{LogLevel, LogLine, SubAgentPhase, SubAgentStatus};
 
 /// 内部环形日志缓冲容量（每个子 Agent 最多保留这么多条日志）。
 const LOG_CAP: usize = 200;
@@ -85,12 +85,7 @@ impl Supervisor {
     }
 
     /// 登记一个新的子 Agent，返回其 id。
-    pub async fn spawn(
-        &self,
-        parent_id: Option<String>,
-        label: String,
-        task: String,
-    ) -> String {
+    pub async fn spawn(&self, parent_id: Option<String>, label: String, task: String) -> String {
         let id = format!("sub-{}", short_id());
         let now = now_ms();
         let status = SubAgentStatus {
@@ -195,10 +190,7 @@ impl Supervisor {
         let msg = if success {
             "✓ 子 Agent 完成".to_string()
         } else {
-            format!(
-                "✗ 子 Agent 失败: {}",
-                error.as_deref().unwrap_or("未知")
-            )
+            format!("✗ 子 Agent 失败: {}", error.as_deref().unwrap_or("未知"))
         };
         self.mutate(id, |s| {
             s.phase = if success {
@@ -209,7 +201,11 @@ impl Supervisor {
             s.current_activity = None;
             s.logs.push(LogLine {
                 ts: now_ms(),
-                level: if success { LogLevel::Info } else { LogLevel::Error },
+                level: if success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Error
+                },
                 text: msg,
             });
             cap_logs(&mut s.logs);

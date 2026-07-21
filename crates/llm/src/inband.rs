@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use agent_core::{
-    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError, LlmProvider,
-    ProviderCallContext, StopReason,
+    Api, AssistantEvent, AssistantEventStream, CompletionRequest, ContentBlock, LlmError,
+    LlmProvider, ProviderCallContext, StopReason,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -38,10 +38,7 @@ impl InbandProvider {
 /// in-band；否则原样返回。供 cli/server 用环境变量（如 `GYRE_INBAND_TOOLS=1`）opt-in，
 /// 对 function-calling 不稳的模型启用「提示词 + 文本协议」工具调用。
 #[must_use]
-pub fn wrap_inband_if(
-    provider: Arc<dyn LlmProvider>,
-    flag: Option<&str>,
-) -> Arc<dyn LlmProvider> {
+pub fn wrap_inband_if(provider: Arc<dyn LlmProvider>, flag: Option<&str>) -> Arc<dyn LlmProvider> {
     match flag.map(str::trim) {
         Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false") => {
             Arc::new(InbandProvider::new(provider, Dialect::Xml))
@@ -144,8 +141,12 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for FakeProvider {
-        fn id(&self) -> &'static str { "fake" }
-        fn supports(&self) -> &[Api] { &[] }
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn supports(&self) -> &[Api] {
+            &[]
+        }
         async fn stream(
             &self,
             _req: CompletionRequest,
@@ -153,7 +154,9 @@ mod tests {
         ) -> Result<AssistantEventStream, LlmError> {
             let text = "我先读取文件。\n<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>\n";
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: text.to_string() }],
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
                 usage: Usage::default(),
                 model: "fake".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -177,6 +180,7 @@ mod tests {
             temperature: None,
             thinking: None,
             cache_key: None,
+            stable_prefix_len: 0,
         }
     }
 
@@ -191,9 +195,9 @@ mod tests {
         let mut found_stop_reason = false;
         while let Some(ev) = s.next().await {
             if let AssistantEvent::MessageEnd(msg) = ev {
-                let has = msg.content.iter().any(|b| {
-                    matches!(b, ContentBlock::ToolCall { name, .. } if name == "read_file")
-                });
+                let has = msg.content.iter().any(
+                    |b| matches!(b, ContentBlock::ToolCall { name, .. } if name == "read_file"),
+                );
                 found_call |= has;
                 found_stop_reason |= msg.stop_reason == Some(StopReason::ToolUse);
             }
@@ -211,7 +215,10 @@ mod tests {
         let provider = InbandProvider::new(Arc::new(FakeProvider), Dialect::Xml);
         let mut req = req_with_tools();
         req.tools.clear();
-        let mut s = provider.stream(req, &ProviderCallContext::default()).await.unwrap();
+        let mut s = provider
+            .stream(req, &ProviderCallContext::default())
+            .await
+            .unwrap();
         // FakeProvider 的文本里仍含 <tool_call>，故仍会被解析——这里只验证流不报错、有 MessageEnd。
         let mut saw_end = false;
         while let Some(ev) = s.next().await {
@@ -228,8 +235,12 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for ChunkedFakeProvider {
-        fn id(&self) -> &'static str { "chunked" }
-        fn supports(&self) -> &[Api] { &[] }
+        fn id(&self) -> &'static str {
+            "chunked"
+        }
+        fn supports(&self) -> &[Api] {
+            &[]
+        }
         async fn stream(
             &self,
             _req: CompletionRequest,
@@ -245,7 +256,9 @@ mod tests {
                 .map(|c| AssistantEvent::TextDelta(c.to_string()))
                 .collect();
             evs.push(AssistantEvent::MessageEnd(AssistantMessage {
-                content: vec![ContentBlock::Text { text: String::new() }],
+                content: vec![ContentBlock::Text {
+                    text: String::new(),
+                }],
                 usage: Usage::default(),
                 model: "chunked".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -268,15 +281,21 @@ mod tests {
             match ev {
                 AssistantEvent::TextDelta(d) => streamed.push_str(&d),
                 AssistantEvent::MessageEnd(msg) => {
-                    found_call = msg.content.iter().any(|b| {
-                        matches!(b, ContentBlock::ToolCall { name, .. } if name == "read_file")
-                    });
+                    found_call = msg.content.iter().any(
+                        |b| matches!(b, ContentBlock::ToolCall { name, .. } if name == "read_file"),
+                    );
                 }
                 _ => {}
             }
         }
-        assert!(!streamed.contains("<tool_call"), "不应泄露开标记: {streamed:?}");
-        assert!(!streamed.contains("</tool_call"), "不应泄露闭标记: {streamed:?}");
+        assert!(
+            !streamed.contains("<tool_call"),
+            "不应泄露开标记: {streamed:?}"
+        );
+        assert!(
+            !streamed.contains("</tool_call"),
+            "不应泄露闭标记: {streamed:?}"
+        );
         assert!(
             !streamed.contains("read_file"),
             "不应泄露工具 JSON 内联: {streamed:?}"

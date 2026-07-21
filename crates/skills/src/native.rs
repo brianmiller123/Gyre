@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_core::{config_dir, Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillSource};
+use agent_core::{
+    Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillSource, config_dir,
+};
 use async_trait::async_trait;
 
 use crate::frontmatter::parse_skill_file;
@@ -173,7 +175,10 @@ mod tests {
 
         // 发现
         let skills = provider.discover(&opts).await.unwrap();
-        let found = skills.iter().find(|s| s.name == "demo").expect("应发现 demo");
+        let found = skills
+            .iter()
+            .find(|s| s.name == "demo")
+            .expect("应发现 demo");
         assert_eq!(found.description, "Demo skill");
         assert_eq!(found.source.level, SkillLevel::User);
         assert_eq!(found.base_dir, demo);
@@ -196,7 +201,11 @@ mod tests {
         // 仅目录名（无 frontmatter name）
         let named = root.join("by-dir");
         std::fs::create_dir_all(&named).unwrap();
-        std::fs::write(named.join("SKILL.md"), "---\ndescription: By dir\n---\nbody").unwrap();
+        std::fs::write(
+            named.join("SKILL.md"),
+            "---\ndescription: By dir\n---\nbody",
+        )
+        .unwrap();
 
         let provider = NativeSkillProvider::new(std::env::temp_dir());
         let opts = SkillLoadOptions {
@@ -205,8 +214,14 @@ mod tests {
             ..Default::default()
         };
         let skills = provider.discover(&opts).await.unwrap();
-        assert!(skills.iter().all(|s| s.name != "empty"), "缺 SKILL.md 的目录不应被发现");
-        let by_dir = skills.iter().find(|s| s.name == "by-dir").expect("应回退目录名");
+        assert!(
+            skills.iter().all(|s| s.name != "empty"),
+            "缺 SKILL.md 的目录不应被发现"
+        );
+        let by_dir = skills
+            .iter()
+            .find(|s| s.name == "by-dir")
+            .expect("应回退目录名");
         assert_eq!(by_dir.description, "By dir");
 
         let _ = std::fs::remove_dir_all(&root);

@@ -15,7 +15,7 @@
 mod store;
 mod structured;
 
-pub use store::{consolidation_prompt, LocalMemoryStore};
+pub use store::{LocalMemoryStore, consolidation_prompt};
 pub use structured::{
     MemoryRecord, MemoryStats, RecallHit, RecallOptions, SearchFilter, StructuredMemoryStore,
 };

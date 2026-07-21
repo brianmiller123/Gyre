@@ -74,7 +74,9 @@ pub fn open(key: &RoomKey, data: &[u8]) -> Result<WireFrame, CollabError> {
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| CollabError::Auth)?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| CollabError::Auth)?;
     let frame = serde_json::from_slice(&plaintext)?;
     Ok(frame)
 }

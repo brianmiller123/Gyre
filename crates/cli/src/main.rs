@@ -125,7 +125,9 @@ async fn run_acp_stdio(cfg: agent_config::Config, cwd: PathBuf) -> Result<()> {
         .build()
         .context(t!("error.build_http"))?;
     let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd));
-    agent_acp::run_stdio(state).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    agent_acp::run_stdio(state)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -207,7 +209,10 @@ async fn main() -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                eprintln!("{}", t!("session.list_entry", id = s.id, bytes = s.bytes, ts = ts));
+                eprintln!(
+                    "{}",
+                    t!("session.list_entry", id = s.id, bytes = s.bytes, ts = ts)
+                );
             }
         }
         return Ok(());
@@ -269,9 +274,10 @@ async fn main() -> Result<()> {
     let mode = cfg.agent.mode;
     let prompts = Arc::new(agent_prompt::PromptCatalog::new());
     let session_path = session_store.path_for(&session_id);
-    let pctx = agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
-        .await
-        .context(t!("error.open_persistence"))?;
+    let pctx =
+        agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
+            .await
+            .context(t!("error.open_persistence"))?;
     pctx.set_summarizer(Box::new(
         agent_context::compaction::LlmSummaryProvider::new(
             Arc::clone(&provider),
@@ -291,8 +297,7 @@ async fn main() -> Result<()> {
     let mcp: Arc<agent_mcp::McpRegistry> = Arc::new(agent_mcp::McpRegistry::load(&cfg.mcp).await);
     // 可选工具开关运行时快照：初值取自配置 [tools].enabled（覆盖各组默认 false）。
     // 后续可由 `/tools <key> on|off` 动态切换；切换后重建 Agent 以反映新工具集与提示词。
-    let mut optional: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
+    let mut optional: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for p in agent_tools::OPTIONAL_TOOL_PROMPTS {
         optional.insert(p.key.to_string(), cfg.tools.effective(p.key, p.default));
     }
@@ -303,7 +308,8 @@ async fn main() -> Result<()> {
     );
     optional.insert("pty".to_string(), cfg.tools.effective("pty", false));
     // 子 Agent 工具集（按启用态装配的可选工具 + MCP，不含 task 以防递归；与模型无关，构建一次）
-    let (mut sub_reg, _) = assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write);
+    let (mut sub_reg, _) =
+        assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write);
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
     }
@@ -406,9 +412,15 @@ async fn main() -> Result<()> {
             agent_config::RulesApprovalPolicy::new(rules, Arc::clone(&prompt_resolver)),
         );
         // 子 Agent 继承父 temperature/thinking（受 [subagent].inherit_parent 控制）
-        let sub_temperature = if subagent_inherit { profile_temperature } else { None };
+        let sub_temperature = if subagent_inherit {
+            profile_temperature
+        } else {
+            None
+        };
         let sub_thinking = if subagent_inherit && enable_thinking {
-            Some(agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000)))
+            Some(agent_core::ThinkingConfig::new(
+                reasoning_budget.unwrap_or(16_000),
+            ))
         } else {
             None
         };
@@ -467,15 +479,14 @@ async fn main() -> Result<()> {
         let builder = if lsp_pool.is_some()
             && (cfg.agent.tools.edit.format_on_write || cfg.agent.tools.edit.diagnostics_on_write)
         {
-            builder.write_effect(std::sync::Arc::new(
-                agent_tools::LspWriteEffect::new(
-                    workspace.root().to_path_buf(),
-                    std::sync::Arc::clone(lsp_pool.as_ref().expect("lsp_pool 已检查 Some")),
-                    cfg.agent.tools.edit.format_on_write,
-                    cfg.agent.tools.edit.diagnostics_on_write,
-                    cfg.agent.tools.edit.diagnostics_deduplicate,
-                ),
-            ) as std::sync::Arc<dyn agent_core::WriteEffect>)
+            builder.write_effect(std::sync::Arc::new(agent_tools::LspWriteEffect::new(
+                workspace.root().to_path_buf(),
+                std::sync::Arc::clone(lsp_pool.as_ref().expect("lsp_pool 已检查 Some")),
+                cfg.agent.tools.edit.format_on_write,
+                cfg.agent.tools.edit.diagnostics_on_write,
+                cfg.agent.tools.edit.diagnostics_deduplicate,
+            ))
+                as std::sync::Arc<dyn agent_core::WriteEffect>)
         } else {
             builder
         };
@@ -513,7 +524,9 @@ async fn main() -> Result<()> {
                         .thinking_policy(agent_core::ThinkingPolicy::auto(classifier, static_cfg))
                         .build()
                 } else {
-                    tracing::warn!("auto_thinking 已启用但 auto_thinking_model 未配置，回退静态思考预算");
+                    tracing::warn!(
+                        "auto_thinking 已启用但 auto_thinking_model 未配置，回退静态思考预算"
+                    );
                     builder.thinking(static_cfg).build()
                 }
             } else {
@@ -646,7 +659,10 @@ async fn main() -> Result<()> {
                         github_allow_write,
                         &optional,
                     );
-                    eprintln!("{}", t!("mode.switched", mode = format!("{current_mode:?}")));
+                    eprintln!(
+                        "{}",
+                        t!("mode.switched", mode = format!("{current_mode:?}"))
+                    );
                     (String::new(), true)
                 }
                 CommandOutcome::Resume(id) => {
@@ -721,9 +737,15 @@ async fn main() -> Result<()> {
                         (String::new(), true)
                     } else {
                         // swarm 子 Agent 同样继承父 temperature/thinking（受 inherit_parent 控制）
-                        let swarm_temperature = if subagent_inherit { profile_temperature } else { None };
+                        let swarm_temperature = if subagent_inherit {
+                            profile_temperature
+                        } else {
+                            None
+                        };
                         let swarm_thinking = if subagent_inherit && enable_thinking {
-                            Some(agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000)))
+                            Some(agent_core::ThinkingConfig::new(
+                                reasoning_budget.unwrap_or(16_000),
+                            ))
                         } else {
                             None
                         };
@@ -754,7 +776,10 @@ async fn main() -> Result<()> {
                     }
                     (String::new(), true)
                 }
-                CommandOutcome::SetGithub { enabled, allow_write } => {
+                CommandOutcome::SetGithub {
+                    enabled,
+                    allow_write,
+                } => {
                     github_enabled = enabled;
                     if let Some(w) = allow_write {
                         github_allow_write = w;
@@ -885,7 +910,10 @@ fn assemble_builtin_tools(
     optional: &std::collections::HashMap<String, bool>,
     github_enabled: bool,
     github_allow_write: bool,
-) -> (agent_tools::DefaultToolRegistry, Option<agent_tools::LspPool>) {
+) -> (
+    agent_tools::DefaultToolRegistry,
+    Option<agent_tools::LspPool>,
+) {
     let mut reg = agent_tools::core_tools();
     let mut lsp_pool: Option<agent_tools::LspPool> = None;
     if *optional.get("ast").unwrap_or(&false) {
@@ -972,7 +1000,10 @@ async fn compact_context(context: &dyn agent_core::ContextManager) {
         .compact(CompactionStrategy::Prune { keep_recent: 8 })
         .await;
     let u = context.token_usage();
-    eprintln!("{}", t!("compact.done", current = u.current, limit = u.limit));
+    eprintln!(
+        "{}",
+        t!("compact.done", current = u.current, limit = u.limit)
+    );
 }
 
 /// 恢复会话后回显对话历史（仅 user/assistant 轮次；超长只显示最近 60 条）。
@@ -985,7 +1016,14 @@ fn print_session_history(path: &std::path::Path) {
         return;
     }
     if total > MAX_HISTORY {
-        eprintln!("{}", t!("session.history_truncated", total = total, max = MAX_HISTORY));
+        eprintln!(
+            "{}",
+            t!(
+                "session.history_truncated",
+                total = total,
+                max = MAX_HISTORY
+            )
+        );
     } else {
         eprintln!("{}", t!("session.history_count", count = total));
     }
@@ -1037,8 +1075,9 @@ async fn run_swarm_yaml(
             temperature,
             thinking,
         ));
-    let progress: agent_swarm::ProgressFn =
-        Arc::new(|name: &str, msg: &str| eprintln!("{}", t!("swarm.progress", name = name, msg = msg)));
+    let progress: agent_swarm::ProgressFn = Arc::new(|name: &str, msg: &str| {
+        eprintln!("{}", t!("swarm.progress", name = name, msg = msg))
+    });
     let cancel = tokio_util::sync::CancellationToken::new();
     let workspace_path: Arc<std::path::Path> = Arc::from(workspace.root());
     let options = agent_swarm::SwarmRunOptions {
@@ -1071,13 +1110,21 @@ fn print_swarm_result(result: &agent_swarm::PipelineResult) {
             Some(r) if r.exit_code == 0 => t!("swarm.output_chars", n = r.output.chars().count()),
             Some(r) => t!(
                 "swarm.failed_short",
-                e = r.error.clone().unwrap_or_else(|| t!("swarm.failed_default").to_string())
+                e = r
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| t!("swarm.failed_default").to_string())
             ),
             None => t!("swarm.not_run"),
         };
         eprintln!(
             "{}",
-            t!("swarm.agent_line", name = name, rounds = runs.len(), summary = summary)
+            t!(
+                "swarm.agent_line",
+                name = name,
+                rounds = runs.len(),
+                summary = summary
+            )
         );
     }
     if !result.errors.is_empty() {
@@ -1125,7 +1172,10 @@ async fn load_skill_catalog(
     {
         Ok(cat) => {
             if !cat.warnings.is_empty() {
-                eprintln!("{}", t!("skill.load_warn", warnings = cat.warnings.join("; ")));
+                eprintln!(
+                    "{}",
+                    t!("skill.load_warn", warnings = cat.warnings.join("; "))
+                );
             }
             if cat.is_empty() {
                 eprintln!("{}", t!("skill.not_found_msg"));
@@ -1133,7 +1183,11 @@ async fn load_skill_catalog(
                 let names: Vec<&str> = cat.skills.iter().map(|s| s.name.as_str()).collect();
                 eprintln!(
                     "{}",
-                    t!("skill.loaded", count = cat.skills.len(), names = names.join(", "))
+                    t!(
+                        "skill.loaded",
+                        count = cat.skills.len(),
+                        names = names.join(", ")
+                    )
                 );
             }
             cat
@@ -1171,7 +1225,8 @@ where
     tokio::pin!(events);
     let mut success = false;
     // 流式 Markdown 美化：仅 TTY 输出着色/高亮，管道透传原文。
-    let mut md = markdown::MarkdownRenderer::new(std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    let mut md =
+        markdown::MarkdownRenderer::new(std::io::IsTerminal::is_terminal(&std::io::stdout()));
     while let Some(ev) = events.next().await {
         match ev {
             AgentEvent::TextDelta(t) => {
@@ -1199,7 +1254,10 @@ where
                 eprintln!("\n{}", t!("event.tool", name = name, output = output));
             }
             AgentEvent::Usage(u) => {
-                eprintln!("\n{}", t!("event.usage", input = u.input_tokens, out = u.output_tokens));
+                eprintln!(
+                    "\n{}",
+                    t!("event.usage", input = u.input_tokens, out = u.output_tokens)
+                );
             }
             AgentEvent::StateChanged(st) => {
                 eprintln!("\n{}", t!("event.state", state = format!("{st:?}")));
@@ -1291,7 +1349,10 @@ mod tests {
         let (reg, _) = assemble_builtin_tools(&optional, true, true);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"github"), "github 由独立参数控制，不受 optional map 影响");
+        assert!(
+            names.contains(&"github"),
+            "github 由独立参数控制，不受 optional map 影响"
+        );
     }
 
     /// 仅启用组进入 system prompt；未启用组（含 github）完全屏蔽。

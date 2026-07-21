@@ -69,7 +69,11 @@ pub fn parse_error_line(message: impl Into<String>) -> String {
 
 /// 构造 [`RpcError`]。
 pub fn rpc_error(code: i32, message: impl Into<String>) -> RpcError {
-    RpcError { code, message: message.into(), data: None }
+    RpcError {
+        code,
+        message: message.into(),
+        data: None,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -175,7 +179,10 @@ fn handle_initialize(req: &crate::types::JsonRpcRequest) -> Value {
 /// 标准 ACP 的 `NewSessionRequest` 含 `cwd` + `mcpServers`；本项目额外通过 `_meta` 或扩展
 /// 字段传递 `model` / `mode`（非标准但向前兼容）。`cwd` 取客户端打开的项目根，使 Agent 工具
 /// 在用户当前目录而非服务端进程 cwd 工作。
-async fn handle_session_new(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
+async fn handle_session_new(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
     let model = param_str(req.params.as_ref(), "model");
     let mode = param_str(req.params.as_ref(), "mode");
     let cwd = param_path(req.params.as_ref(), "cwd");
@@ -204,7 +211,10 @@ async fn handle_session_new(state: &SessionManager, req: &crate::types::JsonRpcR
 }
 
 /// `session/cancel`（通知）：投递 [`ClientFrame::Cancel`]，触发当前 turn 的取消令牌。
-async fn handle_session_cancel(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
+async fn handle_session_cancel(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
     let sid = param_str(req.params.as_ref(), "sessionId")
         .or_else(|| param_str(req.params.as_ref(), "session_id")) // 兼容旧格式
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
@@ -217,7 +227,10 @@ async fn handle_session_cancel(state: &SessionManager, req: &crate::types::JsonR
 }
 
 /// `session/load`：恢复历史会话。
-async fn handle_session_load(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
+async fn handle_session_load(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
     let sid = param_str(req.params.as_ref(), "sessionId")
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
     let model = param_str(req.params.as_ref(), "model");
@@ -232,7 +245,10 @@ async fn handle_session_load(state: &SessionManager, req: &crate::types::JsonRpc
 }
 
 /// `session/close`：关闭并释放会话资源。
-async fn handle_session_close(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
+async fn handle_session_close(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
     let sid = param_str(req.params.as_ref(), "sessionId")
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
     state.close_session(sid).await;
@@ -240,7 +256,10 @@ async fn handle_session_close(state: &SessionManager, req: &crate::types::JsonRp
 }
 
 /// `session/set_mode`：切换模式（通过重建会话实现，与 Web `/switchMode` 一致）。
-async fn handle_set_mode(state: &SessionManager, req: &crate::types::JsonRpcRequest) -> Result<Value, RpcError> {
+async fn handle_set_mode(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
     let sid = param_str(req.params.as_ref(), "sessionId")
         .or_else(|| param_str(req.params.as_ref(), "session_id"))
         .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
@@ -328,9 +347,7 @@ mod tests {
         // promptCapabilities 与 mcpCapabilities 为规范围必填（严格客户端 schema 校验）。
         assert!(result["agentCapabilities"]["promptCapabilities"].is_object());
         assert!(result["agentCapabilities"]["promptCapabilities"]["image"].is_boolean());
-        assert!(
-            result["agentCapabilities"]["promptCapabilities"]["embeddedContext"].is_boolean()
-        );
+        assert!(result["agentCapabilities"]["promptCapabilities"]["embeddedContext"].is_boolean());
         assert!(result["agentCapabilities"]["mcpCapabilities"].is_object());
         assert!(result["agentCapabilities"]["mcpCapabilities"]["stdio"].is_boolean());
         assert!(result["agentCapabilities"]["mcpCapabilities"]["http"].is_boolean());

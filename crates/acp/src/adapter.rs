@@ -60,10 +60,7 @@ pub fn server_frame_to_acp(frame: ServerFrame) -> Option<SessionUpdate> {
 /// 判断帧是否为终止帧（prompt turn 结束）。
 #[must_use]
 pub fn is_terminal_frame(frame: &ServerFrame) -> bool {
-    matches!(
-        frame,
-        ServerFrame::Done { .. } | ServerFrame::Error { .. }
-    )
+    matches!(frame, ServerFrame::Done { .. } | ServerFrame::Error { .. })
 }
 
 #[cfg(test)]
@@ -84,7 +81,9 @@ mod tests {
 
     #[test]
     fn maps_thinking_delta() {
-        match server_frame_to_acp(ServerFrame::ThinkingDelta { delta: "hmm".into() }) {
+        match server_frame_to_acp(ServerFrame::ThinkingDelta {
+            delta: "hmm".into(),
+        }) {
             Some(SessionUpdate::AgentThoughtChunk { content }) => {
                 assert_eq!(content_text(&content), "hmm");
             }
@@ -94,7 +93,9 @@ mod tests {
 
     #[test]
     fn maps_say_as_message_chunk() {
-        match server_frame_to_acp(ServerFrame::Say { text: "info".into() }) {
+        match server_frame_to_acp(ServerFrame::Say {
+            text: "info".into(),
+        }) {
             Some(SessionUpdate::AgentMessageChunk { content }) => {
                 assert_eq!(content_text(&content), "info");
             }
@@ -104,8 +105,17 @@ mod tests {
 
     #[test]
     fn maps_tool_exec() {
-        match server_frame_to_acp(ServerFrame::ToolExec { name: "grep".into(), output: "3 hits".into() }) {
-            Some(SessionUpdate::ToolCall { tool_call_id, title, status, raw_output, .. }) => {
+        match server_frame_to_acp(ServerFrame::ToolExec {
+            name: "grep".into(),
+            output: "3 hits".into(),
+        }) {
+            Some(SessionUpdate::ToolCall {
+                tool_call_id,
+                title,
+                status,
+                raw_output,
+                ..
+            }) => {
                 assert_eq!(tool_call_id, "grep");
                 assert_eq!(title, "grep");
                 assert_eq!(status, "completed");
@@ -117,7 +127,10 @@ mod tests {
 
     #[test]
     fn maps_context_usage() {
-        match server_frame_to_acp(ServerFrame::ContextUsage { current: 10, limit: 100 }) {
+        match server_frame_to_acp(ServerFrame::ContextUsage {
+            current: 10,
+            limit: 100,
+        }) {
             Some(SessionUpdate::UsageUpdate { used, size }) => assert_eq!((used, size), (10, 100)),
             other => panic!("应映射为 UsageUpdate: {other:?}"),
         }
@@ -125,13 +138,30 @@ mod tests {
 
     #[test]
     fn terminal_frames_return_none() {
-        assert!(server_frame_to_acp(ServerFrame::Done { turns: 1, tool_calls: 0, success: true }).is_none());
-        assert!(server_frame_to_acp(ServerFrame::Error { message: "boom".into() }).is_none());
+        assert!(
+            server_frame_to_acp(ServerFrame::Done {
+                turns: 1,
+                tool_calls: 0,
+                success: true
+            })
+            .is_none()
+        );
+        assert!(
+            server_frame_to_acp(ServerFrame::Error {
+                message: "boom".into()
+            })
+            .is_none()
+        );
     }
 
     #[test]
     fn filters_internal_frames() {
-        assert!(server_frame_to_acp(ServerFrame::StateChanged { state: AgentState::Running }).is_none());
+        assert!(
+            server_frame_to_acp(ServerFrame::StateChanged {
+                state: AgentState::Running
+            })
+            .is_none()
+        );
         assert!(server_frame_to_acp(ServerFrame::Usage(Usage::default())).is_none());
         assert!(server_frame_to_acp(ServerFrame::SubAgents { agents: vec![] }).is_none());
     }
@@ -140,6 +170,9 @@ mod tests {
     fn content_text(content: &crate::types::TextContent) -> String {
         let json = serde_json::to_string(content).unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
-        v.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string()
+        v.get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()
     }
 }

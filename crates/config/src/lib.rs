@@ -13,17 +13,21 @@ mod env;
 mod rules;
 
 pub use config::{
-    AgentConfig, AcpConfig, CommandPattern, CommandRules, Config, GithubConfig, McpConfig, McpServerConfig,
-    MemoryConfig, ModelProfile, ServerConfig, SkillsConfig, SubagentConfig, ToolApproval,
-    ToolsConfig, EditToolsConfig,
+    AcpConfig, AgentConfig, CommandPattern, CommandRules, Config, EditToolsConfig, GithubConfig,
+    McpConfig, McpServerConfig, MemoryConfig, ModelProfile, ServerConfig, SkillsConfig,
+    SubagentConfig, ToolApproval, ToolsConfig,
 };
-pub use config::{discover_commands, discover_context_files, CustomCommand};
+pub use config::{CustomCommand, discover_commands, discover_context_files};
 pub use env::expand_env;
 pub use rules::{RulesApprovalPolicy, RulesEngine};
 
 /// 审批交互回调类型：前端（CLI/Web）注入，决定 `prompt()` 如何等待人工决议。
 pub type PromptResolver = std::sync::Arc<
-    dyn Fn(agent_core::AskMessage) -> futures::future::BoxFuture<'static, Result<agent_core::AskResponse, agent_core::ToolError>>
-        + Send
+    dyn Fn(
+            agent_core::AskMessage,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<agent_core::AskResponse, agent_core::ToolError>,
+        > + Send
         + Sync,
 >;

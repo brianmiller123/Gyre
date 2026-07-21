@@ -85,7 +85,10 @@ impl StopDetails {
     /// 是否为 refusal / sensitive 类（API 级终态错误，不应重放）。
     #[must_use]
     pub fn is_refusal_like(&self) -> bool {
-        matches!(self.kind.as_str(), "refusal" | "sensitive" | "content_filter")
+        matches!(
+            self.kind.as_str(),
+            "refusal" | "sensitive" | "content_filter"
+        )
     }
 }
 
@@ -183,7 +186,11 @@ impl AssistantMessage {
         self.content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolCall { id, name, arguments } => Some((id.as_str(), name.as_str(), arguments)),
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
                 _ => None,
             })
             .collect()
@@ -192,7 +199,9 @@ impl AssistantMessage {
     /// 是否含工具调用。
     #[must_use]
     pub fn has_tool_calls(&self) -> bool {
-        self.content.iter().any(|b| matches!(b, ContentBlock::ToolCall { .. }))
+        self.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
     }
 
     /// 拼接所有文本块。
@@ -214,7 +223,10 @@ impl AssistantMessage {
     #[must_use]
     pub fn is_provider_refusal(&self) -> bool {
         matches!(self.stop_reason, Some(StopReason::Error))
-            && self.stop_details.as_ref().is_some_and(StopDetails::is_refusal_like)
+            && self
+                .stop_details
+                .as_ref()
+                .is_some_and(StopDetails::is_refusal_like)
     }
 }
 
@@ -514,7 +526,6 @@ pub enum AgentEvent {
     // `message_end`、`tool_execution_start`/`tool_execution_update`/`tool_execution_end`。
     // `MessageUpdate` 在本设计里复用 `TextDelta`/`ThinkingDelta` 增量（避免每 delta 整条
     // partial 快照的克隆开销），故不单列变体。
-
     /// 轮次开始：每轮模型调用前（steering / 软需求 / 压缩等预处理完成后、构造 provider
     /// 请求时）。与 [`AgentEvent::TurnEnd`] 配对，消费者据此划分轮次边界。
     TurnStart,
@@ -580,7 +591,10 @@ mod tests {
         assert!(!StopDetails::new("").is_refusal_like());
     }
 
-    fn asst(stop_reason: Option<StopReason>, stop_details: Option<StopDetails>) -> AssistantMessage {
+    fn asst(
+        stop_reason: Option<StopReason>,
+        stop_details: Option<StopDetails>,
+    ) -> AssistantMessage {
         AssistantMessage {
             content: vec![ContentBlock::Text { text: "x".into() }],
             usage: Usage::default(),
@@ -593,17 +607,25 @@ mod tests {
     #[test]
     fn is_provider_refusal_requires_error_and_refusal_like_details() {
         // Error + refusal → 真。
-        assert!(asst(Some(StopReason::Error), Some(StopDetails::new("refusal"))).is_provider_refusal());
-        assert!(asst(
-            Some(StopReason::Error),
-            Some(StopDetails::new("content_filter"))
-        )
-        .is_provider_refusal());
+        assert!(
+            asst(Some(StopReason::Error), Some(StopDetails::new("refusal"))).is_provider_refusal()
+        );
+        assert!(
+            asst(
+                Some(StopReason::Error),
+                Some(StopDetails::new("content_filter"))
+            )
+            .is_provider_refusal()
+        );
         // 非 Error 停止原因 → 假（即使带 refusal 详情）。
-        assert!(!asst(Some(StopReason::Stop), Some(StopDetails::new("refusal"))).is_provider_refusal());
+        assert!(
+            !asst(Some(StopReason::Stop), Some(StopDetails::new("refusal"))).is_provider_refusal()
+        );
         // Error 但无 refusal-like 详情 → 假（普通错误，仍可重放）。
         assert!(!asst(Some(StopReason::Error), None).is_provider_refusal());
-        assert!(!asst(Some(StopReason::Error), Some(StopDetails::new("timeout"))).is_provider_refusal());
+        assert!(
+            !asst(Some(StopReason::Error), Some(StopDetails::new("timeout"))).is_provider_refusal()
+        );
     }
 
     #[test]

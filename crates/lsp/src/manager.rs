@@ -7,10 +7,10 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::client::{
-    apply_text_edits, LspClient, LspCodeAction, LspDiagnostic, LspError, LspHover, LspLocation,
-    LspRenameEdit, LspSymbol,
+    LspClient, LspCodeAction, LspDiagnostic, LspError, LspHover, LspLocation, LspRenameEdit,
+    LspSymbol, apply_text_edits,
 };
-use crate::detect::{find_server_for_file, language_id_from_path, LspServerInfo};
+use crate::detect::{LspServerInfo, find_server_for_file, language_id_from_path};
 
 /// 多语言 LSP 服务器管理器。
 pub struct LspManager {
@@ -47,13 +47,19 @@ impl LspManager {
             }
         }
 
-        Ok(Self { root, clients, server_infos: servers.to_vec() })
+        Ok(Self {
+            root,
+            clients,
+            server_infos: servers.to_vec(),
+        })
     }
 
     /// 按需启动语言服务器。
     async fn ensure_client(&mut self, language_id: &str) -> Result<&mut LspClient, LspError> {
         if !self.clients.contains_key(language_id) {
-            let server = self.server_infos.iter()
+            let server = self
+                .server_infos
+                .iter()
                 .find(|s| s.languages.contains(&language_id.to_string()))
                 .cloned();
             if let Some(server) = server {
@@ -61,7 +67,9 @@ impl LspManager {
                 let client = LspClient::initialize(&self.root, &server).await?;
                 self.clients.insert(language_id.to_string(), client);
             } else {
-                return Err(LspError::Unsupported(format!("未找到语言 '{language_id}' 的 LSP 服务器")));
+                return Err(LspError::Unsupported(format!(
+                    "未找到语言 '{language_id}' 的 LSP 服务器"
+                )));
             }
         }
         Ok(self.clients.get_mut(language_id).expect("刚检查/插入"))
@@ -69,8 +77,12 @@ impl LspManager {
 
     /// 根据 URI 找到对应的客户端。
     async fn client_for_uri(&mut self, uri: &Url) -> Result<&mut LspClient, LspError> {
-        let path = uri.to_file_path().map_err(|_| LspError::InvalidUri(uri.to_string()))?;
-        let lang_id = language_id_from_path(&path).unwrap_or("plaintext").to_string();
+        let path = uri
+            .to_file_path()
+            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+        let lang_id = language_id_from_path(&path)
+            .unwrap_or("plaintext")
+            .to_string();
 
         if self.clients.contains_key(&lang_id) {
             return Ok(self.clients.get_mut(&lang_id).expect("刚检查"));
@@ -88,14 +100,19 @@ impl LspManager {
     // ── 委托方法 ──────────────────────────────────────────────────────
 
     pub async fn open_document(&mut self, uri: &Url, text: &str) -> Result<(), LspError> {
-        let path = uri.to_file_path().map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+        let path = uri
+            .to_file_path()
+            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
         let lang_id = language_id_from_path(&path).unwrap_or("plaintext");
         let client = self.ensure_client(lang_id).await?;
         client.open_document(uri, text, lang_id).await
     }
 
     pub async fn change_document(&mut self, uri: &Url, text: &str) -> Result<(), LspError> {
-        self.client_for_uri(uri).await?.change_document(uri, text).await
+        self.client_for_uri(uri)
+            .await?
+            .change_document(uri, text)
+            .await
     }
 
     pub async fn close_document(&mut self, uri: &Url) -> Result<(), LspError> {
@@ -105,7 +122,10 @@ impl LspManager {
     pub async fn diagnostics(&mut self, uri: &Url) -> Vec<LspDiagnostic> {
         match self.client_for_uri(uri).await {
             Ok(client) => client.diagnostics(uri).await,
-            Err(e) => { warn!(error = %e, "获取诊断失败"); vec![] }
+            Err(e) => {
+                warn!(error = %e, "获取诊断失败");
+                vec![]
+            }
         }
     }
 
@@ -117,16 +137,40 @@ impl LspManager {
         all
     }
 
-    pub async fn goto_definition(&mut self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspLocation>, LspError> {
-        self.client_for_uri(uri).await?.goto_definition(uri, line, character).await
+    pub async fn goto_definition(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .goto_definition(uri, line, character)
+            .await
     }
 
-    pub async fn find_references(&mut self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspLocation>, LspError> {
-        self.client_for_uri(uri).await?.find_references(uri, line, character).await
+    pub async fn find_references(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .find_references(uri, line, character)
+            .await
     }
 
-    pub async fn hover(&mut self, uri: &Url, line: u32, character: u32) -> Result<Option<LspHover>, LspError> {
-        self.client_for_uri(uri).await?.hover(uri, line, character).await
+    pub async fn hover(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<LspHover>, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .hover(uri, line, character)
+            .await
     }
 
     pub async fn document_symbols(&mut self, uri: &Url) -> Result<Vec<LspSymbol>, LspError> {
@@ -144,12 +188,29 @@ impl LspManager {
         Ok(all)
     }
 
-    pub async fn rename(&mut self, uri: &Url, line: u32, character: u32, new_name: &str) -> Result<Vec<LspRenameEdit>, LspError> {
-        self.client_for_uri(uri).await?.rename(uri, line, character, new_name).await
+    pub async fn rename(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Vec<LspRenameEdit>, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .rename(uri, line, character, new_name)
+            .await
     }
 
-    pub async fn code_actions(&mut self, uri: &Url, line: u32, character: u32) -> Result<Vec<LspCodeAction>, LspError> {
-        self.client_for_uri(uri).await?.code_actions(uri, line, character).await
+    pub async fn code_actions(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspCodeAction>, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .code_actions(uri, line, character)
+            .await
     }
 
     /// 格式化整个文档：读盘 → 同步文档 → `textDocument/formatting` → 应用 edits。
@@ -196,9 +257,13 @@ impl LspManager {
         Ok(())
     }
 
-    #[must_use] pub fn active_languages(&self) -> Vec<&str> {
+    #[must_use]
+    pub fn active_languages(&self) -> Vec<&str> {
         self.clients.keys().map(String::as_str).collect()
     }
 
-    #[must_use] pub fn root(&self) -> &Path { &self.root }
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
