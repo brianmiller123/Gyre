@@ -1,10 +1,15 @@
 //! 审批规则引擎与 [`RulesApprovalPolicy`]。
 //!
 //! 判定链（移植 oh-my-pi approval）：
+//! 0. **yolo 短路（最高优先级）**：全自动放行，仅保留 deny 安全护栏
+//!    （逐工具 deny + 命令 deny 黑名单）
 //! 1. 逐工具 `allow|prompt|deny|ask` 覆盖
 //! 2. 命令级 `allow/deny/ask` glob 规则
 //! 3. 能力分级（ReadOnly 自动放行）
 //! 4. 三档模式 `always-ask / write / yolo`（code/debug 模式下写类自动放行）
+//!
+//! 注意：yolo 压制一切「需确认」门禁（逐工具 ask/prompt、命令 ask glob），
+//! 但 deny 黑名单始终生效——「不再询问」不等于「放弃安全」。
 
 use std::sync::Arc;
 
@@ -31,8 +36,23 @@ impl RulesEngine {
     }
 
     /// 判定一次调用是否需要人工确认（同步、纯函数）。
+    ///
+    /// 判定链（详见模块文档）：yolo 短路（仅留 deny 护栏）→ 逐工具覆盖 →
+    /// 命令级规则 → 能力分级 → 三档模式。
     #[must_use]
     pub fn decide(&self, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+        // 0. yolo 短路（最高优先级）：跳过一切「需要确认」门禁——逐工具 prompt/ask、
+        //    命令 ask glob、能力分级、模式联动一律放行，agent 全自动执行、不再弹审批。
+        //
+        //    安全语义：yolo 是「不再询问」，不是「放弃安全护栏」。故 deny 仍优先于 yolo：
+        //      - 逐工具 deny（[agent.tools.approval] 写 "deny"）
+        //      - 命令 deny 黑名单（[agent.commands.deny]）
+        //    二者在 yolo 下也照常拦截，确保 `rm -rf /` 这类硬黑名单不会被全自动模式绕过。
+        //    若要连 deny 也一并压过（绝对放行），删除对应 deny 规则即可。
+        if self.agent.approval_mode == ApprovalMode::Yolo {
+            return self.decide_deny_only(request);
+        }
+
         // 1. 逐工具覆盖（最高优先）
         if let Some(override_) = self.agent.tools.approval.get(request.tool) {
             return match override_ {
@@ -66,6 +86,7 @@ impl RulesEngine {
         // 在 always-ask 档也自动放行——编码是这两个模式的核心能力，逐次审批会造成
         // 「写一个文件问一次」的体验割裂。ask/architect（只读导向）不受影响，写操作仍询问。
         // 逐工具覆盖（[agent.tools.approval]）优先级最高，可显式 prompt/ask 强制询问。
+        // （yolo 已在步骤 0 短路，此处 Yolo 分支不可达，保留以满足穷尽匹配。）
         match self.agent.approval_mode {
             ApprovalMode::Yolo => ApprovalDecision::Allow,
             ApprovalMode::Write => {
@@ -85,6 +106,28 @@ impl RulesEngine {
                 }
             }
         }
+    }
+
+    /// yolo 模式专用判定：仅保留 deny 安全护栏，其余一律放行。
+    ///
+    /// yolo 压制所有「需确认」门禁（逐工具 ask/prompt、命令 ask glob），但 deny 不受影响：
+    /// 逐工具 deny 与命令 deny 黑名单仍然拦截。这让 `--approval-mode yolo` 真正实现全自动，
+    /// 同时避免 `rm -rf *` 等硬黑名单在全自动下被绕过。
+    #[must_use]
+    fn decide_deny_only(&self, request: &ApprovalRequest<'_>) -> ApprovalDecision {
+        // 逐工具 deny：硬拦截。
+        if let Some(override_) = self.agent.tools.approval.get(request.tool) {
+            if matches!(override_, ToolApproval::Deny) {
+                return ApprovalDecision::Deny("被该工具的 deny 覆盖阻止");
+            }
+        }
+        // 命令 deny 黑名单：硬拦截（含危险元字符的复合命令也照常匹配 deny）。
+        if let Some(command) = request.command {
+            if matches_any(&self.agent.commands.deny, command, true) {
+                return ApprovalDecision::Deny("命中命令黑名单");
+            }
+        }
+        ApprovalDecision::Allow
     }
 }
 
@@ -210,6 +253,83 @@ ask = []
                 Some("rm -rf x")
             )),
             ApprovalDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn yolo_overrides_per_tool_ask() {
+        // yolo 为判定链最高优先级：逐工具 ask/prompt 也被压过，全自动放行。
+        // （config.example.toml 默认带 run_command = "ask"，yolo 必须能压过它才真正全自动。）
+        let mut agent = AgentConfig::default();
+        agent.approval_mode = ApprovalMode::Yolo;
+        let mut tools = ToolsConfig::default();
+        tools
+            .approval
+            .insert("run_command".into(), ToolApproval::Ask);
+        agent.tools = tools;
+        let e = RulesEngine::new(Arc::new(agent));
+        assert!(matches!(
+            e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn yolo_overrides_command_ask_glob() {
+        // yolo 压过命令级 ask glob（docker * 不再弹确认）。
+        let mut agent = AgentConfig::default();
+        agent.approval_mode = ApprovalMode::Yolo;
+        agent.commands = CommandRules {
+            allow: vec![],
+            deny: vec![],
+            ask: vec![CommandPattern::Simple("docker *".into())],
+        };
+        let e = RulesEngine::new(Arc::new(agent));
+        assert!(matches!(
+            e.decide(&req(
+                "run_command",
+                CapabilityTier::Execute,
+                Some("docker ps")
+            )),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn yolo_still_respects_per_tool_deny() {
+        // 安全护栏：yolo 不压过逐工具 deny。
+        let mut agent = AgentConfig::default();
+        agent.approval_mode = ApprovalMode::Yolo;
+        let mut tools = ToolsConfig::default();
+        tools
+            .approval
+            .insert("write_file".into(), ToolApproval::Deny);
+        agent.tools = tools;
+        let e = RulesEngine::new(Arc::new(agent));
+        assert!(matches!(
+            e.decide(&req("write_file", CapabilityTier::Write, None)),
+            ApprovalDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn yolo_still_respects_command_deny_blacklist() {
+        // 安全护栏：yolo 不压过命令 deny 黑名单（rm -rf * 仍拦截）。
+        let mut agent = AgentConfig::default();
+        agent.approval_mode = ApprovalMode::Yolo;
+        agent.commands = CommandRules {
+            allow: vec![],
+            deny: vec![CommandPattern::Simple("rm -rf *".into())],
+            ask: vec![],
+        };
+        let e = RulesEngine::new(Arc::new(agent));
+        assert!(matches!(
+            e.decide(&req(
+                "run_command",
+                CapabilityTier::Execute,
+                Some("rm -rf /tmp/x")
+            )),
+            ApprovalDecision::Deny(_)
         ));
     }
 

@@ -123,7 +123,7 @@ pub enum ApprovalMode {
     AlwaysAsk,
     /// 仅执行类询问，写类自动。
     Write,
-    /// 全自动（yolo）。
+    /// 全自动（yolo）：判定链最高优先级，压制一切需确认门禁（仅留 deny 安全护栏）。
     Yolo,
 }
 
@@ -167,8 +167,9 @@ pub struct ApprovalRequest<'a> {
 
 /// 审批策略端口：由 config 规则引擎驱动（移植 oh-my-pi approval）。
 ///
-/// 判定链：逐工具 allow|deny|ask 覆盖 → 命令级 allow/deny/ask 规则 →
-/// 能力分级（读层自动放行）→ 三档模式 always-ask / write / yolo。
+/// 判定链：yolo 短路（仅留 deny 护栏）→ 逐工具 allow|deny|ask 覆盖 →
+/// 命令级 allow/deny/ask 规则 → 能力分级（读层自动放行）→ 三档模式 always-ask / write / yolo。
+/// yolo 压制所有 ask/prompt 门禁，但 deny 黑名单始终生效。
 ///
 /// 实现示例：`RulesApprovalPolicy`（config 规则）、`WebApprovalPolicy`（WS 远程确认）。
 #[async_trait::async_trait]
