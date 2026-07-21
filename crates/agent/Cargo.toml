@@ -20,6 +20,9 @@ tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
+# Harmony 泄漏检测（多信号正则融合）+ 审计摘要（GPT-5/Codex）
+regex        = { workspace = true }
+sha2         = { workspace = true }
 
 [dev-dependencies]
 # 仅测试用：提供现成的 ContextManager 实现（InMemoryContext）以验证中断兜底持久化。

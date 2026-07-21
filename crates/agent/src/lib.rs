@@ -29,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 // Span::enter() 的非 Send guard 跨 await。
 use tracing::Instrument;
 
+/// GPT-5 Harmony-header 泄漏检测与恢复（移植 oh-my-pi `harmony-leak`）。
+mod harmony;
 mod task_tool;
 pub use task_tool::{ContextFactory, TaskTool};
 
@@ -512,6 +514,12 @@ const MAX_PAUSED_CONTINUATIONS: usize = 8;
 /// 软工具需求升级上限：模型连续这么多轮仍不调用所需工具（或持续 detour）则中止，
 /// 避免无限强制循环。移植 oh-my-pi `MAX_SOFT_TOOL_ESCALATIONS`。
 const MAX_SOFT_TOOL_ESCALATIONS: usize = 3;
+/// Harmony 泄漏「截断恢复」连续上限（移植 oh-my-pi `harmonyTruncateResumeCount`）。
+/// tool_arg 可恢复时，截断污染输入 + sentinel 续跑；连续超限则升级为错误。
+const MAX_HARMONY_TRUNCATE_RESUME: usize = 2;
+/// Harmony 泄漏「丢弃重试」连续上限（移植 oh-my-pi `harmonyRetryAttempt`）。
+/// text/thinking 泄漏无法恢复，丢弃本轮重采样；连续超限则升级为错误。
+const MAX_HARMONY_ABORT_RETRY: usize = 2;
 
 /// 发射 `on_turn_end` 钩子（per-turn 程序化副作用）。与 `AgentEvent::TurnEnd` 事件配对，
 /// 但面向**不经事件流**的程序化 hook（审计 / 指标 / memory 更新 / telemetry span 等）。
@@ -646,6 +654,9 @@ fn run_loop(
         let mut mistakes: usize = 0;
         // pause_turn 连续重采样计数（见 MAX_PAUSED_CONTINUATIONS）。
         let mut paused_continuations: usize = 0;
+        // P0-C：Harmony 泄漏双计数器（truncate-resume / abort-retry，各自独立上限）。
+        let mut harmony_truncate_resume: usize = 0;
+        let mut harmony_retry: usize = 0;
         // 软需求状态：已注入的 id、是否需升级为强制
         let mut injected_soft_id: String = String::new();
         let mut escalate_soft = false;
@@ -951,6 +962,80 @@ fn run_loop(
             let mut assistant = assistant;
             if let Some(tf) = &transform_assistant {
                 tf(&mut assistant);
+            }
+            // P0-C：Harmony 协议泄漏缓解（GPT-5/Codex）。检测最终化 assistant 消息，命中则
+            // 按表面分流：tool_arg 可恢复 → 截断续跑（truncate-resume 计数器，替换为清理后的
+            // tool call）；text/thinking → 丢弃重试（abort-retry 计数器，不 append 泄漏内容、
+            // 不 yield MessageEnd，直接 continue 重采样）。双计数器各自上限 MAX_HARMONY_*，
+            // 超限升级为错误停止。移植 oh-my-pi harmony-leak 双计数器。
+            if harmony::is_harmony_leak_target(&model) {
+                if let Some(detection) = harmony::detect_in_message(&assistant) {
+                    if let Some(recovered) = harmony::recover_tool_call(&assistant, &detection) {
+                        if harmony_truncate_resume >= MAX_HARMONY_TRUNCATE_RESUME {
+                            let ev = harmony::create_audit_event(
+                                harmony::HarmonyAuditAction::Escalated,
+                                &detection,
+                                &model,
+                                harmony_truncate_resume,
+                                &recovered.removed,
+                            );
+                            harmony::log_audit("Harmony 截断恢复超限，停止", &ev);
+                            yield AgentEvent::Error(format!(
+                                "GPT-5 Harmony 泄漏截断恢复超限（{}）",
+                                ev.signal
+                            ));
+                            yield AgentEvent::StateChanged(AgentState::Idle);
+                            return;
+                        }
+                        harmony_truncate_resume += 1;
+                        let ev = harmony::create_audit_event(
+                            harmony::HarmonyAuditAction::TruncateResume,
+                            &detection,
+                            &model,
+                            harmony_truncate_resume,
+                            &recovered.removed,
+                        );
+                        harmony::log_audit("Harmony 泄漏，截断恢复续跑", &ev);
+                        assistant = recovered.message;
+                    } else {
+                        if harmony_retry >= MAX_HARMONY_ABORT_RETRY {
+                            let removed = harmony::extract_removed(&assistant, &detection);
+                            let ev = harmony::create_audit_event(
+                                harmony::HarmonyAuditAction::Escalated,
+                                &detection,
+                                &model,
+                                harmony_retry,
+                                &removed,
+                            );
+                            harmony::log_audit("Harmony 重试超限，停止", &ev);
+                            yield AgentEvent::Error(format!(
+                                "GPT-5 Harmony 泄漏重试超限（{}）",
+                                ev.signal
+                            ));
+                            yield AgentEvent::StateChanged(AgentState::Idle);
+                            return;
+                        }
+                        harmony_retry += 1;
+                        let removed = harmony::extract_removed(&assistant, &detection);
+                        let ev = harmony::create_audit_event(
+                            harmony::HarmonyAuditAction::AbortRetry,
+                            &detection,
+                            &model,
+                            harmony_retry,
+                            &removed,
+                        );
+                        harmony::log_audit("Harmony 泄漏，丢弃本轮重试", &ev);
+                        yield AgentEvent::Say(StatusMessage {
+                            text: format!(
+                                "检测到 GPT-5 Harmony 协议泄漏（{}），丢弃本轮回复重试",
+                                ev.signal
+                            ),
+                            kind: StatusKind::Warning,
+                        });
+                        // 不 append 泄漏内容、不 yield MessageEnd，直接重采样（受 max_turns 保护）。
+                        continue;
+                    }
+                }
             }
             // P1-E：消息结束边界（message 层生命周期）。携带完整 assistant 消息快照，
             // 消费者无需自行拼接增量即可获得最终消息。同时开启本轮工具结果累积器
