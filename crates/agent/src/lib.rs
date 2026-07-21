@@ -576,6 +576,8 @@ fn run_loop(
         let specs0 = tools.specs();
         let has_read = specs0.iter().any(|s| s.name == "read_file");
         let mut system = prompts.system_with_platform(mode);
+        // 注入当前工作目录（workspace 根）：让模型知晓 cwd，避免盲猜而执行 cd /workspace。
+        system.push(prompts.workspace_section(&workspace.root()));
         // 上下文约定文件（AGENTS.md）注入为额外 system 段
         for cf in &context_files {
             system.push(cf.clone());

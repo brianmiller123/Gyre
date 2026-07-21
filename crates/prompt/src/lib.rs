@@ -6,6 +6,8 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
 
+use std::path::Path;
+
 use agent_core::Mode;
 
 // 编译期内嵌 prompt 文本（来自 prompts/*.md）
@@ -83,6 +85,18 @@ impl PromptCatalog {
         )
     }
 
+    /// 生成工作目录感知系统提示词段落（稳定前缀）。
+    ///
+    /// 让模型知晓当前 workspace 根（cwd）：避免盲猜工作目录而执行 `cd /workspace` 之类的
+    /// 命令，并明确相对路径的基准。会话期内 cwd 不变，属稳定前缀，不破坏 provider 前缀缓存。
+    #[must_use]
+    pub fn workspace_section(&self, cwd: &Path) -> String {
+        format!(
+            "\n\n<workspace>\n当前工作目录：{cwd}。\n所有文件路径默认相对此目录解释；无需执行 `cd` 切换目录，如需访问子目录请在工具参数中直接给出相对或绝对路径。\n</workspace>\n",
+            cwd = cwd.display()
+        )
+    }
+
     /// 按模式返回 system prompt，并自动追加平台感知段落（稳定前缀）。
     ///
     /// 平台段位于模式主体之后，适合作为 `system` 首部之后的固定块。
@@ -134,6 +148,18 @@ mod tests {
         assert!(section.contains(std::env::consts::ARCH), "应含当前 ARCH");
         // 应含 Shell 提示
         assert!(section.contains("Shell"));
+    }
+
+    #[test]
+    fn workspace_section_contains_cwd() {
+        let cat = PromptCatalog::new();
+        let section = cat.workspace_section(std::path::Path::new("/home/user/project"));
+        assert!(section.contains("<workspace>"), "应含 <workspace> 标签");
+        assert!(section.contains("</workspace>"));
+        assert!(
+            section.contains("/home/user/project"),
+            "应含传入的 cwd 路径"
+        );
     }
 
     #[test]
