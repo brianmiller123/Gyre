@@ -99,7 +99,7 @@ function ItemView({ item }: { item: TranscriptItem }) {
     case 'thinking':
       return <ThinkingBlock text={item.text} streaming={!!item.streaming} />
     case 'tool':
-      return <ToolBlock name={item.name} output={item.output} />
+      return <ToolBlock name={item.name} command={item.command} output={item.output} />
     case 'say':
       return <SayLine text={item.text} level={item.level} />
     case 'ask':
@@ -320,24 +320,33 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
   )
 }
 
-function ToolBlock({ name, output }: { name: string; output: string }) {
+function ToolBlock({ name, command, output }: { name: string; command?: string; output: string }) {
   const [open, setOpen] = useState(false)
   const hasOutput = output.trim().length > 0
   return (
     <div className="rounded-xl border border-border bg-surface-2/50">
       <button
-        onClick={() => hasOutput && setOpen((o) => !o)}
+        onClick={() => (hasOutput || !!command) && setOpen((o) => !o)}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs"
       >
         <span className="flex h-6 w-6 items-center justify-center rounded-md bg-primary/10 text-primary">
           <Icon name="cpu" size={13} />
         </span>
         <span className="font-mono font-medium text-text-2">{name}</span>
+        {/* 被执行的命令/主操作数：yolo 等无审批帧的模式下也能一眼看到工具在做什么。 */}
+        {command && (
+          <code
+            className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted"
+            title={command}
+          >
+            {command}
+          </code>
+        )}
         {hasOutput && (
           <Icon
             name="chevron-down"
             size={13}
-            className={cn('ml-auto text-muted transition-transform', open && 'rotate-180')}
+            className={cn('text-muted transition-transform', open && 'rotate-180', !command && 'ml-auto')}
           />
         )}
       </button>

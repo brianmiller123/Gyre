@@ -87,6 +87,12 @@ export type Frame =
   | { type: 'say'; text: string; kind?: string }
   | { type: 'ask'; ask: AskMessage }
   | { type: 'tool_exec'; name: string; output: string }
+  // 三层工具生命周期帧（镜像 AgentEvent::ToolExecution{Start,Update,End}）。
+  // start 携带 args（含 shell 工具的 command）；yolo 模式下 ask 帧不出现，
+  // 前端据此把被执行的命令展示到工具块，无需审批回执即可观测。
+  | { type: 'tool_execution_start'; tool_call_id: string; name: string; args: unknown }
+  | { type: 'tool_execution_update'; tool_call_id: string; name: string; partial: string }
+  | { type: 'tool_execution_end'; tool_call_id: string; name: string; is_error: boolean }
   | { type: 'usage'; usage: Usage }
   | { type: 'usage_snapshot'; usage: Usage }
   | { type: 'done'; turns: number; tool_calls: number; success: boolean }
@@ -112,6 +118,27 @@ export function parseFrame(raw: unknown): Frame | null {
       return { type: 'ask', ask: r.ask as AskMessage }
     case 'tool_exec':
       return { type: 'tool_exec', name: r.name ?? '', output: r.output ?? '' }
+    case 'tool_execution_start':
+      return {
+        type: 'tool_execution_start',
+        tool_call_id: r.tool_call_id ?? '',
+        name: r.name ?? '',
+        args: r.args,
+      }
+    case 'tool_execution_update':
+      return {
+        type: 'tool_execution_update',
+        tool_call_id: r.tool_call_id ?? '',
+        name: r.name ?? '',
+        partial: r.partial ?? '',
+      }
+    case 'tool_execution_end':
+      return {
+        type: 'tool_execution_end',
+        tool_call_id: r.tool_call_id ?? '',
+        name: r.name ?? '',
+        is_error: !!r.is_error,
+      }
     case 'usage':
     case 'usage_snapshot': {
       // usage（增量，前端累加）与 usage_snapshot（全量，前端覆盖）共享归一化；
@@ -180,12 +207,30 @@ export type ClientFrame =
   | { type: 'cancel' }
   | { type: 'compact' }
 
+/**
+ * 从工具调用 args 中提炼「一眼可见的操作」字符串，用于工具块标题展示。
+ *
+ * - shell 类工具（run_command / run_pty_command 等）取 `command`；
+ * - 其余常见单操作数工具取 path/pattern/query/glob/url/file 等主操作数；
+ * - 取不到则返回 undefined（工具块仅显示工具名 + 输出，行为同前）。
+ */
+export function deriveToolCommand(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object') return undefined
+  const a = args as Record<string, unknown>
+  if (typeof a.command === 'string' && a.command.trim()) return a.command
+  for (const key of ['path', 'pattern', 'query', 'glob', 'url', 'file']) {
+    const v = a[key]
+    if (typeof v === 'string' && v.trim()) return v
+  }
+  return undefined
+}
+
 /* ------------------------------- UI models -------------------------------- */
 export type TranscriptItem =
   | { id: string; kind: 'user'; text: string; ts: number; line?: number }
   | { id: string; kind: 'assistant'; text: string; ts: number; streaming?: boolean; line?: number }
   | { id: string; kind: 'thinking'; text: string; ts: number; streaming?: boolean; line?: number }
-  | { id: string; kind: 'tool'; name: string; output: string; ts: number }
+  | { id: string; kind: 'tool'; name: string; command?: string; output: string; ts: number }
   | { id: string; kind: 'say'; text: string; level: string; ts: number }
   | {
       id: string

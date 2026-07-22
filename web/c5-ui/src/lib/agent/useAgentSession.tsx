@@ -9,6 +9,7 @@ import {
 } from 'react'
 import type { ReactNode } from 'react'
 import {
+  deriveToolCommand,
   parseFrame,
   type AgentStateName,
   type AskResponseValue,
@@ -203,6 +204,11 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const genRef = useRef(0)
   // 已处理过的 ask.id 集合，用于去重（防止批准框显示多次）。
   const seenAskIds = useRef<Set<string>>(new Set())
+  // 工具执行开始帧的 FIFO 缓冲：tool_execution_start（携带 args/命令）先于对应的
+  // tool_exec 到达，但 tool_exec 不带 tool_call_id。agent 循环按「调用顺序」发射 start
+  // （阶段一串行）与 exec（阶段二 completed 按调用顺序排序，见 agent/src/lib.rs），故以
+  // FIFO 配对，把命令挂到对应工具块——yolo 模式下无 ask 帧也能观测被执行的命令。
+  const pendingToolStarts = useRef<Array<{ tool_call_id: string; command?: string }>>([])
   // 心跳看门狗：记录最后一次收到服务端帧的时间戳，用于检测后端静默终止。
   const lastActivityRef = useRef<number>(Date.now())
   // WebSocket 重连退避计数（连接成功后重置为 0）。
@@ -476,8 +482,22 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
               pushItem({ kind: 'ask', ask: frame.ask })
             }
             break
-          case 'tool_exec':
-            pushItem({ kind: 'tool', name: frame.name, output: frame.output })
+          case 'tool_execution_start':
+            // 缓冲命令（含 shell 工具的 command），等待配对的 tool_exec 落到工具块上。
+            pendingToolStarts.current.push({
+              tool_call_id: frame.tool_call_id,
+              command: deriveToolCommand(frame.args),
+            })
+            break
+          case 'tool_exec': {
+            // FIFO 配对：取最早的 start（与 exec 同序）挂上命令；缺配对则退回原行为。
+            const start = pendingToolStarts.current.shift()
+            pushItem({ kind: 'tool', name: frame.name, command: start?.command, output: frame.output })
+            break
+          }
+          case 'tool_execution_update':
+          case 'tool_execution_end':
+            // 输出仍由 tool_exec（已截断预览）提供；这两帧仅用于命令配对，不单独建块。
             break
           case 'usage':
             setUsage((u) => addUsage(u, frame.usage))
@@ -573,6 +593,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     setState('no_task')
     openRef.current = {}
     seenAskIds.current = new Set()
+    pendingToolStarts.current = []
   }, [])
 
   const say = useCallback(

@@ -924,10 +924,12 @@ async fn build_agent(
     let workspace = Arc::new(Workspace::new(cwd));
     // 审批策略（提前构造：TaskTool 子 Agent 需注入以尊重规则引擎的 Deny，修复审批旁路）。
     // 用运行时 mode（含 mode_override）覆盖 config 默认 mode，使 mode→审批联动生效
-    // （code/debug 写类放行；ask/architect 写类询问），否则切换模式时审批门槛不跟随。
+    // （code/debug 写类放行；ask 全只读；architect 仅 plans/ 下 markdown 可写），否则切换
+    // 模式时审批门槛不跟随。
     let mut agent_cfg = config.agent.clone();
     agent_cfg.mode = mode;
-    let rules = RulesEngine::new(Arc::new(agent_cfg));
+    let rules = RulesEngine::new(Arc::new(agent_cfg))
+        .with_workspace_root(Some(workspace.root().to_path_buf()));
     let approval: Arc<dyn ApprovalPolicy> = Arc::new(WebApprovalPolicy::new(
         rules,
         broadcast_tx.clone(),

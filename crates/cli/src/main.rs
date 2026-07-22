@@ -403,11 +403,12 @@ async fn main() -> Result<()> {
                        github_allow_write: bool,
                        optional: &std::collections::HashMap<String, bool>|
      -> agent::Agent {
-        // 审批策略按当前 mode 重建（code/debug 写类放行，ask/architect 写类询问），
-        // 使 `/mode` 切换后审批门槛立即跟随——与 server assemble 一致。
+        // 审批策略按当前 mode 重建（code/debug 写类放行；ask 全只读；architect 仅 plans/ 下
+        // markdown 可写），使 `/mode` 切换后审批门槛立即跟随——与 server assemble 一致。
         let mut agent_cfg = cfg.agent.clone();
         agent_cfg.mode = mode;
-        let rules = agent_config::RulesEngine::new(Arc::new(agent_cfg));
+        let rules = agent_config::RulesEngine::new(Arc::new(agent_cfg))
+            .with_workspace_root(Some(workspace.root().to_path_buf()));
         let approval: Arc<dyn agent_core::ApprovalPolicy> = Arc::new(
             agent_config::RulesApprovalPolicy::new(rules, Arc::clone(&prompt_resolver)),
         );
