@@ -31,7 +31,9 @@ use tracing::Instrument;
 
 /// GPT-5 Harmony-header 泄漏检测与恢复（移植 oh-my-pi `harmony-leak`）。
 mod harmony;
+mod pause;
 mod task_tool;
+pub use pause::PauseGate;
 pub use task_tool::{ContextFactory, TaskTool};
 
 /// 工具执行期的 steering 中断策略（移植 oh-my-pi `interruptMode`）。
@@ -58,8 +60,24 @@ pub trait RuntimeOverrides: Send + Sync {
     fn thinking(&self, _model: &agent_core::Model) -> Option<agent_core::ThinkingConfig> {
         None
     }
+    /// 强制关闭本轮思考（移植 oh-my-pi `getDisableReasoning`）。
+    ///
+    /// 返回 `Some(true)` 时，即便 [`Self::thinking`] 或 ThinkingPolicy 给出了思考配置，
+    /// 本轮也置空 thinking（不发 reasoning 参数）——用于 mid-run 按场景关闭思考（如简单
+    /// follow-up 轮省 token）。返回 `None` 或 `Some(false)` 沿用思考解析结果。
+    fn disable_thinking(&self) -> Option<bool> {
+        None
+    }
     /// 覆盖本轮 temperature；返回 `None` 沿用 [`AgentBuilder::temperature`] 静态值。
     fn temperature(&self) -> Option<f32> {
+        None
+    }
+    /// 覆盖本轮 API key（移植 oh-my-pi `getApiKey`）。
+    ///
+    /// 返回 `Some(key)` 时，本轮 provider 调用使用该 key（覆盖启动期
+    /// [`agent_core::ProviderCallContext::api_key`]）——用于 mid-run 凭证轮换 / 多账号
+    /// 切换 / key 限流降级，无需重建 Agent。返回 `None` 沿用启动期 key。
+    fn api_key(&self, _model: &agent_core::Model) -> Option<String> {
         None
     }
 }
@@ -107,6 +125,11 @@ pub struct Agent {
     /// 轮次边界（下一轮模型调用前 / 停止边界）折叠注入。移植 oh-my-pi `getAsideMessages`。
     aside_rx:
         tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    /// followUp 接收端（宿主编排的延续消息：子代理完成、外部工作流注入）。停止边界第三类
+    ///（steering 中断 → aside 被动 → followUp 编排延续），移植 oh-my-pi `getFollowUpMessages`：
+    /// 仅在 agent 本该停止时 drain，触发续跑让宿主「让 agent 继续干」而不借道中断性 steering。
+    followup_rx:
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
     /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新，移植 oh-my-pi
     /// `getReasoning` 等动态解析器）。
     runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
@@ -117,6 +140,9 @@ pub struct Agent {
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// 工具执行期的 steering 中断策略（默认 [`InterruptMode::Immediate`]）。
     interrupt_mode: InterruptMode,
+    /// 进程级暂停门（可选；注入后在每次 provider 调用前 / 工具批执行前 park）。
+    /// 共享单例由 host 驱动（CLI/Web `/pause`）；移植 oh-my-pi `AgentPauseGate`。
+    pause_gate: Option<Arc<PauseGate>>,
 }
 
 impl Agent {
@@ -150,10 +176,12 @@ impl Agent {
             soft_requirement: None,
             steer_rx: None,
             aside_rx: None,
+            followup_rx: None,
             runtime_overrides: None,
             transform_assistant: None,
             write_effect: None,
             interrupt_mode: InterruptMode::default(),
+            pause_gate: None,
         }
     }
 
@@ -245,6 +273,8 @@ pub struct AgentBuilder {
     steer_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
     /// aside 信道：外部注入被动、非中断通知（后台完成 / 延迟 diagnostics 等）。
     aside_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
+    /// followUp 信道：宿主编排的延续消息（停止边界第三类 drain）。
+    followup_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
     /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新）。
     runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
     /// assistant 消息改写钩子（最终化后、入 context/UI/tools 前）。
@@ -253,6 +283,8 @@ pub struct AgentBuilder {
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// 工具执行期的 steering 中断策略。
     interrupt_mode: InterruptMode,
+    /// 进程级暂停门。
+    pause_gate: Option<Arc<PauseGate>>,
 }
 
 impl AgentBuilder {
@@ -285,6 +317,17 @@ impl AgentBuilder {
         self
     }
 
+    /// 注入 followUp 接收端（宿主编排的延续消息）。
+    ///
+    /// 移植 oh-my-pi `getFollowUpMessages`：仅在 agent 本该停止的边界 drain（steering →
+    /// aside → followUp 之后），触发续跑。区别于 steering（中断）/ aside（被动）：
+    /// followUp 是宿主主动「让 agent 继续干」（如子代理完成后注入结果让主代理收尾），
+    /// 故不与中断性 steering 通道混淆。
+    pub fn followup_rx(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<AgentMessage>) -> Self {
+        self.followup_rx = Some(rx);
+        self
+    }
+
     /// 注入运行时配置覆盖（每轮 LLM 调用前解析，mid-run 热更新 thinking / temperature）。
     ///
     /// 移植 oh-my-pi `getReasoning` / `getDisableReasoning` 等动态解析器：host 实现的
@@ -314,6 +357,15 @@ impl AgentBuilder {
     /// [`agent_tools::Tool::interruptible`] 工具时，steering 中途打断在途工具）。
     pub fn interrupt_mode(mut self, mode: InterruptMode) -> Self {
         self.interrupt_mode = mode;
+        self
+    }
+
+    /// 设置进程级暂停门（共享单例，host 驱动 `/pause` `/resume`）。
+    ///
+    /// 注入后，[`Agent::run`] 在每次 provider 调用前与每次工具批执行前轮询此门：pause 时
+    /// 在途工作跑完后 park，resume 后继续；cancel 立即解除 park（无需 resume 整个进程）。
+    pub fn pause_gate(mut self, gate: Arc<PauseGate>) -> Self {
+        self.pause_gate = Some(gate);
         self
     }
     /// 注入 Provider。
@@ -469,9 +521,11 @@ impl AgentBuilder {
             resources: self.resources,
             write_effect: self.write_effect,
             interrupt_mode: self.interrupt_mode,
+            pause_gate: self.pause_gate,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
             aside_rx: tokio::sync::Mutex::new(self.aside_rx),
+            followup_rx: tokio::sync::Mutex::new(self.followup_rx),
             runtime_overrides: self.runtime_overrides,
             transform_assistant: self.transform_assistant,
         }
@@ -584,6 +638,10 @@ fn run_loop(
     let soft_requirement = Arc::clone(&agent.soft_requirement);
     let steer_rx = &agent.steer_rx;
     let aside_rx = &agent.aside_rx;
+    // followUp：宿主编排延续消息，停止边界第三类 drain。
+    let followup_rx = &agent.followup_rx;
+    // 进程级 pause gate：Arc clone（廉价），stream! 内两安全点 `.wait_until_resumed`。
+    let pause_gate = agent.pause_gate.clone();
     // RuntimeOverrides：Arc clone（廉价），stream! 内每轮 `.as_ref()` 解析。
     let runtime_overrides = agent.runtime_overrides.clone();
     // transform_assistant：Arc clone（廉价），每轮最终化后调用。
@@ -817,10 +875,29 @@ fn run_loop(
                 .as_ref()
                 .and_then(|ro| ro.temperature())
                 .or(temperature);
-            let thinking = runtime_overrides
+            let mut thinking = runtime_overrides
                 .as_ref()
                 .and_then(|ro| ro.thinking(&model))
                 .or_else(|| thinking.clone());
+            // P1：mid-run 关闭思考（移植 oh-my-pi `getDisableReasoning`）。host 显式
+            // disable_thinking()==Some(true) 时本轮置空 thinking，覆盖 policy / 静态解析。
+            if runtime_overrides
+                .as_ref()
+                .and_then(|ro| ro.disable_thinking())
+                == Some(true)
+            {
+                thinking = None;
+            }
+            // Sprint3：harmony 重试温度扰动（移植 oh-my-pi agent-loop.ts:1495 `temperature+0.05`）。
+            // harmony abort-retry 计数器 > 0 时本轮 temperature += 0.05，微调采样分布防同款泄漏
+            // 复现（相同输入 + 相同温度更易重现确定性泄漏）。truncate-resume（可恢复，不重采样
+            // 整轮）不扰动。harmony_retry 在循环外定义、harmony 处理在本轮之后，故此处读到的是
+            // 上一轮 abort-retry 后的累计值（首轮为 0，无扰动）。
+            let temperature = if harmony_retry > 0 {
+                temperature.map(|t| t + 0.05)
+            } else {
+                temperature
+            };
 
             let req = CompletionRequest {
                 model: model.clone(),
@@ -850,6 +927,13 @@ fn run_loop(
                 return;
             }
 
+            // Sprint2：进程级 pause gate——provider 调用前安全点（移植 oh-my-pi AgentPauseGate）。
+            // 若门已 pause，在此 park（在途 provider 流 / 工具已跑完），直到 resume 或 cancel。
+            // park 点无 context 锁 / 无 provider stream 持有，安全。cancel 优先解除 park。
+            if let Some(g) = &pause_gate {
+                g.wait_until_resumed(&cancel).await;
+            }
+
             // P1-E：轮次开始边界（turn 层生命周期）。在 max_turns 硬上限检查之后、provider
             // 调用之前——未真正进入轮次的提前 return（cancel/deadline/max_turns）不发
             // TurnStart，保证 TurnStart 与 TurnEnd 严格配对。
@@ -871,8 +955,15 @@ fn run_loop(
                 gen_ai.usage.output_tokens = tracing::field::Empty,
                 gen_ai.response.finish_reason = tracing::field::Empty,
             );
+            // P1：mid-run 凭证覆盖（移植 oh-my-pi `getApiKey`）。每轮 stream 调用前，若 host
+            // 注入了 api_key 则覆盖 ctx，支持凭证轮换 / 多账号 / 限流降级而无需重建 Agent。
+            // ProviderCallContext 已 Clone；每轮 clone 成本可忽略（仅 api_key/base_url 字符串）。
+            let mut ctx_eff = provider_ctx.clone();
+            if let Some(k) = runtime_overrides.as_ref().and_then(|ro| ro.api_key(&model)) {
+                ctx_eff.api_key = Some(k);
+            }
             let mut event_stream = match provider
-                .stream(req, &provider_ctx)
+                .stream(req, &ctx_eff)
                 .instrument(chat_span.clone())
                 .await
             {
@@ -1036,6 +1127,42 @@ fn run_loop(
                         continue;
                     }
                 }
+            }
+            // P0-自愈：瞬时错误恢复（移植 oh-my-pi `recoverTransientErrorToolTurn`）。
+            // 仅当 stop_reason=Error 且 stop_details 为**瞬时流错误类**（经
+            // [`agent_core::StopDetails::is_transient_stream_error`] 白名单：stream_read_error /
+            // stream_parse_error / stream_interrupted / transient）时才恢复——对齐 oh-my-pi 的
+            // 瞬时错误白名单语义。refusal/sensitive 类（[`AssistantMessage::is_provider_refusal`]）
+            // 与无 stop_details 的泛化 Error 均不恢复（保守，避免对未知错误形态误执行副作用工具）。
+            // 另要求本轮已含**已知工具**且参数完整（非 null）。满足时改写 stop_reason 为 ToolUse，
+            // 让循环**执行已完成的工具**而非整轮废弃停止——避免浪费已消耗的 token 与已完成推理。
+            // Aborted（主动中止）不在此列，仍走下方占位 + 停止分支。
+            // 须在 MessageEnd yield 前改写，保证事件 / 上下文 / 工具分发看到统一终态
+            // （ToolUse），后续截断 / Error / 停止边界判定据此自然 fall through 到工具执行。
+            // 先 immutable 借用算出判定、释放后再 mutable 改写，规避借用冲突。
+            let transient_recoverable = assistant.stop_reason == Some(StopReason::Error)
+                && !assistant.is_provider_refusal()
+                && assistant
+                    .stop_details
+                    .as_ref()
+                    .is_some_and(agent_core::StopDetails::is_transient_stream_error)
+                && assistant
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
+                && assistant.content.iter().all(|b| match b {
+                    ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => tools.get(name).is_some() && !arguments.is_null(),
+                    _ => true,
+                });
+            if transient_recoverable {
+                assistant.stop_reason = Some(StopReason::ToolUse);
+                assistant.stop_details = None;
+                yield AgentEvent::Say(StatusMessage {
+                    text: "检测到瞬时错误但本轮已含完整工具调用，恢复执行已完成的工具（不废弃本轮）".into(),
+                    kind: StatusKind::Warning,
+                });
             }
             // P1-E：消息结束边界（message 层生命周期）。携带完整 assistant 消息快照，
             // 消费者无需自行拼接增量即可获得最终消息。同时开启本轮工具结果累积器
@@ -1267,6 +1394,34 @@ fn run_loop(
                         };
                         continue;
                     }
+                    // followUp：宿主编排的延续消息（停止边界第三类）。steering / aside 均无
+                    // 消息时再探测，触发续跑——移植 oh-my-pi `getFollowUpMessages`。区别于
+                    // steering（中断）/ aside（被动）：宿主主动「让 agent 继续」（子代理完成等）。
+                    let mut pending_followup = false;
+                    {
+                        let mut guard_followup = followup_rx.lock().await;
+                        if let Some(rx) = guard_followup.as_mut() {
+                            if let Ok(msg) = rx.try_recv() {
+                                context.append(msg).await;
+                                pending_followup = true;
+                                while let Ok(more) = rx.try_recv() {
+                                    context.append(more).await;
+                                }
+                            }
+                        }
+                    }
+                    if pending_followup {
+                        yield AgentEvent::Say(StatusMessage {
+                            text: "已注入停止边界 followUp 消息，继续…".into(),
+                            kind: StatusKind::Info,
+                        });
+                        yield AgentEvent::TurnEnd {
+                            message: assistant.clone(),
+                            tool_results: std::mem::take(&mut turn_tool_results),
+                            will_continue: true,
+                        };
+                        continue;
+                    }
                 }
 
                 // P1-E：正常停止，turn 结束 → 停止（will_continue: false）。本轮无工具调用，
@@ -1461,6 +1616,12 @@ fn run_loop(
                     args,
                     exclusive: matches!(tool.concurrency(), Concurrency::Exclusive),
                 });
+            }
+
+            // Sprint2：进程级 pause gate——工具批执行前安全点。审批门禁已过、batch_token
+            // 未创建时 park（无在途工具），resume 后继续执行；cancel 优先解除 park。
+            if let Some(g) = &pause_gate {
+                g.wait_until_resumed(&cancel).await;
             }
 
             // ── 阶段二：执行（Shared 并发 / Exclusive 作屏障串行）。──
@@ -2760,6 +2921,132 @@ mod tests {
         );
     }
 
+    /// 桩 Provider：第 1 轮返回 stop_reason=Error + **瞬时** stop_details + 已完成的 ToolCall；
+    /// 第 2 轮返回纯文本（自然结束）。验证 P0 瞬时故障自愈。
+    struct TransientErrorThenDoneProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for TransientErrorThenDoneProvider {
+        fn id(&self) -> &'static str {
+            "transient"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = if n == 0 {
+                // 第 1 轮：瞬时流错误（stream_parse_error）+ 已完成的工具调用。
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "tc1".into(),
+                        name: "probe".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "transient".into(),
+                    stop_reason: Some(StopReason::Error),
+                    stop_details: Some(agent_core::StopDetails::new("stream_parse_error")),
+                }
+            } else {
+                // 第 2 轮：自然结束。
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "transient".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// P0-自愈：stop_reason=Error 且 stop_details 为**瞬时流错误类** + 含已知工具调用 →
+    /// 改写为 ToolUse 续跑，**执行已完成的工具**（不废弃本轮），第 2 轮自然结束 → success=true。
+    /// 与 [`error_stop_reason_with_tool_call_gets_placeholder_and_stops`]（无 stop_details → 不恢复）
+    /// 形成对照：相同 Error+tool_call 形态，仅 stop_details 标记不同即决定恢复与否。
+    #[tokio::test]
+    async fn transient_stream_error_recovers_completed_toolcall() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx = Arc::new(InMemoryContext::new(vec![]));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: max_seen.clone(),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+
+        let mut model = agent_core::Model::with_defaults(
+            "transient",
+            "transient",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TransientErrorThenDoneProvider {
+                calls: calls.clone(),
+            }))
+            .tools(tools)
+            .context(ctx.clone())
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .max_turns(5)
+            .build();
+
+        let mut done_success: Option<bool> = None;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(sum) = ev {
+                done_success = Some(sum.success);
+            }
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "瞬时错误的 tool_call 应被恢复执行（probe 执行 1 次）"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "瞬时错误应续跑（provider 至少调用 2 次），实际 {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            done_success,
+            Some(true),
+            "瞬时恢复后续跑至自然结束，应 success=true"
+        );
+        // 上下文应含真实 tool_result（probe 实际执行结果），而非占位错误。
+        let snapshot = ctx.snapshot().await;
+        let has_real_result = snapshot.iter().any(|m| {
+            matches!(
+                m,
+                agent_core::AgentMessage::ToolResult(t)
+                if t.tool_call_id == "tc1"
+                    && !matches!(t.result, agent_core::ToolResult::Error { .. })
+            )
+        });
+        assert!(
+            has_real_result,
+            "应回填真实 ToolResult（probe 实际执行结果），而非占位错误"
+        );
+    }
+
     // ── P1-C（软工具升级护栏：detour 跳过 + 升级上限）─────────────────────
 
     /// 桩 Provider：每轮返回一个 detour 工具调用（name="other"），永不调用所需工具。
@@ -3835,6 +4122,404 @@ mod tests {
             guard[1],
             (true, Some(0.5)),
             "第 2 轮 RuntimeOverrides 覆盖生效（thinking=Some, temperature=0.5）"
+        );
+    }
+
+    /// 桩 Provider：记录每轮收到的 thinking budget 与 ctx.api_key，供 P1 mid-run override
+    ///（disable_thinking / api_key）测试观测。返回纯文本一轮即结束。
+    struct CtxRecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for CtxRecordingProvider {
+        fn id(&self) -> &'static str {
+            "ctx-rec"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let budget = req.thinking.as_ref().map(|t| t.budget_tokens);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((budget, ctx.api_key.clone()));
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text { text: "done".into() }],
+                usage: Usage::default(),
+                model: "ctx-rec".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// P1：disable_thinking()==Some(true) 应覆盖启动期静态 thinking，本轮置空。
+    struct DisableThinkingOverrides;
+    impl RuntimeOverrides for DisableThinkingOverrides {
+        fn disable_thinking(&self) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_override_disables_thinking() {
+        let seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
+        let mut model = agent_core::Model::with_defaults(
+            "ctx-rec",
+            "ctx-rec",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(CtxRecordingProvider { seen: seen.clone() }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .thinking(agent_core::ThinkingConfig::new(2_000))
+            .runtime_overrides(Arc::new(DisableThinkingOverrides))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let guard = seen.lock().unwrap();
+        assert_eq!(guard.len(), 1, "应正好 1 轮 provider 调用");
+        assert_eq!(
+            guard[0].0,
+            None,
+            "disable_thinking==Some(true) 应置空 thinking（覆盖启动期静态 2000）"
+        );
+    }
+
+    /// P1：api_key() 覆盖应作用于每轮 provider 调用的 ctx（覆盖启动期 key）。
+    struct ApiKeyOverrides;
+    impl RuntimeOverrides for ApiKeyOverrides {
+        fn api_key(&self, _model: &agent_core::Model) -> Option<String> {
+            Some("override-key".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_override_api_key_overrides_ctx() {
+        let seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
+        let mut model = agent_core::Model::with_defaults(
+            "ctx-rec",
+            "ctx-rec",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let mut startup_ctx = agent_core::ProviderCallContext::default();
+        startup_ctx.api_key = Some("startup-key".into());
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(CtxRecordingProvider { seen: seen.clone() }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .provider_ctx(startup_ctx)
+            .runtime_overrides(Arc::new(ApiKeyOverrides))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let guard = seen.lock().unwrap();
+        assert_eq!(guard.len(), 1, "应正好 1 轮 provider 调用");
+        assert_eq!(
+            guard[0].1.as_deref(),
+            Some("override-key"),
+            "api_key override 应覆盖启动期 startup-key，provider 观测到 override-key"
+        );
+    }
+
+    /// 桩 Provider：计数调用次数，返回纯文本（一轮即结束）。
+    struct DoneCountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for DoneCountingProvider {
+        fn id(&self) -> &'static str {
+            "done-count"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text { text: "done".into() }],
+                usage: Usage::default(),
+                model: "done-count".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// Sprint2：进程级 pause gate 集成——run 前 pause，agent 在第一个安全点
+    ///（provider 调用前）park，provider 不被调用；resume 后继续至完成。
+    /// 用 select! 在当前 task 同时 drive stream 与 pause/resume（stream 借用 agent，
+    /// 非 'static，不能 spawn）。
+    #[tokio::test]
+    async fn pause_gate_parks_run_and_resumes() {
+        let gate = PauseGate::new();
+        gate.pause();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
+        let mut model = agent_core::Model::with_defaults(
+            "done-count",
+            "done-count",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(DoneCountingProvider { calls: calls.clone() }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .pause_gate(gate.clone())
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        let mut resumed = false;
+        loop {
+            tokio::select! {
+                ev = stream.next() => match ev {
+                    Some(AgentEvent::Done(_)) | None => break,
+                    _ => {}
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(120)), if !resumed => {
+                    // park 期间（provider 调用前）：provider 不应被调用。
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "pause 时 provider 不应被调用（park 在 provider 调用前）"
+                    );
+                    gate.resume();
+                    resumed = true;
+                }
+            }
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "resume 后 provider 应被调用并完成"
+        );
+    }
+
+    /// 桩 Provider：每轮返回纯文本 `reply #n`（自然结束）。计数调用。
+    struct FollowUpStopBoundaryProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for FollowUpStopBoundaryProvider {
+        fn id(&self) -> &'static str {
+            "followup-stop"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: format!("reply #{n}"),
+                }],
+                usage: Usage::default(),
+                model: "followup-stop".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// Sprint2：followUp 在停止边界触发续跑（移植 oh-my-pi `getFollowUpMessages`）。
+    /// run 前注入一条 followUp，agent 第一轮 done → 停止边界 drain followUp → 续跑 →
+    /// 第二轮 done → 停止边界 drain followUp（空）→ 停止。provider 应被调用 ≥ 2 次。
+    #[tokio::test]
+    async fn followup_at_stop_boundary_continues_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (followup_tx, followup_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
+        let mut model = agent_core::Model::with_defaults(
+            "followup-stop",
+            "followup-stop",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(FollowUpStopBoundaryProvider {
+                calls: calls.clone(),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .followup_rx(followup_rx)
+            .build();
+
+        // run 前注入一条 followUp 延续消息。
+        followup_tx
+            .send(agent_core::AgentMessage::user_text("继续完成子任务".to_string()))
+            .ok();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "followUp 应在停止边界触发续跑（provider 至少调用 2 次），实际 {}",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// 桩 Provider：记录每轮 `req.temperature`；第 1 轮返回 harmony 泄漏 text（触发
+    /// abort-retry），第 2 轮返回 done。用于验证 harmony retry 温度扰动。
+    struct HarmonyLeakTempProvider {
+        calls: Arc<AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<Option<f32>>>>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for HarmonyLeakTempProvider {
+        fn id(&self) -> &'static str {
+            "harmony-temp"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(req.temperature);
+            let msg = if n == 0 {
+                // 第 1 轮：harmony 泄漏（<|return|> token）→ text surface → abort-retry。
+                AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "leaked <|return|> token".into(),
+                    }],
+                    usage: Usage::default(),
+                    model: "harmony-temp".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "harmony-temp".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// Sprint3：harmony abort-retry 后本轮 temperature += 0.05（移植 oh-my-pi
+    /// agent-loop.ts:1495），微调采样分布防同款泄漏复现。首轮无 retry → temperature
+    /// 不变；第 1 轮泄漏触发 abort-retry → 第 2 轮 temperature 扰动。
+    #[tokio::test]
+    async fn harmony_retry_bumps_temperature() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<Option<f32>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
+        // harmony 检测仅对 OpenAiResponses 模型生效（is_harmony_leak_target）。
+        let mut model = agent_core::Model::with_defaults(
+            "gpt-5",
+            "openai",
+            agent_core::Api::OpenAiResponses,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(HarmonyLeakTempProvider {
+                calls: calls.clone(),
+                seen: seen.clone(),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .temperature(0.7)
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let guard = seen.lock().unwrap();
+        assert_eq!(guard.len(), 2, "应正好 2 轮（泄漏 abort-retry + done）");
+        assert_eq!(guard[0], Some(0.7), "首轮无 harmony retry，temperature 不变");
+        // 浮点：0.7 + 0.05 在 f32 下非精确 0.75，用近似比较。
+        let bumped = guard[1].expect("第二轮应有 temperature");
+        assert!(
+            (bumped - 0.75).abs() < 1e-4,
+            "harmony abort-retry 后 temperature +0.05（≈0.75），实际 {bumped}"
         );
     }
 

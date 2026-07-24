@@ -90,6 +90,21 @@ impl StopDetails {
             "refusal" | "sensitive" | "content_filter"
         )
     }
+
+    /// 是否为瞬时流错误（stream read / parse error / 网络抖动），可恢复执行已完成工具。
+    ///
+    /// 移植 oh-my-pi [`recoverTransientErrorToolTurn`](https://github.com/can1357/oh-my-pi/blob/master/packages/agent/src/agent-loop.ts)
+    /// 的「瞬时错误白名单」语义：仅当 provider 显式标记本轮 Error 为瞬时类（流读取 / 解析
+    /// 错误、流中断）时，agent 循环才把 stop_reason 改写为 ToolUse 续跑、执行已完成的工具，
+    /// 而非整轮废弃。refusal/sensitive 类（[`Self::is_refusal_like`]）不在此列；无 stop_details
+    /// 的泛化 Error 也不恢复（保守，避免对未知错误形态误执行副作用工具）。
+    #[must_use]
+    pub fn is_transient_stream_error(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "stream_read_error" | "stream_parse_error" | "stream_interrupted" | "transient"
+        )
+    }
 }
 
 /// token 用量与成本。

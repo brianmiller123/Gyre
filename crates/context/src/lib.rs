@@ -17,6 +17,8 @@ pub mod compaction;
 pub mod persistence;
 pub mod token;
 pub mod tree;
+/// 工具调用配对保护（压缩安全网 + skill read 保护辅助）。内部模块。
+mod tool_protection;
 
 pub use persistence::delete_message_in_file;
 pub use persistence::{SessionInfo, SessionStore};

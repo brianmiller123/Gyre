@@ -98,6 +98,20 @@ pub(crate) fn merge_extra_body(body: &mut serde_json::Value, extra: Option<&serd
     }
 }
 
+/// 把已构建的 assistant 消息标记为「瞬时流错误」（移植 oh-my-pi
+/// [`recoverTransientErrorToolTurn`]：保留已完成的 tool_call 而非整轮废弃）。
+///
+/// 设置 `stop_reason=Error` + `stop_details=stream_interrupted`（瞬时白名单类，见
+/// [`agent_core::StopDetails::is_transient_stream_error`]），使上游 agent 循环的瞬时恢复
+/// 逻辑据此改写为 ToolUse、执行已完成的工具。仅由各 SSE 适配器在流瞬时中断且本轮已含
+/// 已完成工具调用（无 finish）时调用；finish 已收时不应调用（响应实际完成）。
+///
+/// [`recoverTransientErrorToolTurn`]: https://github.com/can1357/oh-my-pi/blob/master/packages/agent/src/agent-loop.ts
+pub(crate) fn mark_transient_stream_error(msg: &mut agent_core::AssistantMessage) {
+    msg.stop_reason = Some(agent_core::StopReason::Error);
+    msg.stop_details = Some(agent_core::StopDetails::new("stream_interrupted"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::drain_line;

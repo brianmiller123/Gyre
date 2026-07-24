@@ -1,0 +1,1296 @@
+{
+  "scriptCompleted": true,
+  "contentDigest": "50865826b6425e5b86b02a170b67a24a75daceb383e6d3dd1210b173427d7a6b",
+  "files": [
+    {
+      "path": ".github/workflows/rust.yml",
+      "language": "yaml",
+      "sizeLines": 117,
+      "fileCategory": "infra"
+    },
+    {
+      "path": "Cargo.toml",
+      "language": "toml",
+      "sizeLines": 147,
+      "fileCategory": "config"
+    },
+    {
+      "path": "README.md",
+      "language": "markdown",
+      "sizeLines": 491,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "README_RU.md",
+      "language": "markdown",
+      "sizeLines": 491,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "README_ZH.md",
+      "language": "markdown",
+      "sizeLines": 491,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "config.example.toml",
+      "language": "toml",
+      "sizeLines": 164,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/acp/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 22,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/acp/src/adapter.rs",
+      "language": "rust",
+      "sizeLines": 178,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/acp/src/http.rs",
+      "language": "rust",
+      "sizeLines": 238,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/acp/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 45,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/acp/src/rpc.rs",
+      "language": "rust",
+      "sizeLines": 408,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/acp/src/stdio.rs",
+      "language": "rust",
+      "sizeLines": 253,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/acp/src/types.rs",
+      "language": "rust",
+      "sizeLines": 283,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/agent/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 32,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/agent/src/harmony.rs",
+      "language": "rust",
+      "sizeLines": 814,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/agent/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 4103,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/agent/src/task_tool.rs",
+      "language": "rust",
+      "sizeLines": 495,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/ast/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/ast/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 412,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/ast/src/pattern.rs",
+      "language": "rust",
+      "sizeLines": 286,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/ast/src/summary.rs",
+      "language": "rust",
+      "sizeLines": 402,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/cli/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 52,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/cli/src/agents_view.rs",
+      "language": "rust",
+      "sizeLines": 188,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/cli/src/main.rs",
+      "language": "rust",
+      "sizeLines": 1391,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/cli/src/markdown.rs",
+      "language": "rust",
+      "sizeLines": 321,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/cli/src/repl.rs",
+      "language": "rust",
+      "sizeLines": 1380,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 27,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/collab/src/codec.rs",
+      "language": "rust",
+      "sizeLines": 121,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/src/error.rs",
+      "language": "rust",
+      "sizeLines": 32,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/src/frame.rs",
+      "language": "rust",
+      "sizeLines": 78,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 28,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/src/relay.rs",
+      "language": "rust",
+      "sizeLines": 299,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/collab/src/room.rs",
+      "language": "rust",
+      "sizeLines": 109,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/config/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/config/src/config.rs",
+      "language": "rust",
+      "sizeLines": 939,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/config/src/env.rs",
+      "language": "rust",
+      "sizeLines": 53,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/config/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 33,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/config/src/rules.rs",
+      "language": "rust",
+      "sizeLines": 819,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/context/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 22,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/context/src/compaction.rs",
+      "language": "rust",
+      "sizeLines": 1381,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/context/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 1524,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/context/src/persistence.rs",
+      "language": "rust",
+      "sizeLines": 810,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/context/src/token.rs",
+      "language": "rust",
+      "sizeLines": 218,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/context/src/tree.rs",
+      "language": "rust",
+      "sizeLines": 417,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 22,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/core/src/context.rs",
+      "language": "rust",
+      "sizeLines": 218,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/error.rs",
+      "language": "rust",
+      "sizeLines": 141,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/hook.rs",
+      "language": "rust",
+      "sizeLines": 104,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 65,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/llm.rs",
+      "language": "rust",
+      "sizeLines": 376,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/memory.rs",
+      "language": "rust",
+      "sizeLines": 51,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/message.rs",
+      "language": "rust",
+      "sizeLines": 655,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/model.rs",
+      "language": "rust",
+      "sizeLines": 119,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/platform.rs",
+      "language": "rust",
+      "sizeLines": 122,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/resource.rs",
+      "language": "rust",
+      "sizeLines": 57,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/skill.rs",
+      "language": "rust",
+      "sizeLines": 153,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/tool.rs",
+      "language": "rust",
+      "sizeLines": 186,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/workspace.rs",
+      "language": "rust",
+      "sizeLines": 303,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/core/src/write_effect.rs",
+      "language": "rust",
+      "sizeLines": 128,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/hashline/src/apply.rs",
+      "language": "rust",
+      "sizeLines": 857,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/format.rs",
+      "language": "rust",
+      "sizeLines": 136,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 92,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/mismatch.rs",
+      "language": "rust",
+      "sizeLines": 322,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/normalize.rs",
+      "language": "rust",
+      "sizeLines": 167,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/parser.rs",
+      "language": "rust",
+      "sizeLines": 240,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/preview.rs",
+      "language": "rust",
+      "sizeLines": 130,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/recovery.rs",
+      "language": "rust",
+      "sizeLines": 283,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/repair.rs",
+      "language": "rust",
+      "sizeLines": 1158,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/snapshots.rs",
+      "language": "rust",
+      "sizeLines": 206,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/tool.rs",
+      "language": "rust",
+      "sizeLines": 248,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/hashline/src/types.rs",
+      "language": "rust",
+      "sizeLines": 96,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/i18n/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 14,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/i18n/locales/en.json",
+      "language": "json",
+      "sizeLines": 186,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/i18n/locales/ja.json",
+      "language": "json",
+      "sizeLines": 187,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/i18n/locales/ru.json",
+      "language": "json",
+      "sizeLines": 187,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/i18n/locales/zh.json",
+      "language": "json",
+      "sizeLines": 187,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/i18n/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 274,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/iso/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 18,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/iso/src/diff.rs",
+      "language": "rust",
+      "sizeLines": 452,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/iso/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 402,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/iso/src/rcopy.rs",
+      "language": "rust",
+      "sizeLines": 419,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/llm/src/anthropic.rs",
+      "language": "rust",
+      "sizeLines": 459,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/deepseek.rs",
+      "language": "rust",
+      "sizeLines": 813,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/dialect.rs",
+      "language": "rust",
+      "sizeLines": 319,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/glm.rs",
+      "language": "rust",
+      "sizeLines": 914,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/inband.rs",
+      "language": "rust",
+      "sizeLines": 309,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 147,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/openai.rs",
+      "language": "rust",
+      "sizeLines": 609,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/plugin.rs",
+      "language": "rust",
+      "sizeLines": 87,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/registry.rs",
+      "language": "rust",
+      "sizeLines": 122,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/thinking.rs",
+      "language": "rust",
+      "sizeLines": 205,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/llm/src/transform.rs",
+      "language": "rust",
+      "sizeLines": 253,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 24,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/lsp/src/client.rs",
+      "language": "rust",
+      "sizeLines": 940,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/src/detect.rs",
+      "language": "rust",
+      "sizeLines": 195,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/src/diagnostics_ledger.rs",
+      "language": "rust",
+      "sizeLines": 126,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 75,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/src/manager.rs",
+      "language": "rust",
+      "sizeLines": 269,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/lsp/src/transport.rs",
+      "language": "rust",
+      "sizeLines": 475,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/mcp/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 20,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/mcp/src/client.rs",
+      "language": "rust",
+      "sizeLines": 419,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/mcp/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 18,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/mcp/src/tool.rs",
+      "language": "rust",
+      "sizeLines": 192,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/memory/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/memory/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 21,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/memory/src/store.rs",
+      "language": "rust",
+      "sizeLines": 309,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/memory/src/structured.rs",
+      "language": "rust",
+      "sizeLines": 595,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/prompt/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 13,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/prompt/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 178,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/pty/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 23,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/pty/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 25,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/pty/src/session.rs",
+      "language": "rust",
+      "sizeLines": 461,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/pty/src/tool.rs",
+      "language": "rust",
+      "sizeLines": 107,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/search/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 18,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/search/src/extras.rs",
+      "language": "rust",
+      "sizeLines": 121,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/search/src/fs_cache.rs",
+      "language": "rust",
+      "sizeLines": 234,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/search/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 217,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/search/src/tokens.rs",
+      "language": "rust",
+      "sizeLines": 44,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/server/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 38,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/server/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 2493,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 21,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/skills/examples/verify_skills.rs",
+      "language": "rust",
+      "sizeLines": 37,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/src/frontmatter.rs",
+      "language": "rust",
+      "sizeLines": 272,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 23,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/src/native.rs",
+      "language": "rust",
+      "sizeLines": 229,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/src/registry.rs",
+      "language": "rust",
+      "sizeLines": 318,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/skills/src/render.rs",
+      "language": "rust",
+      "sizeLines": 93,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/supervisor/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 16,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/supervisor/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 22,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/supervisor/src/model.rs",
+      "language": "rust",
+      "sizeLines": 106,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/supervisor/src/registry.rs",
+      "language": "rust",
+      "sizeLines": 349,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 28,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/swarm/src/dag.rs",
+      "language": "rust",
+      "sizeLines": 210,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/executor.rs",
+      "language": "rust",
+      "sizeLines": 264,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 164,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/pipeline.rs",
+      "language": "rust",
+      "sizeLines": 525,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/render.rs",
+      "language": "rust",
+      "sizeLines": 175,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/schema.rs",
+      "language": "rust",
+      "sizeLines": 276,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/swarm/src/state.rs",
+      "language": "rust",
+      "sizeLines": 342,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/telemetry/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 18,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/telemetry/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 82,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/Cargo.toml",
+      "language": "toml",
+      "sizeLines": 25,
+      "fileCategory": "config"
+    },
+    {
+      "path": "crates/tools/src/ast_tool.rs",
+      "language": "rust",
+      "sizeLines": 344,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/fs.rs",
+      "language": "rust",
+      "sizeLines": 600,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/fuzzy_match.rs",
+      "language": "rust",
+      "sizeLines": 618,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/github.rs",
+      "language": "rust",
+      "sizeLines": 557,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/image.rs",
+      "language": "rust",
+      "sizeLines": 265,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/lib.rs",
+      "language": "rust",
+      "sizeLines": 396,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/list_tool.rs",
+      "language": "rust",
+      "sizeLines": 63,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/lsp_tool.rs",
+      "language": "rust",
+      "sizeLines": 408,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/lsp_write_effect.rs",
+      "language": "rust",
+      "sizeLines": 156,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/search.rs",
+      "language": "rust",
+      "sizeLines": 129,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/shell.rs",
+      "language": "rust",
+      "sizeLines": 226,
+      "fileCategory": "code"
+    },
+    {
+      "path": "crates/tools/src/write.rs",
+      "language": "rust",
+      "sizeLines": 329,
+      "fileCategory": "code"
+    },
+    {
+      "path": "docs/agent-loop-improvement-plan.md",
+      "language": "markdown",
+      "sizeLines": 865,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "prompts/compaction-summary.md",
+      "language": "markdown",
+      "sizeLines": 42,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "prompts/system-architect.md",
+      "language": "markdown",
+      "sizeLines": 8,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "prompts/system-ask.md",
+      "language": "markdown",
+      "sizeLines": 7,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "prompts/system-code.md",
+      "language": "markdown",
+      "sizeLines": 10,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "prompts/system-debug.md",
+      "language": "markdown",
+      "sizeLines": 7,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "language": "toml",
+      "sizeLines": 4,
+      "fileCategory": "config"
+    },
+    {
+      "path": "skills/understand/README.md",
+      "language": "markdown",
+      "sizeLines": 157,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "skills/understand/SKILL.md",
+      "language": "markdown",
+      "sizeLines": 147,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "web/assets/index-B1GzrXLw.js",
+      "language": "javascript",
+      "sizeLines": 61,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/assets/index-UL1jtC-R.css",
+      "language": "css",
+      "sizeLines": 10,
+      "fileCategory": "markup"
+    },
+    {
+      "path": "web/c5-ui/README.md",
+      "language": "markdown",
+      "sizeLines": 112,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "web/c5-ui/index.html",
+      "language": "html",
+      "sizeLines": 33,
+      "fileCategory": "markup"
+    },
+    {
+      "path": "web/c5-ui/package.json",
+      "language": "json",
+      "sizeLines": 33,
+      "fileCategory": "config"
+    },
+    {
+      "path": "web/c5-ui/postcss.config.js",
+      "language": "javascript",
+      "sizeLines": 7,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/App.tsx",
+      "language": "typescript",
+      "sizeLines": 31,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/Toaster.tsx",
+      "language": "typescript",
+      "sizeLines": 52,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/AgentShell.tsx",
+      "language": "typescript",
+      "sizeLines": 274,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/BranchTreeModal.tsx",
+      "language": "typescript",
+      "sizeLines": 282,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/Composer.tsx",
+      "language": "typescript",
+      "sizeLines": 493,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/Inspector.tsx",
+      "language": "typescript",
+      "sizeLines": 287,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/SessionList.tsx",
+      "language": "typescript",
+      "sizeLines": 454,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/SettingsPanel.tsx",
+      "language": "typescript",
+      "sizeLines": 227,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/Sidebar.tsx",
+      "language": "typescript",
+      "sizeLines": 210,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/SubAgentMonitor.tsx",
+      "language": "typescript",
+      "sizeLines": 165,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/Transcript.tsx",
+      "language": "typescript",
+      "sizeLines": 446,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/agent/WorkspacePanel.tsx",
+      "language": "typescript",
+      "sizeLines": 706,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/charts.tsx",
+      "language": "typescript",
+      "sizeLines": 523,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/icons.tsx",
+      "language": "typescript",
+      "sizeLines": 426,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/components/ui.tsx",
+      "language": "typescript",
+      "sizeLines": 880,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/index.css",
+      "language": "css",
+      "sizeLines": 207,
+      "fileCategory": "markup"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/commands.ts",
+      "language": "typescript",
+      "sizeLines": 268,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/highlight.ts",
+      "language": "typescript",
+      "sizeLines": 83,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/markdown.tsx",
+      "language": "typescript",
+      "sizeLines": 351,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/types.ts",
+      "language": "typescript",
+      "sizeLines": 325,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/ui.ts",
+      "language": "typescript",
+      "sizeLines": 36,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "language": "typescript",
+      "sizeLines": 1069,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/agent/workspace.ts",
+      "language": "typescript",
+      "sizeLines": 83,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/cn.ts",
+      "language": "typescript",
+      "sizeLines": 6,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/format.ts",
+      "language": "typescript",
+      "sizeLines": 62,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/i18n.tsx",
+      "language": "typescript",
+      "sizeLines": 159,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/locales.ts",
+      "language": "typescript",
+      "sizeLines": 964,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/notifications.tsx",
+      "language": "typescript",
+      "sizeLines": 59,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/settings.tsx",
+      "language": "typescript",
+      "sizeLines": 67,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/lib/theme.tsx",
+      "language": "typescript",
+      "sizeLines": 79,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/main.tsx",
+      "language": "typescript",
+      "sizeLines": 28,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/types.ts",
+      "language": "typescript",
+      "sizeLines": 94,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/src/vite-env.d.ts",
+      "language": "typescript",
+      "sizeLines": 1,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/tailwind.config.ts",
+      "language": "typescript",
+      "sizeLines": 86,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/tsconfig.json",
+      "language": "json",
+      "sizeLines": 31,
+      "fileCategory": "config"
+    },
+    {
+      "path": "web/c5-ui/tsconfig.node.json",
+      "language": "json",
+      "sizeLines": 12,
+      "fileCategory": "config"
+    },
+    {
+      "path": "web/c5-ui/vite.config.d.ts",
+      "language": "typescript",
+      "sizeLines": 2,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/vite.config.js",
+      "language": "javascript",
+      "sizeLines": 27,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/c5-ui/vite.config.ts",
+      "language": "typescript",
+      "sizeLines": 28,
+      "fileCategory": "code"
+    },
+    {
+      "path": "web/index.html",
+      "language": "html",
+      "sizeLines": 34,
+      "fileCategory": "markup"
+    }
+  ],
+  "totalFiles": 211,
+  "filteredByIgnore": 0,
+  "estimatedComplexity": "large",
+  "stats": {
+    "filesScanned": 211,
+    "byCategory": {
+      "infra": 1,
+      "config": 34,
+      "docs": 12,
+      "code": 160,
+      "markup": 4
+    },
+    "byLanguage": {
+      "yaml": 1,
+      "toml": 27,
+      "markdown": 12,
+      "rust": 122,
+      "json": 7,
+      "javascript": 3,
+      "css": 2,
+      "html": 2,
+      "typescript": 35
+    }
+  }
+}

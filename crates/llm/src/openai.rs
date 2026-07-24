@@ -331,6 +331,19 @@ fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
                 Ok(Some(r)) => r,
                 Ok(None) => break,
                 Err(_) => {
+                    // P0-自愈激活：流瞬时中断时，若 finish 已收或存在已完成工具调用（参数合法
+                    // JSON），发 MessageEnd（finish 未收则标记 stream_interrupted 瞬时错误），
+                    // 供 agent 瞬时恢复保留并执行已完成工具；否则保持原兜底行为（发 Error）。
+                    if let Some(msg) = finalize_stream_interrupt(
+                        &model_id,
+                        &text_buf,
+                        &tool_calls,
+                        &finish,
+                        &usage_acc,
+                    ) {
+                        yield AssistantEvent::MessageEnd(msg);
+                        return;
+                    }
                     yield AssistantEvent::Error(LlmError::StreamInterrupted(format!(
                         "流空闲超过 {} 秒未收到数据，判定上游静默",
                         crate::STREAM_IDLE_TIMEOUT.as_secs()
@@ -341,6 +354,16 @@ fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
+                    if let Some(msg) = finalize_stream_interrupt(
+                        &model_id,
+                        &text_buf,
+                        &tool_calls,
+                        &finish,
+                        &usage_acc,
+                    ) {
+                        yield AssistantEvent::MessageEnd(msg);
+                        return;
+                    }
                     yield AssistantEvent::Error(LlmError::StreamInterrupted(e.to_string()));
                     break;
                 }
@@ -415,10 +438,22 @@ fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
             }
             // 防御无换行的超长行撑爆内存：drain_line 抽干完整行后 buf 仅余未完结尾段。
             if crate::line_buffer_too_long(&buf) {
+                // P0-自愈激活：超长行中断时同样尝试保留已完成工具；无内容则改走 break
+                // fallthrough（而非 return 丢弃累积内容），让流自然结束 MessageEnd 兜底。
+                if let Some(msg) = finalize_stream_interrupt(
+                    &model_id,
+                    &text_buf,
+                    &tool_calls,
+                    &finish,
+                    &usage_acc,
+                ) {
+                    yield AssistantEvent::MessageEnd(msg);
+                    return;
+                }
                 yield AssistantEvent::Error(LlmError::StreamInterrupted(
                     "SSE 行超过最大长度上限".into(),
                 ));
-                return;
+                break;
             }
         }
         // 流自然结束（未见 [DONE]）
@@ -475,6 +510,38 @@ fn build_message(
         stop_reason,
         stop_details,
     }
+}
+
+/// 流瞬时中断兜底终态（移植 oh-my-pi `retainCompletedToolCalls`）。
+///
+/// finish 已收（响应实际完成）或存在已完成工具调用（参数解析为合法 JSON）时返回
+/// [`Some`] 消息供 [`MessageEnd`](AssistantEvent::MessageEnd) 承载——finish 未收时标记
+/// `stream_interrupted` 瞬时错误，供 agent 循环的瞬时恢复改写为 ToolUse、执行已完成工具
+/// 而非整轮废弃；否则返回 [`None`]（无内容可救，调用方发 [`Error`](AssistantEvent::Error)
+/// 走兜底重试 / 续写）。
+fn finalize_stream_interrupt(
+    model_id: &str,
+    text_buf: &str,
+    tool_calls: &[ToolCallAccum],
+    finish: &Option<String>,
+    usage: &Usage,
+) -> Option<agent_core::AssistantMessage> {
+    let recoverable = finish.is_some()
+        || tool_calls.iter().any(|tc| {
+            tc.id.is_some()
+                && tc.name.is_some()
+                && serde_json::from_str::<serde_json::Value>(&tc.args).is_ok()
+        });
+    if !recoverable {
+        return None;
+    }
+    let mut msg = build_message(model_id, text_buf, tool_calls, finish, usage);
+    // finish 已收 → 保留其 stop_reason（含 content_filter→sensitive，不覆盖为瞬时类）；
+    // finish 未收 → 标记瞬时错误触发 agent 瞬时恢复。
+    if finish.is_none() {
+        crate::mark_transient_stream_error(&mut msg);
+    }
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -557,6 +624,53 @@ mod tests {
         assert_eq!(*name, "read_file");
         assert_eq!(arguments["path"], "a.rs");
         assert_eq!(msg.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn finalize_stream_interrupt_retains_completed_toolcall() {
+        // P0-自愈激活：finish 未收 + 已完成工具调用（参数合法 JSON）→ 标记瞬时错误，
+        // 供 agent 瞬时恢复保留并执行已完成工具（而非整轮废弃）。
+        let mut tc = ToolCallAccum::default();
+        tc.id = Some("call_1".into());
+        tc.name = Some("read_file".into());
+        tc.args = r#"{"path":"a.rs"}"#.into();
+        let msg = finalize_stream_interrupt("m", "", &[tc], &None, &Usage::default())
+            .expect("已完成工具调用应可恢复");
+        assert_eq!(msg.stop_reason, Some(StopReason::Error));
+        assert!(msg
+            .stop_details
+            .as_ref()
+            .is_some_and(agent_core::StopDetails::is_transient_stream_error));
+    }
+
+    #[test]
+    fn finalize_stream_interrupt_finish_received_keeps_stop_reason() {
+        // finish 已收（响应实际完成）→ 不标记瞬时错误，保留 finish 推导的 stop_reason。
+        let mut tc = ToolCallAccum::default();
+        tc.id = Some("call_1".into());
+        tc.name = Some("read_file".into());
+        tc.args = r#"{"path":"a.rs"}"#.into();
+        let msg =
+            finalize_stream_interrupt("m", "", &[tc], &Some("tool_calls".into()), &Usage::default())
+                .expect("finish 已收应返回消息");
+        assert_eq!(msg.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(msg.stop_details, None);
+    }
+
+    #[test]
+    fn finalize_stream_interrupt_partial_args_not_recoverable() {
+        // 参数不合法 JSON（流中断于工具参数中途）→ 不可恢复，返回 None。
+        let mut tc = ToolCallAccum::default();
+        tc.id = Some("call_1".into());
+        tc.name = Some("read_file".into());
+        tc.args = r#"{"path":"a.rs"#.into(); // 残缺 JSON
+        assert!(finalize_stream_interrupt("m", "", &[tc], &None, &Usage::default()).is_none());
+    }
+
+    #[test]
+    fn finalize_stream_interrupt_empty_not_recoverable() {
+        // 无内容、无 finish → 不可恢复，返回 None（调用方发 Error 走兜底）。
+        assert!(finalize_stream_interrupt("m", "", &[], &None, &Usage::default()).is_none());
     }
 
     #[test]

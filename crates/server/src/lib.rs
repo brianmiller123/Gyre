@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent::{Agent, AgentBuilder};
+use agent::{Agent, AgentBuilder, PauseGate};
 use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
@@ -396,6 +396,11 @@ pub struct SessionManager {
     relay: agent_collab::Relay,
     /// 协同中继维护循环是否已启动（惰性，首次创建会话时拉起）。
     maintenance_started: Arc<std::sync::atomic::AtomicBool>,
+    /// 进程级暂停门（共享单例）：注入每个会话的 Agent，由 `/api/pause` `/api/resume`
+    /// 驱动。pause 时所有 agent loop 在下一安全点（provider 调用前 / 工具批执行前）
+    /// park，在途 provider 流与已启动工具跑完后冻结，resume 后从原处继续（零丢失）。
+    /// 移植 oh-my-pi `AgentPauseGate`。
+    pause_gate: Arc<PauseGate>,
 }
 
 impl SessionManager {
@@ -409,6 +414,7 @@ impl SessionManager {
             cwd,
             relay: agent_collab::Relay::new(),
             maintenance_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_gate: PauseGate::new(),
         }
     }
 
@@ -422,6 +428,12 @@ impl SessionManager {
     #[must_use]
     pub fn cwd(&self) -> &std::path::Path {
         self.cwd.as_path()
+    }
+
+    /// 进程级暂停门句柄（`/api/pause` `/api/resume` 路由驱动其 `pause()` / `resume()`）。
+    #[must_use]
+    pub fn pause_gate(&self) -> &Arc<PauseGate> {
+        &self.pause_gate
     }
 
     /// 创建/恢复/fork 会话。
@@ -531,6 +543,7 @@ impl SessionManager {
             mode_override,
             Arc::clone(&mcp),
             Arc::clone(&skill_catalog),
+            Arc::clone(&self.pause_gate),
         )
         .await?;
 
@@ -862,6 +875,8 @@ async fn build_agent(
     mcp: Arc<agent_mcp::McpRegistry>,
     // Skill 目录（create_session 加载并共享；只读端点 `/skills` 复用）。
     skill_catalog: Arc<agent_skills::SkillCatalog>,
+    // 进程级暂停门（共享单例；注入 Agent，由 `/api/pause` `/api/resume` 驱动）。
+    pause_gate: Arc<PauseGate>,
 ) -> Result<(Agent, Arc<dyn agent_core::ContextManager>), String> {
     let profile = config.resolve_model(alias).map_err(|e| e.to_string())?;
     use secrecy::ExposeSecret;
@@ -1031,6 +1046,7 @@ async fn build_agent(
         skill_catalog,
         context_files,
         memory,
+        pause_gate,
     );
     Ok((agent, context))
 }
@@ -1052,6 +1068,7 @@ fn assemble(
     catalog: Arc<agent_skills::SkillCatalog>,
     context_files: Vec<String>,
     memory: Option<Arc<dyn agent_core::MemoryStore>>,
+    pause_gate: Arc<PauseGate>,
 ) -> Agent {
     let workspace_root = workspace.root().to_path_buf();
     // fuzzy 配置 → 全局覆盖（首次装配 set，OnceLock 幂等；与 CLI 一致）。
@@ -1079,7 +1096,8 @@ fn assemble(
         .max_turns(config.agent.max_turns)
         .context_guard(config.agent.context_window_guard)
         .catalog(catalog)
-        .context_files(context_files);
+        .context_files(context_files)
+        .pause_gate(pause_gate);
     // 注入思考模式（若 config 启用）—— 与 CLI 一致
     let builder = if config.agent.enable_thinking {
         builder.thinking(agent_core::ThinkingConfig::new(
@@ -1165,6 +1183,32 @@ fn asset_response(path: &str, file: &rust_embed::EmbeddedFile) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `POST /api/pause`：进程级冻结所有 agent loop（移植 oh-my-pi `AgentPauseGate`）。
+///
+/// 在途 provider 流与已启动工具跑完后，每个 loop 在下一安全点（provider 调用前 /
+/// 工具批执行前）park。queued steering / followUp 保持排队，[`resume_handler`] 后正常
+/// 投递。幂等：已是暂停态时 `already_paused=true`。
+async fn pause_handler(State(state): State<SessionManager>) -> Response {
+    // pause() 返回 false 表示已是暂停态（无操作）。
+    let already_paused = !state.pause_gate().pause();
+    Json(serde_json::json!({
+        "paused": true,
+        "already_paused": already_paused,
+    }))
+    .into_response()
+}
+
+/// `POST /api/resume`：解除进程级冻结，所有 parked loop 从原处继续（零丢失）。
+async fn resume_handler(State(state): State<SessionManager>) -> Response {
+    let paused_for = state.pause_gate().resume();
+    Json(serde_json::json!({
+        "paused": false,
+        "was_paused": paused_for.is_some(),
+        "paused_secs": paused_for.map(|d| d.as_secs_f64()),
+    }))
+    .into_response()
+}
+
 /// 构建 axum Router（静态前端内嵌于二进制，运行时无需 `web/` 目录）。
 #[must_use]
 pub fn app(state: SessionManager) -> Router {
@@ -1187,6 +1231,8 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/commands", get(list_commands))
         .route("/api/models", get(list_models))
         .route("/api/stats", get(stats))
+        .route("/api/pause", post(pause_handler))
+        .route("/api/resume", post(resume_handler))
         .route("/api/workspace", get(workspace_info))
         .route("/api/fs", get(list_dir))
         .route("/api/file", get(read_file))
@@ -2489,5 +2535,26 @@ mod tests {
         assert_eq!(tree["nodes"].as_array().unwrap().len(), 4);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sprint 4-1：`/api/pause` `/api/resume` 处理器驱动 SessionManager 共享的进程级暂停门。
+    /// 证明「HTTP 路由 → 共享单例 PauseGate」接线端到端正确；park/resume 机制本身由
+    /// agent crate 的 `pause_gate_parks_run_and_resumes` 覆盖。
+    #[tokio::test]
+    async fn pause_and_resume_handlers_drive_shared_gate() {
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+        );
+        assert!(!mgr.pause_gate().paused(), "初始应为运行态");
+        // pause 处理器驱动共享门 → 冻结。
+        let _ = pause_handler(State(mgr.clone())).await;
+        assert!(mgr.pause_gate().paused(), "pause 后应冻结");
+        // resume 处理器解除 → 恢复运行。
+        let _ = resume_handler(State(mgr.clone())).await;
+        assert!(!mgr.pause_gate().paused(), "resume 后应恢复运行");
     }
 }

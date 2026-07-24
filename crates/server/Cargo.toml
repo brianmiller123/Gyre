@@ -34,5 +34,9 @@ serde_json   = { workspace = true }
 tracing      = { workspace = true }
 uuid         = { workspace = true }
 
+[dev-dependencies]
+# 测试用：解析 config.example.toml 构造 SessionManager（pause/resume 处理器接线测试）。
+toml = { workspace = true }
+
 [lints]
 workspace = true

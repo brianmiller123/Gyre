@@ -1,0 +1,581 @@
+{
+  "scriptCompleted": true,
+  "stats": {
+    "filesScanned": 211,
+    "filesWithImports": 77,
+    "totalEdges": 283
+  },
+  "importMap": {
+    ".github/workflows/rust.yml": [],
+    "Cargo.toml": [],
+    "README.md": [],
+    "README_RU.md": [],
+    "README_ZH.md": [],
+    "config.example.toml": [],
+    "crates/acp/Cargo.toml": [],
+    "crates/acp/src/adapter.rs": [
+      "crates/acp/src/types.rs"
+    ],
+    "crates/acp/src/http.rs": [
+      "crates/acp/src/adapter.rs",
+      "crates/acp/src/rpc.rs",
+      "crates/acp/src/types.rs"
+    ],
+    "crates/acp/src/lib.rs": [
+      "crates/acp/src/adapter.rs",
+      "crates/acp/src/http.rs",
+      "crates/acp/src/rpc.rs",
+      "crates/acp/src/stdio.rs",
+      "crates/acp/src/types.rs"
+    ],
+    "crates/acp/src/rpc.rs": [
+      "crates/acp/src/types.rs"
+    ],
+    "crates/acp/src/stdio.rs": [
+      "crates/acp/src/adapter.rs",
+      "crates/acp/src/rpc.rs",
+      "crates/acp/src/types.rs"
+    ],
+    "crates/acp/src/types.rs": [],
+    "crates/agent/Cargo.toml": [],
+    "crates/agent/src/harmony.rs": [],
+    "crates/agent/src/lib.rs": [
+      "crates/agent/src/harmony.rs",
+      "crates/agent/src/task_tool.rs"
+    ],
+    "crates/agent/src/task_tool.rs": [],
+    "crates/ast/Cargo.toml": [],
+    "crates/ast/src/lib.rs": [
+      "crates/ast/src/pattern.rs",
+      "crates/ast/src/summary.rs"
+    ],
+    "crates/ast/src/pattern.rs": [],
+    "crates/ast/src/summary.rs": [],
+    "crates/cli/Cargo.toml": [],
+    "crates/cli/src/agents_view.rs": [],
+    "crates/cli/src/main.rs": [
+      "crates/cli/src/agents_view.rs",
+      "crates/cli/src/markdown.rs",
+      "crates/cli/src/repl.rs"
+    ],
+    "crates/cli/src/markdown.rs": [],
+    "crates/cli/src/repl.rs": [],
+    "crates/collab/Cargo.toml": [],
+    "crates/collab/src/codec.rs": [
+      "crates/collab/src/error.rs",
+      "crates/collab/src/frame.rs"
+    ],
+    "crates/collab/src/error.rs": [],
+    "crates/collab/src/frame.rs": [],
+    "crates/collab/src/lib.rs": [
+      "crates/collab/src/codec.rs",
+      "crates/collab/src/error.rs",
+      "crates/collab/src/frame.rs",
+      "crates/collab/src/relay.rs",
+      "crates/collab/src/room.rs"
+    ],
+    "crates/collab/src/relay.rs": [
+      "crates/collab/src/codec.rs",
+      "crates/collab/src/error.rs",
+      "crates/collab/src/frame.rs",
+      "crates/collab/src/room.rs"
+    ],
+    "crates/collab/src/room.rs": [
+      "crates/collab/src/codec.rs",
+      "crates/collab/src/error.rs"
+    ],
+    "crates/config/Cargo.toml": [],
+    "crates/config/src/config.rs": [],
+    "crates/config/src/env.rs": [],
+    "crates/config/src/lib.rs": [
+      "crates/config/src/config.rs",
+      "crates/config/src/env.rs",
+      "crates/config/src/rules.rs"
+    ],
+    "crates/config/src/rules.rs": [
+      "crates/config/src/config.rs"
+    ],
+    "crates/context/Cargo.toml": [],
+    "crates/context/src/compaction.rs": [],
+    "crates/context/src/lib.rs": [
+      "crates/context/src/compaction.rs",
+      "crates/context/src/persistence.rs",
+      "crates/context/src/token.rs",
+      "crates/context/src/tree.rs"
+    ],
+    "crates/context/src/persistence.rs": [],
+    "crates/context/src/token.rs": [],
+    "crates/context/src/tree.rs": [],
+    "crates/core/Cargo.toml": [],
+    "crates/core/src/context.rs": [
+      "crates/core/src/error.rs",
+      "crates/core/src/message.rs",
+      "crates/core/src/model.rs",
+      "crates/core/src/tool.rs"
+    ],
+    "crates/core/src/error.rs": [],
+    "crates/core/src/hook.rs": [
+      "crates/core/src/message.rs"
+    ],
+    "crates/core/src/lib.rs": [
+      "crates/core/src/context.rs",
+      "crates/core/src/error.rs",
+      "crates/core/src/hook.rs",
+      "crates/core/src/llm.rs",
+      "crates/core/src/memory.rs",
+      "crates/core/src/message.rs",
+      "crates/core/src/model.rs",
+      "crates/core/src/platform.rs",
+      "crates/core/src/resource.rs",
+      "crates/core/src/skill.rs",
+      "crates/core/src/tool.rs",
+      "crates/core/src/workspace.rs",
+      "crates/core/src/write_effect.rs"
+    ],
+    "crates/core/src/llm.rs": [
+      "crates/core/src/error.rs",
+      "crates/core/src/message.rs",
+      "crates/core/src/model.rs",
+      "crates/core/src/tool.rs"
+    ],
+    "crates/core/src/memory.rs": [],
+    "crates/core/src/message.rs": [
+      "crates/core/src/llm.rs",
+      "crates/core/src/tool.rs"
+    ],
+    "crates/core/src/model.rs": [],
+    "crates/core/src/platform.rs": [],
+    "crates/core/src/resource.rs": [],
+    "crates/core/src/skill.rs": [
+      "crates/core/src/message.rs"
+    ],
+    "crates/core/src/tool.rs": [
+      "crates/core/src/error.rs",
+      "crates/core/src/message.rs"
+    ],
+    "crates/core/src/workspace.rs": [],
+    "crates/core/src/write_effect.rs": [],
+    "crates/hashline/Cargo.toml": [],
+    "crates/hashline/src/apply.rs": [
+      "crates/hashline/src/format.rs",
+      "crates/hashline/src/mismatch.rs",
+      "crates/hashline/src/repair.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/format.rs": [
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/lib.rs": [
+      "crates/hashline/src/apply.rs",
+      "crates/hashline/src/format.rs",
+      "crates/hashline/src/mismatch.rs",
+      "crates/hashline/src/normalize.rs",
+      "crates/hashline/src/parser.rs",
+      "crates/hashline/src/preview.rs",
+      "crates/hashline/src/recovery.rs",
+      "crates/hashline/src/repair.rs",
+      "crates/hashline/src/snapshots.rs",
+      "crates/hashline/src/tool.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/mismatch.rs": [
+      "crates/hashline/src/format.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/normalize.rs": [],
+    "crates/hashline/src/parser.rs": [
+      "crates/hashline/src/format.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/preview.rs": [],
+    "crates/hashline/src/recovery.rs": [
+      "crates/hashline/src/apply.rs",
+      "crates/hashline/src/mismatch.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/repair.rs": [
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/snapshots.rs": [
+      "crates/hashline/src/format.rs"
+    ],
+    "crates/hashline/src/tool.rs": [
+      "crates/hashline/src/apply.rs",
+      "crates/hashline/src/format.rs",
+      "crates/hashline/src/normalize.rs",
+      "crates/hashline/src/parser.rs",
+      "crates/hashline/src/preview.rs",
+      "crates/hashline/src/types.rs"
+    ],
+    "crates/hashline/src/types.rs": [],
+    "crates/i18n/Cargo.toml": [],
+    "crates/i18n/locales/en.json": [],
+    "crates/i18n/locales/ja.json": [],
+    "crates/i18n/locales/ru.json": [],
+    "crates/i18n/locales/zh.json": [],
+    "crates/i18n/src/lib.rs": [],
+    "crates/iso/Cargo.toml": [],
+    "crates/iso/src/diff.rs": [],
+    "crates/iso/src/lib.rs": [
+      "crates/iso/src/diff.rs",
+      "crates/iso/src/rcopy.rs"
+    ],
+    "crates/iso/src/rcopy.rs": [],
+    "crates/llm/Cargo.toml": [],
+    "crates/llm/src/anthropic.rs": [
+      "crates/llm/src/transform.rs"
+    ],
+    "crates/llm/src/deepseek.rs": [],
+    "crates/llm/src/dialect.rs": [],
+    "crates/llm/src/glm.rs": [],
+    "crates/llm/src/inband.rs": [
+      "crates/llm/src/dialect.rs"
+    ],
+    "crates/llm/src/lib.rs": [
+      "crates/llm/src/anthropic.rs",
+      "crates/llm/src/deepseek.rs",
+      "crates/llm/src/dialect.rs",
+      "crates/llm/src/glm.rs",
+      "crates/llm/src/inband.rs",
+      "crates/llm/src/openai.rs",
+      "crates/llm/src/plugin.rs",
+      "crates/llm/src/registry.rs",
+      "crates/llm/src/thinking.rs",
+      "crates/llm/src/transform.rs"
+    ],
+    "crates/llm/src/openai.rs": [],
+    "crates/llm/src/plugin.rs": [],
+    "crates/llm/src/registry.rs": [],
+    "crates/llm/src/thinking.rs": [],
+    "crates/llm/src/transform.rs": [],
+    "crates/lsp/Cargo.toml": [],
+    "crates/lsp/src/client.rs": [
+      "crates/lsp/src/detect.rs",
+      "crates/lsp/src/transport.rs"
+    ],
+    "crates/lsp/src/detect.rs": [],
+    "crates/lsp/src/diagnostics_ledger.rs": [],
+    "crates/lsp/src/lib.rs": [
+      "crates/lsp/src/client.rs",
+      "crates/lsp/src/detect.rs",
+      "crates/lsp/src/diagnostics_ledger.rs",
+      "crates/lsp/src/manager.rs",
+      "crates/lsp/src/transport.rs"
+    ],
+    "crates/lsp/src/manager.rs": [
+      "crates/lsp/src/client.rs",
+      "crates/lsp/src/detect.rs"
+    ],
+    "crates/lsp/src/transport.rs": [],
+    "crates/mcp/Cargo.toml": [],
+    "crates/mcp/src/client.rs": [],
+    "crates/mcp/src/lib.rs": [
+      "crates/mcp/src/client.rs",
+      "crates/mcp/src/tool.rs"
+    ],
+    "crates/mcp/src/tool.rs": [
+      "crates/mcp/src/client.rs"
+    ],
+    "crates/memory/Cargo.toml": [],
+    "crates/memory/src/lib.rs": [
+      "crates/memory/src/store.rs",
+      "crates/memory/src/structured.rs"
+    ],
+    "crates/memory/src/store.rs": [],
+    "crates/memory/src/structured.rs": [],
+    "crates/prompt/Cargo.toml": [],
+    "crates/prompt/src/lib.rs": [],
+    "crates/pty/Cargo.toml": [],
+    "crates/pty/src/lib.rs": [
+      "crates/pty/src/session.rs",
+      "crates/pty/src/tool.rs"
+    ],
+    "crates/pty/src/session.rs": [],
+    "crates/pty/src/tool.rs": [
+      "crates/pty/src/session.rs"
+    ],
+    "crates/search/Cargo.toml": [],
+    "crates/search/src/extras.rs": [],
+    "crates/search/src/fs_cache.rs": [],
+    "crates/search/src/lib.rs": [
+      "crates/search/src/extras.rs",
+      "crates/search/src/fs_cache.rs",
+      "crates/search/src/tokens.rs"
+    ],
+    "crates/search/src/tokens.rs": [],
+    "crates/server/Cargo.toml": [],
+    "crates/server/src/lib.rs": [],
+    "crates/skills/Cargo.toml": [],
+    "crates/skills/examples/verify_skills.rs": [],
+    "crates/skills/src/frontmatter.rs": [],
+    "crates/skills/src/lib.rs": [
+      "crates/skills/src/frontmatter.rs",
+      "crates/skills/src/native.rs",
+      "crates/skills/src/registry.rs",
+      "crates/skills/src/render.rs"
+    ],
+    "crates/skills/src/native.rs": [
+      "crates/skills/src/frontmatter.rs"
+    ],
+    "crates/skills/src/registry.rs": [
+      "crates/skills/src/native.rs"
+    ],
+    "crates/skills/src/render.rs": [],
+    "crates/supervisor/Cargo.toml": [],
+    "crates/supervisor/src/lib.rs": [
+      "crates/supervisor/src/model.rs",
+      "crates/supervisor/src/registry.rs"
+    ],
+    "crates/supervisor/src/model.rs": [],
+    "crates/supervisor/src/registry.rs": [
+      "crates/supervisor/src/model.rs"
+    ],
+    "crates/swarm/Cargo.toml": [],
+    "crates/swarm/src/dag.rs": [
+      "crates/swarm/src/schema.rs"
+    ],
+    "crates/swarm/src/executor.rs": [
+      "crates/swarm/src/schema.rs"
+    ],
+    "crates/swarm/src/lib.rs": [
+      "crates/swarm/src/dag.rs",
+      "crates/swarm/src/executor.rs",
+      "crates/swarm/src/pipeline.rs",
+      "crates/swarm/src/render.rs",
+      "crates/swarm/src/schema.rs",
+      "crates/swarm/src/state.rs"
+    ],
+    "crates/swarm/src/pipeline.rs": [
+      "crates/swarm/src/executor.rs",
+      "crates/swarm/src/schema.rs",
+      "crates/swarm/src/state.rs"
+    ],
+    "crates/swarm/src/render.rs": [
+      "crates/swarm/src/state.rs"
+    ],
+    "crates/swarm/src/schema.rs": [],
+    "crates/swarm/src/state.rs": [],
+    "crates/telemetry/Cargo.toml": [],
+    "crates/telemetry/src/lib.rs": [],
+    "crates/tools/Cargo.toml": [],
+    "crates/tools/src/ast_tool.rs": [],
+    "crates/tools/src/fs.rs": [],
+    "crates/tools/src/fuzzy_match.rs": [],
+    "crates/tools/src/github.rs": [],
+    "crates/tools/src/image.rs": [],
+    "crates/tools/src/lib.rs": [
+      "crates/tools/src/ast_tool.rs",
+      "crates/tools/src/fs.rs",
+      "crates/tools/src/fuzzy_match.rs",
+      "crates/tools/src/github.rs",
+      "crates/tools/src/image.rs",
+      "crates/tools/src/list_tool.rs",
+      "crates/tools/src/lsp_tool.rs",
+      "crates/tools/src/lsp_write_effect.rs",
+      "crates/tools/src/search.rs",
+      "crates/tools/src/shell.rs",
+      "crates/tools/src/write.rs"
+    ],
+    "crates/tools/src/list_tool.rs": [],
+    "crates/tools/src/lsp_tool.rs": [],
+    "crates/tools/src/lsp_write_effect.rs": [],
+    "crates/tools/src/search.rs": [],
+    "crates/tools/src/shell.rs": [],
+    "crates/tools/src/write.rs": [],
+    "docs/agent-loop-improvement-plan.md": [],
+    "prompts/compaction-summary.md": [],
+    "prompts/system-architect.md": [],
+    "prompts/system-ask.md": [],
+    "prompts/system-code.md": [],
+    "prompts/system-debug.md": [],
+    "rust-toolchain.toml": [],
+    "skills/understand/README.md": [],
+    "skills/understand/SKILL.md": [],
+    "web/assets/index-B1GzrXLw.js": [],
+    "web/assets/index-UL1jtC-R.css": [],
+    "web/c5-ui/README.md": [],
+    "web/c5-ui/index.html": [],
+    "web/c5-ui/package.json": [],
+    "web/c5-ui/postcss.config.js": [],
+    "web/c5-ui/src/App.tsx": [
+      "web/c5-ui/src/components/agent/AgentShell.tsx",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/notifications.tsx",
+      "web/c5-ui/src/lib/settings.tsx",
+      "web/c5-ui/src/lib/theme.tsx"
+    ],
+    "web/c5-ui/src/components/Toaster.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/notifications.tsx",
+      "web/c5-ui/src/types.ts"
+    ],
+    "web/c5-ui/src/components/agent/AgentShell.tsx": [
+      "web/c5-ui/src/components/Toaster.tsx",
+      "web/c5-ui/src/components/agent/Composer.tsx",
+      "web/c5-ui/src/components/agent/Inspector.tsx",
+      "web/c5-ui/src/components/agent/SettingsPanel.tsx",
+      "web/c5-ui/src/components/agent/Sidebar.tsx",
+      "web/c5-ui/src/components/agent/Transcript.tsx",
+      "web/c5-ui/src/components/agent/WorkspacePanel.tsx",
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/ui.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/format.ts",
+      "web/c5-ui/src/lib/i18n.tsx"
+    ],
+    "web/c5-ui/src/components/agent/BranchTreeModal.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/notifications.tsx"
+    ],
+    "web/c5-ui/src/components/agent/Composer.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/commands.ts",
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/settings.tsx"
+    ],
+    "web/c5-ui/src/components/agent/Inspector.tsx": [
+      "web/c5-ui/src/components/agent/SubAgentMonitor.tsx",
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/ui.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/format.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/settings.tsx"
+    ],
+    "web/c5-ui/src/components/agent/SessionList.tsx": [
+      "web/c5-ui/src/components/agent/BranchTreeModal.tsx",
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/notifications.tsx"
+    ],
+    "web/c5-ui/src/components/agent/SettingsPanel.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/locales.ts",
+      "web/c5-ui/src/lib/notifications.tsx",
+      "web/c5-ui/src/lib/settings.tsx",
+      "web/c5-ui/src/lib/theme.tsx"
+    ],
+    "web/c5-ui/src/components/agent/Sidebar.tsx": [
+      "web/c5-ui/src/components/agent/SessionList.tsx",
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/locales.ts",
+      "web/c5-ui/src/lib/settings.tsx",
+      "web/c5-ui/src/lib/theme.tsx"
+    ],
+    "web/c5-ui/src/components/agent/SubAgentMonitor.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/format.ts",
+      "web/c5-ui/src/lib/i18n.tsx"
+    ],
+    "web/c5-ui/src/components/agent/Transcript.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/markdown.tsx",
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/agent/ui.ts",
+      "web/c5-ui/src/lib/agent/useAgentSession.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/notifications.tsx"
+    ],
+    "web/c5-ui/src/components/agent/WorkspacePanel.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/components/ui.tsx",
+      "web/c5-ui/src/lib/agent/highlight.ts",
+      "web/c5-ui/src/lib/agent/workspace.ts",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/format.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/theme.tsx"
+    ],
+    "web/c5-ui/src/components/charts.tsx": [
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/types.ts"
+    ],
+    "web/c5-ui/src/components/icons.tsx": [],
+    "web/c5-ui/src/components/ui.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/format.ts"
+    ],
+    "web/c5-ui/src/index.css": [],
+    "web/c5-ui/src/lib/agent/commands.ts": [
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/format.ts",
+      "web/c5-ui/src/lib/settings.tsx"
+    ],
+    "web/c5-ui/src/lib/agent/highlight.ts": [],
+    "web/c5-ui/src/lib/agent/markdown.tsx": [
+      "web/c5-ui/src/components/icons.tsx",
+      "web/c5-ui/src/lib/agent/highlight.ts",
+      "web/c5-ui/src/lib/cn.ts",
+      "web/c5-ui/src/lib/i18n.tsx"
+    ],
+    "web/c5-ui/src/lib/agent/types.ts": [
+      "web/c5-ui/src/lib/settings.tsx"
+    ],
+    "web/c5-ui/src/lib/agent/ui.ts": [
+      "web/c5-ui/src/components/ui.tsx"
+    ],
+    "web/c5-ui/src/lib/agent/useAgentSession.tsx": [
+      "web/c5-ui/src/lib/agent/types.ts",
+      "web/c5-ui/src/lib/agent/workspace.ts",
+      "web/c5-ui/src/lib/i18n.tsx",
+      "web/c5-ui/src/lib/settings.tsx"
+    ],
+    "web/c5-ui/src/lib/agent/workspace.ts": [],
+    "web/c5-ui/src/lib/cn.ts": [],
+    "web/c5-ui/src/lib/format.ts": [],
+    "web/c5-ui/src/lib/i18n.tsx": [
+      "web/c5-ui/src/lib/locales.ts"
+    ],
+    "web/c5-ui/src/lib/locales.ts": [],
+    "web/c5-ui/src/lib/notifications.tsx": [
+      "web/c5-ui/src/lib/agent/types.ts"
+    ],
+    "web/c5-ui/src/lib/settings.tsx": [],
+    "web/c5-ui/src/lib/theme.tsx": [],
+    "web/c5-ui/src/main.tsx": [
+      "web/c5-ui/src/App.tsx",
+      "web/c5-ui/src/index.css"
+    ],
+    "web/c5-ui/src/types.ts": [],
+    "web/c5-ui/src/vite-env.d.ts": [],
+    "web/c5-ui/tailwind.config.ts": [],
+    "web/c5-ui/tsconfig.json": [],
+    "web/c5-ui/tsconfig.node.json": [],
+    "web/c5-ui/vite.config.d.ts": [],
+    "web/c5-ui/vite.config.js": [],
+    "web/c5-ui/vite.config.ts": [],
+    "web/index.html": []
+  }
+}

@@ -20,6 +20,11 @@ use agent_core::{
 };
 use futures::StreamExt;
 
+use crate::tool_protection::{
+    assistant_has_any_call, is_protected_skill_message, sanitize_agent_messages,
+    skill_read_call_ids,
+};
+
 /// 压缩器：纯函数，不直接调 LLM；summarize 的摘要由外部 `SummaryProvider` 注入。
 pub struct Compactor;
 
@@ -269,7 +274,9 @@ impl Compactor {
         // 先 supersede：移除被后续同文件 read 取代的旧结果（内容已过期），释放上下文。
         let deduped = supersede_read_results(log);
         if deduped.len() <= keep_recent {
-            return deduped;
+            // 出口安全网：supersede 可能留下悬空 ToolCall（旧 read 结果被取代、调用残留），
+            // 经配对强制器清理，使持久化日志与 provider 视图同样满足配对约束。
+            return sanitize_agent_messages(deduped);
         }
         let protected = skill_read_call_ids(&deduped);
         let split = deduped.len() - keep_recent;
@@ -284,7 +291,7 @@ impl Compactor {
                 _ => None,
             })
             .collect();
-        deduped
+        let kept: Vec<AgentMessage> = deduped
             .iter()
             .enumerate()
             .filter(|(i, m)| {
@@ -293,7 +300,10 @@ impl Compactor {
                     || assistant_has_any_call(m, &needed_call_ids)
             })
             .map(|(_, m)| m.clone())
-            .collect()
+            .collect();
+        // 出口安全网：剥离 supersede / 跨窗口裁剪可能残留的孤立 ToolCall，使持久化日志
+        // 与 provider 视图同样满足配对约束（此前仅 build 时 sanitize_provider_messages 清理）。
+        sanitize_agent_messages(kept)
     }
 
     /// Shake（机械级）：去连续重复 Status、删空助手消息。纯同步、不落盘。
@@ -846,49 +856,6 @@ fn supersede_read_results(log: &[AgentMessage]) -> Vec<AgentMessage> {
         .filter(|m| !matches!(m, AgentMessage::ToolResult(t) if remove.contains(&t.tool_call_id)))
         .cloned()
         .collect()
-}
-
-/// 收集日志中 `read_file skill://...` 调用的 tool_call_id（受保护，prune 时不裁剪）。
-fn skill_read_call_ids(log: &[AgentMessage]) -> std::collections::HashSet<String> {
-    let mut ids = std::collections::HashSet::new();
-    for m in log {
-        let AgentMessage::Assistant(a) = m else {
-            continue;
-        };
-        for block in &a.content {
-            if let ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } = block
-            {
-                if name == "read_file"
-                    && arguments
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|p| p.starts_with("skill://"))
-                {
-                    ids.insert(id.clone());
-                }
-            }
-        }
-    }
-    ids
-}
-
-/// 消息是否为受保护的 skill read 结果。
-fn is_protected_skill_message(m: &AgentMessage, ids: &std::collections::HashSet<String>) -> bool {
-    matches!(m, AgentMessage::ToolResult(t) if ids.contains(&t.tool_call_id))
-}
-
-/// 助手消息是否含任一指定 tool_call_id（用于保留「被保留 ToolResult」的发起消息，避免孤立）。
-fn assistant_has_any_call(m: &AgentMessage, ids: &HashSet<String>) -> bool {
-    let AgentMessage::Assistant(a) = m else {
-        return false;
-    };
-    a.content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolCall { id, .. } if ids.contains(id)))
 }
 
 /// 单条消息渲染为摘要行。
