@@ -40,6 +40,11 @@ use agent_core::{
 
 pub use persistence::PersistentContext;
 
+/// 工具保护规则（压缩时不裁剪的工具结果匹配器，移植 oh-my-pi `ProtectedToolMatcher`）
+/// 及内置 [`SkillReadRule`]（保护 `read_file skill://...`）。装配层可经
+/// [`InMemoryContext::set_protection_rules`] 注入额外规则。
+pub use tool_protection::{SkillReadRule, ToolProtectionRule};
+
 /// 内存上下文：会话树（节点森林 + 活跃叶子）+ 稳定前缀 + 精确 token 计数。
 ///
 /// 内部以 `Vec<SessionNode>` 森林存储**全部历史**（含所有分支），`active_leaf` 标记当前
@@ -66,6 +71,9 @@ struct Inner {
     shake_config: compaction::ShakeConfig,
     /// Shake 落盘槽（`None` → 用 [`compaction::NullSink`]，占位符仍生成但不可回读）。
     shake_sink: Option<Arc<dyn compaction::ShakeSink>>,
+    /// 压缩保护规则列表（始终以内置 [`crate::tool_protection::SkillReadRule`] 为首项，
+    /// 其后为 host 经 [`InMemoryContext::set_protection_rules`] 注入的额外规则）。
+    protection_rules: Vec<Box<dyn crate::tool_protection::ToolProtectionRule>>,
     /// 缓存的模型上下文窗口上限（由 `build_provider_context` 更新）。
     /// 供 `token_usage()` 同步返回正确的 limit，避免 Web/ACP 客户端收到 limit=0。
     model_limit: usize,
@@ -223,6 +231,7 @@ impl InMemoryContext {
                 summarizer: None,
                 shake_config: compaction::ShakeConfig::default(),
                 shake_sink: None,
+                protection_rules: vec![Box::new(crate::tool_protection::SkillReadRule)],
                 model_limit: 0,
                 last_model_id: String::new(),
                 prefix_digests: Vec::new(),
@@ -245,6 +254,7 @@ impl InMemoryContext {
                 summarizer: None,
                 shake_config: compaction::ShakeConfig::default(),
                 shake_sink: None,
+                protection_rules: vec![Box::new(crate::tool_protection::SkillReadRule)],
                 model_limit: 0,
                 last_model_id: String::new(),
                 prefix_digests: Vec::new(),
@@ -262,6 +272,18 @@ impl InMemoryContext {
     /// 建议传入 [`compaction::DirSink`]，指向 `<workspace>/.gyre/artifacts`。
     pub async fn set_shake_sink(&self, sink: Arc<dyn compaction::ShakeSink>) {
         self.inner.lock().await.shake_sink = Some(sink);
+    }
+
+    /// 注入额外的压缩保护规则（始终前置内置 [`crate::tool_protection::SkillReadRule`],
+    /// 故 host 只需传**额外**规则，`skill://` 保护永不丢失）。
+    pub async fn set_protection_rules(
+        &self,
+        extra: Vec<Box<dyn crate::tool_protection::ToolProtectionRule>>,
+    ) {
+        let mut rules: Vec<Box<dyn crate::tool_protection::ToolProtectionRule>> =
+            vec![Box::new(crate::tool_protection::SkillReadRule)];
+        rules.extend(extra);
+        self.inner.lock().await.protection_rules = rules;
     }
 
     /// 覆盖 Shake 配置（保护窗口 / 节省阈值 / 块门槛）。默认见 [`compaction::ShakeConfig::default`]。
@@ -494,7 +516,8 @@ impl ContextManager for InMemoryContext {
                     return Ok(());
                 };
                 let path = inner.active_path_messages();
-                let new_log = compaction::Compactor::prune(&path, keep_recent);
+                let new_log =
+                    compaction::Compactor::prune_with_rules(&path, keep_recent, &inner.protection_rules);
                 tracing::info!(
                     before = path.len(),
                     after = new_log.len(),
@@ -513,11 +536,12 @@ impl ContextManager for InMemoryContext {
                     .shake_sink
                     .clone()
                     .unwrap_or_else(|| Arc::new(compaction::NullSink));
-                match compaction::Compactor::shake_with(
+                match compaction::Compactor::shake_with_rules(
                     &path,
                     &config,
                     &self.counter,
                     sink.as_ref(),
+                    &inner.protection_rules,
                 ) {
                     Ok((new_log, stats)) => {
                         if stats.saved > 0 {

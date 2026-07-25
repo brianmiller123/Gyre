@@ -20,9 +20,41 @@ use std::collections::HashSet;
 
 use agent_core::{AgentMessage, ContentBlock};
 
-/// 收集日志中 `read_file skill://...` 调用的 tool_call_id（受保护，prune 时不裁剪）。
-pub(crate) fn skill_read_call_ids(log: &[AgentMessage]) -> HashSet<String> {
+/// 工具保护规则：按（工具名 + 参数）判定某次工具调用是否受压缩保护（移植 oh-my-pi
+/// `ProtectedToolMatcher = string | (ctx) => boolean`）。
+///
+/// 装配层可注入自定义规则（如保护 `plans://` read、特定工具结果）；内置 [`SkillReadRule`]
+/// 保护 `read_file skill://...`（按需加载的 skill 内容不在压缩中丢失）。压缩时，任一规则
+/// 命中即视为受保护——其 `ToolResult` 与发起 `ToolCall` 均不被裁剪。
+pub trait ToolProtectionRule: Send + Sync {
+    /// `tool_name` 为工具名（如 `read_file`），`args` 为本次调用参数。
+    fn matches(&self, tool_name: &str, args: &serde_json::Value) -> bool;
+}
+
+/// 内置规则：保护 `read_file skill://...`（按需加载的 skill 内容不在压缩中丢失）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SkillReadRule;
+
+impl ToolProtectionRule for SkillReadRule {
+    fn matches(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        tool_name == "read_file"
+            && args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| p.starts_with("skill://"))
+    }
+}
+
+/// 收集日志中受任一规则匹配的工具调用 tool_call_id（压缩时不裁剪）。规则为空时返回空集
+/// （无保护）；调用方通常至少包含 [`SkillReadRule`]（compact 时由 host 决定是否额外注入）。
+pub fn protected_call_ids(
+    log: &[AgentMessage],
+    rules: &[Box<dyn ToolProtectionRule>],
+) -> HashSet<String> {
     let mut ids = HashSet::new();
+    if rules.is_empty() {
+        return ids;
+    }
     for m in log {
         let AgentMessage::Assistant(a) = m else {
             continue;
@@ -34,18 +66,19 @@ pub(crate) fn skill_read_call_ids(log: &[AgentMessage]) -> HashSet<String> {
                 arguments,
             } = block
             {
-                if name == "read_file"
-                    && arguments
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|p| p.starts_with("skill://"))
-                {
+                if rules.iter().any(|r| r.matches(name, arguments)) {
                     ids.insert(id.clone());
                 }
             }
         }
     }
     ids
+}
+
+/// 收集日志中 `read_file skill://...` 调用的 tool_call_id（受保护，prune 时不裁剪）。
+/// 等价于 [`protected_call_ids`] 仅含 [`SkillReadRule`]；保留以兼容既有调用与测试。
+pub(crate) fn skill_read_call_ids(log: &[AgentMessage]) -> HashSet<String> {
+    protected_call_ids(log, &[Box::new(SkillReadRule)])
 }
 
 /// 消息是否为受保护的 skill read 结果。
@@ -286,5 +319,45 @@ mod tests {
         assert!(!assistant_has_any_call(&AgentMessage::user_text("u"), &ids));
         assert!(is_protected_skill_message(&res("c1", "x"), &ids));
         assert!(!is_protected_skill_message(&res("c2", "x"), &ids));
+    }
+
+    #[test]
+    fn protected_call_ids_supports_custom_rules() {
+        // P3：自定义规则保护非 skill 工具调用（验证 matcher 泛化对内置 SkillReadRule 之外生效）。
+        struct SpecialRule;
+        impl ToolProtectionRule for SpecialRule {
+            fn matches(&self, tool_name: &str, _args: &serde_json::Value) -> bool {
+                tool_name == "special"
+            }
+        }
+        let special_call = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "sp".into(),
+                name: "special".into(),
+                arguments: json!({}),
+            }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: None,
+            stop_details: None,
+        });
+        let skill_call = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "sk".into(),
+                name: "read_file".into(),
+                arguments: json!({ "path": "skill://x" }),
+            }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: None,
+            stop_details: None,
+        });
+        // 内置 SkillReadRule + 自定义 SpecialRule 同时生效。
+        let rules: Vec<Box<dyn ToolProtectionRule>> =
+            vec![Box::new(SkillReadRule), Box::new(SpecialRule)];
+        let ids = protected_call_ids(&[special_call, skill_call, call("plain")], &rules);
+        assert!(ids.contains("sp"), "自定义规则应保护 special 工具调用");
+        assert!(ids.contains("sk"), "内置 SkillReadRule 仍保护 skill://");
+        assert!(!ids.contains("plain"), "普通工具调用不受任一规则保护");
     }
 }

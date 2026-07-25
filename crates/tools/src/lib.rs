@@ -106,7 +106,11 @@ pub trait Tool: Send + Sync {
     /// 间隔轮询 steering 队列，命中即触发**批级** cancel 中断在途工具）。默认 `false`。
     /// 长时阻塞工具（如 `run_command`）应覆写为 `true`，使其在用户中途发消息时尽快让出。
     /// 工具实现须响应 [`ToolContext::cancel`] 才能真正被中断。
-    fn interruptible(&self) -> bool {
+    ///
+    /// 接收本次调用的参数 `args`，使工具可**按参数**判定可中断性（移植 oh-my-pi
+    /// `interruptible(args)`）：例如 `run_command` 可对后台 / 长时命令返回 `true`、对瞬时
+    /// 命令返回 `false`。不关心参数的工具忽略之并返回静态值即可。
+    fn interruptible(&self, _args: &serde_json::Value) -> bool {
         false
     }
 

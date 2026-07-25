@@ -575,6 +575,23 @@ const MAX_HARMONY_TRUNCATE_RESUME: usize = 2;
 /// text/thinking 泄漏无法恢复，丢弃本轮重采样；连续超限则升级为错误。
 const MAX_HARMONY_ABORT_RETRY: usize = 2;
 
+/// Provider 瞬时错误（[`LlmError::RateLimit`] / [`LlmError::Transport`] /
+/// [`LlmError::StreamInterrupted`] / 5xx）连续退避重试上限。与每任务的
+/// `max_mistakes`（终止性错误计数）**分离**：限流/抖动应退避而非立即轰击 API，
+/// 连续瞬时错误超过此上限才升级为终止性错误计入 `mistakes`。移植 oh-my-pi
+/// pi-ai 重试策略 + 消费本地 `LlmError::RateLimit.retry_after_ms`（此前该字段
+/// 被定义却从未被循环消费——见 P0）。
+const MAX_PROVIDER_RETRIES: usize = 5;
+/// 指数退避基准延迟：`base << attempt`，attempt 钳到 5（→ 1/2/4/8/16/32s）。
+const RETRY_BASE_DELAY_MS: u64 = 1_000;
+/// 退避封顶（单次最长等待），避免上游持续 429/抖动时无限等待拖死长程任务。
+const RETRY_MAX_DELAY_MS: u64 = 60_000;
+
+/// P2：主动 handoff 软阈值——低于 [`context_guard`]（硬阈值级联触发点），在此处
+/// 主动触发一次 Summarize（每 run 仅一次），给模型留充裕头 room 再摘要，质量与稳定性
+/// 优于「逼近上限才被动压缩」。移植 oh-my-pi auto-handoff threshold 思想。
+const HANDOFF_SOFT_GUARD: f32 = 0.65;
+
 /// 发射 `on_turn_end` 钩子（per-turn 程序化副作用）。与 `AgentEvent::TurnEnd` 事件配对，
 /// 但面向**不经事件流**的程序化 hook（审计 / 指标 / memory 更新 / telemetry span 等）。
 /// 事件消费者（如 server 的 `to_server_frame`）已能从 TurnEnd 事件观测；本钩子供 agent
@@ -710,6 +727,12 @@ fn run_loop(
         summary.tools_available = specs0.iter().map(|s| s.name.clone()).collect();
         summary.tools_available.sort();
         let mut mistakes: usize = 0;
+        // P0：provider 瞬时错误退避重试计数（RateLimit/Transport/StreamInterrupted/5xx）。
+        // 与 mistakes 分离：退避重试不计入终止配额，连续超 MAX_PROVIDER_RETRIES 才升级。
+        // 成功建立流后归零（仅累计「连续」瞬时错误）。
+        let mut provider_retries: usize = 0;
+        // P2：主动 handoff 是否已触发（每 run 仅一次，避免反复 summarize）。
+        let mut handoff_done = false;
         // pause_turn 连续重采样计数（见 MAX_PAUSED_CONTINUATIONS）。
         let mut paused_continuations: usize = 0;
         // P0-C：Harmony 泄漏双计数器（truncate-resume / abort-retry，各自独立上限）。
@@ -819,6 +842,29 @@ fn run_loop(
                     return;
                 }
             };
+
+            // P2：主动 handoff 续命——在硬阈值级联（near_limit(guard)）**之前**的软阈值
+            //（HANDOFF_SOFT_GUARD）主动触发一次 Summarize（每 run 仅一次）。给模型留出充裕
+            // 头 room 再摘要，质量与稳定性优于「逼近上限才被动压缩」。复用现有 Summarize 路径，
+            // 无新 trait 表面 / 无前缀缓存失效风险。移植 oh-my-pi auto-handoff threshold 思想。
+            if !handoff_done && built.tokens.near_limit(HANDOFF_SOFT_GUARD) {
+                handoff_done = true;
+                let _ = context
+                    .compact(CompactionStrategy::Summarize { max_tokens: 0 })
+                    .await;
+                built = match context.build_provider_context(&model, &specs).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield AgentEvent::Error(e.to_string());
+                        yield AgentEvent::StateChanged(AgentState::Idle);
+                        return;
+                    }
+                };
+                yield AgentEvent::Say(StatusMessage {
+                    text: "上下文接近软阈值，已主动生成 handoff 摘要（续命）".into(),
+                    kind: StatusKind::Info,
+                });
+            }
 
             // 上下文压缩（接近上限）：分级触发——先 shake（机械去冗余 + 大块归档，便宜），
             // 重新评估；仍超限才 summarize（LLM handoff 摘要，贵且可能失败）；再超限才
@@ -967,10 +1013,68 @@ fn run_loop(
                 .instrument(chat_span.clone())
                 .await
             {
-                Ok(s) => s,
+                // 成功建立流：连续瞬时错误计数归零（仅累计「连续」错误）。
+                Ok(s) => {
+                    provider_retries = 0;
+                    s
+                }
                 Err(e) => {
-                    mistakes += 1;
-                    yield AgentEvent::Error(format!("LLM 调用失败: {e}"));
+                    // P0：provider 错误分类重试（移植 oh-my-pi pi-ai 重试 + 消费本地
+                    // LlmError::RateLimit.retry_after_ms）。瞬时错误（RateLimit/Transport/
+                    // StreamInterrupted/5xx）做指数退避重试，与终止计数器 mistakes 分离——
+                    // 限流/抖动场景退避而非立即轰击 API；连续超 MAX_PROVIDER_RETRIES 才升级为
+                    // 终止性错误。终止性错误（Auth/Decode/Unsupported/4xx）直接计入 mistakes。
+                    let delay_ms = match &e {
+                        agent_core::LlmError::RateLimit { retry_after_ms } => {
+                            // 精确尊重服务端 Retry-After 提示（glm/deepseek 当前硬编码 5000ms；
+                            // 字段已就绪供未来解析真实 header），仅加 50ms 下限防零延迟轰击、
+                            // 封顶 60s 避免无限等待。指数退避（下方）仅用于无服务端提示的瞬时错误。
+                            Some((*retry_after_ms).max(50).min(RETRY_MAX_DELAY_MS))
+                        }
+                        agent_core::LlmError::Transport(_)
+                        | agent_core::LlmError::StreamInterrupted(_) => {
+                            Some((RETRY_BASE_DELAY_MS << provider_retries.min(5)).min(RETRY_MAX_DELAY_MS))
+                        }
+                        agent_core::LlmError::Http { status, .. }
+                            if (500..600).contains(status) =>
+                        {
+                            Some((RETRY_BASE_DELAY_MS << provider_retries.min(5)).min(RETRY_MAX_DELAY_MS))
+                        }
+                        // Auth / Decode / Unsupported / 4xx：终止性，不退避。
+                        _ => None,
+                    };
+                    if let Some(delay_ms) = delay_ms {
+                        if provider_retries >= MAX_PROVIDER_RETRIES {
+                            // 瞬时错误连续重试达上限：升级为终止性错误。
+                            provider_retries = 0;
+                            mistakes += 1;
+                            yield AgentEvent::Error(format!(
+                                "LLM 瞬时错误重试达上限 {MAX_PROVIDER_RETRIES} 次，升级终止: {e}"
+                            ));
+                        } else {
+                            provider_retries += 1;
+                            yield AgentEvent::Say(StatusMessage {
+                                text: format!(
+                                    "LLM 瞬时错误（{e}），{delay_ms}ms 后第 {provider_retries}/{MAX_PROVIDER_RETRIES} 次退避重试"
+                                ),
+                                kind: StatusKind::Warning,
+                            });
+                            // 退避等待须响应取消：用户取消优先解除 sleep，避免 hang。
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    yield AgentEvent::Error("任务被取消".into());
+                                    yield AgentEvent::StateChanged(AgentState::Idle);
+                                    return;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                            }
+                        }
+                    } else {
+                        // 终止性错误：计入 mistakes（保留原语义）。
+                        mistakes += 1;
+                        yield AgentEvent::Error(format!("LLM 调用失败: {e}"));
+                    }
                     if mistakes >= max_mistakes {
                         for h in &hooks {
                             h.on_event(&HookEvent::Stop { success: false }).await;
@@ -991,17 +1095,81 @@ fn run_loop(
             // 避免上游挂起时取消信号无法中断（仅靠 loop 顶部检查不足以打断 await）。
             let mut authoritative: Option<AssistantMessage> = None;
             let mut usage = Usage::default();
-            // 累积流式文本增量：流被取消/异常断开（未到达 MessageEnd）时，已生成并
-            // 显示给用户的文本若不落盘会丢失对话历史。中断时兜底持久化（仅保留 Text——
-            // Thinking 的 signature 在流式中不可靠，ToolCall 参数可能残缺，二者丢弃）。
+            // 累积流式增量：流被取消/异常断开（未到达 MessageEnd）时，已生成并显示给用户
+            // 的内容若不落盘会丢失对话历史。中断兜底持久化（P1a：保留 Text + 已完成的
+            // ToolCall；Thinking 的 signature 在流式中不可靠，故丢弃）。
             let mut acc_text = String::new();
+            // 流式工具调用跟踪（对齐 oh-my-pi completedToolCallIds）：ToolCallStart 记 name、
+            // ToolCallDelta 累积 partial_json、ToolCallEnd 标记完成。中断时仅保留已 toolcall_end
+            // 且参数可解析为合法非 null JSON 的调用，丢弃残缺（参数中途断开）的，避免对
+            // 残缺参数误执行副作用工具。详见 build_interrupted_blocks / retain_completed_tool_calls。
+            let mut tool_call_names: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut tool_call_args: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut completed_tool_call_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        // 中断兜底：持久化已生成的部分回复，避免丢失对话历史。
-                        persist_interrupted(&context, &mut acc_text, &model, &usage).await;
+                        // 中断兜底：持久化已生成的部分回复（含已完成工具调用），避免丢失。
+                        persist_interrupted(
+                            &context,
+                            retain_completed_tool_calls(
+                                build_interrupted_blocks(
+                                    &mut acc_text,
+                                    &tool_call_names,
+                                    &tool_call_args,
+                                    &completed_tool_call_ids,
+                                ),
+                                &completed_tool_call_ids,
+                            ),
+                            &model,
+                            &usage,
+                        )
+                        .await;
                         yield AgentEvent::Error("任务被取消".into());
+                        yield AgentEvent::StateChanged(AgentState::Idle);
+                        return;
+                    }
+                    // P1：deadline 端到端可达——在途流式生成期间也响应运行时限（此前仅轮次
+                    // 边界检查，单次长生成可远超 deadline）。deadline_at 为 Some 时，sleep
+                    //（剩余时长）先就绪即触发；用 Duration 而非 tokio::time::Instant 以避免
+                    // 类型转换。命中时持久化已生成部分（与 cancel 同款兜底），success=false 停止。
+                    // 移植 oh-my-pi `AbortSignal.any([signal, deadlineSignal])` 语义。
+                    _ = async {
+                        if let Some(d) = deadline_at {
+                            tokio::time::sleep(d.saturating_duration_since(std::time::Instant::now()))
+                                .await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if deadline_at.is_some() => {
+                        persist_interrupted(
+                            &context,
+                            retain_completed_tool_calls(
+                                build_interrupted_blocks(
+                                    &mut acc_text,
+                                    &tool_call_names,
+                                    &tool_call_args,
+                                    &completed_tool_call_ids,
+                                ),
+                                &completed_tool_call_ids,
+                            ),
+                            &model,
+                            &usage,
+                        )
+                        .await;
+                        yield AgentEvent::Say(StatusMessage {
+                            text: "达到运行时限（deadline），停止".into(),
+                            kind: StatusKind::Warning,
+                        });
+                        for h in &hooks {
+                            h.on_event(&HookEvent::Stop { success: false }).await;
+                        }
+                        record_run_end(&invoke_span, &summary, run_start);
+                        yield AgentEvent::Done(summary);
                         yield AgentEvent::StateChanged(AgentState::Idle);
                         return;
                     }
@@ -1012,6 +1180,18 @@ fn run_loop(
                         }
                         Some(AssistantEvent::ThinkingDelta(d)) => {
                             yield AgentEvent::ThinkingDelta(d);
+                        }
+                        // P1a：跟踪流式工具调用进度。中断兜底时仅保留已 toolcall_end 且
+                        // 参数合法的调用（见 build_interrupted_blocks）；正常 MessageEnd 路径
+                        // 不依赖这些（authoritative 消息已含完整块）。
+                        Some(AssistantEvent::ToolCallStart { id, name }) => {
+                            tool_call_names.insert(id, name);
+                        }
+                        Some(AssistantEvent::ToolCallDelta { id, partial_json }) => {
+                            tool_call_args.entry(id).or_default().push_str(&partial_json);
+                        }
+                        Some(AssistantEvent::ToolCallEnd { id }) => {
+                            completed_tool_call_ids.insert(id);
                         }
                         Some(AssistantEvent::Usage(u)) => {
                             usage.add(&u);
@@ -1028,8 +1208,22 @@ fn run_loop(
             }
 
             let Some(assistant) = authoritative else {
-                // 未见 MessageEnd：流异常中断。兜底持久化已生成的部分文本，避免丢失。
-                persist_interrupted(&context, &mut acc_text, &model, &usage).await;
+                // 未见 MessageEnd：流异常中断。兜底持久化已生成的部分回复（含已完成工具调用）。
+                persist_interrupted(
+                    &context,
+                    retain_completed_tool_calls(
+                        build_interrupted_blocks(
+                            &mut acc_text,
+                            &tool_call_names,
+                            &tool_call_args,
+                            &completed_tool_call_ids,
+                        ),
+                        &completed_tool_call_ids,
+                    ),
+                    &model,
+                    &usage,
+                )
+                .await;
                 mistakes += 1;
                 yield AgentEvent::Error("未收到完整助手消息".into());
                 if mistakes >= max_mistakes {
@@ -1633,7 +1827,7 @@ fn run_loop(
             let need_steering_poll = matches!(agent.interrupt_mode, InterruptMode::Immediate)
                 && runnable
                     .iter()
-                    .any(|t| matches!(tools.get(&t.name), Some(tool) if tool.interruptible()));
+                    .any(|t| matches!(tools.get(&t.name), Some(tool) if tool.interruptible(&t.args)));
             // P1-F：工具流式 partial 回调 channel。工具 execute 内经 tcx.update_tx 推送
             // ToolUpdate；下方 select! 边执行边 drain，发射 ToolExecutionUpdate 事件。
             // 移植 oh-my-pi `AgentToolUpdateCallback` 的 partialResult。
@@ -1986,33 +2180,94 @@ fn record_run_end(span: &tracing::Span, summary: &AgentRunSummary, start: std::t
     span.record("gyre.duration", &tracing::field::debug(start.elapsed()));
 }
 
-/// 流式中断兜底持久化：把已累积的文本增量作为一条被中断的 assistant 消息落盘。
+/// 流式中断兜底持久化：把已累积的富块（Text + 已完成 ToolCall）作为一条被中断的
+/// assistant 消息落盘（P1a，移植 oh-my-pi `emitAbortedAssistantMessage`）。
 ///
 /// 仅在流式被取消或异常断开（未到达 [`AssistantEvent::MessageEnd`]）时调用，避免
-/// 已显示给用户的回复因未落盘而在 resume 会话时丢失。仅保留 `Text` 块：
-/// - `Thinking` 的 signature 在流式中不可靠，持久化后重放可能导致 provider 校验失败；
-/// - `ToolCall` 的参数 JSON 可能残缺，会产生悬空工具调用（无对应 tool 结果）。
-/// 故二者丢弃。`stop_reason` 置 `None` 标记此条为中断产物。
+/// 已显示给用户的回复因未落盘而在 resume 会话时丢失。保留 `Text` 块 + 已完成的
+/// `ToolCall` 块；不保留：
+/// - `Thinking`：signature 在流式中不可靠，持久化后重放可能导致 provider 校验失败；
+/// - 残缺参数的 `ToolCall`：由调用方 `build_interrupted_blocks` / `retain_completed_tool_calls`
+///   过滤（仅保留参数可解析为合法非 null JSON 的已完成调用）。
+/// `stop_reason` 置 `None` 标记此条为中断产物。
 async fn persist_interrupted(
     context: &Arc<dyn ContextManager>,
-    acc_text: &mut String,
+    blocks: Vec<ContentBlock>,
     model: &agent_core::Model,
     usage: &Usage,
 ) {
-    if acc_text.is_empty() {
+    if blocks.is_empty() {
         return;
     }
-    let text = std::mem::take(acc_text);
-    tracing::info!(bytes = text.len(), "持久化被中断的部分回复");
+    tracing::info!(blocks = blocks.len(), "持久化被中断的部分回复（含已完成工具调用）");
     context
         .append(agent_core::AgentMessage::Assistant(AssistantMessage {
-            content: vec![ContentBlock::Text { text }],
+            content: blocks,
             usage: usage.clone(),
             model: model.id.clone(),
             stop_reason: None,
             stop_details: None,
         }))
         .await;
+}
+
+/// 从流式累积重建中断时的富块：Text（非空）+ 已完成且参数合法的 ToolCall。
+///
+/// 移植 oh-my-pi `emitAbortedAssistantMessage`（保留已完成 toolCall 而非仅 Text）。
+/// 仅 `completed_ids` 内、name 已知（ToolCallStart 收到）、参数可解析为合法非 null JSON
+/// 的调用才保留；流式中断于参数中途（残缺 JSON）的丢弃，避免对残缺参数误执行副作用工具。
+/// 调用后 `acc_text` 被 take 清空（保留原「清空缓冲」语义）。
+fn build_interrupted_blocks(
+    acc_text: &mut String,
+    tool_call_names: &std::collections::HashMap<String, String>,
+    tool_call_args: &std::collections::HashMap<String, String>,
+    completed_ids: &std::collections::HashSet<String>,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if !acc_text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: std::mem::take(acc_text),
+        });
+    }
+    for id in completed_ids {
+        let Some(name) = tool_call_names.get(id) else {
+            continue;
+        };
+        let Some(args_str) = tool_call_args.get(id) else {
+            continue;
+        };
+        // 仅参数可解析为合法非 null JSON 的调用才保留（对齐 Sprint 1 瞬时恢复判定 +
+        // Sprint 4 provider finalize_stream_interrupt 的「完整工具」语义）。
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(args_str) {
+            if !value.is_null() {
+                blocks.push(ContentBlock::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: value,
+                });
+            }
+        }
+    }
+    blocks
+}
+
+/// 循环层防御性二线（移植 oh-my-pi `retainCompletedToolCalls`）：仅保留 `completed_ids`
+/// 内的 ToolCall 块，丢弃残缺（未收到 toolcall_end）的；非 ToolCall 块（Text 等）原样保留。
+///
+/// 设计为与 provider 层过滤**正交**的保底：即便某 provider 未实现流式 finalize
+/// （Sprint 4 `finalize_stream_interrupt`），循环层亦能保底移除残缺 toolcall，避免把
+/// 「完整 + 残缺」混合的消息判定为不可恢复而整轮丢弃。已配对序列为 no-op（幂等）。
+fn retain_completed_tool_calls(
+    blocks: Vec<ContentBlock>,
+    completed_ids: &std::collections::HashSet<String>,
+) -> Vec<ContentBlock> {
+    blocks
+        .into_iter()
+        .filter(|b| match b {
+            ContentBlock::ToolCall { id, .. } => completed_ids.contains(id),
+            _ => true,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2039,17 +2294,100 @@ mod tests {
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let model =
             agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
-        // 有内容：应落盘为 1 条 assistant 文本消息，并清空缓冲。
-        let mut acc = String::from("这是一段被中断的部分回复");
-        persist_interrupted(&ctx, &mut acc, &model, &Usage::default()).await;
-        assert!(acc.is_empty(), "持久化后累积缓冲应被清空");
+        // 有内容：应落盘为 1 条 assistant 文本消息。
+        let blocks = vec![ContentBlock::Text {
+            text: "这是一段被中断的部分回复".into(),
+        }];
+        persist_interrupted(&ctx, blocks, &model, &Usage::default()).await;
         let built = ctx.build_provider_context(&model, &[]).await.unwrap();
         assert_eq!(built.messages.len(), 1, "应持久化 1 条 assistant 消息");
-        // 空缓冲：幂等无副作用，不追加消息。
-        let mut empty = String::new();
-        persist_interrupted(&ctx, &mut empty, &model, &Usage::default()).await;
+        // 空 blocks：幂等无副作用，不追加消息。
+        persist_interrupted(&ctx, Vec::new(), &model, &Usage::default()).await;
         let built2 = ctx.build_provider_context(&model, &[]).await.unwrap();
-        assert_eq!(built2.messages.len(), 1, "空缓冲不应追加消息");
+        assert_eq!(built2.messages.len(), 1, "空 blocks 不应追加消息");
+    }
+
+    /// retain 二线：未在 completed_ids 内的 ToolCall 被丢弃，Text 等非工具块原样保留。
+    /// 对齐 oh-my-pi retainCompletedToolCalls——即使某 provider 未实现流式 finalize，
+    /// 循环层亦能保底移除残缺 toolcall。
+    #[test]
+    fn retain_completed_tool_calls_strips_incomplete_toolcall() {
+        let completed: std::collections::HashSet<String> =
+            ["call_done"].into_iter().map(String::from).collect();
+        let blocks = vec![
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::ToolCall {
+                id: "call_done".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a"}),
+            },
+            ContentBlock::ToolCall {
+                id: "call_partial".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": "x"}),
+            },
+        ];
+        let kept = retain_completed_tool_calls(blocks, &completed);
+        let kept_ids: Vec<String> = kept
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept_ids, vec!["call_done".to_string()], "仅保留已完成 toolcall");
+        assert_eq!(kept.len(), 2, "Text + call_done（残缺 call_partial 被丢弃）");
+    }
+
+    /// build：已完成 + 参数合法的 toolcall 保留；残缺 JSON 丢弃；累积文本被 take 清空。
+    #[test]
+    fn build_interrupted_blocks_keeps_completed_and_drops_incomplete() {
+        let mut acc_text = String::from("部分文本");
+        let mut names = std::collections::HashMap::new();
+        names.insert("c1".to_string(), "read".to_string());
+        names.insert("c2".to_string(), "write".to_string());
+        let mut args = std::collections::HashMap::new();
+        args.insert("c1".to_string(), r#"{"path":"a"}"#.to_string()); // 合法 JSON
+        args.insert("c2".to_string(), "{\"path\":".to_string()); // 残缺 JSON
+        let mut completed = std::collections::HashSet::new();
+        completed.insert("c1".to_string());
+        completed.insert("c2".to_string());
+        let blocks = build_interrupted_blocks(&mut acc_text, &names, &args, &completed);
+        let kept_ids: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        // c2 残缺 JSON 被丢弃；仅 c1 保留。
+        assert_eq!(kept_ids, vec!["c1".to_string()], "残缺参数 toolcall 应丢弃");
+        assert!(acc_text.is_empty(), "累积文本缓冲应被清空");
+        assert_eq!(blocks.len(), 2, "Text + c1");
+    }
+
+    /// 端到端：流式中断时富块（Text + 已完成 ToolCall）落盘为一条 assistant 消息，
+    /// resume 后可见（对齐 oh-my-pi emitAbortedAssistantMessage）。
+    #[tokio::test]
+    async fn persist_interrupted_saves_completed_toolcall() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("m", "openai", agent_core::Api::OpenAiCompletions);
+        let blocks = vec![
+            ContentBlock::Text { text: "我先读取文件".into() },
+            ContentBlock::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+        ];
+        persist_interrupted(&ctx, blocks, &model, &Usage::default()).await;
+        let built = ctx.build_provider_context(&model, &[]).await.unwrap();
+        assert_eq!(
+            built.messages.len(),
+            1,
+            "应持久化 1 条含已完成工具调用的 assistant 消息"
+        );
     }
 
     // ── 工具并发执行（shared/exclusive）──────────────────────────────────
@@ -3047,6 +3385,248 @@ mod tests {
         );
     }
 
+    // ── P0（provider 错误分类重试 + 退避）────────────────────────────────
+
+    /// 桩 Provider：第 1 次调用返回 RateLimit（带 retry_after_ms），第 2 次返回自然结束。
+    /// 验证循环消费 retry_after_ms 做退避重试，而非立即计入 mistakes 终止。
+    struct RateLimitThenDoneProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for RateLimitThenDoneProvider {
+        fn id(&self) -> &'static str {
+            "ratelimit"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(agent_core::LlmError::RateLimit { retry_after_ms: 60 })
+            } else {
+                let msg = AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "ratelimit".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                };
+                Ok(Box::pin(futures::stream::iter(vec![
+                    agent_core::AssistantEvent::MessageEnd(msg),
+                ])))
+            }
+        }
+    }
+
+    /// P0：RateLimit 错误应按 retry_after_ms 退避重试，第 2 次成功 → 恰好调用 2 次、
+    /// success=true（不因瞬时错误计入 mistakes 而提前终止）。
+    #[tokio::test]
+    async fn rate_limit_error_backoffs_and_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut model = agent_core::Model::with_defaults(
+            "ratelimit",
+            "ratelimit",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(RateLimitThenDoneProvider {
+                calls: calls.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .max_turns(5)
+            .build();
+
+        let mut done_success: Option<bool> = None;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(sum) = ev {
+                done_success = Some(sum.success);
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "RateLimit 应退避重试一次后成功（provider 恰好调用 2 次）"
+        );
+        assert_eq!(
+            done_success,
+            Some(true),
+            "RateLimit 退避重试后应自然结束 success=true（未计入 mistakes 终止）"
+        );
+    }
+
+    // ── P1（deadline 端到端可达：中断在途流式生成）──────────────────────
+
+    /// 桩 Provider：立即发射一个 TextDelta，随后 sleep 10s 才发 MessageEnd。
+    /// 配合短 deadline，验证 deadline 在**流式生成期间**即可中断（而非等满整轮）。
+    struct SlowStreamingProvider;
+    #[async_trait]
+    impl agent_core::LlmProvider for SlowStreamingProvider {
+        fn id(&self) -> &'static str {
+            "slow"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let done = AssistantMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                usage: Usage::default(),
+                model: "slow".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            let s = futures::stream::once(async {
+                agent_core::AssistantEvent::TextDelta("hi".into())
+            })
+            .chain(futures::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                agent_core::AssistantEvent::MessageEnd(done)
+            }));
+            Ok(Box::pin(s))
+        }
+    }
+
+    /// P1：deadline 在流式生成期间（MessageEnd 之前）中断，证明端到端可达。
+    #[tokio::test]
+    async fn deadline_interrupts_in_flight_streaming() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut model =
+            agent_core::Model::with_defaults("slow", "slow", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(SlowStreamingProvider))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .deadline(Duration::from_millis(300))
+            .max_turns(5)
+            .build();
+
+        let mut saw_start = false;
+        let mut saw_end = false;
+        let mut done_success: Option<bool> = None;
+        let started = std::time::Instant::now();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::MessageStart => saw_start = true,
+                AgentEvent::MessageEnd(_) => saw_end = true,
+                AgentEvent::Done(sum) => done_success = Some(sum.success),
+                _ => {}
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            saw_start,
+            "应已进入流式（MessageStart），证明 deadline 在流式中断而非轮次边界"
+        );
+        assert!(
+            !saw_end,
+            "deadline 应在 MessageEnd 之前中断流式生成"
+        );
+        assert_eq!(done_success, Some(false), "deadline 中断应 success=false");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "应在 deadline 附近停止而非等满 10s 流，实际 {elapsed:?}"
+        );
+    }
+
+    // ── P2（主动 handoff 续命：软阈值触发摘要）──────────────────────────
+
+    /// 计数式摘要器：记录被调用次数，返回固定短摘要（P2 主动 handoff 测试专用）。
+    struct HandoffCountingSummary {
+        calls: Arc<AtomicUsize>,
+    }
+    impl agent_context::compaction::SummaryProvider for HandoffCountingSummary {
+        fn summarize(
+            &self,
+            _old: &[String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("[handoff summary]".to_string()) })
+        }
+    }
+
+    /// P2：占比落在软阈值（0.65）与硬阈值（此处抬到 0.95）之间时，仅主动 handoff 触发
+    /// 一次 summarize（硬级联不触发），证明主动续命路径生效。
+    #[tokio::test]
+    async fn proactive_handoff_fires_at_soft_threshold() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // heuristic 计数器（chars/4）使 token 数学可预测。预填 8 条消息（每条 360 字符 →
+        // 90 token；共 ~720 token + 系统 prompt），占比 ~0.75 落在 [0.65, 0.95)：仅软阈值触发
+        // summarize。多条消息确保 Compactor 有内容可折叠（keep=min(len,6)=6 → 折叠 2 条），
+        // 否则单条消息时 summarize 为 no-op 不调摘要器。
+        let ctx = Arc::new(InMemoryContext::with_counter(
+            vec![],
+            agent_context::token::TokenCounter::heuristic(),
+        ));
+        for _ in 0..8 {
+            ctx.append(agent_core::AgentMessage::user_text(&"x".repeat(360)))
+                .await;
+        }
+        ctx.set_summarizer(Box::new(HandoffCountingSummary {
+            calls: calls.clone(),
+        }))
+        .await;
+
+        let mut model =
+            agent_core::Model::with_defaults("h", "openai", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 1_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(DoneCountingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            // 抬高硬阈值，确保只有软阈值（0.65）触发 → summarize 恰好一次。
+            .context_guard(0.95)
+            .max_turns(5)
+            .build();
+
+        let mut done_success: Option<bool> = None;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(sum) = ev {
+                done_success = Some(sum.success);
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "软阈值（0.65）应触发恰好一次主动 summarize；硬阈值已抬到 0.95 故级联不触发"
+        );
+        assert_eq!(
+            done_success,
+            Some(true),
+            "主动 handoff 后应自然结束 success=true"
+        );
+    }
+
     // ── P1-C（软工具升级护栏：detour 跳过 + 升级上限）─────────────────────
 
     /// 桩 Provider：每轮返回一个 detour 工具调用（name="other"），永不调用所需工具。
@@ -3286,7 +3866,7 @@ mod tests {
         fn capability(&self) -> CapabilityTier {
             CapabilityTier::Execute
         }
-        fn interruptible(&self) -> bool {
+        fn interruptible(&self, _args: &serde_json::Value) -> bool {
             true
         }
         async fn execute(

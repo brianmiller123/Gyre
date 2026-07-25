@@ -960,6 +960,10 @@ async fn build_agent(
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
     }
+    // PTY 工具（[tools].enabled.pty，默认关闭；与父 Agent、CLI assemble_builtin_tools 对齐）
+    if config.tools.effective("pty", false) {
+        sub_reg = sub_reg.with(Box::new(agent_pty::RunPtyTool));
+    }
     let sub_tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(sub_reg);
     // task 工具（委派子 Agent）—— 受 [subagent] 控制：
     //   enabled 开关 / max_concurrent 并发护栏 / inherit_parent 继承父 temperature·thinking /
@@ -988,6 +992,10 @@ async fn build_agent(
     }
     for t in mcp.tools() {
         tool_registry = tool_registry.with(Box::new(t.clone()));
+    }
+    // PTY 工具（[tools].enabled.pty，默认关闭；与 CLI 的 assemble_builtin_tools 对齐）
+    if config.tools.effective("pty", false) {
+        tool_registry = tool_registry.with(Box::new(agent_pty::RunPtyTool));
     }
     if config.subagent.enabled {
         let task_tool = agent::TaskTool::new(
@@ -1018,6 +1026,10 @@ async fn build_agent(
     let mut context_files = agent_config::discover_context_files(cwd);
     if config.github.enabled {
         context_files.push(agent_tools::PROMPT_SECTION.to_string());
+    }
+    // PTY 使用指引（启用时注入 system prompt，禁用完全屏蔽以省 Token；与 CLI 一致）
+    if config.tools.effective("pty", false) {
+        context_files.push(agent_pty::PROMPT_SECTION.to_string());
     }
     // 长期记忆（可选；按 cwd 项目作用域）
     let memory: Option<Arc<dyn agent_core::MemoryStore>> = if config.memory.enabled {

@@ -21,8 +21,8 @@ use agent_core::{
 use futures::StreamExt;
 
 use crate::tool_protection::{
-    assistant_has_any_call, is_protected_skill_message, sanitize_agent_messages,
-    skill_read_call_ids,
+    assistant_has_any_call, is_protected_skill_message, protected_call_ids, sanitize_agent_messages,
+    SkillReadRule, ToolProtectionRule,
 };
 
 /// 压缩器：纯函数，不直接调 LLM；summarize 的摘要由外部 `SummaryProvider` 注入。
@@ -264,13 +264,18 @@ fn content_hash(s: &str) -> String {
 const PLACEHOLDER_TOKEN_ESTIMATE: usize = 16;
 
 impl Compactor {
-    /// Prune：保留最近 `keep_recent` 条；`skill://` read 的工具结果受保护（即便在窗口外也保留），
-    /// 避免按需加载的 skill 内容在压缩中丢失（移植 oh-my-pi tool-protection 思想）。
+    /// Prune：保留最近 `keep_recent` 条；受 `rules` 匹配的工具结果受保护（即便在窗口外也保留），
+    /// 避免按需加载内容（如 `skill://` read）在压缩中丢失（移植 oh-my-pi tool-protection）。
     ///
     /// 工具配对完整性：任一被保留的 `ToolResult`，其发起 `ToolCall` 的助手消息也一并保留，
     /// 避免压缩后留下孤立 tool 消息（OpenAI 要求每条 tool 消息前必有对应的 tool_calls）。
+    /// 传 `&[Box::new(SkillReadRule)]` 等价于默认 [`prune`](Self::prune) 行为。
     #[must_use]
-    pub fn prune(log: &[AgentMessage], keep_recent: usize) -> Vec<AgentMessage> {
+    pub fn prune_with_rules(
+        log: &[AgentMessage],
+        keep_recent: usize,
+        rules: &[Box<dyn ToolProtectionRule>],
+    ) -> Vec<AgentMessage> {
         // 先 supersede：移除被后续同文件 read 取代的旧结果（内容已过期），释放上下文。
         let deduped = supersede_read_results(log);
         if deduped.len() <= keep_recent {
@@ -278,9 +283,9 @@ impl Compactor {
             // 经配对强制器清理，使持久化日志与 provider 视图同样满足配对约束。
             return sanitize_agent_messages(deduped);
         }
-        let protected = skill_read_call_ids(&deduped);
+        let protected = protected_call_ids(&deduped, rules);
         let split = deduped.len() - keep_recent;
-        // 会被保留的 ToolResult（窗口内 或 skill 受保护）所依赖的 tool_call_id：
+        // 会被保留的 ToolResult（窗口内 或 受规则保护）所依赖的 tool_call_id：
         // 这些 ToolCall 所在的助手消息也必须保留，否则产生孤立 tool 消息。
         let needed_call_ids: HashSet<String> = deduped
             .iter()
@@ -306,6 +311,12 @@ impl Compactor {
         sanitize_agent_messages(kept)
     }
 
+    /// [`prune_with_rules`] 的便捷入口：使用内置 [`SkillReadRule`]（保护 `skill://` read）。
+    #[must_use]
+    pub fn prune(log: &[AgentMessage], keep_recent: usize) -> Vec<AgentMessage> {
+        Self::prune_with_rules(log, keep_recent, &[Box::new(SkillReadRule)])
+    }
+
     /// Shake（机械级）：去连续重复 Status、删空助手消息。纯同步、不落盘。
     ///
     /// 保留为无 sink 的默认入口与既有测试使用；大块归档见 [`Compactor::shake_with`]。
@@ -325,13 +336,24 @@ impl Compactor {
     ///
     /// # Errors
     /// 仅在 sink 落盘失败时返回错误字符串（调用方据此回退、保留原日志）。
+    pub fn shake_with_rules(
+        log: &[AgentMessage],
+        config: &ShakeConfig,
+        counter: &crate::token::TokenCounter,
+        sink: &dyn ShakeSink,
+        rules: &[Box<dyn ToolProtectionRule>],
+    ) -> Result<(Vec<AgentMessage>, ShakeStats), String> {
+        shake_with_estimator(log, config, &|s| counter.count_text(s), sink, rules)
+    }
+
+    /// [`shake_with_rules`] 的便捷入口：使用内置 [`SkillReadRule`]（保护 `skill://` read）。
     pub fn shake_with(
         log: &[AgentMessage],
         config: &ShakeConfig,
         counter: &crate::token::TokenCounter,
         sink: &dyn ShakeSink,
     ) -> Result<(Vec<AgentMessage>, ShakeStats), String> {
-        shake_with_estimator(log, config, &|s| counter.count_text(s), sink)
+        Self::shake_with_rules(log, config, counter, sink, &[Box::new(SkillReadRule)])
     }
 
     /// Summarize：将旧消息折叠为单条 handoff 摘要用户消息。
@@ -410,6 +432,7 @@ fn shake_with_estimator(
     config: &ShakeConfig,
     estimate: &dyn Fn(&str) -> usize,
     sink: &dyn ShakeSink,
+    rules: &[Box<dyn ToolProtectionRule>],
 ) -> Result<(Vec<AgentMessage>, ShakeStats), String> {
     let deduped = shake_mechanical(log);
     let n = deduped.len();
@@ -418,7 +441,7 @@ fn shake_with_estimator(
         return Ok((deduped, stats));
     }
 
-    let protected = skill_read_call_ids(&deduped);
+    let protected = protected_call_ids(&deduped, rules);
 
     // 累计「严格在该条之后」的 token，用于保护窗口判定。
     let mut acc: usize = 0;

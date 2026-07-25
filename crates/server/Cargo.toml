@@ -19,6 +19,7 @@ agent-mcp    = { workspace = true }
 agent-memory = { workspace = true }
 agent-collab = { workspace = true }
 agent-llm    = { workspace = true }
+agent-pty    = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 futures      = { workspace = true }

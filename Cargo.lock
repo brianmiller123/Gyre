@@ -348,6 +348,7 @@ dependencies = [
  "agent-mcp",
  "agent-memory",
  "agent-prompt",
+ "agent-pty",
  "agent-skills",
  "agent-supervisor",
  "agent-tools",
