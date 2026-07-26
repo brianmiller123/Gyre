@@ -139,6 +139,7 @@ agent-supervisor = { path = "crates/supervisor" }
 agent-acp     = { path = "crates/acp" }
 agent-i18n    = { path = "crates/i18n" }
 agent-cli     = { path = "crates/cli" }
+agent-advisor = { path = "crates/advisor" }
 
 [profile.release]
 opt-level     = 3

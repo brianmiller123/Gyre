@@ -240,6 +240,17 @@ pub struct AgentConfig {
     /// 复用当前 profile 的 provider/api。`None` 时 auto_thinking 不生效（回退静态预算）。
     #[serde(default)]
     pub auto_thinking_model: Option<String>,
+    /// 是否启用后台审阅者（advisor）的 **LLM 批评大脑**。
+    ///
+    /// 默认 `false`：仅启用零成本的启发式质量信号（重复调用检测）与后台上下文维护
+    /// （异步 summarize，净成本中性）。置 `true` 额外每轮调用一次 LLM 做主动审阅/纠偏
+    /// （移植 oh-my-pi AdvisorRuntime 完整语义）。失败隔离三原则保证其永不影响主循环。
+    #[serde(default)]
+    pub enable_advisor: bool,
+    /// advisor LLM 大脑使用的独立模型 id（如 "gpt-4o-mini" / "glm-4-flash"）。
+    /// 复用当前 profile 的 provider/api；`None` 时复用主模型。仅在 `enable_advisor = true` 时生效。
+    #[serde(default)]
+    pub advisor_model: Option<String>,
     /// 逐工具审批覆盖。
     #[serde(default)]
     pub tools: ToolsConfig,
@@ -260,6 +271,8 @@ impl Default for AgentConfig {
             reasoning_budget: None,
             auto_thinking: false,
             auto_thinking_model: None,
+            enable_advisor: false,
+            advisor_model: None,
             tools: ToolsConfig::default(),
             commands: CommandRules::default(),
         }

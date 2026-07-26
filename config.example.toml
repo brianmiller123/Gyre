@@ -72,6 +72,11 @@ context_window_guard = 0.8               # token 占用达 80% 触发压缩
 enable_thinking      = false             # 启用后由支持思考的模型消费（如 deepseek-reasoner）
 reasoning_budget     = 16000             # 思考 token 预算（可选）
 max_turns            = 10000             # agent最大循环次数
+# 后台审阅者（advisor）。默认 false：仅启用零成本的「重复工具调用」启发式提醒 + 后台异步
+# summarize（先于主循环硬阈值压缩、主循环不再因压缩冻结，净成本中性）。置 true 额外每轮调用
+# 一次 LLM 做主动审阅/纠偏（移植 oh-my-pi AdvisorRuntime；失败隔离三原则保证永不影响主循环）。
+enable_advisor       = false
+# advisor_model       = "glm-4-flash"  # 可选：advisor 大脑用独立便宜模型（复用当前 provider/api）；注释则复用主模型
 
 # 逐工具审批覆盖（优先于 write/always-ask 模式与能力分级；yolo 模式会压过这里的 ask/prompt，
 # 仅 deny 仍生效）。code/debug 模式下写类（write_file / str_replace / apply_diff 等）默认已自动

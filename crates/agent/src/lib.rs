@@ -48,6 +48,18 @@ pub enum InterruptMode {
     Immediate,
 }
 
+/// 宿主上下文同步端口：每次模型调用前热刷新 system prompt（移植 oh-my-pi
+/// `syncContextBeforeModelCall`）。装配层注入实现以按需追加**动态 system 段**（新发现的
+/// 项目规则、最新状态摘要等）。与 [`RuntimeOverrides`]（覆盖 thinking / temperature）互补：
+/// 本端口改 system prompt。返回非空时该请求**停用前缀缓存**（`cache_key=None`），避免 system
+/// 变更后仍命中陈旧缓存。
+pub trait HostContextSync: Send + Sync {
+    /// 返回本轮需追加到 system prompt 的段（空 Vec = 不追加，沿用前缀缓存）。
+    fn extra_system(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// 运行时配置覆盖（每轮 LLM 调用前解析，移植 oh-my-pi `getReasoning` / `getDisableReasoning`
 /// 等动态解析器）。host 实现此 trait 经 [`AgentBuilder::runtime_overrides`] 注入，可在 run
 /// 中途改变 thinking / temperature 等配置而**无需重建 Agent**。
@@ -143,6 +155,12 @@ pub struct Agent {
     /// 进程级暂停门（可选；注入后在每次 provider 调用前 / 工具批执行前 park）。
     /// 共享单例由 host 驱动（CLI/Web `/pause`）；移植 oh-my-pi `AgentPauseGate`。
     pause_gate: Option<Arc<PauseGate>>,
+    /// P0-3：后台 advisor 运行时（廉价 `Clone`）。注入后，主循环压缩级联在 advisor **健康**
+    /// 时跳过同步 `summarize`（信任 advisor 后台已压到位），仅保留 `shake` + `prune` 兜底；
+    /// advisor **降级**（halted/quota/failing）时回落原同步级联（安全网）。`None` 时维持原行为。
+    advisor: Option<agent_advisor::AdvisorRuntime>,
+    /// P1-G：宿主上下文同步（每次模型调用前追加动态 system 段）。未注入则无影响。
+    host_sync: Option<Arc<dyn HostContextSync>>,
 }
 
 impl Agent {
@@ -182,6 +200,8 @@ impl Agent {
             write_effect: None,
             interrupt_mode: InterruptMode::default(),
             pause_gate: None,
+            advisor: None,
+            host_sync: None,
         }
     }
 
@@ -285,6 +305,11 @@ pub struct AgentBuilder {
     interrupt_mode: InterruptMode,
     /// 进程级暂停门。
     pause_gate: Option<Arc<PauseGate>>,
+    /// P0-3：后台 advisor 运行时（可选）。注入后主循环压缩级联据 [`is_healthy`] 决定是否
+    /// 跳过同步 summarize。
+    advisor: Option<agent_advisor::AdvisorRuntime>,
+    /// P1-G：宿主上下文同步（每轮模型调用前追加动态 system 段）。
+    host_sync: Option<Arc<dyn HostContextSync>>,
 }
 
 impl AgentBuilder {
@@ -339,6 +364,16 @@ impl AgentBuilder {
         self
     }
 
+    /// P1-G：注入宿主上下文同步端口（移植 oh-my-pi `syncContextBeforeModelCall`）。
+    ///
+    /// 每轮模型调用前调用 [`HostContextSync::extra_system`]，返回的段追加到 system prompt。
+    /// 返回非空时该请求停用前缀缓存（system 变更后 fingerprint 失配，避免陈旧缓存命中）。
+    /// 与 [`Self::runtime_overrides`] 互补：一个改 system prompt，一个改 thinking/temperature。
+    pub fn host_sync(mut self, sync: Arc<dyn HostContextSync>) -> Self {
+        self.host_sync = Some(sync);
+        self
+    }
+
     /// 注入 assistant 消息改写钩子（每轮最终化后、入 context / UI / 工具分发前原地改写）。
     ///
     /// 移植 oh-my-pi `transformAssistantMessage`：用于宏展开（如 `@[[runtime.name(args)]]`）、
@@ -366,6 +401,15 @@ impl AgentBuilder {
     /// 在途工作跑完后 park，resume 后继续；cancel 立即解除 park（无需 resume 整个进程）。
     pub fn pause_gate(mut self, gate: Arc<PauseGate>) -> Self {
         self.pause_gate = Some(gate);
+        self
+    }
+
+    /// P0-3：注入后台 advisor 运行时。装配层在创建 [`agent_advisor::AdvisorHook`]（注册为
+    /// turn-end 钩子）的同时，clone 一份同源 [`agent_advisor::AdvisorRuntime`] 注入此处——
+    /// 主循环据此在压缩级联中判定「能否信任 advisor 已压到位」并跳过同步 summarize。
+    /// 未注入则维持原同步压缩行为（安全网始终在线）。
+    pub fn advisor(mut self, rt: agent_advisor::AdvisorRuntime) -> Self {
+        self.advisor = Some(rt);
         self
     }
     /// 注入 Provider。
@@ -522,6 +566,8 @@ impl AgentBuilder {
             write_effect: self.write_effect,
             interrupt_mode: self.interrupt_mode,
             pause_gate: self.pause_gate,
+            advisor: self.advisor,
+            host_sync: self.host_sync,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
             aside_rx: tokio::sync::Mutex::new(self.aside_rx),
@@ -663,6 +709,10 @@ fn run_loop(
     let runtime_overrides = agent.runtime_overrides.clone();
     // transform_assistant：Arc clone（廉价），每轮最终化后调用。
     let transform_assistant = agent.transform_assistant.clone();
+    // P0-3：advisor 运行时（廉价 Clone）；主循环压缩级联据此判定是否跳过同步 summarize。
+    let advisor = agent.advisor.clone();
+    // P1-G：宿主上下文同步（廉价 Clone）；主循环每轮 req 构造前据此追加动态 system 段。
+    let host_sync = agent.host_sync.clone();
 
     async_stream::stream! {
         // P1-D：GenAI invoke_agent span（OTel 语义规范）——agent run 的逻辑根 span。
@@ -743,6 +793,8 @@ fn run_loop(
         let mut escalate_soft = false;
         // P1-C：软需求升级计数——模型非合规（detour 或未调所需工具）连续 N 轮后中止。
         let mut soft_escalations: usize = 0;
+        // P0-R3b-2：停止边界 advisor 求审触发的续跑计数（防无限续跑，见 MAX_ADVISOR_STOP_CATCHUPS）。
+        let mut advisor_stop_catchups: usize = 0;
 
         loop {
             // 取消检查
@@ -843,11 +895,20 @@ fn run_loop(
                 }
             };
 
+            // P0-3：advisor 健康判定——决定压缩级联能否跳过同步 summarize（信任 advisor 后台
+            // 已压到位）。advisor 降级（halted/quota/failing）或未注入时为 false，回落原同步级联
+            // （安全网始终在线）。每轮重算（advisor 状态可能 mid-run 变化）。
+            let advisor_healthy = advisor.as_ref().map_or(false, |a| a.is_healthy());
+            // P0-E：记录压缩级联前的 token 占用；级联后若真实收缩则通知 advisor re-prime
+            //（仅在实际压缩时触发，避免 no-op shake 反复清空 advisor 记忆、抵消 P0-1 连续性）。
+            let tokens_before_compact = built.tokens.current;
+
             // P2：主动 handoff 续命——在硬阈值级联（near_limit(guard)）**之前**的软阈值
             //（HANDOFF_SOFT_GUARD）主动触发一次 Summarize（每 run 仅一次）。给模型留出充裕
             // 头 room 再摘要，质量与稳定性优于「逼近上限才被动压缩」。复用现有 Summarize 路径，
             // 无新 trait 表面 / 无前缀缓存失效风险。移植 oh-my-pi auto-handoff threshold 思想。
-            if !handoff_done && built.tokens.near_limit(HANDOFF_SOFT_GUARD) {
+            // P0-3：advisor 健康时跳过——其后台 ThresholdCompactor（0.6）已先于软阈值压到位。
+            if !handoff_done && !advisor_healthy && built.tokens.near_limit(HANDOFF_SOFT_GUARD) {
                 handoff_done = true;
                 let _ = context
                     .compact(CompactionStrategy::Summarize { max_tokens: 0 })
@@ -881,7 +942,9 @@ fn run_loop(
                         return;
                     }
                 };
-                if built.tokens.near_limit(guard) {
+                // P0-3：advisor 健康时跳过同步 summarize（信任后台已压到位）；降级时回落此同步
+                // 级联。prune 始终兜底（下方独立 if），故即便 advisor 没及时压也不会溢出。
+                if built.tokens.near_limit(guard) && !advisor_healthy {
                     stages.push("summarize");
                     let _ = context
                         .compact(CompactionStrategy::Summarize { max_tokens: 0 })
@@ -894,23 +957,33 @@ fn run_loop(
                             return;
                         }
                     };
-                    if built.tokens.near_limit(guard) {
-                        stages.push("prune");
-                        let _ = context.compact(CompactionStrategy::Prune { keep_recent: 8 }).await;
-                        built = match context.build_provider_context(&model, &specs).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                yield AgentEvent::Error(e.to_string());
-                                yield AgentEvent::StateChanged(AgentState::Idle);
-                                return;
-                            }
-                        };
-                    }
+                }
+                if built.tokens.near_limit(guard) {
+                    stages.push("prune");
+                    let _ = context.compact(CompactionStrategy::Prune { keep_recent: 8 }).await;
+                    built = match context.build_provider_context(&model, &specs).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            yield AgentEvent::Error(e.to_string());
+                            yield AgentEvent::StateChanged(AgentState::Idle);
+                            return;
+                        }
+                    };
                 }
                 yield AgentEvent::Say(StatusMessage {
                     text: format!("上下文接近上限，已触发压缩（{}）", stages.join(" + ")),
                     kind: StatusKind::Warning,
                 });
+            }
+
+            // P0-E：压缩级联（handoff / shake / summarize / prune 任一）使主上下文真实收缩
+            // → 通知 advisor re-prime（清空失配记忆/去重/启发式历史 + 递增 epoch）。仅在
+            // current < before 时触发；advisor 未注入时 no-op。advisor 自身的后台压缩由其
+            // drain_loop 内部 re-prime 覆盖（见 process_batch maintainer 分支）。
+            if built.tokens.current < tokens_before_compact {
+                if let Some(a) = &advisor {
+                    a.on_context_compacted();
+                }
             }
 
             // P3-A：运行时覆盖（mid-run 热更新，移植 oh-my-pi getReasoning/getDisableReasoning）。
@@ -945,6 +1018,23 @@ fn run_loop(
                 temperature
             };
 
+            // P1-G：pre-call 宿主 system 刷新（移植 oh-my-pi `syncContextBeforeModelCall`）。
+            // 每轮 req 构造前向宿主要求动态 system 段（新发现的规则 / 最新状态摘要等），追加到
+            // built.system。返回非空时停用前缀缓存（system 变更后 fingerprint 失配，避免命中
+            // 陈旧缓存）；空则无影响（沿用 fingerprint 缓存）。
+            let host_system_added = match host_sync.as_ref() {
+                Some(hs) => {
+                    let extra = hs.extra_system();
+                    if extra.is_empty() {
+                        false
+                    } else {
+                        built.system.extend(extra);
+                        true
+                    }
+                }
+                None => false,
+            };
+
             let req = CompletionRequest {
                 model: model.clone(),
                 system: built.system.clone(),
@@ -955,8 +1045,13 @@ fn run_loop(
                 temperature,
                 thinking: thinking.clone(),
                 // P0-A：前缀指纹透传为 cache_key，供 provider 观测/命中前缀缓存
-                //（fingerprint 含 system + tool spec）。
-                cache_key: Some(built.fingerprint.clone()),
+                //（fingerprint 含 system + tool spec）。P1-G：宿主注入了动态 system 段时
+                // 停用（None）——fingerprint 已与实际 system 失配。
+                cache_key: if host_system_added {
+                    None
+                } else {
+                    Some(built.fingerprint.clone())
+                },
                 // 稳定前缀长度：provider 据此精确放置 cache_control breakpoint（移植
                 // oh-my-pi longestStablePrefix）。压缩/分支切换/steering 后会缩短，
                 // provider 端 breakpoint 随之前移，避免浪费缓存配额。
@@ -1437,6 +1532,8 @@ fn run_loop(
                         .append(agent_core::AgentMessage::ToolResult(msg))
                         .await;
                 }
+                // P2 可观测性：截断（length）未执行的工具计入 skipped（区别于真实 error）。
+                summary.record_skipped(tool_calls.len());
                 context
                     .append(agent_core::AgentMessage::user_text(
                         "（你的上一条回复因输出达到长度上限被截断或流异常中断，含未完成的工具调用，均已回滚未执行。请直接从中断处继续输出剩余内容，不要重复已生成的部分，也不要重复未完成的工具调用。）",
@@ -1476,6 +1573,8 @@ fn run_loop(
                         .append(agent_core::AgentMessage::ToolResult(msg))
                         .await;
                 }
+                // P2 可观测性：Error/Aborted 未执行的工具计入 aborted（区别于真实 error）。
+                summary.record_aborted(tool_calls.len());
                 // P1-E：error/aborted 终止，turn 结束 → 停止（will_continue: false）。
                 fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
                 yield AgentEvent::TurnEnd {
@@ -1621,6 +1720,38 @@ fn run_loop(
                 // P1-E：正常停止，turn 结束 → 停止（will_continue: false）。本轮无工具调用，
                 // turn_tool_results 为空。
                 fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
+
+                // P0-R3b-2：关键决策点求审——主代理即将「成功停止」前，等 advisor 处理完
+                // 积压审阅（最多 [`ADVISOR_STOP_CATCHUP_MS`] ms / 阈值 1）。若 advisor 此时
+                // 产出 blocker/concern 并经 steer_tx 注入，则 steer_rx 会积压——下方检测到
+                // 积压则 `continue` 让循环顶部 drain 消费（触发续跑，让模型重看 advisor 纠偏），
+                // 而非忽略 advisor 的最后一条强警告。
+                //
+                // **防无限续跑**：[`advisor_stop_catchups`] 限制此类「停止前求审触发的续跑」
+                // 最多 [`MAX_ADVISOR_STOP_CATCHUPS`] 次（默认 2）。advisor 降级时
+                // [`wait_for_catchup`] 立即放行，不阻塞停止。普通 turn 不经此路径。
+                if let Some(a) = &advisor {
+                    if advisor_stop_catchups < MAX_ADVISOR_STOP_CATCHUPS {
+                        let _ = a.wait_for_catchup(ADVISOR_STOP_CATCHUP_MS, 1).await;
+                        // 检测 steer_rx 是否有 advisor 注入的 blocker（非消费 peek）。
+                        let steer_has_pending = {
+                            let guard = steer_rx.lock().await;
+                            guard.as_ref().is_some_and(|rx| !rx.is_empty())
+                        };
+                        if steer_has_pending {
+                            advisor_stop_catchups += 1;
+                            summary.turns += 1;
+                            tracing::info!(
+                                round = advisor_stop_catchups,
+                                "advisor 在停止边界注入 blocker，触发续跑（计入 turn 配额）"
+                            );
+                            // 跳过本轮 Done——循环顶部会 drain steer_rx（中断语义在此无工具
+                            // 可中断，等价于把 advisor 纠偏注入上下文后续跑）。
+                            continue;
+                        }
+                    }
+                }
+
                 yield AgentEvent::TurnEnd {
                     message: assistant.clone(),
                     tool_results: std::mem::take(&mut turn_tool_results),
@@ -2128,6 +2259,20 @@ async fn run_batch(
 ///
 /// 一次同步的队列长度检查，延迟上界为一个轮询周期。
 const STEERING_INTERRUPT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// P0-R3b-2：主代理「成功停止」前等 advisor 处理完积压审阅的最长时间。
+///
+/// advisor 降级（halted/quota/failing）时 [`wait_for_catchup`] 立即放行，故此超时仅在
+/// advisor 健康但慢（如长 brain 往返）时触发——超时后放行停止，advisor 末条纠偏可能丢失
+/// （权衡：不阻塞主代理正常停止）。2s 足以覆盖一次快速 brain 审阅。
+const ADVISOR_STOP_CATCHUP_MS: u64 = 2_000;
+
+/// P0-R3b-2：停止边界 advisor 求审触发的续跑上限（防无限续跑）。
+///
+/// 每次 advisor 在停止边界注入 blocker 触发续跑消耗 1 配额；达上限后即便 advisor 仍发
+/// blocker 也直接停止（信任 advisor 已表达过纠偏，避免 advisor 故障导致 agent 永不停止）。
+/// 主循环的 [`max_turns`](AgentRunSummary) 是另一层独立兜底。
+const MAX_ADVISOR_STOP_CATCHUPS: usize = 2;
 
 /// 边执行工具批次边轮询 steering 队列：每 [`STEERING_INTERRUPT_POLL`] 用
 /// [`tokio::sync::mpsc::UnboundedReceiver::len`]（**非消费 peek**）检查一次，命中即
@@ -3117,6 +3262,7 @@ mod tests {
             .build();
 
         let mut said_truncated = false;
+        let mut skipped = 0u64;
         let stream = agent.run("go");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
@@ -3124,6 +3270,8 @@ mod tests {
                 if s.text.contains("截断") {
                     said_truncated = true;
                 }
+            } else if let AgentEvent::Done(sum) = &ev {
+                skipped = sum.tools_skipped;
             }
         }
 
@@ -3135,6 +3283,8 @@ mod tests {
         );
         // 应发出截断续写警告。
         assert!(said_truncated, "应发出截断续写警告");
+        // P2：截断未执行的工具应计入 tools_skipped（区别于真实 error）。
+        assert!(skipped >= 1, "length 截断的工具应计入 tools_skipped，实得 {skipped}");
         // 应续写至少一轮。
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
@@ -3226,11 +3376,13 @@ mod tests {
             .build();
 
         let mut done_success: Option<bool> = None;
+        let mut done_aborted: u64 = 0;
         let stream = agent.run("go");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
             if let AgentEvent::Done(sum) = ev {
                 done_success = Some(sum.success);
+                done_aborted = sum.tools_aborted;
             }
         }
 
@@ -3248,6 +3400,11 @@ mod tests {
             done_success,
             Some(false),
             "Error+tool_call 应以 success=false 停止"
+        );
+        // P2：Error 未执行的工具应计入 tools_aborted（区别于真实 error）。
+        assert!(
+            done_aborted >= 1,
+            "Error 的工具应计入 tools_aborted，实得 {done_aborted}"
         );
         let snapshot = ctx.snapshot().await;
         let has_placeholder = snapshot.iter().any(
@@ -4702,6 +4859,115 @@ mod tests {
             guard[1],
             (true, Some(0.5)),
             "第 2 轮 RuntimeOverrides 覆盖生效（thinking=Some, temperature=0.5）"
+        );
+    }
+
+    // ── HostContextSync（P1-G：pre-call system 刷新）────────────────────────
+
+    /// 记录每轮 provider 收到的 system（join），用于断言宿主注入段是否到达。
+    struct SystemRecordingProvider {
+        calls: Arc<AtomicUsize>,
+        seen_system: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for SystemRecordingProvider {
+        fn id(&self) -> &'static str {
+            "sys-recording"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.seen_system.lock().unwrap().push(req.system.join("\n"));
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "probe".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    model: "sys-recording".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    usage: Usage::default(),
+                    model: "sys-recording".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 宿主同步桩：每轮返回固定的动态 system 段。
+    struct FixedHostSync;
+    impl HostContextSync for FixedHostSync {
+        fn extra_system(&self) -> Vec<String> {
+            vec!["<host-dynamic>最新规则：禁止直接 push 到 main</host-dynamic>".into()]
+        }
+    }
+
+    /// P1-G：注入的 HostContextSync 每轮在模型调用前把动态 system 段追加到请求——
+    /// provider 两轮都应观测到该段。
+    #[tokio::test]
+    async fn host_sync_injects_system_before_each_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_system: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model = agent_core::Model::with_defaults(
+            "sys-recording",
+            "sys-recording",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(SystemRecordingProvider {
+                calls: calls.clone(),
+                seen_system: seen_system.clone(),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .host_sync(Arc::new(FixedHostSync))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                break;
+            }
+        }
+        let guard = seen_system.lock().unwrap();
+        assert_eq!(guard.len(), 2, "应正好 2 轮 provider 调用");
+        assert!(
+            guard.iter().all(|s| s.contains("<host-dynamic>")),
+            "每轮 system 都应含宿主注入段: {guard:?}"
         );
     }
 

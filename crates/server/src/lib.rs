@@ -1043,7 +1043,8 @@ async fn build_agent(
     // 长回复被中途截断（finish_reason=length）→ 误报「任务完成」。
     let max_output_tokens = model.max_output_tokens;
     let agent = assemble(
-        Agent::builder(model),
+        Agent::builder(model.clone()),
+        model,
         provider,
         tools,
         lsp_pool,
@@ -1066,6 +1067,7 @@ async fn build_agent(
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     builder: AgentBuilder,
+    model: agent_core::Model,
     provider: Arc<dyn LlmProvider>,
     tools: Arc<dyn agent_tools::ToolRegistry>,
     lsp_pool: agent_tools::LspPool,
@@ -1083,6 +1085,10 @@ fn assemble(
     pause_gate: Arc<PauseGate>,
 ) -> Agent {
     let workspace_root = workspace.root().to_path_buf();
+    // P0-1 Advisor：在 provider/provider_ctx 被 builder 链 move 前 clone 供 brain 用。
+    let advisor_provider = Arc::clone(&provider);
+    let advisor_provider_ctx = provider_ctx.clone();
+    let advisor_context = Arc::clone(&context);
     // fuzzy 配置 → 全局覆盖（首次装配 set，OnceLock 幂等；与 CLI 一致）。
     {
         let mut opts = agent_tools::FuzzyOpts::from_env();
@@ -1094,6 +1100,8 @@ fn assemble(
         opts.threshold = config.agent.tools.edit.fuzzy_threshold;
         agent_tools::set_fuzzy_opts(opts);
     }
+    // P1-1 watchdog：move 前保留项目约定文本，供 advisor brain 依据项目约定纠偏。
+    let advisor_conventions = context_files.join("\n\n");
     let builder = builder
         .provider(provider)
         .tools(tools)
@@ -1132,6 +1140,47 @@ fn assemble(
     } else {
         builder
     };
+    // P0-1 Advisor（后台审阅者）：每轮异步审阅，建议经 aside 通道折叠注入。
+    // 失败隔离三原则保证主循环永不阻塞 / 永不因 advisor 故障受损（见 agent_advisor）。
+    let (aside_tx, aside_rx) =
+        tokio::sync::mpsc::unbounded_channel::<agent_core::AgentMessage>();
+    // P0-R3a/b：steering 通道——advisor 的 blocker/concern 级建议经此触发主 agent 批级
+    // cancel + Immediate 中断轮询（STEERING_INTERRUPT_POLL），立即中止在途工具。
+    // rx 注入 builder（steer_rx），tx 给 advisor（with_maintainer_and_steer）。
+    let (steer_tx, steer_rx) =
+        tokio::sync::mpsc::unbounded_channel::<agent_core::AgentMessage>();
+    // P2：enable_advisor（默认 false）才装载 LLM 批评大脑；否则用 NoopBrain，
+    // advisor 仍跑零成本启发式 + 后台阈值压缩。
+    let advisor_brain: Arc<dyn agent_advisor::AdvisorBrain> = if config.agent.enable_advisor {
+        // 可选独立便宜模型（advisor_model）；未配置则复用主模型。
+        let mut advisor_model = model;
+        if let Some(id) = &config.agent.advisor_model {
+            advisor_model.id = id.clone();
+        }
+        Arc::new(agent_advisor::LlmBrain::with_conventions(
+            advisor_provider,
+            advisor_model,
+            advisor_provider_ctx,
+            &advisor_conventions,
+        ))
+    } else {
+        Arc::new(agent_advisor::NoopBrain)
+    };
+    // P0-2：后台阈值压缩器（0.6）先于主循环硬阈值异步 summarize，主循环同步路径多为 no-op。
+    // P0-R3b：注入 steer_tx——advisor 的 blocker/concern 经此触发主 agent 批级 cancel。
+    let advisor_rt = agent_advisor::AdvisorRuntime::with_maintainer_and_steer(
+        advisor_brain,
+        aside_tx,
+        Arc::new(agent_advisor::ThresholdCompactor::default_ratio(advisor_context)),
+        steer_tx,
+    );
+    // P0-R3b：steer_rx 注入主 agent，使 advisor blocker steer 能被主循环消费（中断在途工具）。
+    let builder = builder
+        .hooks(vec![Arc::new(agent_advisor::AdvisorHook::new(advisor_rt.clone()))
+            as Arc<dyn agent_core::Hook>])
+        .aside_rx(aside_rx)
+        .steer_rx(steer_rx)
+        .advisor(advisor_rt);
     if let Some(m) = memory {
         builder.memory(m).build()
     } else {

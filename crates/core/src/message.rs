@@ -474,6 +474,12 @@ pub struct AgentRunSummary {
     /// 实际调用过的工具名集合（P2-K coverage）。`unused = available − invoked`，见 [`AgentRunSummary::unused_tools`]。
     #[serde(default)]
     pub tools_invoked: BTreeSet<String>,
+    /// 因输出截断（length）而未执行、回填占位结果的工具调用数（P2 可观测性）。
+    #[serde(default)]
+    pub tools_skipped: u64,
+    /// 因助手消息以 Error/Aborted 结束而未执行、回填占位结果的工具调用数（P2 可观测性）。
+    #[serde(default)]
+    pub tools_aborted: u64,
 }
 
 impl AgentRunSummary {
@@ -488,6 +494,16 @@ impl AgentRunSummary {
             counters.ok += 1;
         }
         self.tools_invoked.insert(name.to_string());
+    }
+
+    /// 记录因输出截断（length）而未执行（占位）的工具数（P2 可观测性，移植 oh-my-pi `recordSkippedTool`）。
+    pub fn record_skipped(&mut self, n: usize) {
+        self.tools_skipped += n as u64;
+    }
+
+    /// 记录因 Error/Aborted 而未执行（占位）的工具数（P2 可观测性）。
+    pub fn record_aborted(&mut self, n: usize) {
+        self.tools_aborted += n as u64;
     }
 
     /// 返回「注册但从未被调用」的工具名（排序，P2-K coverage）——用于评估「该用没用」。

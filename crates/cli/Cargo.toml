@@ -28,6 +28,7 @@ agent-server = { workspace = true }
 agent-acp    = { workspace = true }
 agent-telemetry = { workspace = true }
 agent-hashline = { workspace = true }
+agent-advisor  = { workspace = true }
 agent-pty    = { workspace = true }
 agent-collab = { workspace = true }
 agent-swarm  = { workspace = true }

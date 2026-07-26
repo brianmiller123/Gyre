@@ -10,6 +10,7 @@ description = "Agent execution loop: state machine + tool orchestration + approv
 agent-core   = { workspace = true }
 agent-iso    = { workspace = true }
 agent-supervisor = { workspace = true }
+agent-advisor = { workspace = true }
 agent-tools  = { workspace = true }
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }

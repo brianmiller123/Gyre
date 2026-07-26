@@ -370,6 +370,9 @@ async fn main() -> Result<()> {
     // P1-K：自适应思考配置（closure 内按 mode 重建时复用）。
     let auto_thinking = cfg.agent.auto_thinking;
     let auto_thinking_model = cfg.agent.auto_thinking_model.clone();
+    // P2：advisor LLM 批评大脑开关（默认 false：仅零成本启发式 + 后台维护）。
+    let enable_advisor = cfg.agent.enable_advisor;
+    let advisor_model_id = cfg.agent.advisor_model.clone();
     let auto_consolidate = cfg.memory.auto_consolidate;
     // 子 Agent 配置（[subagent]：开关 / 并发护栏 / 继承父 temperature·thinking / 独立 token 预算）
     let subagent_enabled = cfg.subagent.enabled;
@@ -496,18 +499,67 @@ async fn main() -> Result<()> {
         } else {
             builder
         };
-        let builder = if let Some(m) = &memory {
-            let hook = ConsolidateHook {
+        // P0-1：Advisor（后台审阅者）——每轮异步审阅，建议经 aside 通道折叠注入。
+        // 失败隔离三原则保证主循环永不阻塞 / 永不因 advisor 故障而受损（见 agent_advisor）。
+        // 每次 build_agent 都派生独立 advisor + aside 信道；旧 agent 重建释放后旧 drain 自然退出。
+        let (aside_tx, aside_rx) =
+            tokio::sync::mpsc::unbounded_channel::<agent_core::AgentMessage>();
+        // P0-R3a/b：steering 通道——advisor 的 blocker/concern 级建议经此注入主 agent，
+        // 触发既有的批级 cancel + Immediate 中断轮询（STEERING_INTERRUPT_POLL），立即中止
+        // 在途工具。rx 注入 builder（steer_rx），tx 给 advisor（with_maintainer_and_steer）。
+        // 未启用 advisor 时通道空跑（无人发送），零成本。
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::unbounded_channel::<agent_core::AgentMessage>();
+        let advisor_brain: Arc<dyn agent_advisor::AdvisorBrain> = if enable_advisor {
+            // 可选独立便宜模型（advisor_model）；未配置则复用主模型。
+            let mut advisor_model = model.clone();
+            if let Some(id) = &advisor_model_id {
+                advisor_model.id = id.clone();
+            }
+            // P1-1 watchdog：把项目约定（AGENTS.md + 启用工具指引）注入审阅 system 段，
+            // 使 advisor 依据项目约定纠偏主代理（移植 oh-my-pi watchdog.ts）。
+            let advisor_conventions =
+                optional_context_files(&base_context_files, optional, github_enabled)
+                    .join("\n\n");
+            Arc::new(agent_advisor::LlmBrain::with_conventions(
+                Arc::clone(&provider),
+                advisor_model,
+                provider_ctx.clone(),
+                &advisor_conventions,
+            ))
+        } else {
+            // 默认关闭 LLM 批评：advisor 仍跑零成本启发式 + 后台阈值压缩。
+            Arc::new(agent_advisor::NoopBrain)
+        };
+        // P0-2：后台阈值压缩器（0.6）先于主循环硬阈值异步 summarize，主循环同步路径多为 no-op。
+        // P0-R3b：注入 steer_tx——advisor 的 blocker/concern 级建议经此触发主 agent 批级 cancel，
+        // 立即中止在途工具（复用 STEERING_INTERRUPT_POLL）；nit 仍走 aside。
+        let advisor_rt = agent_advisor::AdvisorRuntime::with_maintainer_and_steer(
+            advisor_brain,
+            aside_tx,
+            Arc::new(agent_advisor::ThresholdCompactor::default_ratio(Arc::clone(&context))),
+            steer_tx,
+        );
+        // P0-3：advisor_rt 同时注入 builder（主循环压缩卸载判定）与 hook（turn-end 触发），
+        // 故此处 clone 给 hook，原值随后注入 .advisor(..)。
+        let mut hooks: Vec<Arc<dyn agent_core::Hook>> =
+            vec![Arc::new(agent_advisor::AdvisorHook::new(advisor_rt.clone()))];
+        if let Some(m) = &memory {
+            hooks.push(Arc::new(ConsolidateHook {
                 store: Arc::clone(m),
                 provider: Arc::clone(&provider),
                 model: model.clone(),
                 provider_ctx: provider_ctx.clone(),
                 auto_consolidate,
-            };
-            builder.hooks(vec![Arc::new(hook) as Arc<dyn agent_core::Hook>])
-        } else {
-            builder
-        };
+            }));
+        }
+        // P0-R3b：steer_rx 注入主 agent——使 advisor 的 blocker steer 能被主循环顶部 drain +
+        // 批内 STEERING_INTERRUPT_POLL 轮询消费（中断在途工具）。
+        let builder = builder
+            .hooks(hooks)
+            .aside_rx(aside_rx)
+            .steer_rx(steer_rx)
+            .advisor(advisor_rt);
         if enable_thinking {
             let static_cfg = agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000));
             if auto_thinking {
