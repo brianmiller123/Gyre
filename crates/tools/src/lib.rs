@@ -8,6 +8,7 @@
 #![warn(clippy::pedantic)]
 
 mod ast_tool;
+pub mod intercept;
 mod fs;
 mod fuzzy_match;
 mod github;
@@ -35,6 +36,7 @@ pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunCommandTool;
+pub use intercept::{CompiledRule, default_compiled};
 pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
 
 /// 工具流式 partial 更新（工具 execute 内经 [`ToolContext::update_tx`] 推送，agent 循环端
@@ -189,13 +191,16 @@ impl ToolRegistry for DefaultToolRegistry {
 /// 核心工具集（始终启用，不受 `[tools]` 开关控制）：
 /// read_file / write_file / list_files / run_command / grep / glob。
 /// 编辑经可选的 `apply_hashline`（主推）完成；`write_file` 负责整文件创建/覆写。
+///
+/// `intercept` 为 `run_command` 的命令拦截规则（把 cat/grep/find/echo-redirect 重定向到
+/// 专用工具）；传空 Vec 即关闭拦截。装配层按配置 `[agent.commands.interceptor]` 决定。
 #[must_use]
-pub fn core_tools() -> DefaultToolRegistry {
+pub fn core_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
     DefaultToolRegistry::new()
         .with(Box::new(ReadFileTool))
         .with(Box::new(WriteFileTool))
         .with(Box::new(ListFilesTool))
-        .with(Box::new(RunCommandTool))
+        .with(Box::new(RunCommandTool::new(intercept)))
         .with(Box::new(GrepTool))
         .with(Box::new(GlobTool))
 }
@@ -226,8 +231,8 @@ pub fn lsp_tool(reg: DefaultToolRegistry) -> DefaultToolRegistry {
 /// 注意：可被装配层按需裁剪。生产装配应使用 [`core_tools`] + 各可选组构造器，
 /// 仅启用已配置的工具组，以严格控制初始上下文长度（避免无用 Token 开销）。
 #[must_use]
-pub fn builtin_tools() -> DefaultToolRegistry {
-    let reg = core_tools();
+pub fn builtin_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
+    let reg = core_tools(intercept);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     lsp_tool(reg)
@@ -235,8 +240,8 @@ pub fn builtin_tools() -> DefaultToolRegistry {
 
 /// 与 [`builtin_tools`] 相同，但额外返回 `LspTool` 的共享 [`LspPool`]（供 `LspWriteEffect` 复用同一套语言服务器）。
 #[must_use]
-pub fn builtin_tools_with_pool() -> (DefaultToolRegistry, LspPool) {
-    let reg = core_tools();
+pub fn builtin_tools_with_pool(intercept: Vec<CompiledRule>) -> (DefaultToolRegistry, LspPool) {
+    let reg = core_tools(intercept);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     let lsp = LspTool::new();
@@ -327,7 +332,7 @@ mod tests {
 
     #[test]
     fn registry_lists_and_finds() {
-        let reg = builtin_tools();
+        let reg = builtin_tools(vec![]);
         let specs = reg.specs();
         assert!(specs.iter().any(|s| s.name == "read_file"));
         assert!(reg.get("write_file").is_some());
@@ -338,7 +343,7 @@ mod tests {
 
     #[test]
     fn core_tools_excludes_optional() {
-        let reg = core_tools();
+        let reg = core_tools(vec![]);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         for core in [
@@ -365,7 +370,7 @@ mod tests {
 
     #[test]
     fn ast_tools_adds_ast_group() {
-        let reg = ast_tools(core_tools());
+        let reg = ast_tools(core_tools(vec![]));
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));

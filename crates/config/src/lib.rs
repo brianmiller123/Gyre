@@ -14,8 +14,8 @@ mod rules;
 
 pub use config::{
     AcpConfig, AgentConfig, CommandPattern, CommandRules, Config, EditToolsConfig, GithubConfig,
-    McpConfig, McpServerConfig, MemoryConfig, ModelProfile, ServerConfig, SkillsConfig,
-    SubagentConfig, ToolApproval, ToolsConfig,
+    InterceptorConfig, McpConfig, McpServerConfig, MemoryConfig, ModelProfile, ServerConfig,
+    SkillsConfig, SubagentConfig, ToolApproval, ToolsConfig,
 };
 pub use config::{CustomCommand, discover_commands, discover_context_files};
 pub use env::expand_env;

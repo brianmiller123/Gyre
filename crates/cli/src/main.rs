@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
     optional.insert("pty".to_string(), cfg.tools.effective("pty", false));
     // 子 Agent 工具集（按启用态装配的可选工具 + MCP，不含 task 以防递归；与模型无关，构建一次）
     let (mut sub_reg, _) =
-        assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write);
+        assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write, cfg.agent.commands.interceptor.enabled);
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
     }
@@ -428,7 +428,7 @@ async fn main() -> Result<()> {
         let sub_max_output = subagent_max_output_override.unwrap_or(max_output);
         // 父 Agent 工具集 = 按启用态装配的可选工具 + MCP + task（task 受 [subagent].enabled 控制）
         let (mut tool_registry, lsp_pool) =
-            assemble_builtin_tools(optional, github_enabled, github_allow_write);
+            assemble_builtin_tools(optional, github_enabled, github_allow_write, cfg.agent.commands.interceptor.enabled);
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
         }
@@ -911,11 +911,17 @@ fn assemble_builtin_tools(
     optional: &std::collections::HashMap<String, bool>,
     github_enabled: bool,
     github_allow_write: bool,
+    interceptor_enabled: bool,
 ) -> (
     agent_tools::DefaultToolRegistry,
     Option<agent_tools::LspPool>,
 ) {
-    let mut reg = agent_tools::core_tools();
+    let intercept = if interceptor_enabled {
+        agent_tools::intercept::default_compiled()
+    } else {
+        Vec::new()
+    };
+    let mut reg = agent_tools::core_tools(intercept);
     let mut lsp_pool: Option<agent_tools::LspPool> = None;
     if *optional.get("ast").unwrap_or(&false) {
         reg = agent_tools::ast_tools(reg);
@@ -1311,7 +1317,7 @@ mod tests {
     #[test]
     fn assemble_defaults_to_core_only() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, false, false);
+        let (reg, _) = assemble_builtin_tools(&optional, false, false, false);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
@@ -1334,7 +1340,7 @@ mod tests {
     fn assemble_enables_ast_group() {
         let mut optional = std::collections::HashMap::new();
         optional.insert("ast".to_string(), true);
-        let (reg, _) = assemble_builtin_tools(&optional, false, false);
+        let (reg, _) = assemble_builtin_tools(&optional, false, false, false);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));
@@ -1347,7 +1353,7 @@ mod tests {
     #[test]
     fn assemble_github_independent_of_optional_map() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, true, true);
+        let (reg, _) = assemble_builtin_tools(&optional, true, true, false);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(

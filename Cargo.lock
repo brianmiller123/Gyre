@@ -432,6 +432,7 @@ dependencies = [
  "agent-search",
  "async-trait",
  "base64 0.22.1",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

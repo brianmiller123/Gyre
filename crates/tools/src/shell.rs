@@ -7,12 +7,33 @@ use agent_core::{ApprovalRequest, CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::intercept::{self, CompiledRule};
 use crate::{Tool, ToolContext};
 
 /// 在工作区执行 shell 命令。
 ///
 /// 跨平台：Unix 走 `/bin/sh -c`，Windows 走 `cmd /C`。`kill_on_drop` 确保取消时子进程被回收。
-pub struct RunCommandTool;
+pub struct RunCommandTool {
+    /// 命令拦截规则（命中即在 spawn 前重定向到专用工具）。空 Vec = 不拦截。
+    intercept: Vec<CompiledRule>,
+}
+
+impl RunCommandTool {
+    /// 构造带指定拦截规则的 `run_command` 工具。
+    #[must_use]
+    pub fn new(intercept: Vec<CompiledRule>) -> Self {
+        Self { intercept }
+    }
+}
+
+impl Default for RunCommandTool {
+    /// 默认启用内置规则集（cat/grep/find/echo-redirect → 专用工具）。
+    fn default() -> Self {
+        Self {
+            intercept: intercept::default_compiled(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for RunCommandTool {
@@ -60,6 +81,16 @@ impl Tool for RunCommandTool {
             .get("command")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `command` 参数".into()))?;
+
+        // 命令拦截：把 cat/grep/find/echo-redirect 等有专用工具等价物的命令，在 spawn 前重定向
+        // 到专用工具（移植 oh-my-pi bash 拦截器）。命中即返回可恢复错误，回灌模型使其改用专用
+        // 工具——不计入连续错误预算（`ToolError::Execution` 的 `is_recoverable` 为真）。
+        if let Some(rule) = intercept::check(command, &self.intercept) {
+            return Err(ToolError::Execution(format!(
+                "已拦截：该命令有更合适的专用工具——改用 `{}` 工具（{}）。\n原始命令：{command}",
+                rule.tool, rule.message
+            )));
+        }
 
         let mut cmd = shell_command(command);
         cmd.current_dir(ctx.workspace.root())

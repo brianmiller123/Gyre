@@ -360,6 +360,9 @@ pub struct CommandRules {
     /// 需询问的命令（glob）。
     #[serde(default)]
     pub ask: Vec<CommandPattern>,
+    /// 命令拦截器：把 cat/grep/find/echo-redirect 等重定向到专用工具（移植 oh-my-pi bashInterceptor）。
+    #[serde(default)]
+    pub interceptor: InterceptorConfig,
 }
 
 /// 单条命令规则。
@@ -387,6 +390,25 @@ impl CommandPattern {
             CommandPattern::Simple(s) => s,
             CommandPattern::Full { pattern } => pattern,
         }
+    }
+}
+
+/// `run_command` 命令拦截器配置（对应 TOML `[agent.commands.interceptor]`）。
+///
+/// 开启后，`run_command` 在 spawn 前把 `cat/head/tail` → `read_file`、`grep/rg` → `grep`、
+/// `find/fd -name` → `glob`、`echo/printf > 文件` → `write_file`（移植 oh-my-pi `bashInterceptor`）。
+/// 默认开启。规则集由工具层内置，目标均为始终启用的核心工具，故任何装配下都安全；如需关闭
+/// （例如某些工作流确实需要 `cat`），置 `enabled = false`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct InterceptorConfig {
+    /// 是否启用命令拦截（默认 `true`）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for InterceptorConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -935,5 +957,23 @@ pattern = "docker *"
         assert_eq!(cfg.agent.commands.deny[0].pattern(), "rm -rf *");
         assert_eq!(cfg.agent.commands.ask.len(), 1);
         assert_eq!(cfg.agent.commands.ask[0].pattern(), "docker *");
+    }
+
+    #[test]
+    fn interceptor_defaults_on_and_can_disable() {
+        // 未显式配置时，interceptor 默认启用。
+        let toml_src = r#"
+[default_model]
+id       = "ds"
+api      = "deepseek"
+base_url = "https://api.deepseek.com"
+"#;
+        let cfg: Config = toml::from_str(toml_src).expect("解析应成功");
+        assert!(cfg.agent.commands.interceptor.enabled, "interceptor 默认应启用");
+
+        // 显式关闭。
+        let off = format!("{toml_src}\n[agent.commands.interceptor]\nenabled = false\n");
+        let cfg: Config = toml::from_str(&off).expect("解析应成功");
+        assert!(!cfg.agent.commands.interceptor.enabled, "interceptor 应被关闭");
     }
 }

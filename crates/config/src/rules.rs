@@ -506,6 +506,7 @@ ask = []
             allow: vec![],
             deny: vec![],
             ask: vec![CommandPattern::Simple("docker *".into())],
+            interceptor: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -544,6 +545,7 @@ ask = []
             allow: vec![],
             deny: vec![CommandPattern::Simple("rm -rf *".into())],
             ask: vec![],
+            interceptor: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -572,6 +574,7 @@ ask = []
             allow: vec![CommandPattern::Simple("git status".into())],
             deny: vec![],
             ask: vec![],
+            interceptor: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(

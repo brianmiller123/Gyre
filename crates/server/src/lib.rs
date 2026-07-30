@@ -950,8 +950,14 @@ async fn build_agent(
         broadcast_tx.clone(),
         Arc::clone(pending),
     ));
+    // run_command 命令拦截规则（cat/grep/find/echo-redirect → 专用工具）；按 [agent.commands.interceptor] 开关。
+    let intercept = if config.agent.commands.interceptor.enabled {
+        agent_tools::intercept::default_compiled()
+    } else {
+        Vec::new()
+    };
     // 子 Agent 工具集（builtin + MCP，不含 task 以防递归）
-    let mut sub_reg = agent_tools::builtin_tools();
+    let mut sub_reg = agent_tools::builtin_tools(intercept.clone());
     if config.github.enabled {
         sub_reg = sub_reg.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,
@@ -980,7 +986,7 @@ async fn build_agent(
         None
     };
     // 父 Agent 工具集 = builtin + MCP + task（task 受开关控制）
-    let (mut tool_registry, lsp_pool) = agent_tools::builtin_tools_with_pool();
+    let (mut tool_registry, lsp_pool) = agent_tools::builtin_tools_with_pool(intercept);
     if config.github.enabled {
         tool_registry = tool_registry.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,

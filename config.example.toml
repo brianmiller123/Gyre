@@ -106,6 +106,12 @@ pattern = "rm -rf *"
 [[agent.commands.ask]]
 pattern = "docker *"
 
+# 命令拦截器：把 cat/head/tail→read_file、grep/rg→grep、find/fd -name→glob、
+# echo/printf>文件→write_file 等有专用工具等价物的 shell 命令，在执行前重定向到专用工具
+# （移植 oh-my-pi bashInterceptor）。默认开启；置 false 关闭。
+[agent.commands.interceptor]
+enabled = true
+
 [server]
 bind = "127.0.0.1:8080"
 # auth_token = "${AGENT_SERVER_TOKEN}"
