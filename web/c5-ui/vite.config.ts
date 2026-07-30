@@ -16,6 +16,14 @@ export default defineConfig({
       '@': path.resolve(__dirname, 'src'),
     },
   },
+  build: {
+    // 构建产物直接写入仓库根 web/（rust-embed 内嵌服务目录，见 server/lib.rs 的 WebAsset
+    // folder）。与 `--serve` 读取路径一致——`npm run build` 后产物即生效（debug 模式 rust-embed
+    // 实时读盘；release 需重新编译二进制内嵌）。emptyOutDir=false：outDir 在项目根之外，
+    // 禁止清空以免误删 web/c5-ui 源码与既有字体资源。
+    outDir: path.resolve(__dirname, '..'),
+    emptyOutDir: false,
+  },
   server: {
     host: true,
     port: 5173,

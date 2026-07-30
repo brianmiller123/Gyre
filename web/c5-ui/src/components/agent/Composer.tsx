@@ -189,10 +189,11 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   }
 
   function submit() {
-    if (running || !connected) return
+    if (!connected) return
     const t = text.trim()
     if (!t && images.length === 0) return
     if (isCommand) {
+      if (running) return // 斜杠命令运行中不响应；纯文本作 steering 插话（服务器忙时 steer）
       // Execute a typed command directly (e.g. "/clear" or "/mode code").
       const p = parseCommandLine(t)!
       const cmd = allCommands.find((c) => c.name === p.name)

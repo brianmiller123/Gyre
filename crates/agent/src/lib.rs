@@ -120,6 +120,9 @@ pub struct Agent {
     /// steering 接收端（外部中途注入消息）。
     steer_rx:
         tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<agent_core::AgentMessage>>>,
+    /// steering 发送端镜像（`.steering()` 开启时由 builder 内部创建并存入；供宿主经
+    /// [`Agent::steer`] 中途注入消息。`None` 时 steer 为空操作）。
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<agent_core::AgentMessage>>,
     /// aside 接收端（外部注入**被动、非中断**通知——后台任务完成、延迟 LSP diagnostics 等）。
     /// 与 steering 的区别：aside **永不**打断在途工具（不走 Immediate 批级 cancel），只在
     /// 轮次边界（下一轮模型调用前 / 停止边界）折叠注入。移植 oh-my-pi `getAsideMessages`。
@@ -175,6 +178,7 @@ impl Agent {
             resources: None,
             soft_requirement: None,
             steer_rx: None,
+            steer_tx: None,
             aside_rx: None,
             followup_rx: None,
             runtime_overrides: None,
@@ -183,6 +187,14 @@ impl Agent {
             interrupt_mode: InterruptMode::default(),
             pause_gate: None,
         }
+    }
+
+    /// 中途向运行中的 agent 注入一条消息（steering）。命中后由 Immediate 中断策略尽快打断
+    /// 在途的可中断工具（如 `run_command`），并在下一注入边界把消息投给模型——实现「运行中
+    /// 随时输入、模型立即收到」。未启用 steering（构建时未调 `.steering()`）时为空操作，
+    /// 返回 `false`。移植 oh-my-pi `Agent.steer()`。
+    pub fn steer(&self, message: agent_core::AgentMessage) -> bool {
+        self.steer_tx.as_ref().and_then(|tx| tx.send(message).ok()).is_some()
     }
 
     /// 取消句柄（外部中止）。
@@ -271,6 +283,8 @@ pub struct AgentBuilder {
     soft_requirement: Option<SoftToolRequirement>,
     /// steering 信道：外部中途注入消息打断当前任务。
     steer_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
+    /// steering 发送端（`.steering()` 创建信道时一并存入，build 时镜像进 Agent）。
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentMessage>>,
     /// aside 信道：外部注入被动、非中断通知（后台完成 / 延迟 diagnostics 等）。
     aside_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
     /// followUp 信道：宿主编排的延续消息（停止边界第三类 drain）。
@@ -302,6 +316,17 @@ impl AgentBuilder {
 
     /// 注入 steering 接收端（外部经返回的发送端中途打断）。
     pub fn steer_rx(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<AgentMessage>) -> Self {
+        self.steer_rx = Some(rx);
+        self
+    }
+
+    /// 启用 steering：内部创建无界信道，rx 注入 agent 循环，tx 镜像进 Agent 供
+    /// [`Agent::steer`] 使用。供需要「运行中接受用户输入并立即投递」的宿主（CLI/Web）调用。
+    /// 与 `.steer_rx(rx)` 互斥：后者由调用方自带接收端（测试用），本方法自洽创建一对。
+    #[must_use]
+    pub fn steering(mut self) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
+        self.steer_tx = Some(tx);
         self.steer_rx = Some(rx);
         self
     }
@@ -524,6 +549,7 @@ impl AgentBuilder {
             pause_gate: self.pause_gate,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
+            steer_tx: self.steer_tx,
             aside_rx: tokio::sync::Mutex::new(self.aside_rx),
             followup_rx: tokio::sync::Mutex::new(self.followup_rx),
             runtime_overrides: self.runtime_overrides,
@@ -2636,6 +2662,109 @@ mod tests {
             2,
             "停止边界 steering 应触发续跑（provider 调用 2 次，而非搁置后仅 1 次）"
         );
+    }
+
+    /// 配合 `steer_via_public_api_delivers`：第 1 轮 stream() 通知测试「已进入」并等待测试
+    /// 经公共 API steer 后再放行——保证 steering 在停止边界 drain 前已入队（确定性，无时序竞态）。
+    struct SteerApiProvider {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for SteerApiProvider {
+        fn id(&self) -> &'static str {
+            "steer-api"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: format!("reply #{n}"),
+                }],
+                usage: Usage::default(),
+                model: "steer-api".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 公共 API [`Agent::steer`]（经 `.steering()` 启用）在停止边界被 drain 并触发续跑。
+    /// 与 `stop_boundary_steering_continues_run` 的区别：后者经外部信道 tx 注入，本测试走宿主
+    /// 真实路径——`Agent::steer()`，证明前端（CLI/Web）调用即可让运行中的模型立即收到消息。
+    #[tokio::test]
+    async fn steer_via_public_api_delivers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "steer-api",
+            "steer-api",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Arc::new(
+            Agent::builder(model)
+                .provider(Arc::new(SteerApiProvider {
+                    calls: Arc::clone(&calls),
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }))
+                .tools(Arc::new(DefaultToolRegistry::new()))
+                .context(ctx)
+                .prompts(Arc::new(PromptCatalog::new()))
+                .approval(Arc::new(YoloApproval))
+                .workspace(Arc::new(Workspace::new(".")))
+                .steering()
+                .build(),
+        );
+
+        let agent_run = Arc::clone(&agent);
+        let handle = tokio::spawn(async move {
+            let stream = agent_run.run("go");
+            tokio::pin!(stream);
+            let mut done = false;
+            let mut injected = false;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    AgentEvent::Done(_) => done = true,
+                    AgentEvent::Say(s) if s.text.contains("停止边界 steering") => injected = true,
+                    _ => {}
+                }
+            }
+            (done, injected)
+        });
+
+        started.notified().await; // provider 已进入第 1 轮
+        // 宿主真实路径：经公共 API 注入 steering（而非外部信道 tx）。
+        assert!(
+            agent.steer(AgentMessage::user_text("[steer] 接着做 Y")),
+            "启用 .steering() 后 steer() 应返回 true"
+        );
+        release.notify_one(); // 放行第 1 轮返回 → 停止边界 drain steering → 续跑第 2 轮。
+
+        let (done, injected) = handle.await.unwrap();
+        assert!(done, "应正常结束");
+        assert!(
+            injected,
+            "公共 API steer 应在停止边界被 drain 并发出注入提示"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "应续跑（provider 调用 2 次）");
     }
 
     /// cancel 时不 drain steering（防搁浅）：第一轮注入 steering 并取消 → 停止边界

@@ -53,7 +53,8 @@ pub fn server_frame_to_acp(frame: ServerFrame) -> Option<SessionUpdate> {
         | ServerFrame::MessageEnd { .. }
         | ServerFrame::ToolExecutionStart { .. }
         | ServerFrame::ToolExecutionUpdate { .. }
-        | ServerFrame::ToolExecutionEnd { .. } => return None,
+        | ServerFrame::ToolExecutionEnd { .. }
+        | ServerFrame::Steered { .. } => return None,
     })
 }
 

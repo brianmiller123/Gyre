@@ -18,6 +18,7 @@ use agent_core::{
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use futures::StreamExt;
+use tokio::io::AsyncBufReadExt;
 use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 use secrecy::ExposeSecret;
@@ -456,6 +457,7 @@ async fn main() -> Result<()> {
         let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
 
         let builder = agent::Agent::builder(model.clone())
+            .steering()
             .provider(Arc::clone(&provider))
             .tools(tools)
             .context(Arc::clone(&context))
@@ -1212,7 +1214,7 @@ async fn run_turn(
     task: &str,
     accumulated: &Arc<std::sync::Mutex<Usage>>,
 ) -> Result<bool> {
-    consume_stream(agent.run(task), accumulated).await
+    consume_stream(agent.run(task), accumulated, Some(agent)).await
 }
 
 /// 运行一条带图像等多模态内容块的用户消息（`/paste`）。
@@ -1221,11 +1223,107 @@ async fn run_turn_message(
     msg: agent_core::UserMessage,
     accumulated: &Arc<std::sync::Mutex<Usage>>,
 ) -> Result<bool> {
-    consume_stream(agent.run_message(msg), accumulated).await
+    consume_stream(agent.run_message(msg), accumulated, Some(agent)).await
+}
+
+/// 渲染单个 agent 事件到终端（流式 Markdown / 状态行 / 工具 / 用量 / done）。
+/// 返回 `Some(success)` 当且仅当事件为 `Done`（此时已 flush 残留并累加用量），其余返回 `None`。
+fn render_event(
+    ev: AgentEvent,
+    md: &mut markdown::MarkdownRenderer,
+    accumulated: &Arc<std::sync::Mutex<Usage>>,
+) -> Option<bool> {
+    match ev {
+        AgentEvent::TextDelta(t) => {
+            let rendered = md.push(&t);
+            if !rendered.is_empty() {
+                print!("{rendered}");
+                let _ = std::io::stdout().flush();
+            }
+            None
+        }
+        AgentEvent::ThinkingDelta(t) => {
+            eprint!("\x1b[2m{t}\x1b[0m");
+            let _ = std::io::stderr().flush();
+            None
+        }
+        AgentEvent::Say(s) => {
+            let tag = match s.kind {
+                StatusKind::Info => t!("event.info"),
+                StatusKind::Thinking => t!("event.think"),
+                StatusKind::Success => t!("event.ok"),
+                StatusKind::Warning => t!("event.warn"),
+                StatusKind::Error => t!("event.err"),
+            };
+            eprintln!("\n[{tag}] {}", s.text);
+            None
+        }
+        AgentEvent::ToolExec { name, output } => {
+            eprintln!("\n{}", t!("event.tool", name = name, output = output));
+            None
+        }
+        AgentEvent::Usage(u) => {
+            eprintln!(
+                "\n{}",
+                t!("event.usage", input = u.input_tokens, out = u.output_tokens)
+            );
+            None
+        }
+        AgentEvent::StateChanged(st) => {
+            eprintln!("\n{}", t!("event.state", state = format!("{st:?}")));
+            None
+        }
+        AgentEvent::Error(e) => {
+            eprintln!("\n{}", t!("event.error", e = e));
+            None
+        }
+        AgentEvent::Done(summary) => {
+            // flush 末尾残留（未闭合代码块 / 行缓冲）
+            let tail = md.finish();
+            if !tail.is_empty() {
+                print!("{tail}");
+                let _ = std::io::stdout().flush();
+            }
+            let success = summary.success;
+            if let Ok(mut acc) = accumulated.lock() {
+                acc.add(&summary.usage);
+            }
+            eprintln!(
+                "\n{}",
+                t!(
+                    "event.done",
+                    turns = summary.turns,
+                    tools = summary.tool_calls,
+                    success = summary.success,
+                    cost = format!("{:.6}", summary.usage.cost_usd)
+                )
+            );
+            Some(success)
+        }
+        AgentEvent::Ask(_)
+        | AgentEvent::Assistant(_)
+        | AgentEvent::TurnStart
+        | AgentEvent::TurnEnd { .. }
+        | AgentEvent::MessageStart
+        | AgentEvent::MessageEnd(_)
+        | AgentEvent::ToolExecutionStart { .. }
+        | AgentEvent::ToolExecutionUpdate { .. }
+        | AgentEvent::ToolExecutionEnd { .. } => None,
+    }
 }
 
 /// 消费 agent 事件流并打印（`run_turn` / `run_turn_message` 共用）。
-async fn consume_stream<S>(events: S, accumulated: &Arc<std::sync::Mutex<Usage>>) -> Result<bool>
+///
+/// `steer` 为 `Some(agent)` 时（交互 REPL），运行期间并发读 stdin：用户键入的每一行经
+/// [`agent::Agent::steer`] 即时投递给运行中的 agent——Immediate 策略会尽快打断在途的可中断
+/// 工具，并在下一注入边界把消息投给模型（移植 oh-my-pi `Agent.steer()`）。rustyline 仅在空闲态
+/// 持有终端（行编辑/补全），运行期间终端处于 cooked 模式，故此处 `read_line` 与空闲态的
+/// rustyline 互斥、不抢字节；非交互（stdin 非 tty）时退化为纯事件循环。
+async fn consume_stream<S>(
+    events: S,
+    accumulated: &Arc<std::sync::Mutex<Usage>>,
+    steer: Option<&agent::Agent>,
+) -> Result<bool>
 where
     S: futures::Stream<Item = AgentEvent>,
 {
@@ -1234,75 +1332,57 @@ where
     // 流式 Markdown 美化：仅 TTY 输出着色/高亮，管道透传原文。
     let mut md =
         markdown::MarkdownRenderer::new(std::io::IsTerminal::is_terminal(&std::io::stdout()));
-    while let Some(ev) = events.next().await {
-        match ev {
-            AgentEvent::TextDelta(t) => {
-                let rendered = md.push(&t);
-                if !rendered.is_empty() {
-                    print!("{rendered}");
-                    let _ = std::io::stdout().flush();
+
+    // 纯事件循环（一次性任务 / 非交互 / 未启用 steering）。
+    let Some(steer_agent) = steer.filter(|_| std::io::IsTerminal::is_terminal(&std::io::stdin()))
+    else {
+        while let Some(ev) = events.next().await {
+            if let Some(s) = render_event(ev, &mut md, accumulated) {
+                success = s;
+            }
+        }
+        return Ok(success);
+    };
+
+    // 交互 REPL：事件流与 stdin 并发；运行中键入即 steering。
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut buf = String::new();
+    let mut stdin_eof = false;
+    loop {
+        if stdin_eof {
+            // stdin 已 EOF：不再并发读，专心排空事件流。
+            match events.next().await {
+                Some(ev) => {
+                    if let Some(s) = render_event(ev, &mut md, accumulated) {
+                        success = s;
+                    }
                 }
+                None => break,
             }
-            AgentEvent::ThinkingDelta(t) => {
-                eprint!("\x1b[2m{t}\x1b[0m");
-                let _ = std::io::stderr().flush();
-            }
-            AgentEvent::Say(s) => {
-                let tag = match s.kind {
-                    StatusKind::Info => t!("event.info"),
-                    StatusKind::Thinking => t!("event.think"),
-                    StatusKind::Success => t!("event.ok"),
-                    StatusKind::Warning => t!("event.warn"),
-                    StatusKind::Error => t!("event.err"),
-                };
-                eprintln!("\n[{tag}] {}", s.text);
-            }
-            AgentEvent::ToolExec { name, output } => {
-                eprintln!("\n{}", t!("event.tool", name = name, output = output));
-            }
-            AgentEvent::Usage(u) => {
-                eprintln!(
-                    "\n{}",
-                    t!("event.usage", input = u.input_tokens, out = u.output_tokens)
-                );
-            }
-            AgentEvent::StateChanged(st) => {
-                eprintln!("\n{}", t!("event.state", state = format!("{st:?}")));
-            }
-            AgentEvent::Error(e) => {
-                eprintln!("\n{}", t!("event.error", e = e));
-            }
-            AgentEvent::Done(summary) => {
-                // flush 末尾残留（未闭合代码块 / 行缓冲）
-                let tail = md.finish();
-                if !tail.is_empty() {
-                    print!("{tail}");
-                    let _ = std::io::stdout().flush();
+            continue;
+        }
+        tokio::select! {
+            biased;
+            ev = events.next() => match ev {
+                Some(ev) => {
+                    if let Some(s) = render_event(ev, &mut md, accumulated) {
+                        success = s;
+                    }
                 }
-                success = summary.success;
-                if let Ok(mut acc) = accumulated.lock() {
-                    acc.add(&summary.usage);
+                None => break,
+            },
+            n = stdin.read_line(&mut buf) => match n {
+                Ok(0) | Err(_) => stdin_eof = true,
+                Ok(_) => {
+                    let line = buf.trim().to_string();
+                    buf.clear();
+                    if !line.is_empty()
+                        && steer_agent.steer(agent_core::AgentMessage::user_text(line))
+                    {
+                        eprintln!("\n[steer] 消息已投递给运行中的 agent");
+                    }
                 }
-                eprintln!(
-                    "\n{}",
-                    t!(
-                        "event.done",
-                        turns = summary.turns,
-                        tools = summary.tool_calls,
-                        success = summary.success,
-                        cost = format!("{:.6}", summary.usage.cost_usd)
-                    )
-                );
-            }
-            AgentEvent::Ask(_)
-            | AgentEvent::Assistant(_)
-            | AgentEvent::TurnStart
-            | AgentEvent::TurnEnd { .. }
-            | AgentEvent::MessageStart
-            | AgentEvent::MessageEnd(_)
-            | AgentEvent::ToolExecutionStart { .. }
-            | AgentEvent::ToolExecutionUpdate { .. }
-            | AgentEvent::ToolExecutionEnd { .. } => {}
+            },
         }
     }
     Ok(success)

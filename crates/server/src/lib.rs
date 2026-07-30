@@ -159,6 +159,10 @@ pub enum ServerFrame {
     },
     /// 错误。
     Error { message: String },
+    /// 用户在任务运行中提交的消息已作为 steering 投递给当前 agent（移植 oh-my-pi：忙时
+    /// steer 而非拒绝）。Immediate 策略会尽快打断在途工具，并在下一边界把消息投给模型。
+    /// 前端据此把该消息渲染为一次「插话」，区别于普通轮次。
+    Steered { text: String },
     /// 子 Agent 监控快照（聚合后下发，前端整体替换）。
     SubAgents {
         /// 全部子 Agent 状态（含日志尾部）。
@@ -686,10 +690,28 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
         match frame {
             ClientFrame::NewTask { text, content, .. } => {
                 if deps.running.swap(true, Ordering::SeqCst) {
-                    if let Err(e) = deps.tx.send(ServerFrame::Error {
-                        message: "已有任务运行中".into(),
-                    }) {
-                        tracing::warn!(?e, "广播错误帧失败");
+                    // 已有任务运行中：把消息作为 steering 投递（移植 oh-my-pi——忙时 steer 而非拒绝）。
+                    // Immediate 策略会尽快打断在途的可中断工具，在下一注入边界把消息投给模型。
+                    let frame_text = text.clone();
+                    let _steered = match &content {
+                        Some(blocks) if !blocks.is_empty() => {
+                            let mut contents: Vec<UserContent> = Vec::new();
+                            if !text.is_empty() {
+                                contents.push(UserContent::Text { text });
+                            }
+                            let uploads_snapshot = deps.uploads.lock().await.clone();
+                            for b in blocks {
+                                if let Some(uc) = b.to_user_content(&uploads_snapshot) {
+                                    contents.push(uc);
+                                }
+                            }
+                            deps.uploads.lock().await.clear();
+                            deps.agent.steer(agent_core::AgentMessage::user(contents))
+                        }
+                        _ => deps.agent.steer(agent_core::AgentMessage::user_text(text)),
+                    };
+                    if let Err(e) = deps.tx.send(ServerFrame::Steered { text: frame_text }) {
+                        tracing::warn!(?e, "广播 steering 帧失败");
                     }
                     continue;
                 }
@@ -1037,7 +1059,7 @@ async fn build_agent(
     // 长回复被中途截断（finish_reason=length）→ 误报「任务完成」。
     let max_output_tokens = model.max_output_tokens;
     let agent = assemble(
-        Agent::builder(model),
+        Agent::builder(model).steering(),
         provider,
         tools,
         lsp_pool,
