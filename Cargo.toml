@@ -88,6 +88,8 @@ serde_yaml = "0.9"
 aes-gcm    = "0.10"
 rand       = { version = "0.8", features = ["std_rng"] }
 base64     = "0.22"
+# 文本编码兜底（run_command 在 Windows 按 OEM 代码页解码非 UTF-8 输出，如 CP936/GBK）
+encoding_rs = "0.8"
 # 图像 / 剪贴板（CLI 图片粘贴：RGBA→PNG 编码 + 跨平台剪贴板读取）
 image      = { version = "0.25", default-features = false, features = ["png"] }
 arboard    = "3"

@@ -205,13 +205,13 @@ where
 fn combine_capped(out: Vec<u8>, err: Vec<u8>) -> String {
     let mut combined = String::new();
     if !out.is_empty() {
-        combined.push_str(&String::from_utf8_lossy(&out));
+        combined.push_str(&decode_output(&out));
     }
     if !err.is_empty() {
         if !combined.is_empty() {
             combined.push_str("\n[stderr]\n");
         }
-        combined.push_str(&String::from_utf8_lossy(&err));
+        combined.push_str(&decode_output(&err));
     }
     if combined.len() > CMD_MAX_OUTPUT {
         // 回退到最近的 UTF-8 字符边界，避免 truncate panic。
@@ -223,6 +223,36 @@ fn combine_capped(out: Vec<u8>, err: Vec<u8>) -> String {
         combined.push_str("\n...(输出过长，已截断)");
     }
     combined
+}
+
+/// 构造 Windows 命令前置：`chcp 65001 >nul && <command>`，把 cmd 控制台代码页切到 UTF-8。
+///
+/// 单独成函数便于在非 Windows 平台单测包裹格式。`>nul` 抑制 `chcp` 自身的
+/// "Active code page: 65001" 提示行，避免污染命令输出。
+fn windows_utf8_wrapper(command: &str) -> String {
+    format!("chcp 65001 >nul && {command}")
+}
+
+/// 解码子进程输出字节为字符串。
+///
+/// 优先严格 UTF-8——force-UTF-8（Unix 经 `forced_utf8_locale` 注入 LC_ALL/LANG；Windows 经
+/// `chcp 65001` + Python env）生效时输出即 UTF-8，此路径零损耗。失败时按 `gbk_fallback`
+/// 决定兜底：Windows 下按 GBK（中文 Windows 的 OEM 代码页 CP936）解码以正确显示中文；
+/// 其余情形退化为 lossy，避免把罕见非 UTF-8 字节误判为 GBK。
+fn decode_bytes(bytes: &[u8], gbk_fallback: bool) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    if gbk_fallback {
+        encoding_rs::GBK.decode_without_bom_handling(bytes).0.into_owned()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// 解码子进程输出：严格 UTF-8 优先；Windows 下失败回退 GBK，其余回退 lossy。
+fn decode_output(bytes: &[u8]) -> String {
+    decode_bytes(bytes, cfg!(windows))
 }
 
 /// 命令墙钟超时上限。
@@ -247,11 +277,48 @@ fn shell_command(command: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
         let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command);
+        // 强制 UTF-8：前置 `chcp 65001` 把 cmd 控制台代码页切到 UTF-8，使 cmd 内建命令
+        // （echo/dir…）及尊重输出代码页的程序以 UTF-8 输出（`>nul` 抑制 chcp 自身提示行）。
+        // 与 Unix 的 `forced_utf8_locale` 注入对齐，确保下游 `from_utf8` 解码不乱码。
+        c.arg("/C").arg(windows_utf8_wrapper(command));
+        // Python：强制 UTF-8 stdio（覆盖 Windows 默认的 ANSI 代码页）。
+        c.env("PYTHONUTF8", "1");
+        c.env("PYTHONIOENCODING", "utf-8");
         c
     }
     #[cfg(not(any(unix, windows)))]
     {
         compile_error!("run_command 仅支持 unix 与 windows");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_wrapper_prepends_utf8_codepage() {
+        assert_eq!(windows_utf8_wrapper("echo 你好"), "chcp 65001 >nul && echo 你好");
+    }
+
+    #[test]
+    fn decode_bytes_passthrough_valid_utf8() {
+        assert_eq!(decode_bytes("你好".as_bytes(), true), "你好");
+        assert_eq!(decode_bytes("ascii".as_bytes(), false), "ascii");
+    }
+
+    #[test]
+    fn decode_bytes_gbk_fallback_recovers_chinese() {
+        // "你好" in GBK (CP936): C4 E3 BA C3 —— 既非合法 UTF-8，应触发 GBK 兜底。
+        let gbk = [0xC4, 0xE3, 0xBA, 0xC3];
+        assert_eq!(decode_bytes(&gbk, true), "你好");
+    }
+
+    #[test]
+    fn decode_bytes_lossy_when_fallback_disabled() {
+        // 同样的 GBK 字节，关闭兜底时走 lossy（含 U+FFFD），不抛错。
+        let gbk = [0xC4, 0xE3, 0xBA, 0xC3];
+        let s = decode_bytes(&gbk, false);
+        assert!(s.contains('\u{FFFD}'), "lossy 应含替换字符，实际: {s:?}");
     }
 }
