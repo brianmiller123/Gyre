@@ -8,6 +8,8 @@ description = "Agent execution loop: state machine + tool orchestration + approv
 
 [dependencies]
 agent-core   = { workspace = true }
+agent-ttsr   = { workspace = true }
+agent-advisor = { workspace = true }
 agent-iso    = { workspace = true }
 agent-supervisor = { workspace = true }
 agent-tools  = { workspace = true }
@@ -27,6 +29,8 @@ sha2         = { workspace = true }
 [dev-dependencies]
 # 仅测试用：提供现成的 ContextManager 实现（InMemoryContext）以验证中断兜底持久化。
 agent-context = { workspace = true }
+# 仅测试用：无中毒检查的快速锁（FallbackProbe 调用记录）。
+parking_lot = "0.12"
 
 [lints]
 workspace = true

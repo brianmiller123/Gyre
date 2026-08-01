@@ -213,6 +213,19 @@ impl LspManager {
             .await
     }
 
+    /// 执行服务器命令（code action 的 command 路径）。
+    pub async fn execute_command(
+        &mut self,
+        uri: &Url,
+        command: &str,
+        arguments: &[serde_json::Value],
+    ) -> Result<serde_json::Value, LspError> {
+        self.client_for_uri(uri)
+            .await?
+            .execute_command(command, arguments)
+            .await
+    }
+
     /// 格式化整个文档：读盘 → 同步文档 → `textDocument/formatting` → 应用 edits。
     ///
     /// 服务器不支持 formatting 或无 edits 时返回 `Ok(None)`；否则返回格式化后的完整文本。

@@ -978,7 +978,10 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   )
 
   const newCollabRoom = useCallback(async () => {
-    const d = await apiGet<CollabRoom>('/api/collab/room')
+    // 绑定当前会话：guest 连接时由 host 下发会话历史快照（transcript 分页传输）。
+    const sid = sessionIdRef.current
+    const q = sid ? `?sid=${encodeURIComponent(sid)}` : ''
+    const d = await apiGet<CollabRoom>(`/api/collab/room${q}`)
     return d ?? null
   }, [apiGet])
 

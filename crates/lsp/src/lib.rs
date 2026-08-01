@@ -63,12 +63,14 @@
 #![warn(clippy::pedantic)]
 
 pub mod client;
+pub mod edits;
 pub mod detect;
 pub mod diagnostics_ledger;
 pub mod manager;
 pub mod transport;
 
-pub use client::{LspClient, LspError};
+pub use client::{LspClient, LspCodeAction, LspCommand, LspError, LspRenameEdit};
+pub use edits::apply_text_edits;
 pub use detect::{LspServerInfo, detect_servers, find_server_for_file, language_id_from_path};
 pub use diagnostics_ledger::DiagnosticsLedger;
 pub use manager::LspManager;

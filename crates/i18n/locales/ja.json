@@ -183,5 +183,9 @@
   "lang.name.zh": "中文",
   "lang.name.ru": "Русский",
   "lang.name.ja": "日本語",
-  "help.lang": "  /lang [コード]    表示 / 切替 UI 言語（en|zh|ru|ja）"
+  "help.lang": "  /lang [コード]    表示 / 切替 UI 言語（en|zh|ru|ja）",
+  "context.foreign_loaded": "外来エージェント設定を {count} 件読み込みました（AGENTS.md/CLAUDE.md/Cursor/Cline）",
+  "collab.write_link": "│ 書き込みリンク : http://{bind}/collab/{room}?wt={token}",
+  "collab.view_link": "│ 読み取り専用リンク : http://{bind}/collab/{room}（wt なし → 読み取り専用）",
+  "collab.wt_tip": "ヒント: 書き込みリンクには 16 バイトの書き込みトークン（wt）が含まれ、中継は wt で公開権限を検証します。スナップショットはチャンク転送（各 ≤48KB）、再接続時は ~/.gyre/collab/ から復元できます。"
 }

@@ -71,6 +71,27 @@ pub enum LlmError {
     Unsupported(String),
 }
 
+impl LlmError {
+    /// 是否可经 fallback 链换适配器重试（P2：Provider 路由增强）。
+    ///
+    /// 可重试：网络/传输错误、5xx、429 速率限制、401/403 鉴权（换 key/provider 有意义）。
+    /// 不可重试：其余 4xx（客户端错误，换 provider 无意义）、流式中断（已开始流数据）、
+    /// 解码失败（provider 特有响应格式）、不支持（路由层已排除）。
+    #[must_use]
+    pub const fn is_fallbackable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_)
+                | Self::RateLimit { .. }
+                | Self::Auth(_)
+                | Self::Http {
+                    status: 401 | 403 | 429 | 500..,
+                    ..
+                }
+        )
+    }
+}
+
 /// 工具执行相关错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {

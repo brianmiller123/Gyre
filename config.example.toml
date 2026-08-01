@@ -162,6 +162,9 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 
 # 子 Agent（task 委派 + swarm 多代理编排）统一配置。
 # 控制 task 工具开关、并发护栏、是否继承父 temperature/thinking、独立 token 预算。
+[ttsr]
+# enabled = true          # 缺省：存在规则即启用；false 关闭
+# disabled_rules = ["no-box-leak"]   # 按规则名禁用
 [subagent]
 enabled            = true      # 总开关：false 则不注册 task 工具，且 /swarm 拒绝执行
 max_concurrent     = 4         # 同波/并行子 Agent 最大并发数（信号量护栏，防触发上游速率限制）

@@ -216,6 +216,8 @@ mod tests {
             resources: None,
             write_effect: None,
             update_tx: None,
+            conflicts: None,
+            pending_rewrites: None,
         }
     }
 

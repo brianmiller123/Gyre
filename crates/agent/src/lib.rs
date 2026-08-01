@@ -31,10 +31,29 @@ use tracing::Instrument;
 
 /// GPT-5 Harmony-header 泄漏检测与恢复（移植 oh-my-pi `harmony-leak`）。
 mod harmony;
+pub mod keywords;
 mod pause;
 mod task_tool;
 pub use pause::PauseGate;
 pub use task_tool::{ContextFactory, TaskTool};
+
+/// P1-L：advisor 评审触发周期（每 N 轮一次；评审本身是独立 LLM 调用，太频繁会拖慢主循环）。
+const ADVISOR_EVERY_N_TURNS: usize = 4;
+
+/// 把 TTSR 提醒文本前置到工具结果（Text 前置文本；Error 前置到 message；Image 跳过）。
+fn prepend_reminder(result: &ToolResult, reminder: &str) -> ToolResult {
+    match result {
+        ToolResult::Text(t) => ToolResult::Text(format!("{reminder}\n{t}")),
+        ToolResult::Error {
+            recoverable,
+            message,
+        } => ToolResult::Error {
+            recoverable: *recoverable,
+            message: format!("{reminder}\n{message}"),
+        },
+        ToolResult::Image { .. } => result.clone(),
+    }
+}
 
 /// 工具执行期的 steering 中断策略（移植 oh-my-pi `interruptMode`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -79,6 +98,36 @@ pub trait RuntimeOverrides: Send + Sync {
     /// 切换 / key 限流降级，无需重建 Agent。返回 `None` 沿用启动期 key。
     fn api_key(&self, _model: &agent_core::Model) -> Option<String> {
         None
+    }
+}
+
+/// 单模型的 API key 轮换环（round-robin）。
+///
+/// P2：配置层 `[[models]].api_keys` 多 key 列表 → 每轮请求换下一个 key，
+/// 任一 key 被限流/撤销时自动切换（配合 registry 的 fallback 重试语义）。
+/// 轮换状态是原子计数，`Agent` 并发安全。
+pub struct KeyRing {
+    keys: Vec<String>,
+    index: std::sync::atomic::AtomicUsize,
+}
+
+impl KeyRing {
+    /// 构造轮换环（`keys` 为空时 [`Self::next`] 恒返回 `None`，等同不轮换）。
+    #[must_use]
+    pub fn new(keys: Vec<String>) -> Self {
+        Self {
+            keys,
+            index: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// 取下一个 key（按轮次取模）。空环返回 `None`。
+    pub fn next(&self) -> Option<String> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let idx = self.index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(self.keys[idx % self.keys.len()].clone())
     }
 }
 
@@ -146,6 +195,20 @@ pub struct Agent {
     /// 进程级暂停门（可选；注入后在每次 provider 调用前 / 工具批执行前 park）。
     /// 共享单例由 host 驱动（CLI/Web `/pause`）；移植 oh-my-pi `AgentPauseGate`。
     pause_gate: Option<Arc<PauseGate>>,
+    /// TTSR 流规则协调器（可选；注入后对流式输出实时匹配规则，命中中断重试）。
+    ttsr: Option<Arc<agent_ttsr::TtsrCoordinator>>,
+    /// P1-L：独立评审 advisor（可选；每 N 轮评审一次快照，建议经 `[advisor:…]` 注入）。
+    advisor: Option<Arc<agent_advisor::Advisor>>,
+    /// advisor 评审触发周期（轮；默认 [`ADVISOR_EVERY_N_TURNS`]）。
+    advisor_every_n_turns: usize,
+    /// 会话级合并冲突注册表（read 注册 / write 解决，`conflict://` 协议）。
+    conflicts: Arc<std::sync::Mutex<agent_tools::ConflictHistory>>,
+    /// 会话级 ast-rewrite 暂存队列（`ast_rewrite preview:true` → `xd://resolve/reject`）。
+    pending_rewrites: Arc<std::sync::Mutex<Vec<agent_tools::PendingRewrite>>>,
+    /// P2：模型 fallback 链（主模型失败且错误可重试时依序尝试的备用模型）。
+    fallbacks: Vec<agent_core::Model>,
+    /// P2：API key 轮换环（model id → key 环；`runtime_overrides` 命中时优先，跳过轮换）。
+    key_rings: Arc<std::collections::HashMap<String, KeyRing>>,
 }
 
 impl Agent {
@@ -184,8 +247,13 @@ impl Agent {
             runtime_overrides: None,
             transform_assistant: None,
             write_effect: None,
+            fallbacks: Vec::new(),
+            key_rings: std::collections::HashMap::new(),
             interrupt_mode: InterruptMode::default(),
             pause_gate: None,
+            ttsr: None,
+            advisor: None,
+            advisor_every_n_turns: ADVISOR_EVERY_N_TURNS,
         }
     }
 
@@ -295,10 +363,20 @@ pub struct AgentBuilder {
     transform_assistant: Option<Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>>,
     /// 写入效果（编辑后 LSP format/diagnostics）。
     write_effect: Option<Arc<dyn WriteEffect>>,
+    /// P2：模型 fallback 链（主模型失败且错误可重试时依序尝试；跨线协议族亦可）。
+    fallbacks: Vec<agent_core::Model>,
+    /// P2：API key 轮换环（model id → key 列表；每轮请求 round-robin 换 key）。
+    key_rings: std::collections::HashMap<String, Vec<String>>,
     /// 工具执行期的 steering 中断策略。
     interrupt_mode: InterruptMode,
     /// 进程级暂停门。
     pause_gate: Option<Arc<PauseGate>>,
+    /// TTSR 流规则协调器（可选）。
+    ttsr: Option<Arc<agent_ttsr::TtsrCoordinator>>,
+    /// P1-L 独立评审 advisor（可选）。
+    advisor: Option<Arc<agent_advisor::Advisor>>,
+    /// advisor 评审触发周期（轮）。
+    advisor_every_n_turns: usize,
 }
 
 impl AgentBuilder {
@@ -391,6 +469,40 @@ impl AgentBuilder {
     /// 在途工作跑完后 park，resume 后继续；cancel 立即解除 park（无需 resume 整个进程）。
     pub fn pause_gate(mut self, gate: Arc<PauseGate>) -> Self {
         self.pause_gate = Some(gate);
+        self
+    }
+
+    /// 注入 TTSR 流规则协调器（`.gyre/rules` 发现后装配；`None` 禁用）。
+    pub fn ttsr(mut self, ttsr: Option<Arc<agent_ttsr::TtsrCoordinator>>) -> Self {
+        self.ttsr = ttsr;
+        self
+    }
+
+    /// 注入 P1-L 独立评审 advisor（每 N 轮评审一次；`None` 禁用）。
+    pub fn advisor(mut self, advisor: Option<Arc<agent_advisor::Advisor>>) -> Self {
+        self.advisor = advisor;
+        self
+    }
+
+    /// advisor 评审触发周期（轮；默认 4）。
+    #[must_use]
+    pub fn advisor_every_n_turns(mut self, n: usize) -> Self {
+        self.advisor_every_n_turns = n.max(1);
+        self
+    }
+
+    /// P2：模型 fallback 链——主模型调用失败且错误可重试（网络/5xx/429/鉴权）时，
+    /// 依序尝试这些备用模型（跨线协议族亦可，如 Anthropic 主 → OpenAI 备）。
+    /// 链上模型的 `thinking`/工具规格沿用主模型请求（备用模型宜同族同能力）。
+    pub fn fallbacks(mut self, models: Vec<agent_core::Model>) -> Self {
+        self.fallbacks = models;
+        self
+    }
+
+    /// P2：API key 轮换环（model id → key 列表）。每轮请求 round-robin 取下一个 key，
+    /// 任一 key 被限流/撤销时自动切换；[`RuntimeOverrides::api_key`] 命中时优先（跳过轮换）。
+    pub fn key_rings(mut self, rings: std::collections::HashMap<String, Vec<String>>) -> Self {
+        self.key_rings = rings.into_iter().filter(|(_, v)| !v.is_empty()).collect();
         self
     }
     /// 注入 Provider。
@@ -547,6 +659,11 @@ impl AgentBuilder {
             write_effect: self.write_effect,
             interrupt_mode: self.interrupt_mode,
             pause_gate: self.pause_gate,
+            ttsr: self.ttsr,
+            advisor: self.advisor,
+            advisor_every_n_turns: self.advisor_every_n_turns,
+            conflicts: Arc::new(std::sync::Mutex::new(agent_tools::ConflictHistory::new())),
+            pending_rewrites: Arc::new(std::sync::Mutex::new(Vec::new())),
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
             steer_tx: self.steer_tx,
@@ -554,6 +671,13 @@ impl AgentBuilder {
             followup_rx: tokio::sync::Mutex::new(self.followup_rx),
             runtime_overrides: self.runtime_overrides,
             transform_assistant: self.transform_assistant,
+            fallbacks: self.fallbacks,
+            key_rings: Arc::new(
+                self.key_rings
+                    .into_iter()
+                    .map(|(id, keys)| (id, KeyRing::new(keys)))
+                    .collect(),
+            ),
         }
     }
 }
@@ -672,6 +796,16 @@ fn run_loop(
     let runtime_overrides = agent.runtime_overrides.clone();
     // transform_assistant：Arc clone（廉价），每轮最终化后调用。
     let transform_assistant = agent.transform_assistant.clone();
+    // TTSR：流规则协调器（可选）。
+    let ttsr = agent.ttsr.clone();
+    let advisor = agent.advisor.clone();
+    let advisor_every_n_turns = agent.advisor_every_n_turns;
+    // 合并冲突注册表（`read_file :conflicts` 注册 / `write_file conflict://N` 解决）。
+    let conflicts = Arc::clone(&agent.conflicts);
+    let pending_rewrites = Arc::clone(&agent.pending_rewrites);
+    // P2：模型 fallback 链 + key 轮换环（Arc clone 廉价；stream! 内每轮尝试链/取 key）。
+    let fallbacks = agent.fallbacks.clone();
+    let key_rings = Arc::clone(&agent.key_rings);
 
     async_stream::stream! {
         // P1-D：GenAI invoke_agent span（OTel 语义规范）——agent run 的逻辑根 span。
@@ -718,14 +852,40 @@ fn run_loop(
             }
         }
         context.set_system(system, &specs0).await;
+        // Magic keywords：散文词命中 → 隐藏通知先于用户消息注入；`ultrathink` 额外拉满
+        // 思考预算（见下方 thinking 解析）。`workflowz` 需要 task 工具在场。
+        let has_task_tool = specs0.iter().any(|s| s.name == "task");
+        let keyword_detect = keywords::detect(&prompt_text, has_task_tool);
+        for notice in &keyword_detect.notices {
+            context
+                .append(agent_core::AgentMessage::user_text(notice.clone()))
+                .await;
+        }
         context.append(agent_core::AgentMessage::User(user_msg)).await;
         yield AgentEvent::StateChanged(AgentState::Running);
+
+        // TTSR：恢复会话中已注入的规则抑制状态（扫描 `[ttsr-injection:…]` 标记消息）。
+        // 注入状态存于分支日志（消息级元数据），压缩/分支切换/恢复后不重复注入。
+        if let Some(t) = &ttsr {
+            let nodes = context.snapshot_nodes().await;
+            let msgs: Vec<agent_core::AgentMessage> =
+                nodes.into_iter().map(|n| n.message).collect();
+            t.restore_from_messages(&msgs);
+        }
 
         // P1-K：自适应思考预算——按本轮 prompt 难度解析 ThinkingConfig（移植 oh-my-pi
         // auto-thinking）。Auto 策略经分类器决定 Effort → budget，钳到模型范围；分类失败 →
         // fallback；模型不支持思考 → None（本轮不思考）。Static/None → 沿用静态 thinking。
         // 每轮 prompt 难度恒定，解析一次/run 即可（分类器成本 ≤ 一次 tiny 模型调用）。
-        let thinking: Option<ThinkingConfig> = if let Some(policy) = &thinking_policy {
+        // Magic keywords：`ultrathink` 跳过分类器，直接拉满模型支持的思考预算
+        //（移植 omp `clampAutoThinkingEffort(model, Effort.Max)` 的简化版）。
+        let thinking: Option<ThinkingConfig> = if keyword_detect.ultrathink {
+            if model.supports_thinking {
+                Some(ThinkingConfig::new(agent_core::Effort::XHigh.default_budget()))
+            } else {
+                None
+            }
+        } else if let Some(policy) = &thinking_policy {
             policy.resolve(&prompt_text, &model).await
         } else {
             thinking
@@ -746,6 +906,8 @@ fn run_loop(
         let mut escalate_soft = false;
         // P1-C：软需求升级计数——模型非合规（detour 或未调所需工具）连续 N 轮后中止。
         let mut soft_escalations: usize = 0;
+        // P1-L：advisor 评审轮次计数（每 ADVISOR_EVERY_N_TURNS 轮触发一次）。
+        let mut advisor_turn_counter: usize = 0;
 
         loop {
             // 取消检查
@@ -797,6 +959,34 @@ fn run_loop(
                             text: "已注入 aside 消息".into(),
                             kind: StatusKind::Info,
                         });
+                    }
+                }
+            }
+
+            // P1-L：advisor 双代理评审——每 ADVISOR_EVERY_N_TURNS 轮触发一次独立评审
+            // （快照脱敏 → 独立 provider 评审 → emission-guard 过滤），建议以
+            // `[advisor:<severity>]` 标记消息折叠注入 context（与 aside 同语义：不打断
+            // 在途工具，下一轮模型调用前可见）。评审失败仅告警，不阻断主循环。
+            if let Some(advisor) = &advisor {
+                advisor_turn_counter += 1;
+                if advisor_turn_counter % advisor_every_n_turns == 0 {
+                    let nodes = context.snapshot_nodes().await;
+                    let msgs: Vec<agent_core::AgentMessage> =
+                        nodes.into_iter().map(|n| n.message).collect();
+                    match advisor.review(&msgs, &provider_ctx).await {
+                        Ok(advices) => {
+                            for a in advices {
+                                let text = format!("[advisor:{}] {}", a.severity.label(), a.note);
+                                context.append(agent_core::AgentMessage::user_text(text)).await;
+                                yield AgentEvent::Say(StatusMessage {
+                                    text: format!("advisor ({})：{}", a.severity.label(), a.note),
+                                    kind: StatusKind::Info,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "advisor 评审失败（继续主循环）");
+                        }
                     }
                 }
             }
@@ -981,20 +1171,54 @@ fn run_loop(
                 gen_ai.usage.output_tokens = tracing::field::Empty,
                 gen_ai.response.finish_reason = tracing::field::Empty,
             );
-            // P1：mid-run 凭证覆盖（移植 oh-my-pi `getApiKey`）。每轮 stream 调用前，若 host
-            // 注入了 api_key 则覆盖 ctx，支持凭证轮换 / 多账号 / 限流降级而无需重建 Agent。
-            // ProviderCallContext 已 Clone；每轮 clone 成本可忽略（仅 api_key/base_url 字符串）。
-            let mut ctx_eff = provider_ctx.clone();
-            if let Some(k) = runtime_overrides.as_ref().and_then(|ro| ro.api_key(&model)) {
-                ctx_eff.api_key = Some(k);
+            // P2：模型 fallback 链 + API key 轮换。链 = [主模型] + 备用模型，依序尝试：
+            // 可重试错误（网络/5xx/429/鉴权）换下一模型；不可重试错误立即上抛。
+            // key 轮换：RuntimeOverrides 命中优先（host 动态凭证），否则按模型 key 环
+            // round-robin（配置层 `[[models]].api_keys`）。全链失败算一次 mistake。
+            let mut last_err: Option<agent_core::LlmError> = None;
+            let mut event_stream = None;
+            for (i, m) in std::iter::once(&model).chain(fallbacks.iter()).enumerate() {
+                // mid-run 凭证覆盖（移植 oh-my-pi `getApiKey`）：host 注入的 api_key 优先。
+                let mut ctx_eff = provider_ctx.clone();
+                if let Some(k) = runtime_overrides.as_ref().and_then(|ro| ro.api_key(m)) {
+                    ctx_eff.api_key = Some(k);
+                } else if let Some(ring) = key_rings.get(&m.id) {
+                    ctx_eff.api_key = ring.next();
+                }
+                let mut req = req.clone();
+                req.model = m.clone();
+                match provider
+                    .stream(req, &ctx_eff)
+                    .instrument(chat_span.clone())
+                    .await
+                {
+                    Ok(s) => {
+                        if i > 0 {
+                            tracing::info!(
+                                from = i,
+                                model = %m.id,
+                                "model fallback 成功（第 {} 个模型）",
+                                i + 1
+                            );
+                        }
+                        event_stream = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(model = %m.id, error = %e, "模型调用失败");
+                        let fallbackable = e.is_fallbackable();
+                        last_err = Some(e);
+                        if !fallbackable {
+                            break;
+                        }
+                    }
+                }
             }
-            let mut event_stream = match provider
-                .stream(req, &ctx_eff)
-                .instrument(chat_span.clone())
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
+            let mut event_stream = match event_stream {
+                Some(s) => s,
+                None => {
+                    // 主模型必然尝试过 → last_err 必有值。
+                    let e = last_err.expect("fallback 链至少尝试了主模型");
                     mistakes += 1;
                     yield AgentEvent::Error(format!("LLM 调用失败: {e}"));
                     if mistakes >= max_mistakes {
@@ -1012,11 +1236,17 @@ fn run_loop(
             // P1-E：消息开始边界（message 层生命周期）。流式首个增量前；消息体见后续
             // TextDelta/ThinkingDelta 增量与 MessageEnd。
             yield AgentEvent::MessageStart;
+            // TTSR：本轮开始（清流缓冲、轮号 +1）。
+            if let Some(t) = &ttsr {
+                t.on_turn_start();
+            }
 
             // 累积流式事件，以 MessageEnd 为权威结束。流式阶段同样响应取消，
             // 避免上游挂起时取消信号无法中断（仅靠 loop 顶部检查不足以打断 await）。
             let mut authoritative: Option<AssistantMessage> = None;
             let mut usage = Usage::default();
+            // TTSR：流式中命中的可中断规则名（命中即中断流，丢弃部分输出后重试）。
+            let mut ttsr_abort: Option<Vec<String>> = None;
             // 累积流式文本增量：流被取消/异常断开（未到达 MessageEnd）时，已生成并
             // 显示给用户的文本若不落盘会丢失对话历史。中断时兜底持久化（仅保留 Text——
             // Thinking 的 signature 在流式中不可靠，ToolCall 参数可能残缺，二者丢弃）。
@@ -1034,9 +1264,26 @@ fn run_loop(
                     ev = event_stream.next() => match ev {
                         Some(AssistantEvent::TextDelta(d)) => {
                             acc_text.push_str(&d);
+                            // TTSR：文本流实时匹配，命中可中断规则即中断流（丢弃部分输出
+                            // 后注入规则重试；违规增量不发射，用户看不到违规内容）。
+                            if let Some(t) = &ttsr {
+                                let names = t.check_text_delta(&d);
+                                if !names.is_empty() {
+                                    ttsr_abort = Some(names);
+                                    break;
+                                }
+                            }
                             yield AgentEvent::TextDelta(d);
                         }
                         Some(AssistantEvent::ThinkingDelta(d)) => {
+                            // TTSR：思考流实时匹配（缓冲在协调器内部，独立于 text）。
+                            if let Some(t) = &ttsr {
+                                let names = t.check_thinking_delta(&d);
+                                if !names.is_empty() {
+                                    ttsr_abort = Some(names);
+                                    break;
+                                }
+                            }
                             yield AgentEvent::ThinkingDelta(d);
                         }
                         Some(AssistantEvent::Usage(u)) => {
@@ -1051,6 +1298,37 @@ fn run_loop(
                         None => break,
                     },
                 }
+            }
+
+            // TTSR：流式中命中可中断规则 → 丢弃部分输出（discard 模式）、注入规则后重试。
+            // 中断即 drop event_stream（HTTP 连接关闭），已生成 token 不计费；重试前缀不变，
+            // 命中 provider prompt-cache 折扣价。受 max_turns 硬上限保护。
+            if let Some(names) = ttsr_abort.take() {
+                let t = ttsr.as_ref().expect("ttsr_abort 仅在注入 ttsr 时置位");
+                let text = t.render_injection(&names);
+                yield AgentEvent::Say(StatusMessage {
+                    text: format!(
+                        "检测到规则违规（{}），已中断输出并注入规则重试",
+                        names.join(", ")
+                    ),
+                    kind: StatusKind::Warning,
+                });
+                context
+                    .append(agent_core::AgentMessage::user_text(text))
+                    .await;
+                // P1-E：turn 边界——合成 aborted 消息维持 MessageStart/TurnEnd 配对。
+                yield AgentEvent::TurnEnd {
+                    message: AssistantMessage {
+                        content: Vec::new(),
+                        usage: Usage::default(),
+                        model: model.id.clone(),
+                        stop_reason: Some(StopReason::Aborted),
+                        stop_details: None,
+                    },
+                    tool_results: Vec::new(),
+                    will_continue: true,
+                };
+                continue;
             }
 
             let Some(assistant) = authoritative else {
@@ -1206,6 +1484,31 @@ fn run_loop(
                     _ => None,
                 })
                 .collect();
+
+            // TTSR：MessageEnd 对工具载荷做快照匹配（matcherDigest）。Always 规则 → 丢弃
+            // 整条 assistant（不 append）并注入重试；Never 规则 → 折叠提醒进工具结果
+            //（回填时 `take_reminder`）。
+            if let Some(t) = &ttsr {
+                if let agent_ttsr::ToolOutcome::Abort(names) = t.check_tool_calls(&assistant) {
+                    let text = t.render_injection(&names);
+                    yield AgentEvent::Say(StatusMessage {
+                        text: format!(
+                            "检测到工具调用违反规则（{}），丢弃本轮重试",
+                            names.join(", ")
+                        ),
+                        kind: StatusKind::Warning,
+                    });
+                    context
+                        .append(agent_core::AgentMessage::user_text(text))
+                        .await;
+                    yield AgentEvent::TurnEnd {
+                        message: assistant.clone(),
+                        tool_results: Vec::new(),
+                        will_continue: true,
+                    };
+                    continue;
+                }
+            }
 
             context
                 .append(agent_core::AgentMessage::Assistant(assistant.clone()))
@@ -1680,6 +1983,8 @@ fn run_loop(
                     .map(|r| r.as_ref() as &dyn agent_core::ResourceResolver),
                 write_effect: write_effect.as_ref().map(std::sync::Arc::as_ref),
                 update_tx: Some(&update_tx),
+                conflicts: Some(&conflicts),
+                pending_rewrites: Some(&pending_rewrites),
             };
             // 调度执行（Shared 并发 / Exclusive 屏障串行），结果按原始顺序返回。
             // Immediate 模式 + batch 含 interruptible 工具时，边执行边轮询 steering 队列，
@@ -1745,9 +2050,17 @@ fn run_loop(
                 // P1-E：工具执行结束（tool 层生命周期）。先判定 is_error 并构造持久化消息，
                 // 再发射事件 + 回填上下文（消息 move 进 context；事件与 turn 累积器持 clone）。
                 let is_error = matches!(&result, ToolResult::Error { .. });
+                // TTSR：折叠非打断规则提醒（Never 规则命中时前置 system-reminder 到结果）。
+                let effective_result = match &ttsr {
+                    Some(t) => t.take_reminder(&id).map_or_else(
+                        || result.clone(),
+                        |reminder| prepend_reminder(&result, &reminder),
+                    ),
+                    None => result.clone(),
+                };
                 let msg = ToolResultMessage {
                     tool_call_id: id.clone(),
-                    result: result.clone(),
+                    result: effective_result,
                 };
                 turn_tool_results.push(msg.clone());
                 yield AgentEvent::ToolExecutionEnd {
@@ -2052,6 +2365,7 @@ mod tests {
     };
     use agent_tools::{Concurrency, DefaultToolRegistry, Tool, ToolContext, ToolRegistry};
     use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use futures::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2151,6 +2465,8 @@ mod tests {
             resources: None,
             write_effect: None,
             update_tx: None,
+            conflicts: None,
+            pending_rewrites: None,
         }
     }
 
@@ -4913,5 +5229,808 @@ mod tests {
             vec![true, false],
             "on_turn_end 应在工具轮（will_continue=true）与停止轮（false）各调一次"
         );
+    }
+
+    // ── Magic keywords（ultrathink / orchestrate）集成 ────────────────────────
+
+    /// prompt 含 `orchestrate` → 隐藏通知先于用户消息注入 context；不含 → 无注入。
+    #[tokio::test]
+    async fn magic_keyword_orchestrate_injects_notice() {
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "kw",
+            "kw",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build();
+
+        let stream = agent.run("请 orchestrate 这些任务");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let texts: Vec<&str> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::User { content } => content.iter().find_map(
+                    |c| match c {
+                        agent_core::UserContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    },
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[magic-keyword:orchestrate]")),
+            "orchestrate 命中应注入隐藏通知"
+        );
+    }
+
+    /// `orchestrates`（复数）不命中：无通知注入。
+    #[tokio::test]
+    async fn magic_keyword_plural_does_not_inject() {
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "kw",
+            "kw",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build();
+
+        let stream = agent.run("请 orchestrates 这些任务");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let has_notice = built.messages.iter().any(|m| {
+            matches!(m, agent_core::ProviderMessage::User { content } if content.iter().any(
+                |c| matches!(c, agent_core::UserContent::Text { text } if text.contains("[magic-keyword:"))
+            ))
+        });
+        assert!(!has_notice, "复数形式不应命中关键词");
+    }
+
+    // ── Advisor（P1-L 独立评审）集成 ───────────────────────────────────────
+
+    /// advisor 专用 provider 桩：吐一条 blocker 建议后正常结束。
+    struct AdvisorProvider {
+        advice: &'static str,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for AdvisorProvider {
+        fn id(&self) -> &'static str {
+            "advisor-stub"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<BoxStream<'static, agent_core::AssistantEvent>, agent_core::LlmError> {
+            let msg = agent_core::AssistantMessage {
+                content: vec![agent_core::ContentBlock::Text {
+                    text: self.advice.into(),
+                }],
+                usage: agent_core::Usage::default(),
+                model: "advisor-stub".into(),
+                stop_reason: Some(agent_core::StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::TextDelta(self.advice.into()),
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// advisor 评审命中 → `[advisor:blocker]` 标记消息注入 context；filler 建议被 guard 拦截。
+    #[tokio::test]
+    async fn advisor_injects_blocker_advice() {
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "adv",
+            "adv",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let advisor = agent_advisor::Advisor::new(
+            Arc::new(AdvisorProvider {
+                advice: "[blocker] The fix no longer matches acceptance criteria.",
+            }),
+            model.clone(),
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .advisor(Some(Arc::new(advisor)))
+            .advisor_every_n_turns(1)
+            .build();
+
+        let stream = agent.run("请完成任务");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let has_advice = built.messages.iter().any(|m| {
+            matches!(m, agent_core::ProviderMessage::User { content } if content.iter().any(
+                |c| matches!(c, agent_core::UserContent::Text { text }
+                    if text.contains("[advisor:blocker]") && text.contains("acceptance criteria"))
+            ))
+        });
+        assert!(has_advice, "blocker 建议应注入 context");
+    }
+
+    /// filler（"Stop."）不注入；评审失败（provider 报错）不阻断主循环。
+    #[tokio::test]
+    async fn advisor_filters_filler_and_tolerates_failure() {
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "adv",
+            "adv",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let advisor = agent_advisor::Advisor::new(
+            Arc::new(AdvisorProvider { advice: "[nit] Stop." }),
+            model.clone(),
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .advisor(Some(Arc::new(advisor)))
+            .advisor_every_n_turns(1)
+            .build();
+
+        let stream = agent.run("请完成任务");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let has_advice = built.messages.iter().any(|m| {
+            matches!(m, agent_core::ProviderMessage::User { content } if content.iter().any(
+                |c| matches!(c, agent_core::UserContent::Text { text } if text.contains("[advisor:"))
+            ))
+        });
+        assert!(!has_advice, "filler 建议不应注入");
+    }
+
+    // ── TTSR（时间旅行流规则）集成 ───────────────────────────────────────────
+
+    /// 构造 TTSR 协调器（单条文本规则 `leak`：匹配 `Box::leak`）。
+    fn ttsr_leak_coordinator() -> std::sync::Arc<agent_ttsr::TtsrCoordinator> {
+        std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
+            agent_ttsr::TtsrConfig::default(),
+            vec![agent_ttsr::parse_rule(
+                "leak",
+                "---\ncondition: [Box::leak]\n---\n禁止在生产代码路径使用 Box::leak。",
+            )
+            .unwrap()],
+        ))
+    }
+
+    /// 单轮工具调用 Provider：**前 `violating_calls` 次**返回指定工具调用，后续返回纯文本
+    /// 收尾（保证测试有界终止）。
+    struct SingleToolCallProvider {
+        tool: &'static str,
+        args: serde_json::Value,
+        calls: Arc<AtomicUsize>,
+        /// 返回违规工具调用的次数（之后返回收尾文本）。
+        violating_calls: usize,
+    }
+    impl SingleToolCallProvider {
+        fn new(
+            tool: &'static str,
+            args: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                tool,
+                args,
+                calls,
+                violating_calls: 1,
+            }
+        }
+        fn violating(mut self, n: usize) -> Self {
+            self.violating_calls = n;
+            self
+        }
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for SingleToolCallProvider {
+        fn id(&self) -> &'static str {
+            "ttsr-tool"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<BoxStream<'static, agent_core::AssistantEvent>, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = if n < self.violating_calls {
+                agent_core::AssistantMessage {
+                    content: vec![agent_core::ContentBlock::ToolCall {
+                        id: format!("call-{n}"),
+                        name: self.tool.into(),
+                        arguments: self.args.clone(),
+                    }],
+                    usage: agent_core::Usage::default(),
+                    model: "ttsr-tool".into(),
+                    stop_reason: Some(agent_core::StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                agent_core::AssistantMessage {
+                    content: vec![agent_core::ContentBlock::Text {
+                        text: "完成".into(),
+                    }],
+                    usage: agent_core::Usage::default(),
+                    model: "ttsr-tool".into(),
+                    stop_reason: Some(agent_core::StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 流式 Provider：按序发射文本增量 + 无工具 MessageEnd；记录调用次数。
+    struct TtsrStreamProvider {
+        calls: Arc<AtomicUsize>,
+    }    #[async_trait]
+    impl agent_core::LlmProvider for TtsrStreamProvider {
+        fn id(&self) -> &'static str {
+            "ttsr-stream"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<BoxStream<'static, agent_core::AssistantEvent>, agent_core::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = agent_core::AssistantMessage {
+                content: vec![agent_core::ContentBlock::Text {
+                    text: "完成".into(),
+                }],
+                usage: agent_core::Usage::default(),
+                model: "ttsr-stream".into(),
+                stop_reason: Some(agent_core::StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::TextDelta("let x = ".into()),
+                agent_core::AssistantEvent::TextDelta("Box::leak".into()),
+                agent_core::AssistantEvent::TextDelta("(y);".into()),
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 流式命中规则 → 中断流、丢弃部分输出、注入规则并重试（provider 被调 2 次）；
+    /// once 抑制：第二次调用不再中断。
+    #[tokio::test]
+    async fn ttsr_mid_stream_abort_injects_and_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "ttsr-stream",
+            "ttsr-stream",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider { calls: calls.clone() }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .ttsr(Some(ttsr_leak_coordinator()))
+            .build();
+
+        let mut saw_warning = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev {
+                if s.text.contains("规则违规") && s.text.contains("leak") {
+                    saw_warning = true;
+                }
+            }
+        }
+        assert!(saw_warning, "应发出规则违规警告");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "中断后应重试一次（once 抑制，第二次不再中断）"
+        );
+        // 注入消息已进上下文（带持久化标记）。
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let has_marker = built.messages.iter().any(|m| {
+            matches!(m, agent_core::ProviderMessage::User { content } if content.iter().any(
+                |c| matches!(c, agent_core::UserContent::Text { text } if text.contains("[ttsr-injection:leak]"))
+            ))
+        });
+        assert!(has_marker, "注入消息应带 [ttsr-injection:leak] 标记");
+        // 违规增量未被发射（用户在 UI 上看不到违规内容）。
+        let built2 = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let _ = built2;
+    }
+
+    /// 会话加载恢复：上下文中已存在注入标记 → 规则抑制，不再中断（provider 仅调 1 次）。
+    #[tokio::test]
+    async fn ttsr_restore_from_context_suppresses_refire() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        ctx.append(agent_core::AgentMessage::user_text(
+            "[ttsr-injection:leak]\n<system-interrupt reason=\"rule_violation\" rule=\"leak\">\n禁止 Box::leak。\n</system-interrupt>",
+        ))
+        .await;
+        let model = agent_core::Model::with_defaults(
+            "ttsr-stream",
+            "ttsr-stream",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TtsrStreamProvider { calls: calls.clone() }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .ttsr(Some(ttsr_leak_coordinator()))
+            .build();
+
+        let mut saw_warning = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev {
+                if s.text.contains("规则违规") {
+                    saw_warning = true;
+                }
+            }
+        }
+        assert!(!saw_warning, "恢复抑制后不应再次中断");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "不应重试");
+    }
+
+    /// 工具作用域非打断规则：MessageEnd 快照命中 → 提醒折叠进工具结果（不中断执行）。
+    #[tokio::test]
+    async fn ttsr_tool_never_rule_folds_reminder_into_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let ttsr = std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
+            agent_ttsr::TtsrConfig::default(),
+            vec![agent_ttsr::parse_rule(
+                "no-secret",
+                "---\nscope: tool:echo\ninterruptMode: never\ncondition: [secret]\n---\n不要输出 secret。",
+            )
+            .unwrap()],
+        ));
+        // 回显工具（把参数 JSON 作为结果文本返回，便于断言折叠）。
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(reg);
+        // Provider：单轮返回含 echo 工具调用的消息。
+        let provider = SingleToolCallProvider::new(
+            "echo",
+            serde_json::json!({ "message": "secret here" }),
+            calls.clone(),
+        );
+        let model = agent_core::Model::with_defaults(
+            "ttsr-tool",
+            "ttsr-tool",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(provider))
+            .tools(Arc::clone(&tools))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .ttsr(Some(ttsr))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let tool_msgs: Vec<String> = built
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_msgs.iter().any(|c| c.contains("<system-reminder reason=\"rule_violation\" rule=\"no-secret\">")),
+            "工具结果应折叠 system-reminder 提醒"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "非打断规则不应触发重试（工具轮执行后正常收尾，共 2 次调用）"
+        );
+    }
+
+    /// 工具作用域可中断规则：MessageEnd 快照命中 → 丢弃整条 assistant、注入后重试；
+    /// 第一轮工具未执行（max_seen == 0 只统计第二轮）。
+    #[tokio::test]
+    async fn ttsr_tool_always_rule_discards_and_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn agent_core::ContextManager> =
+            Arc::new(InMemoryContext::new(vec![]));
+        let ttsr = std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
+            agent_ttsr::TtsrConfig::default(),
+            vec![agent_ttsr::parse_rule(
+                "no-secret",
+                "---\nscope: tool:echo\ncondition: [secret]\n---\n不要输出 secret。",
+            )
+            .unwrap()],
+        ));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(reg);
+        let provider = SingleToolCallProvider::new(
+            "echo",
+            serde_json::json!({ "message": "secret here" }),
+            calls.clone(),
+        )
+        .violating(2);
+        let model = agent_core::Model::with_defaults(
+            "ttsr-tool",
+            "ttsr-tool",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(provider))
+            .tools(Arc::clone(&tools))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .ttsr(Some(ttsr))
+            .build();
+
+        let mut saw_warning = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev {
+                if s.text.contains("工具调用违反规则") {
+                    saw_warning = true;
+                }
+            }
+        }
+        assert!(saw_warning, "应发出工具违规警告");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "可中断工具规则：abort 轮 + 执行轮 + 收尾轮（once 抑制后第二轮正常执行）"
+        );
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let has_marker = built.messages.iter().any(|m| {
+            matches!(m, agent_core::ProviderMessage::User { content } if content.iter().any(
+                |c| matches!(c, agent_core::UserContent::Text { text } if text.contains("[ttsr-injection:no-secret]"))
+            ))
+        });
+        assert!(has_marker, "注入消息应带 [ttsr-injection:no-secret] 标记");
+    }
+
+    // ── P2：模型 fallback 链 + API key 轮换 ────────────────────────────────
+
+    /// 按模型 id 分派 + 记录调用（model.id, ctx.api_key）的桩 Provider。
+    struct FallbackProbe {
+        calls: Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>,
+        /// 对这些 id 返回可重试错误（其余返回 done）。
+        fail_ids: &'static [&'static str],
+        /// 对该 id 返回**不可重试**错误（换模型无意义，应立即上抛）。
+        hard_fail_id: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl agent_core::LlmProvider for FallbackProbe {
+        fn id(&self) -> &'static str {
+            "probe"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            self.calls.lock().push((req.model.id.clone(), ctx.api_key.clone()));
+            if self.hard_fail_id == Some(req.model.id.as_str()) {
+                return Err(agent_core::LlmError::Decode("不可重试".into()));
+            }
+            if self.fail_ids.contains(&req.model.id.as_str()) {
+                return Err(agent_core::LlmError::Transport("boom".into()));
+            }
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                usage: Usage::default(),
+                model: req.model.id.clone(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    fn probe_agent(
+        probe: Arc<FallbackProbe>,
+        model: agent_core::Model,
+        fallbacks: Vec<agent_core::Model>,
+        key_rings: std::collections::HashMap<String, Vec<String>>,
+    ) -> AgentBuilder {
+        Agent::builder(model)
+            .provider(probe)
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::new(InMemoryContext::new(vec!["sys".into()])))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .fallbacks(fallbacks)
+            .key_rings(key_rings)
+    }
+
+    /// 主模型失败（可重试）→ 依序尝试备用模型；全链只算一次 LLM 调用失败。
+    #[tokio::test]
+    async fn model_fallback_switches_to_next_model() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &["primary"],
+            hard_fail_id: None,
+        });
+        let primary = agent_core::Model::with_defaults(
+            "primary",
+            "p",
+            agent_core::Api::AnthropicMessages,
+        );
+        let backup = agent_core::Model::with_defaults(
+            "backup",
+            "p",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = probe_agent(probe, primary, vec![backup], Default::default()).build();
+        let mut said = String::new();
+        let mut errs = 0;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::MessageEnd(m) => {
+                    for c in &m.content {
+                        if let agent_core::ContentBlock::Text { text } = c {
+                            said.push_str(text);
+                        }
+                    }
+                }
+                AgentEvent::Error(_) => errs += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(said, "done", "备用模型应产出结果");
+        assert_eq!(errs, 0);
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "主模型失败后应尝试备用模型");
+        assert_eq!(calls[0].0, "primary");
+        assert_eq!(calls[1].0, "backup");
+    }
+
+    /// 全链失败 = 本轮 1 个 mistake（轮内换模型不重复计错）；max_mistakes=1 时一轮即停。
+    #[tokio::test]
+    async fn model_fallback_all_fail_yields_error_and_counts_single_mistake() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &["primary", "backup"],
+            hard_fail_id: None,
+        });
+        let primary = agent_core::Model::with_defaults(
+            "primary",
+            "p",
+            agent_core::Api::AnthropicMessages,
+        );
+        let backup = agent_core::Model::with_defaults("backup", "p", agent_core::Api::Zai);
+        let agent = probe_agent(probe, primary, vec![backup], Default::default())
+            .max_mistakes(1)
+            .build();
+        let mut errs = 0;
+        let mut stopped = false;
+        let mut saw_boom = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Error(e) => {
+                    errs += 1;
+                    if e.contains("boom") {
+                        saw_boom = true;
+                    }
+                }
+                AgentEvent::StateChanged(agent_core::AgentState::Idle) => stopped = true,
+                _ => {}
+            }
+        }
+        assert!(saw_boom, "应透传底层错误");
+        assert_eq!(errs, 2, "boom 错误 + 停止提示各一次（全链失败只算 1 个 mistake）");
+        assert!(stopped, "达到 max_mistakes 应停止");
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "本轮应尝试链上全部模型");
+    }
+
+    /// 不可重试错误（解码失败等）立即上抛，不浪费备用模型尝试。
+    #[tokio::test]
+    async fn model_fallback_hard_error_aborts_chain() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: Some("primary"),
+        });
+        let primary = agent_core::Model::with_defaults(
+            "primary",
+            "p",
+            agent_core::Api::AnthropicMessages,
+        );
+        let backup = agent_core::Model::with_defaults("backup", "p", agent_core::Api::Zai);
+        let agent = probe_agent(probe, primary, vec![backup], Default::default())
+            .max_mistakes(1)
+            .build();
+        let mut errs = 0;
+        let mut saw_hard = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Error(e) = ev {
+                errs += 1;
+                if e.contains("不可重试") {
+                    saw_hard = true;
+                }
+            }
+        }
+        assert!(saw_hard, "应透传不可重试错误");
+        assert_eq!(errs, 2, "错误 + 停止提示");
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1, "不可重试错误不应尝试备用模型");
+    }
+
+    /// key 环 round-robin：同模型多次调用依序取 key；RuntimeOverrides 命中时优先。
+    #[tokio::test]
+    async fn key_ring_rotates_and_override_wins() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: None,
+        });
+        let model = agent_core::Model::with_defaults(
+            "primary",
+            "p",
+            agent_core::Api::AnthropicMessages,
+        );
+        let rings =
+            std::collections::HashMap::from([("primary".to_string(), vec!["k1".to_string(), "k2".to_string()])]);
+        let agent = probe_agent(Arc::clone(&probe), model.clone(), Vec::new(), rings).build();
+        let mut stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(_) = ev {
+                break;
+            }
+        }
+        let mut stream = agent.run("go2");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(_) = ev {
+                break;
+            }
+        }
+        // override 优先：命中时跳过轮换。
+        struct KeyOverride;
+        impl RuntimeOverrides for KeyOverride {
+            fn api_key(&self, _m: &agent_core::Model) -> Option<String> {
+                Some("override-key".into())
+            }
+        }
+        let agent2 = probe_agent(Arc::clone(&probe), model, Vec::new(), Default::default())
+            .runtime_overrides(Arc::new(KeyOverride))
+            .build();
+        let mut stream = agent2.run("go3");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(_) = ev {
+                break;
+            }
+        }
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].1.as_deref(), Some("k1"), "首轮 k1");
+        assert_eq!(calls[1].1.as_deref(), Some("k2"), "次轮 k2（round-robin）");
+        assert_eq!(calls[2].1.as_deref(), Some("override-key"), "override 优先");
+    }
+
+    #[test]
+    fn key_ring_round_robins() {
+        let ring = KeyRing::new(vec!["k1".into(), "k2".into()]);
+        assert_eq!(ring.next().as_deref(), Some("k1"));
+        assert_eq!(ring.next().as_deref(), Some("k2"));
+        assert_eq!(ring.next().as_deref(), Some("k1"));
+        assert!(KeyRing::new(Vec::new()).next().is_none(), "空环不轮换");
     }
 }

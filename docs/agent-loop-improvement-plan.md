@@ -863,3 +863,331 @@ Gyre 无 refusal 识别（与普通 error 混同）。此为已计划 [`P2-J`](#
 - **第三轮首选**：**P0-G（结构化 handoff 提示词）**——一处提示词改动即可显著提升 summarize 压缩与分支切换 handoff 的恢复质量（模型不再丢线索/重复工作），改动极小、零风险、立即可见。**P1-G（停止边界 steering 再检查）**——修复「用户在最后一轮期间发消息被搁置到下次 prompt」的 UX 缺陷，改动小。两者建议作为第三轮首批落地。
 - **第四轮首选**：**P0-L（snapcompact 图像化压缩）**——把昂贵的本地 LLM summarize 替换为本地 PNG 渲染，长会话压缩成本与延迟降一个数量级，且信息以图像形式保留（视觉模型直接读图回放，比文本摘要丢信息少）。工作量大（Rust 栅格化 + bitmap 字体 + provider 感知帧形状）但 ROI 最高，建议作为本轮攻关首选。**P1-K（auto-thinking）** 与 **P2-P（refusal 过滤）** 改动小、立即可见，可作为本批「速修暖身」与 P0-L 并行。
 - **第四轮差异化**：**P1-L（advisor 双代理评审）** 与 **P1-M（goals 目标预算）** 是 oh-my-pi 真正区别于普通 Agent 循环的「智能层」——Gyre 已把循环引擎吃透，下一步竞争力于此。建议 P0-L 落地后启动。
+
+---
+
+## 第五轮深度对比（2026-08）：产品层三件套（TTSR / conflict:// / magic keywords）
+
+> 依据 [`oh-my-pi-feature-analysis.md`](oh-my-pi-feature-analysis.md) 的 P0 优先级落地。
+> 循环引擎已吃透，本轮补**引擎之上的智能层与工具面**。全部完成，610 项 workspace 测试全绿。
+
+### 🔴 P0-TTSR：时间旅行流规则（零上下文成本硬约束）✅ 已完成
+
+**问题**：规则写进 system prompt 永远吃 token 且是 advisory（模型可无视）；无规则时又零约束。
+
+**任务**（新 crate `crates/ttsr`，约 1400 行 + 集成）：
+
+- [x] `rule.rs`：frontmatter 解析（自写极简解析器）+ `Rule` 模型（scope: text/thinking/tool/tool:NAME(GLOB)、
+  globs 全局门、interruptMode: always|never、repeat: once|always、condition 正则 OR + astCondition）。
+  glob 简写（`*.rs` → `tool:write_file`）；Rust `regex` crate 线性时间（消除 JS 版 ReDoS）。
+- [x] `matcher.rs`：`TtsrManager` 每流缓冲（text/thinking 增量累积；工具载荷一次性快照），
+  门控顺序：禁用过滤 → 注入抑制（once）→ 作用域 → 路径 glob → 条件；`digest_for` 按工具提取
+  matcherDigest（write_file→content、apply_hashline→patch、run_command→command）；astCondition
+  经 `agent_ast::search` 对内存文本做结构匹配（含 metavariable 同一性）。
+- [x] `coordinator.rs`：线程安全协调器——`check_text_delta`/`check_thinking_delta`（可中断规则
+  命中返回名字，流式中断）、`check_tool_calls`（Always → Abort；Never → 折叠
+  `<system-reminder>` 进工具结果）、`render_injection`（`[ttsr-injection:…]` 标记 +
+  `<system-interrupt>` 包装）、`restore_from_messages`（会话加载扫描标记恢复抑制）。
+- [x] `run_loop` 五插入点：生成器头恢复抑制（snapshot_nodes 扫描）→ MessageStart 清缓冲 →
+  流式 TextDelta/ThinkingDelta 命中即 break（drop event_stream = 关闭 HTTP 连接，违规增量不发射）→
+  中断后丢弃部分输出（discard）、注入、合成 aborted TurnEnd、continue 重试 → MessageEnd 工具
+  载荷快照（Abort 不 append 直接重试；Never 提醒暂存）→ 工具结果回填时 `take_reminder` 前置折叠。
+- [x] 抑制状态持久化：注入消息带 `[ttsr-injection:name1,name2]` 标记（User 消息），压缩/分支切换/
+  恢复后 `restore_from_messages` 重建抑制（repeat=once），不重复注入。
+- [x] 装配：`[ttsr]` 配置段（enabled/disabled_rules）+ CLI/server 双端 `<cwd>/.gyre/rules/*.md`
+  发现（`discover_rules` 解析失败跳过并告警）+ `config.example.toml` 文档段。
+- [x] 测试：ttsr crate 32 项（frontmatter/作用域/glob 简写/缓冲累积/抑制/restore/digest/ast 匹配/
+  abort-vs-remind）+ agent 集成 4 项（流式中断重试、恢复抑制、工具 Never 折叠、工具 Always 丢弃重试）。
+
+**v1 边界**（文档化）：文本/思考作用域的 `interruptMode: never` 按 Always 处理（无流式折叠通道）；
+`repeat: after-gap` 未实现（once|always）；注入消息在 UI 显示为带标记的用户消息（透明可见）。
+
+### 🔴 P0-conflict：conflict:// 合并冲突解决 ✅ 已完成
+
+**问题**：模型处理 Git 冲突需读 200 行手抄；读改写三方易错。
+
+**任务**（`crates/tools/src/conflict.rs` ~550 行 + fs 集成）：
+
+- [x] 扫描状态机：严格列 0 标记（`<<<<<<<`/`|||||||`/`=======`/`>>>>>>>`，CRLF 容忍），
+  仅闭合块返回；`RawBlock` → `ConflictBlock`（侧文本 + 标记行原文）。
+- [x] 会话级 `ConflictHistory`：path+start_line 复用 id；read 注册 / write 解决后移除。
+- [x] read：`<file>:conflicts` selector（扫描+注册+逐块摘要）；`conflict://<N>`（完整块带原文
+  行号）/ `conflict://<N>/ours|theirs|base`（单侧）；`conflict://*` 读取报错。
+- [x] write：`conflict://<N>` 支持 `@ours`/`@theirs`/`@base`/`@both` token 与替换文本；
+  `conflict://*` 批量（`N: @ours` 指令行或全文应用全部；按文件分组 + 自底向上保持锚点）。
+- [x] splice 防漂移：标记行内容校验（首尾标记 + sep/base 按序出现，非固定索引——ours 行数不定）；
+  区域以换行结尾时 replacement 补换行；CRLF 行尾跟随。
+- [x] 注入：`Agent` 持 `Arc<Mutex<ConflictHistory>>`，run_loop ToolContext 注入；9 处构造点补 None。
+- [x] 测试：conflict.rs 12 项 + fs 端到端 6 项（扫描→单侧读→@ours 解决→漂移拒绝→批量指令→
+  未启用报错→通配读拒绝）。
+
+### 🟢 P0-keywords：magic keywords（ultrathink / orchestrate / workflowz）✅ 已完成
+
+**问题**：用户无法一句话切换行为契约（深度推理 / 多代理编排）。
+
+**任务**（`crates/agent/src/keywords.rs` ~400 行 + run_loop 集成）：
+
+- [x] 词边界匹配：Rust regex 无 look-around → `find_iter` + 前后字符检查实现 omp 边界语义
+  （排除字母数字下划线/`./`/`-`/`\`/`::`，后不跟 `.`/`(`；仅小写全词）。
+- [x] markdown 掩码：长度保持地抹掉围栏代码块（≥3 反引号/波浪号，行首闭围栏）、内联代码、
+  HTML 注释、XML/HTML 标签（嵌套同名深度计数 + 自闭合）。
+- [x] `ultrathink` → 跳过 auto-thinking 分类器、`Effort::XHigh` 预算拉满（模型不支持思考则 None）；
+  `orchestrate` → 10 条编排契约隐藏通知；`workflowz` → 需 task 工具在场（Gyre 无 eval，注入
+  简化版 task 工作流提示）。通知先于用户消息注入 context。
+- [x] 测试：单元 9 项（边界排除/围栏/内联代码/XML 嵌套/注释/复数不命中/workflowz 门控）+ 集成 2 项
+  （orchestrate 注入、orchestrates 复数不注入）。
+
+**排期建议（接续）**：P0 三件套后，按 [`oh-my-pi-feature-analysis.md`](oh-my-pi-feature-analysis.md)
+P1 顺序推进：web_search + 站点抽取、Advisor（P1-L）、LSP 写操作（WorkspaceEdit/rename_file）、
+resolve 暂存（ast_rewrite 预览→应用）。
+
+---
+
+## 第五轮补充（2026-08）：P1 四件套（web_search / Advisor / LSP 写操作 / resolve 暂存）
+
+> 接 P0 三件套之后按 [`oh-my-pi-feature-analysis.md`](oh-my-pi-feature-analysis.md) P1 顺序落地。
+> 全部完成，workspace 645 项测试全绿。
+
+### 🟡 P1-4：web_search + 站点感知抽取 ✅ 已完成
+
+- [x] `WebSearchProvider` trait + 顺序回退链（首个非空结果胜出；失败汇总错误）：
+  `DuckDuckGoHtml`（免 key，HTML 端点解析）为主，`Searxng`（`GYRE_SEARXNG_URL` env 懒加载）可选。
+- [x] 站点抽取 `extract_site`：arxiv（citation 元标签 + abstract 段）、crates.io（API JSON：版本/下载量）、
+  npm（registry latest）、github（raw README 首段）→ 结构 markdown（锚点保留）。
+- [x] 复用 `fetch_http`（SSRF 每跳校验/15s/1MiB）；**fetch_client 补身份 UA**——crates.io API 对无 UA
+  返回 403（实测修复）。DDG 在本环境不可达（网络策略），错误信息明确提示 `GYRE_SEARXNG_URL` 出路。
+- [x] `web_search` 工具（`CapabilityTier::Network` 审批门槛）进 `core_tools`；6 单测（解析/回退链/截断/编码）。
+- [ ] 后续：jina/perplexity 等 key provider、更多站点抽取器（mdn/stackoverflow/reddit）。
+
+### 🟡 P1-5：Advisor 双代理评审（P1-L）✅ 已完成
+
+- [x] 新 crate `crates/advisor`（仅依赖 agent-core，无循环依赖）：
+  - `EmissionGuard`：normalize（NFKC+小写+折叠标点）→ `(severity, 文本)` 去重 + filler 黑名单
+    （stop/ok/continue/lgtm…）——真实教训：无去重 advisor 会 spam（issue #3520）；
+  - `SecretObfuscator`：sk-/ghp_/AKIA/Bearer/env 导出等 8 类内置 pattern + 可追加，替换 `<redacted>`；
+  - `WATCHDOG.md` 发现：cwd walkup + `~/.gyre` + 项目 `.gyre`，注入评审 system prompt；
+  - `Advisor::review`：快照渲染（角色 + 截断 + 工具结果折叠 + 脱敏，总上限 24k 字符）→
+    独立 provider 一次流式调用 → `[severity] note` 解析 → guard 过滤。
+- [x] run_loop 集成：每 N 轮（默认 4，builder 可调）在 aside drain 后评审一次，建议以
+  `[advisor:<severity>]` 标记 User 消息注入 context（与 aside 同语义：不打断在途工具）+ Say 事件；
+  评审失败仅 warn 不阻断主循环。
+- [x] 装配：env `GYRE_ADVISOR=1` 启用（复用主 provider + watchdog 自动发现）；CLI/测试双验证。
+- [x] 测试：advisor crate 15 项（guard 去重/filler、脱敏、watchdog 发现、解析/快照/截断）+ agent 集成 2 项
+  （blocker 注入、filler 不注入）。
+- [ ] 后续：近窗口 promote 到更大 model（MVP 固定主模型）、advice 经 yield queue 而非 context 直注。
+
+### 🟡 P1-6：LSP 写操作 ✅ 已完成
+
+- [x] `crates/lsp/src/edits.rs`：`apply_text_edits` WorkspaceEdit 应用器——行切分 + UTF-16 列→字节
+  （代理对中间列严格报错）、重叠校验（排序后相邻检查）、自底向上降序拼接；6 单测（多行区间/
+  重叠拒绝/插入/代理对/越界）。
+- [x] client 扩展：`LspRenameEdit` 补 end 位置（原实现只存 start，编辑无法应用）、`LspCodeAction`
+  补 `command`（executeCommand 路径）、新增 `execute_command`（manager 透传）。
+- [x] 新工具 `lsp_apply`（Write 审批门槛）：`{edits: [...]}` 直传（lsp rename/code_actions 输出原样回传）
+  或 `{code_action_index, uri, line, character}` 重取应用；多文件按 uri 分组逐文件读改写，
+  old_text 非空时漂移校验；command 型 code action 执行后返回响应。
+- [x] 装配：`lsp_tool()` 构造器共享 LspPool，`lsp_apply` 与 `lsp` 同池（同一套语言服务器）。
+- [ ] 后续：rename_file（willRenameFiles 文件移动 + 引用重写）、诊断版本账本联动应用后延迟诊断。
+
+### 🟡 P1-7：resolve 暂存（ast_rewrite 预览→应用）✅ 已完成
+
+- [x] `ast_rewrite {preview: true}`：不落盘，返回 `(proposed) N replacements` + 首处差异预览，
+  暂存到会话级队列（同文件重复 preview 只留最新）。
+- [x] `write_file` 三路 `xd://` 设备：`xd://pending`（列出队列）、`xd://resolve`（应用：重读文件 +
+  重放重写 + **计数与字节数双重复查**防漂移，要么全成要么全不，失败条目保留可重试）、
+  `xd://reject`（丢弃指定）；content 支持 `path` / `path:pattern` 精确过滤。
+- [x] 注入：Agent 持队列 Arc，run_loop ToolContext 注入；9 构造点补 None。
+- [x] 测试 4 项：暂存→应用、漂移拒绝、丢弃、重预览替换 + 过滤应用。
+
+**排期建议（接续）**：按 P2 顺序推进：eval 内核、DAP、pr:///issue:// GitHub 缓存、provider 路由、
+Collab 补齐、snapcompact（P0-L）、规则导入（P2-N）。
+
+---
+
+## 第六轮（2026-08）：P2 首批三件套（pr:///issue:// / discovery 规则导入 / Provider fallback）
+
+> 按 feature 分析 P2 排期，取成本可控、价值直接的三项；workspace 655 项测试全绿。
+
+### 🟢 P2-10：pr:// / issue:// GitHub 读取 + 文件缓存 ✅ 已完成
+
+- [x] `github.rs` 提取 `api_get_json`（pub(crate)）：GET `<owner>/<repo>/<path>` + **auth 指纹文件缓存**
+  （`<workspace>/.gyre/cache/github/{指纹}__{owner}__{repo}__{path}.json`；列表 TTL 60s、单对象 300s；
+  匿名/鉴权缓存隔离；缓存损坏回退直连）。
+- [x] `render_gh_uri`：单对象 → `#N 标题 [state] — @user · 时间` + body + 合并状态/增删行 + 评论数；
+  列表 → 逐条 `#N [state] 标题 — @user` + 详情提示。
+- [x] read_file 路由：`pr://<owner>/<repo>[/<N>][?state=…]`、`issue://` 同构；缺省 `state=open&per_page=10`；
+  裸 `pr://` 提示；非法路径报错。schema 描述已更新。
+- [x] 真实冒烟：匿名读 rust-lang/rust 开放 PR 列表 10 条成功（无 GH_TOKEN）。
+- [ ] 后续：缓存失效机制（bash 变异？）、评论/审查详情读取、`gh` CLI 优先。
+
+### 🟢 P2-14：discovery 外来配置互操作（AGENTS.md/CLAUDE.md/Cursor/Cline）✅ 已完成
+
+- [x] 新 crate `crates/discovery`（**零依赖**纯 std）：`discover(cwd)` → 按来源优先级排序的
+  `DiscoveredSection`（source/path/name/globs/content），`source:path` 去重（walkup 不同层级全保留）。
+- [x] 四来源：`AGENTS.md`（walkup + `~/.agent`）、`CLAUDE.md`/`.claude/CLAUDE.md`（walkup）、
+  `.cursor/rules/*.mdc`（frontmatter: description/globs/alwaysApply + body）、
+  `.clinerules/*.md` + `.clinerules.md`。
+- [x] `render_section`：`外来配置[cursor] <path> name（适用于 globs）:\n内容` 注入段。
+- [x] CLI 装配：`base_context_files` 追加外来段（与 AGENTS.md 同通道）；i18n 4 语言键
+  （`context.foreign_loaded`）；REPL 冒烟验证「已加载 2 条外来 Agent 配置」。
+- [x] 5 单测（发现/去重/MDC frontmatter/Cline 目录与单文件/渲染）。
+- [ ] 后续：codex/gemini/opencode/windsurf/vscode/mcp-json 来源、rule→TTSR 规则转换。
+
+### 🟢 P2-11：Provider 路由增强（fallback 链）✅ 已完成
+
+- [x] `LlmError::is_fallbackable()`（core）：Transport/5xx/429/401/403 可换适配器重试；
+  其余 4xx/StreamInterrupted/Decode/Unsupported 立即上抛。
+- [x] `ProviderRegistry::route_all(api)` + `stream_fallback`：依序尝试全部支持该线协议族的适配器，
+  首个成功建流者胜出；失败分类决定是否换下一家；全失败汇总「全部 N 个适配器失败（最后一个: …）」。
+  多适配器注册（各带不同 key env 的适配器）即凭证轮换通道。
+- [x] `impl LlmProvider for ProviderRegistry::stream` 默认走 fallback（单适配器与旧行为等价）。
+- [x] 3 测试：Transport 跳下一家、5xx fallback 而 400 立即失败（不尝试第二家）、全失败汇总。
+
+### 🟢 P2-12：Collab 协议补齐（帧扩展 / write token 权限 / 快照分块恢复）✅ 已完成
+
+> 目标：从「实验性中继」到「可分享的 live session」。WS 端到端冒烟已验证。
+
+- [x] **帧类型扩展**：`WireFrame` 新增 `Hello`（proto/name/write_token）、`Welcome`（proto/read_only/entry_count）、
+  `SnapshotChunk`（seq/final_chunk/chunk）、`Bye`（reason）、`Error`（message）——serde tag=type 兼容扩展；
+  Gyre 全密封形态（hello 亦密封，中继盲视更严格，与 omp 明文 hello 有差异，已注释说明）。
+- [x] **write token 权限**：`generate_write_token()`（16B CSPRNG → 32 hex）；`Relay::set_write_token/clear_write_token` +
+  `publish_with_token`——受管房间无令牌发布 → `WriteForbidden`；未注册房间保持开放（demo 兼容）。
+  `CollabClient::with_write_token`（缺省只读 view）。WS 层：`/api/collab/room` 生成并注册 token、
+  `/collab/{room}?wt=` 连接级校验。
+- [x] **快照分块 + 恢复**：`chunk_snapshot`（UTF-8 字符边界切割，默认 48 KiB/块，适配 WS 64 KiB 帧上限）、
+  `SnapshotAssembler`（seq 严格递增、final_chunk 收尾、乱序/重复拒绝）、`append_snapshot_log`/`read_snapshot_log`
+  （`~/.gyre/collab/<room_id>.jsonl` JSONL 追加，取最后一行恢复）。
+- [x] **WS 退避**：不适用——Gyre 无 WS 客户端重连路径（桥为服务端接收侧），断线恢复由快照日志 + `cleanup_empty` 覆盖；已标注。
+- [x] 测试 +13（权限 6：开放房/受管房/清 token/只读 client 拒发/帧 roundtrip/token 格式；快照 7：单块/空/UTF-8/大回环/乱序/未完成/落盘）；
+  clippy 新代码清零（collab 预存 4 条移植 doc 警告不动）。**WS 端到端冒烟**：裸 socket 验证——只读连接发布被拒
+  （server warn + 零送达），带 wt 连接发布广播送达订阅者。
+- [ ] 后续：浏览器 guest（collab-web 前端移植）、host 侧 read_only 裁决（Hello.write_token 已就绪）、transcript 分页拉取。
+
+### 🟢 P2-13：Provider 路由增强（模型 fallback 链 + API key 轮换）✅ 已完成
+
+> 目标：把「单模型单 key」升级为「主模型失败自动换备、多 key 限流自动轮换」。
+> 配置冒烟已验证（合法链通过 / 环与重复引用报错）；agent 层 mock 集成测试验证切换语义。
+
+- [x] **模型 fallback 链（配置维度）**：`ModelProfile.fallbacks`（alias/id 引用，跨线协议族亦可，
+  如 Anthropic 主 → OpenAI 备）；`Config::resolve_chain` 依序展开 + **防环防重复**（配置错误
+  启动即报错，validate 阶段全量检查）；`ModelProfile::to_model` 统一 profile→Model 映射
+  （cli/server 装配复用，消除两处内联差异）。
+- [x] **调用链语义**：agent loop 每轮 `[主模型] + fallbacks` 依序尝试，可重试错误
+  （网络/5xx/429/401/403）换下一模型，**不可重试错误立即上抛不浪费备选**；全链失败
+  **只算 1 个 mistake**（轮内换模型不重复计错）；命中备用模型打 `model fallback 成功` 日志。
+- [x] **API key 轮换（配置维度）**：`ModelProfile.api_keys` 多 key 列表（`${ENV}` 展开）→
+  `KeyRing`（AtomicUsize round-robin，并发安全）；每轮请求换下一个 key；空 = 单 key 不轮换。
+  `RuntimeOverrides::api_key` 命中时**优先于轮换**（host 动态凭证语义不变）。
+- [x] **与既有机制叠加**：外层模型链（agent loop）⊃ 内层适配器链（registry.stream_fallback
+  同 api 多适配器）——两层 fallback 组合为完整语义；凭证轮换独立于 registry（ctx 级覆盖）。
+- [x] 测试 +5（config 3：链展开顺序/缺引用+环报错/key 环+to_model；agent 5：主失败换备成功、
+  全链失败单 mistake、硬错误中断链、key 轮换+override 优先、KeyRing 取模）；clippy 新增代码
+  清零（config 回归 HEAD 基线 26 条预存警告，本轮新增 2 条已修）。
+- [ ] 后续：`fallbacks` 支持内联 profile（含 key 差异的匿名备选）、失败计数/熔断（同模型连续
+  失败 N 次后跳过）、per-model 并发上限（max_in_flight 配置化）。
+
+### 🟢 P2-14：Collab 浏览器 guest（端到端加密 Web 视图）✅ 已完成
+
+> 目标：把 `/collab/{room}` 分享链接从「WS 握手错误页」变成可用 UI——浏览器端
+> WebCrypto 解密查看 + 聊天。浏览器端到端验证通过（可写 tab ↔ 只读 tab 跨连接消息闭环）。
+
+- [x] **GET 分发**：`/collab/{room_id}` 普通浏览器 GET（无 WS Upgrade 头）→ 返回单文件
+  guest 页（`crates/server/src/collab_guest.html`，内嵌 CSS/JS，零外部依赖）；
+  WS 升级路径不变。`OptionalWsUpgrade` extractor（axum 未导出 WS rejection 类型，
+  自行判定 Upgrade 头，握手不完整降级为 guest 页，无副作用）。
+- [x] **端到端加密**：房间密钥取自链接 `#` 片段（base64url → 32B），WebCrypto AES-GCM
+  与 Rust codec 对偶（`[12B IV][ciphertext+tag]`）；密钥永不发服务器。
+- [x] **帧协议对偶**：WireFrame serde `tag=type` snake_case 全 9 变体前端渲染——
+  chat 气泡（自己/他人分侧）、hello/presence 在线列表、bye/error 系统消息、
+  **snapshot_chunk 聚合恢复**（seq 校验 + final 收尾，乱序丢弃重来）。
+- [x] **权限模型**：`?wt=` 携带 → 可写（输入启用）；缺省 → 只读 view（输入禁用 +
+  「无写令牌」提示）。中继层 write token 校验不变（受管房间只读连接发布被拒）。
+- [x] **断线重连**：指数退避 1s→2s→4s→8s 封顶（P2-12 曾标注「无 WS 客户端重连路径」——
+  guest 即新客户端，重连语义落地）。
+- [x] 测试 +2：guest 页浏览器 GET 200 HTML（含 WebCrypto/分块/重连标记）、
+  密封布局常量与 Rust codec 一致性；**浏览器端到端冒烟**：可写 tab seal 消息 → 中继 →
+  只读 tab 解封渲染；在线列表/加入提示联动；只读 tab 输入禁用。
+- [x] **排障记录**（关键 bug）：`crypto.subtle.encrypt` 返回 ArrayBuffer，
+  `Uint8Array.set(ArrayBuffer)` 静默不拷贝 → 密封帧密文全零、解封恒 OperationError。
+  修复：`new Uint8Array(await encrypt(...))`。evaluate 自测路径因显式包裹而幸免，
+  页面路径踩坑——注释已写明。
+- [ ] 后续：transcript 分页（host 侧以快照块下发会话历史）。
+
+---
+
+## 第七轮（2026-08）：Collab 中继历史重放（新加入者先见历史再收实时）✅ 已完成
+
+> 接 P2-14 guest 页：新开 tab 只有空白与实时帧，看不到已有消息。
+> 方案选型：**中继层内存 ring buffer**（vs host 代答 / 服务端持久化）——服务端纯转发无状态、
+> host 常不在线、guest 页无需发 Sync 即可拿历史；ring buffer 只存**密封字节**（密钥盲视）。
+
+- [x] **relay 历史环**（[`crates/collab/src/relay.rs`](../crates/collab/src/relay.rs)）：
+  `Room { sender, history: VecDeque }`，`publish_with_token` 先 push 历史（截断至
+  `DEFAULT_REPLAY_LIMIT = 200`，快照分块单帧 ≤48 KiB，最坏 ~9.6 MiB/房间，60s 清理周期回收）
+  **再判 `receiver_count() == 0`**——无订阅者（全员掉线）的帧仍进历史，重连可找回；
+  房间不存在时 publish 自动创建（发方从不 join 自身）。
+- [x] **原子 `join_with_replay`**：历史克隆与 subscribe 在同一 `rooms` 锁内完成，
+  杜绝「取历史后、订阅前」的丢帧缝隙；`join` 委托其丢弃历史部分（兼容旧调用）。
+- [x] **空房间语义**：无订阅者房间不再于 join/publish 时移除——历史须跨掉线存活；
+  统一由 server 60s 周期 `cleanup_empty` 回收（有订阅者保留）。
+- [x] **WS 桥历史补发**（[`crates/server/src/lib.rs`](../crates/server/src/lib.rs) `collab_relay`）：
+  连接建立后先逐条补发历史密封帧，再进广播循环；发送失败（客户端断开）即返回。
+- [x] **guest 页收帧即已连接**：历史补发先于 welcome 到达、host 离线时无 welcome——
+  `handle()` 对非 welcome 帧先置「已连接」再分发。
+- [x] 测试 +4 / 改 1：`replay_history_to_new_subscriber`（历史+实时间无缝隙）、
+  `replay_ring_is_bounded`（cap=5 发 8 取最近 5）、`offline_frames_survive_reconnect`（掉线帧重连找回）、
+  `publish_to_empty_room_returns_zero_and_keeps_history`（空房间保留 + 订阅者退出后 cleanup 才回收）；
+  collab 27/27 绿，clippy 新代码清零。
+- [x] **浏览器端到端冒烟**：tab A 发消息（自收回显渲染）→ tab B 新开即见历史
+  （chat 帧 + 对方 hello 加入提示），再发实时帧 tab B 顺序到达；控制台零错误
+  （P2-14 遗留的自收自解闭环已随重建验证通过）。
+
+---
+
+## 第八轮（2026-08）：Collab host 侧 read_only 裁决（Welcome 单播握手）✅ 已完成
+
+> 接第七轮：guest 页此前以链接 `?wt=` 乐观判定读写（`writable = !!wt`），错误/过期 wt
+> 会 UI 可写但中继拒发（WriteForbidden 静默），体验断裂。本轮把裁决权交给 host。
+
+- [x] **本服务即 host 进程**（对标 oh-my-pi 的 coding-agent 持密钥）：[`new_collab_room`]
+  本地生成密钥后不再丢弃——登记到 `SessionManager.collab_hosts`（`HostSecret{key, write_token}`），
+  仅存内存、从不外发；**中继 [`Relay`] 保持密钥盲视**（只存密封字节），host 只 seal 自己的
+  裁决帧、永不解封他人帧。
+- [x] **裁决与中继发布校验同源**（[`seal_host_welcome`]）：连接 `wt` 对照规范令牌
+  （[`Relay::set_write_token`] 登记的同一值）→ 密封 `Welcome{read_only, entry_count: 0}`
+  **单播直发**该连接（不走中继广播，不干扰其他 guest；历史重放前先发握手帧）。
+  正确 wt → 可写；缺失（view 链接）/错误 wt → 只读。
+- [x] **guest 页收编裁决**：`welcome` 帧优先于链接乐观判定——`read_only` → 禁用输入 +
+  状态栏「已连接（proto N，只读）」+ badge 只读 + 说明性 placeholder；可写裁决幂等确认。
+  `connected` 标志防止 hello 回显帧覆盖 welcome 的丰富状态。
+- [x] 测试 +1：`host_welcome_adjudicates_read_only_from_connection_wt`（正确/缺失/错误 wt
+  三态解封断言）；server 8/8、workspace 682 全绿；clippy 新代码清零。
+- [x] **浏览器端到端冒烟**：同房间三链接形态——view 链接（只读，输入禁用）、全链接
+  （可写，发送成功）、**错误 wt**（host 裁决只读，输入禁用 + 提示「链接 wt 无效」）；
+  可写 tab 消息被两个只读 tab 实时渲染；控制台零错误。
+---
+
+## 第九轮（2026-08）：Collab transcript 下发（host 以快照块推送会话历史）✅ 已完成
+
+> 接第八轮：guest 能看到实时帧与中继历史，但看不到**绑定 agent 会话**的完整 transcript。
+> 本轮把会话历史以快照分块下发（分页传输：48 KiB/块，`Welcome.entry_count` 告知块数）。
+
+- [x] **会话绑定**：`/api/collab/room?sid=<session_id>` —— `SessionParams` 新增 `sid`，
+  `HostSecret` 增 `session_id` 字段；Web UI（c5-ui `newCollabRoom`）自动携带当前会话 id。
+- [x] **transcript 渲染**（[`render_session_transcript`]）：与 `read_history` 同源解析
+  （新旧持久化格式兼容），逐条渲染 `[user]/[thinking]/[assistant]/[tool]/[tool result]/
+  [status]/[ask]` 前缀文本；`SoftRequirement` 等内部机制消息跳过；超限
+  （`TRANSCRIPT_MAX_CHARS` = 4 MiB）截断**保留尾部最新**并加省略标记。
+- [x] **WS 桥下发**：`collab_relay` 连接时先渲染绑定会话 → `chunk_snapshot` 分块 →
+  `Welcome.entry_count` 填块数 → 逐块 seal **单播直发**（welcome → 快照块 → 中继历史 →
+  实时广播的顺序；均不走中继，不干扰其他 guest）。
+- [x] **guest 页加载态**：`welcome.entry_count > 0` → 「正在加载会话快照（共 N 块）…」，
+  聚合收齐后 snapshotDone 渲染「已恢复快照（N 块 / M 字符）——以下为快照原文」。
+- [x] 测试 +3：`render_session_transcript_renders_all_roles`（全 role 前缀 + 跳过内部消息）、
+  `render_session_transcript_missing_or_empty_returns_none`、`host_welcome_carries_entry_count`；
+  server 11/11、workspace 685 全绿；clippy 新代码清零。
+- [x] **浏览器端到端冒烟**：720 KiB 冒烟会话（user/thinking/assistant 长文本/tool_result）→
+  绑定房间 → guest 收到 welcome（entry_count=15）+ 15 块快照（每块 ~48 KiB）聚合渲染
+  （240 K 字符全文，含省略逻辑未触发）；只读 view 链接权限裁决不受影响。
+
+

@@ -44,6 +44,7 @@ tokio-util  = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 async-stream = "0.3"
 futures     = "0.3"
+futures-util = "0.3"
 inventory   = "0.3"
 tokio-stream = "0.1"
 
@@ -126,6 +127,8 @@ agent-context = { path = "crates/context" }
 agent-prompt  = { path = "crates/prompt" }
 agent-tools   = { path = "crates/tools" }
 agent-ast     = { path = "crates/ast" }
+agent-advisor = { path = "crates/advisor" }
+agent-discovery = { path = "crates/discovery" }
 agent-search  = { path = "crates/search" }
 agent-skills  = { path = "crates/skills" }
 agent-lsp     = { path = "crates/lsp" }
@@ -140,6 +143,7 @@ agent-collab  = { path = "crates/collab" }
 agent-supervisor = { path = "crates/supervisor" }
 agent-acp     = { path = "crates/acp" }
 agent-i18n    = { path = "crates/i18n" }
+agent-ttsr    = { path = "crates/ttsr" }
 agent-cli     = { path = "crates/cli" }
 
 [profile.release]

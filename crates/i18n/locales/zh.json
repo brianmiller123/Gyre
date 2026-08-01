@@ -183,5 +183,9 @@
   "lang.name.zh": "中文",
   "lang.name.ru": "Русский",
   "lang.name.ja": "日本語",
-  "help.lang": "  /lang [代码]      显示 / 切换界面语言（en|zh|ru|ja）"
+  "help.lang": "  /lang [代码]      显示 / 切换界面语言（en|zh|ru|ja）",
+  "context.foreign_loaded": "已加载 {count} 条外来 Agent 配置（AGENTS.md/CLAUDE.md/Cursor/Cline）",
+  "collab.write_link": "│ 可写链接 : http://{bind}/collab/{room}?wt={token}",
+  "collab.view_link": "│ 只读链接 : http://{bind}/collab/{room}（无 wt → 只读 view）",
+  "collab.wt_tip": "提示：可写链接含 16 字节写令牌（wt），只读 view 链接不含；中继按 wt 校验发布权限。快照经分块传输（每块 ≤48KB），断线可在 ~/.gyre/collab/ 按房间 id 恢复。"
 }

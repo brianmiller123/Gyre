@@ -227,22 +227,20 @@ async fn main() -> Result<()> {
     };
     eprintln!("{}", t!("session.label", id = session_id));
 
-    // 2. 解析模型 profile
-    let profile = cfg
-        .resolve_model(cli.model.as_deref())
+    // 2. 解析模型 profile（P2：含 fallback 链——主模型失败且错误可重试时依序换备用模型）
+    let chain = cfg
+        .resolve_chain(cli.model.as_deref())
         .context(t!("error.resolve_model"))?;
+    let profile = chain[0];
     let api_key: String = profile.resolve_api_key().expose_secret().to_string();
-    let model = agent_core::Model {
-        id: profile.id.clone(),
-        provider: "openai-compatible".into(),
-        api: profile.api,
-        max_input_tokens: profile.effective_max_input_tokens(),
-        max_output_tokens: profile.max_output_tokens.unwrap_or(4096),
-        supports_tools: true,
-        supports_streaming: true,
-        supports_thinking: false,
-        extra_body: profile.extra_body.clone(),
-    };
+    let model = profile.to_model();
+    let fallback_models: Vec<agent_core::Model> =
+        chain.iter().skip(1).map(|p| p.to_model()).collect();
+    // P2：API key 轮换环（`api_keys` 多 key 列表；空 = 单 key 不轮换）。
+    let key_rings: std::collections::HashMap<String, Vec<String>> = chain
+        .iter()
+        .map(|p| (p.id.clone(), p.key_ring()))
+        .collect();
 
     // 3. 装配 Provider（registry + OpenAI Chat Completions 适配器）
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
@@ -326,7 +324,22 @@ async fn main() -> Result<()> {
     // GitHub 提示词按启用态在 build_agent 内动态注入（见 github_context_files）；
     // 未启用时完全不进入 system prompt，零额外 Token 开销（按需加载）。
     // 启用态可由配置 [github] 初始化，或经 /github 命令运行时切换。
-    let base_context_files = agent_config::discover_context_files(&cwd);
+    let foreign_sections: Vec<String> = agent_discovery::discover(&cwd)
+        .iter()
+        .map(agent_discovery::render_section)
+        .collect();
+    if !foreign_sections.is_empty() {
+        eprintln!(
+            "{}",
+            t!(
+                "context.foreign_loaded",
+                count = foreign_sections.len()
+            )
+        );
+    }
+    // 外来配置追加进上下文约定（与 AGENTS.md 同通道注入 system）。
+    let mut base_context_files = agent_config::discover_context_files(&cwd);
+    base_context_files.extend(foreign_sections);
     let commands = agent_config::discover_commands(&cwd);
     if !commands.is_empty() {
         eprintln!("{}", t!("commands.loaded", count = commands.len()));
@@ -456,6 +469,44 @@ async fn main() -> Result<()> {
         }
         let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
 
+        // TTSR 流规则：发现 `<cwd>/.gyre/rules/*.md` 并装配协调器（缺省有规则即启用；
+        // `[ttsr] enabled = false` 或 `disabled_rules` 可关闭/过滤）。规则零上下文成本：
+        // 命中才注入，违规输出中断重试（见 agent-ttsr crate 文档）。
+        let ttsr = if cfg.ttsr.enabled.unwrap_or(true) {
+            let rules = agent_ttsr::discover_rules(&workspace.root().join(".gyre/rules"));
+            if rules.is_empty() {
+                None
+            } else {
+                let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
+                eprintln!("已加载 {} 条 TTSR 规则: {}", rules.len(), names.join(", "));
+                Some(Arc::new(agent_ttsr::TtsrCoordinator::new(
+                    agent_ttsr::TtsrConfig {
+                        disabled_rules: cfg.ttsr.disabled_rules.clone(),
+                        ..Default::default()
+                    },
+                    rules,
+                )))
+            }
+        } else {
+            None
+        };
+
+        // P1-L：advisor 独立评审（env `GYRE_ADVISOR=1` 启用；WATCHDOG.md 准则自动发现）。
+        // 复用主 provider（独立 LLM 调用），快照脱敏后喂评审；建议经 `[advisor:…]` 注入。
+        let advisor = if std::env::var("GYRE_ADVISOR").is_ok_and(|v| v == "1") {
+            let watchdog = agent_advisor::render_watchdog(&workspace.root());
+            let adv = agent_advisor::Advisor::new(Arc::clone(&provider), model.clone());
+            let adv = if watchdog.is_empty() {
+                adv
+            } else {
+                adv.with_watchdog(watchdog)
+            };
+            eprintln!("已启用 advisor（每 {} 轮独立评审）", 4);
+            Some(Arc::new(adv))
+        } else {
+            None
+        };
+
         let builder = agent::Agent::builder(model.clone())
             .steering()
             .provider(Arc::clone(&provider))
@@ -465,7 +516,11 @@ async fn main() -> Result<()> {
             .approval(Arc::clone(&approval))
             .workspace(Arc::clone(&workspace))
             .provider_ctx(provider_ctx.clone())
+            .fallbacks(fallback_models.clone())
+            .key_rings(key_rings.clone())
             .mode(mode)
+            .ttsr(ttsr)
+            .advisor(advisor)
             // 与 server assemble 一致：把模型输出预算下发给 Agent 作为每轮请求 max_tokens，
             // 否则回落到硬编码 4096，长回复被截断（finish_reason=length）→ 误报「任务完成」。
             .max_output_tokens(model.max_output_tokens)

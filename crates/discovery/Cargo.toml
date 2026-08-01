@@ -1,0 +1,9 @@
+[package]
+name        = "agent-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Discover and convert foreign agent-tool configs (AGENTS.md / CLAUDE.md / Cursor .mdc / Cline) into Gyre context sections"
+
+[dependencies]

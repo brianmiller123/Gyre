@@ -19,6 +19,9 @@ agent-i18n   = { workspace = true }
 agent-llm    = { workspace = true }
 agent-context = { workspace = true }
 agent-tools  = { workspace = true }
+agent-ttsr   = { workspace = true }
+agent-advisor = { workspace = true }
+agent-discovery = { workspace = true }
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }
 agent-mcp    = { workspace = true }

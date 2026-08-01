@@ -45,6 +45,9 @@ pub struct Config {
     /// ACP（Agent Client Protocol）服务端配置。
     #[serde(default)]
     pub acp: AcpConfig,
+    /// TTSR 流规则配置（`.gyre/rules` 发现；缺省段 = 有规则即启用）。
+    #[serde(default)]
+    pub ttsr: TtsrConfig,
 }
 
 impl Config {
@@ -118,6 +121,8 @@ impl Config {
             if matches!(m.max_input_tokens, Some(0)) {
                 return Err(ConfigError::Invalid("max_input_tokens 必须 > 0".into()));
             }
+            // P2：fallback 引用存在性 + 防环（配置错误尽早暴露，而非运行时静默跳过）。
+            self.resolve_chain(m.alias.as_deref().or(Some(m.id.as_str())))?;
         }
         Ok(())
     }
@@ -129,14 +134,57 @@ impl Config {
     pub fn resolve_model(&self, alias: Option<&str>) -> Result<&ModelProfile, ConfigError> {
         if let Some(alias) = alias {
             return self
-                .models
-                .iter()
-                .find(|m| m.alias.as_deref() == Some(alias) || m.id == alias)
-                .or(Some(&self.default_model)
-                    .filter(|m| m.alias.as_deref() == Some(alias) || m.id == alias))
+                .find_profile(alias)
                 .ok_or_else(|| ConfigError::ModelNotFound(alias.into()));
         }
         Ok(&self.default_model)
+    }
+
+    /// 解析模型 fallback 链：主 profile（`alias=None` 用默认）+ 依序展开 `fallbacks` 引用。
+    ///
+    /// 链中每个 profile 至多出现一次；引用不存在、成环或重复均报错（配置错误应尽早暴露，
+    /// 而非在运行时静默跳过）。
+    ///
+    /// # Errors
+    /// 主模型或任一 fallback 引用找不到 → [`ConfigError::ModelNotFound`]；
+    /// 引用成环/重复 → [`ConfigError::Invalid`]。
+    pub fn resolve_chain(&self, alias: Option<&str>) -> Result<Vec<&ModelProfile>, ConfigError> {
+        let primary = self.resolve_model(alias)?;
+        let mut chain = vec![primary];
+        let mut seen = std::collections::HashSet::from([primary.id.clone()]);
+        self.expand_fallbacks(primary, &mut chain, &mut seen)?;
+        Ok(chain)
+    }
+
+    /// 按 alias 或 id 查找 profile（含默认 profile）。
+    fn find_profile(&self, alias: &str) -> Option<&ModelProfile> {
+        self.models
+            .iter()
+            .find(|m| m.alias.as_deref() == Some(alias) || m.id == alias)
+            .or(Some(&self.default_model)
+                .filter(|m| m.alias.as_deref() == Some(alias) || m.id == alias))
+    }
+
+    /// 递归展开 `profile.fallbacks` 引用到 `chain`；引用已入链 → 成环/重复错误。
+    fn expand_fallbacks<'a>(
+        &'a self,
+        profile: &'a ModelProfile,
+        chain: &mut Vec<&'a ModelProfile>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ConfigError> {
+        for f in &profile.fallbacks {
+            let next = self
+                .find_profile(f)
+                .ok_or_else(|| ConfigError::ModelNotFound(f.clone()))?;
+            if !seen.insert(next.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "模型 fallback 引用成环或重复: {f}"
+                )));
+            }
+            chain.push(next);
+            self.expand_fallbacks(next, chain, seen)?;
+        }
+        Ok(())
     }
 }
 
@@ -172,6 +220,16 @@ pub struct ModelProfile {
     /// API key 模板（SecretString 包裹，永不进日志；可为 `${ENV}` 形式）。
     #[serde(default)]
     pub api_key: SecretString,
+    /// 多 API key 轮换环：非空时每轮请求依序取一个 key（round-robin），
+    /// 任一 key 被限流/撤销时自动换下一个；为空时用单个 [`Self::api_key`]。
+    /// 展开 `${ENV}` 同 `api_key`。
+    #[serde(default)]
+    pub api_keys: Vec<SecretString>,
+    /// fallback 模型链：引用同配置的其他 profile（`alias` 或 `id`），主模型请求失败且
+    /// 错误可重试（网络/5xx/429/鉴权）时依序尝试备选模型。跨线协议族亦可
+    /// （如 Anthropic 主 → `OpenAI` 备）。引用须存在且不成环、不重复。
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
     /// 温度。
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -205,6 +263,39 @@ impl ModelProfile {
     #[must_use]
     pub fn effective_max_input_tokens(&self) -> usize {
         self.max_input_tokens.unwrap_or(128_000)
+    }
+
+    /// 展开后的 API key 轮换环：`api_keys` 非空用多 key 环（`${ENV}` 已展开），
+    /// 否则单 key 环（`api_key`）。轮换由调用方按轮次取模。
+    #[must_use]
+    pub fn key_ring(&self) -> Vec<String> {
+        use secrecy::ExposeSecret;
+        let keys: Vec<String> = self
+            .api_keys
+            .iter()
+            .map(|k| super::env::expand_env(k.expose_secret()))
+            .collect();
+        if keys.is_empty() {
+            vec![self.resolve_api_key().expose_secret().to_string()]
+        } else {
+            keys
+        }
+    }
+
+    /// 转为运行时 [`Model`](agent_core::Model)（provider 标识 `openai-compatible`）。
+    #[must_use]
+    pub fn to_model(&self) -> agent_core::Model {
+        agent_core::Model {
+            id: self.id.clone(),
+            provider: "openai-compatible".into(),
+            api: self.api,
+            max_input_tokens: self.effective_max_input_tokens(),
+            max_output_tokens: self.max_output_tokens.unwrap_or(4096),
+            supports_tools: true,
+            supports_streaming: true,
+            supports_thinking: false,
+            extra_body: self.extra_body.clone(),
+        }
     }
 }
 
@@ -753,6 +844,19 @@ fn default_max_concurrent() -> usize {
     4
 }
 
+/// TTSR 流规则配置（对应 TOML `[ttsr]`）。
+///
+/// 规则文件位于 `<cwd>/.gyre/rules/*.md`（frontmatter + Markdown 正文，语法见
+/// `agent-ttsr` crate 文档）。规则不写进 system prompt——命中时才注入，零上下文成本。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TtsrConfig {
+    /// 总开关（`None`/缺省 = 存在规则即启用）。
+    pub enabled: Option<bool>,
+    /// 禁用的规则名（按 frontmatter `name` 或文件名主干）。
+    pub disabled_rules: Vec<String>,
+}
+
 /// ACP（Agent Client Protocol）服务端配置（对应 TOML `[acp]`）。
 ///
 /// 控制 ACP 标准协议端点的启用与传输模式。`--acp` CLI flag 可运行时覆盖
@@ -975,5 +1079,115 @@ base_url = "https://api.deepseek.com"
         let off = format!("{toml_src}\n[agent.commands.interceptor]\nenabled = false\n");
         let cfg: Config = toml::from_str(&off).expect("解析应成功");
         assert!(!cfg.agent.commands.interceptor.enabled, "interceptor 应被关闭");
+    }
+
+    // ── P2：fallback 链 + key 轮换 ────────────────────────────────────────
+
+    /// `fallbacks` 依序展开（含默认模型起始与跨 api 引用）。
+    #[test]
+    fn resolve_chain_expands_fallbacks_in_order() {
+        let toml_src = r#"
+[default_model]
+id       = "main"
+api      = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+fallbacks = ["backup", "third"]
+
+[[models]]
+id       = "backup"
+api      = "openai-completions"
+base_url = "https://api.openai.com/v1"
+
+[[models]]
+id       = "third"
+alias    = "t3"
+api      = "deepseek"
+base_url = "https://api.deepseek.com"
+fallbacks = ["backup"]
+"#;
+        let cfg: Config = toml::from_str(toml_src).expect("解析应成功");
+        // 原始配置：third 再引 backup（已在链）→ 防环报错。
+        assert!(cfg.resolve_chain(None).is_err(), "重复引用应报错");
+        // 去掉 third 的 fallbacks → 无环路径：main → backup → third。
+        let toml_src2 = toml_src.replace(r#"fallbacks = ["backup"]"#, "");
+        let cfg2: Config = toml::from_str(&toml_src2).expect("解析2");
+        let chain2 = cfg2.resolve_chain(None).expect("默认链2");
+        let ids2: Vec<&str> = chain2.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids2, ["main", "backup", "third"]);
+        // alias 解析：resolve_chain(Some("t3")) 命中 third。
+        let chain3 = cfg2.resolve_chain(Some("t3")).expect("alias 链");
+        assert_eq!(chain3[0].id, "third");
+    }
+
+    /// 缺引用报错 + 环（互相引用）报错。
+    #[test]
+    fn resolve_chain_rejects_missing_and_cycles() {
+        let missing = r#"
+[default_model]
+id = "main"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+fallbacks = ["ghost"]
+"#;
+        let cfg: Config = toml::from_str(missing).expect("解析应成功");
+        // validate 阶段即暴露（load 时校验引用存在性）。
+        assert!(matches!(
+            cfg.validate(),
+            Err(super::ConfigError::ModelNotFound(_))
+        ));
+        // resolve_chain 同样报 ModelNotFound。
+        assert!(matches!(
+            cfg.resolve_chain(None),
+            Err(super::ConfigError::ModelNotFound(_))
+        ));
+
+        let cyc = r#"
+[default_model]
+id = "a"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+fallbacks = ["b"]
+
+[[models]]
+id = "b"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+fallbacks = ["a"]
+"#;
+        let cfg: Config = toml::from_str(cyc).expect("解析应成功");
+        assert!(matches!(
+            cfg.resolve_chain(None),
+            Err(super::ConfigError::Invalid(_))
+        ));
+    }
+
+    /// 多 key 环优先于单 key；${ENV} 展开；to_model 正确映射。
+    /// 多 key 环优先于单 key；to_model 正确映射。
+    /// （`${ENV}` 展开逻辑由 env.rs 单测覆盖，此处用字面量避免 unsafe set_var。）
+    #[test]
+    fn key_ring_and_to_model() {
+        let toml_src = r#"
+[default_model]
+id = "m"
+api = "openai-completions"
+base_url = "https://api.openai.com/v1"
+api_key = "single"
+api_keys = ["k1", "k2"]
+"#;
+        let cfg: Config = toml::from_str(toml_src).expect("解析应成功");
+        let ring = cfg.default_model.key_ring();
+        assert_eq!(ring, ["k1", "k2"]);
+
+        // 无 api_keys → 单 key 环。
+        let toml_src2 = toml_src.replace("api_keys = [\"k1\", \"k2\"]", "");
+        let cfg2: Config = toml::from_str(&toml_src2).expect("解析2");
+        assert_eq!(cfg2.default_model.key_ring(), ["single"]);
+
+        // to_model：字段映射 + 默认输出 token。
+        let m = cfg.default_model.to_model();
+        assert_eq!(m.id, "m");
+        assert_eq!(m.api, super::Api::OpenAiCompletions);
+        assert_eq!(m.max_input_tokens, 128_000);
+        assert_eq!(m.max_output_tokens, 4096);
     }
 }

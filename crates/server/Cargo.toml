@@ -13,6 +13,7 @@ agent-supervisor = { workspace = true }
 agent-config = { workspace = true }
 agent-context = { workspace = true }
 agent-tools  = { workspace = true }
+agent-ttsr   = { workspace = true }
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }
 agent-mcp    = { workspace = true }
@@ -37,6 +38,8 @@ uuid         = { workspace = true }
 [dev-dependencies]
 # 测试用：解析 config.example.toml 构造 SessionManager（pause/resume 处理器接线测试）。
 toml = { workspace = true }
+# 测试用：Router::oneshot 集成测试（tower ServiceExt）。
+tower = "0.5"
 
 [lints]
 workspace = true

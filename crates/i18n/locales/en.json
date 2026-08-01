@@ -183,5 +183,9 @@
   "lang.name.zh": "中文",
   "lang.name.ru": "Русский",
   "lang.name.ja": "日本語",
-  "help.lang": "  /lang [code]      show / switch interface language (en|zh|ru|ja)"
+  "help.lang": "  /lang [code]      show / switch interface language (en|zh|ru|ja)",
+  "context.foreign_loaded": "Loaded {count} foreign agent configs (AGENTS.md/CLAUDE.md/Cursor/Cline)",
+  "collab.write_link": "│ Writable link: http://{bind}/collab/{room}?wt={token}",
+  "collab.view_link": "│ Read-only link: http://{bind}/collab/{room} (no wt → read-only view)",
+  "collab.wt_tip": "Tip: writable links carry a 16-byte write token (wt); view links do not. Relay gates publish on wt. Snapshots transfer in chunks (≤48KB each); recovery logs at ~/.gyre/collab/ per room id."
 }

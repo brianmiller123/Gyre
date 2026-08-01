@@ -181,7 +181,31 @@ impl Tool for AstSearchTool {
 }
 
 /// 用 ast-grep 按结构化 pattern + rewrite 重写源码文件（原地改写）。
+///
+/// `preview: true`（暂存模式）：不落盘，把重写暂存到会话级 pending 队列并返回
+/// `(proposed) N replacements` 预览；随后用 `write_file {path: "xd://resolve"}`
+/// 应用（应用时重放重写并复查替换计数，文件已漂移则拒绝），或 `xd://reject` 丢弃。
+/// 移植 oh-my-pi `ast_edit` 的 `(proposed) → 应用/拒绝` 暂存语义。
 pub struct AstRewriteTool;
+
+/// 暂存的 ast-grep 重写（预览 → 应用/拒绝）。
+#[derive(Debug, Clone)]
+pub struct PendingRewrite {
+    /// 目标文件路径（相对工作区根，与调用时一致）。
+    pub path: String,
+    /// ast-grep 匹配模式。
+    pub pattern: String,
+    /// 重写模板。
+    pub replacement: String,
+    /// 匹配严格度（可选）。
+    pub strictness: Option<String>,
+    /// 预览时的替换计数（应用时复查）。
+    pub count: usize,
+    /// 预览时文件字节数。
+    pub old_len: usize,
+    /// 重写后字节数。
+    pub new_len: usize,
+}
 
 #[async_trait]
 impl Tool for AstRewriteTool {
@@ -202,7 +226,8 @@ impl Tool for AstRewriteTool {
                 "lang":       { "type": "string", "enum": ["rust", "python", "javascript", "typescript", "go"],
                                 "description": "语言（可选；省略则按扩展名推断）" },
                 "strictness": { "type": "string", "enum": ["cst", "smart", "ast", "relaxed", "signature", "template"],
-                                "description": "匹配严格度（可选，默认 smart）" }
+                                "description": "匹配严格度（可选，默认 smart）" },
+                "preview":    { "type": "boolean", "description": "暂存模式：不落盘，返回 (proposed) 预览；用 write_file xd://resolve 应用" }
             },
             "required": ["path", "pattern", "rewrite"]
         })
@@ -236,6 +261,55 @@ impl Tool for AstRewriteTool {
         let lang = resolve_lang(&input, &full)?;
         let strictness =
             agent_ast::AstMatchStrictness::parse(input.get("strictness").and_then(|v| v.as_str()));
+        let strictness_str = input
+            .get("strictness")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // 暂存模式：预览替换计数 + 新文本，不落盘；应用经 `write_file xd://resolve`。
+        let preview = input
+            .get("preview")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if preview {
+            let matches = agent_ast::search(&text, lang, pattern, strictness)
+                .map_err(ToolError::Execution)?;
+            if matches.is_empty() {
+                return Ok(ToolResult::text(format!(
+                    "模式未匹配任何节点，{path} 未改动（未暂存）"
+                )));
+            }
+            let new_text = agent_ast::rewrite(&text, lang, pattern, replacement, strictness)
+                .map_err(ToolError::Execution)?;
+            let pending = PendingRewrite {
+                path: path.to_string(),
+                pattern: pattern.to_string(),
+                replacement: replacement.to_string(),
+                strictness: strictness_str,
+                count: matches.len(),
+                old_len: text.len(),
+                new_len: new_text.len(),
+            };
+            let Some(queue) = ctx.pending_rewrites else {
+                return Err(ToolError::Execution(
+                    "暂存队列未启用（当前运行环境不支持 preview）".into(),
+                ));
+            };
+            let mut q = queue.lock().expect("pending 队列锁");
+            // 同一 path 已有暂存：先移除旧项（最新预览为准）。
+            q.retain(|p| p.path != pending.path);
+            q.push(pending);
+            drop(q);
+            return Ok(ToolResult::text(format!(
+                "(proposed) {} replacements — {path}（{} → {} 字节）已暂存，未写入。\
+用 write_file {{path: \"xd://resolve\"}} 应用，或 xd://reject 丢弃；\
+首处变化预览：\n{}",
+                matches.len(),
+                text.len(),
+                new_text.len(),
+                first_diff_line(&text, &new_text)
+            )));
+        }
 
         let new_text = agent_ast::rewrite(&text, lang, pattern, replacement, strictness)
             .map_err(ToolError::Execution)?;
@@ -278,6 +352,35 @@ fn line_of(src: &str, byte_off: usize) -> usize {
     src[..off].matches('\n').count() + 1
 }
 
+/// 首个差异行的前后各一行预览（≤3 行，`-`/`+` 前缀，限 200 字符/行）。
+fn first_diff_line(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let common = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = String::new();
+    if common > 0 {
+        let show = (common - 1).max(common.saturating_sub(1));
+        if show > 0 {
+            let line = old_lines[show.min(old_lines.len() - 1)];
+            let line = &line[..line.len().min(200)];
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    if let Some(l) = old_lines.get(common) {
+        let l = &l[..l.len().min(200)];
+        out.push_str(&format!("- {l}\n"));
+    }
+    if let Some(l) = new_lines.get(common) {
+        let l = &l[..l.len().min(200)];
+        out.push_str(&format!("+ {l}\n"));
+    }
+    out.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +413,8 @@ mod tests {
             resources: None,
             write_effect: None,
             update_tx: None,
+            conflicts: None,
+            pending_rewrites: None,
         }
     }
 

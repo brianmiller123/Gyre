@@ -8,23 +8,27 @@
 #![warn(clippy::pedantic)]
 
 mod ast_tool;
+pub mod conflict;
 pub mod intercept;
 mod fs;
 mod fuzzy_match;
 mod github;
 mod image;
 mod list_tool;
+mod lsp_apply;
 mod lsp_tool;
 mod lsp_write_effect;
 mod search;
 mod shell;
+mod web_search;
 mod write;
 
 use agent_core::{
     ApprovalPolicy, ApprovalRequest, CapabilityTier, ToolResult, ToolSpec, Workspace, WriteEffect,
 };
 
-pub use ast_tool::{AstRewriteTool, AstSearchTool, ReplaceBlockTool};
+pub use conflict::{ConflictBlock, ConflictHistory, ConflictTarget};
+pub use ast_tool::{AstRewriteTool, AstSearchTool, PendingRewrite, ReplaceBlockTool};
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use fuzzy_match::{
     FuzzyOpts, MatchError, MatchMethod, MatchOutcome, find_unique_match, set_fuzzy_opts,
@@ -32,11 +36,13 @@ pub use fuzzy_match::{
 pub use github::{GithubTool, PROMPT_SECTION};
 pub use image::{ImageGenTool, ReadImageTool};
 pub use list_tool::ListFilesTool;
+pub use lsp_apply::LspApplyTool;
 pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunCommandTool;
 pub use intercept::{CompiledRule, default_compiled};
+pub use web_search::{DuckDuckGoHtml, Searxng, SitePage, WebResult, WebSearchChain, WebSearchProvider, WebSearchTool, extract_site};
 pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
 
 /// 工具流式 partial 更新（工具 execute 内经 [`ToolContext::update_tx`] 推送，agent 循环端
@@ -72,6 +78,12 @@ pub struct ToolContext<'a> {
     /// agent 循环端在执行批次时 select! 接收并发射 `ToolExecutionUpdate` 事件。移植 oh-my-pi
     /// `AgentToolUpdateCallback`。`None` 时工具无流式能力（默认，既有工具零改动）。
     pub update_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<ToolUpdate>>,
+    /// 会话级合并冲突注册表（可选；`read_file :conflicts` 注册，`write_file conflict://N`
+    /// 解决）。`None` 时 conflict:// 路径返回「未启用/未注册」错误。
+    pub conflicts: Option<&'a std::sync::Arc<std::sync::Mutex<ConflictHistory>>>,
+    /// 会话级 ast-rewrite 暂存队列（`ast_rewrite preview:true` 暂存，`write_file xd://resolve`
+    /// 应用 / `xd://reject` 丢弃）。`None` 时 preview 模式报「暂存队列未启用」。
+    pub pending_rewrites: Option<&'a std::sync::Arc<std::sync::Mutex<Vec<PendingRewrite>>>>,
 }
 
 /// 工具并发模式（决定同一轮多工具调用的调度）。
@@ -203,6 +215,7 @@ pub fn core_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
         .with(Box::new(RunCommandTool::new(intercept)))
         .with(Box::new(GrepTool))
         .with(Box::new(GlobTool))
+        .with(Box::new(WebSearchTool::new()))
 }
 
 /// AST 可选工具组：`replace_block` / `ast_search` / `ast_rewrite`（受 `[tools].ast` 控制）。
@@ -223,7 +236,9 @@ pub fn image_tools(reg: DefaultToolRegistry) -> DefaultToolRegistry {
 /// LSP 可选工具（受 `[tools].lsp` 控制）。
 #[must_use]
 pub fn lsp_tool(reg: DefaultToolRegistry) -> DefaultToolRegistry {
-    reg.with(Box::new(LspTool::new()))
+    let tool = LspTool::new();
+    let pool = tool.pool();
+    reg.with(Box::new(tool)).with(Box::new(LspApplyTool::new(pool)))
 }
 
 /// 全部内置工具（core + ast + image + lsp），向后兼容入口。

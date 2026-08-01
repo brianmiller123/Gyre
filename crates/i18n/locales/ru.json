@@ -183,5 +183,9 @@
   "lang.name.zh": "中文",
   "lang.name.ru": "Русский",
   "lang.name.ja": "日本語",
-  "help.lang": "  /lang [код]       показать / сменить язык интерфейса (en|zh|ru|ja)"
+  "help.lang": "  /lang [код]       показать / сменить язык интерфейса (en|zh|ru|ja)",
+  "context.foreign_loaded": "Загружено {count} внешних конфигураций агентов (AGENTS.md/CLAUDE.md/Cursor/Cline)",
+  "collab.write_link": "│ Ссылка на запись: http://{bind}/collab/{room}?wt={token}",
+  "collab.view_link": "│ Ссылка только для чтения: http://{bind}/collab/{room} (без wt → view)",
+  "collab.wt_tip": "Подсказка: ссылки на запись содержат 16-байтный токен записи (wt); view-ссылки — нет. Реле проверяет wt. Снимки передаются частями (≤48KB каждая); лог восстановления — ~/.gyre/collab/ по id комнаты."
 }

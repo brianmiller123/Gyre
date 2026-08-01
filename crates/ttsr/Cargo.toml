@@ -1,0 +1,22 @@
+[package]
+name = "agent-ttsr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-core = { workspace = true }
+agent-ast = { workspace = true }
+regex = { workspace = true }
+globset = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

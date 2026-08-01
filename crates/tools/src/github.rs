@@ -361,11 +361,140 @@ fn build_client() -> Result<&'static reqwest::Client, ToolError> {
 }
 
 /// 读取鉴权 token（`GH_TOKEN` 优先于 `GITHUB_TOKEN`），空值视为无。
-fn auth_token() -> Option<String> {
+pub(crate) fn auth_token() -> Option<String> {
     std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// `pr://` / `issue://` 内部协议路由：GET `<owner>/<repo>/<path>` 并缓存到
+/// `<workspace>/.gyre/cache/github/`（文件缓存：auth 指纹 + TTL 300s；列表 TTL 60s）。
+///
+/// `path` 例：`pulls/42`、`issues/7`、`pulls?state=open&per_page=5`。
+///
+/// # Errors
+/// 网络错误、HTTP 非 2xx 或缓存读写失败时返回 [`ToolError::Execution`]。
+pub(crate) async fn api_get_json(
+    owner: &str,
+    repo: &str,
+    path: &str,
+    ctx: &ToolContext<'_>,
+) -> Result<serde_json::Value, ToolError> {
+    use std::time::SystemTime;
+
+    let url = format!("{API_BASE}/repos/{owner}/{repo}/{path}");
+    // auth 指纹：token 前 8 字符 + 有无（匿名缓存与鉴权缓存隔离）。
+    let auth = auth_token();
+    let fingerprint = auth
+        .as_ref()
+        .map(|t| format!("tok-{}", &t[..t.len().min(8)]))
+        .unwrap_or_else(|| "anon".into());
+    // 列表（含 `?`）TTL 短：60s；单对象 TTL 长：300s。
+    let ttl = if path.contains('?') { 60 } else { 300 };
+    let safe_key = format!("{owner}__{repo}__{path}")
+        .replace(['/', '?', '=', '&'], "_");
+    let cache_dir = ctx.workspace.root().join(".gyre/cache/github");
+    let cache_file = cache_dir.join(format!("{fingerprint}__{safe_key}.json"));
+
+    // 命中新鲜缓存 → 直接返回。
+    if let Ok(meta) = tokio::fs::metadata(&cache_file).await {
+        if let Ok(modified) = meta.modified() {
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default()
+                .as_secs();
+            if age < ttl {
+                if let Ok(text) = tokio::fs::read_to_string(&cache_file).await {
+                    return serde_json::from_str(&text)
+                        .map_err(|e| ToolError::Execution(format!("缓存 JSON 损坏: {e}")));
+                }
+            }
+        }
+    }
+
+    let mut builder = build_client()?.get(&url);
+    if let Some(t) = &auth {
+        builder = builder.bearer_auth(t);
+    }
+    let body = fetch(builder, ctx).await?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ToolError::Execution(format!("GitHub 响应 JSON 解析失败: {e}")))?;
+    // 写缓存（尽力而为；失败不影响返回）。
+    let _ = tokio::fs::create_dir_all(&cache_dir).await;
+    let _ = tokio::fs::write(&cache_file, &body).await;
+    Ok(value)
+}
+
+/// `pr://` / `issue://` 路由渲染：单对象 → 结构化 markdown；列表 → 逐条摘要。
+/// 供 `read_file` 内部协议调用。
+///
+/// # Errors
+/// 网络/解析失败时返回 [`ToolError::Execution`]。
+pub(crate) async fn render_gh_uri(
+    kind: &str,
+    owner: &str,
+    repo: &str,
+    number: Option<u64>,
+    query: &str,
+    ctx: &ToolContext<'_>,
+) -> Result<String, ToolError> {
+    let endpoint = match kind {
+        "pr" => "pulls",
+        "issue" => "issues",
+        other => return Err(ToolError::InvalidArgs(format!("未知 GitHub 类型 `{other}`（pr|issue）"))),
+    };
+    let display = format!("{owner}/{repo}");
+    match number {
+        Some(n) => {
+            let v = api_get_json(owner, repo, &format!("{endpoint}/{n}"), ctx).await?;
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("(无标题)");
+            let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+            let user = v.pointer("/user/login").and_then(|x| x.as_str()).unwrap_or("?");
+            let created = v
+                .get("created_at")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
+            let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+            let comments = v.get("comments").and_then(|x| x.as_u64()).unwrap_or(0);
+            let mut out = format!("#{n} {title} [{state}] — @{user} · {created}\n\n");
+            if kind == "pr" {
+                let merged = v
+                    .get("merged")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let additions = v.pointer("/additions").and_then(|x| x.as_u64()).unwrap_or(0);
+                let deletions = v.pointer("/deletions").and_then(|x| x.as_u64()).unwrap_or(0);
+                out.push_str(&format!("合并: {} · +{additions}/-{deletions} 行\n\n", if merged { "是" } else { "否" }));
+            }
+            if !body.is_empty() {
+                out.push_str(&format!("{body}\n\n"));
+            }
+            out.push_str(&format!("评论 {comments} 条 · 来源: <https://github.com/{display}/{endpoint}/{n}>\n"));
+            Ok(out)
+        }
+        None => {
+            let v = api_get_json(owner, repo, &format!("{endpoint}?{query}"), ctx).await?;
+            let arr = match v.as_array() {
+                Some(a) => a,
+                None => {
+                    return Err(ToolError::Execution(format!(
+                        "{display} {endpoint} 列表响应非数组（可能是速率限制或 repo 不存在）"
+                    )));
+                }
+            };
+            let mut out = format!("{display} 的 {} 列表（共 {} 条，{query}）：\n", kind, arr.len());
+            for item in arr {
+                let n = item.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
+                let title = item.get("title").and_then(|x| x.as_str()).unwrap_or("(无标题)");
+                let state = item.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+                let user = item.pointer("/user/login").and_then(|x| x.as_str()).unwrap_or("?");
+                out.push_str(&format!("  #{n} [{state}] {title} — @{user}\n"));
+            }
+            out.push_str(&format!("\n`read_file` 可读 `{kind}://{display}/<编号>` 看详情\n"));
+            Ok(out)
+        }
+    }
 }
 
 /// 发送请求并返回响应体文本；二进制响应（如 logs 的 zip）回退为元信息。

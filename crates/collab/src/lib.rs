@@ -20,9 +20,11 @@ pub mod error;
 pub mod frame;
 pub mod relay;
 pub mod room;
+pub mod snapshot;
 
 pub use codec::{KEY_LEN, NONCE_LEN, RoomKey, generate_room_key, open, seal};
 pub use error::CollabError;
 pub use frame::WireFrame;
-pub use relay::{CollabClient, Relay};
+pub use relay::{CollabClient, Relay, generate_write_token};
 pub use room::{build_share_url, decode_room_key, encode_room_key, parse_share_url, room_id};
+pub use snapshot::{append_snapshot_log, chunk_snapshot, read_snapshot_log, SNAPSHOT_CHUNK_MAX};

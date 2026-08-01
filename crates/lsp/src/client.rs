@@ -69,12 +69,16 @@ pub struct LspSymbol {
     pub container: Option<String>,
 }
 
-/// 重命名编辑。
+/// 单个 LSP 文本编辑（workspace/rename/code action 共用；行/列为 0-based UTF-16）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspRenameEdit {
     pub uri: String,
     pub line: u32,
     pub character: u32,
+    /// 结束行（0-based；与 `line` 相等时替换单点/空区间）。
+    pub end_line: u32,
+    /// 结束列（0-based UTF-16）。
+    pub end_character: u32,
     pub new_text: String,
     pub old_text: String,
 }
@@ -86,6 +90,16 @@ pub struct LspCodeAction {
     pub kind: Option<String>,
     pub is_preferred: bool,
     pub edits: Vec<LspRenameEdit>,
+    /// 服务器命令（executeCommand 执行；code action 常走此路径而非直接 edits）。
+    pub command: Option<LspCommand>,
+}
+
+/// 服务器命令（`workspace/executeCommand`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspCommand {
+    pub title: String,
+    pub command: String,
+    pub arguments: Vec<serde_json::Value>,
 }
 
 /// 文本编辑（textDocument/formatting 等返回）。
@@ -366,6 +380,20 @@ impl LspClient {
             return Ok(vec![]);
         }
         Ok(parse_code_actions(&response))
+    }
+
+    /// 执行服务器命令（`workspace/executeCommand`，code action 的 command 路径）。
+    /// 返回服务器响应（可空）。
+    pub async fn execute_command(
+        &self,
+        command: &str,
+        arguments: &[serde_json::Value],
+    ) -> Result<serde_json::Value, LspError> {
+        let params = serde_json::json!({
+            "command": command,
+            "arguments": arguments
+        });
+        self.request("workspace/executeCommand", params).await
     }
 
     // ── 格式化 ───────────────────────────────────────────────────────
@@ -744,6 +772,7 @@ fn parse_workspace_edit(v: &serde_json::Value) -> Vec<LspRenameEdit> {
             if let Some(arr) = text_edits.as_array() {
                 for edit in arr {
                     let start = edit.get("range").and_then(|r| r.get("start"));
+                    let end = edit.get("range").and_then(|r| r.get("end"));
                     edits.push(LspRenameEdit {
                         uri: uri.clone(),
                         line: start
@@ -752,6 +781,14 @@ fn parse_workspace_edit(v: &serde_json::Value) -> Vec<LspRenameEdit> {
                             .unwrap_or(0) as u32,
                         character: start
                             .and_then(|s| s.get("character"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0) as u32,
+                        end_line: end
+                            .and_then(|e| e.get("line"))
+                            .and_then(|l| l.as_u64())
+                            .unwrap_or(0) as u32,
+                        end_character: end
+                            .and_then(|e| e.get("character"))
                             .and_then(|c| c.as_u64())
                             .unwrap_or(0) as u32,
                         new_text: edit
@@ -791,6 +828,7 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
                         if let Some(arr) = text_edits.as_array() {
                             for e in arr {
                                 let start = e.get("range").and_then(|r| r.get("start"));
+                                let end = e.get("range").and_then(|r| r.get("end"));
                                 edits.push(LspRenameEdit {
                                     uri: uri.clone(),
                                     line: start
@@ -800,6 +838,16 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
                                         as u32,
                                     character: start
                                         .and_then(|s| s.get("character"))
+                                        .and_then(|c| c.as_u64())
+                                        .unwrap_or(0)
+                                        as u32,
+                                    end_line: end
+                                        .and_then(|e| e.get("line"))
+                                        .and_then(|l| l.as_u64())
+                                        .unwrap_or(0)
+                                        as u32,
+                                    end_character: end
+                                        .and_then(|e| e.get("character"))
                                         .and_then(|c| c.as_u64())
                                         .unwrap_or(0)
                                         as u32,
@@ -815,11 +863,30 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
                     }
                 }
             }
+            // code action 的命令（executeCommand 路径）。
+            let command = action.get("command").map(|c| LspCommand {
+                title: c
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                command: c
+                    .get("command")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                arguments: c
+                    .get("arguments")
+                    .and_then(|a| a.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            });
             Some(LspCodeAction {
                 title,
                 kind,
                 is_preferred,
                 edits,
+                command,
             })
         })
         .collect()
@@ -837,6 +904,8 @@ pub enum LspError {
     Deserialize(String),
     #[error("无效 URI: {0}")]
     InvalidUri(String),
+    #[error("编辑无效: {0}")]
+    InvalidEdit(String),
     #[error("文档未打开: {0}")]
     DocumentNotOpen(String),
     #[error("服务器不支持: {0}")]

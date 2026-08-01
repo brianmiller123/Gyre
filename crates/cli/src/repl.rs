@@ -910,14 +910,21 @@ fn print_collab(ctx: &CommandContext<'_>) {
     let key = agent_collab::generate_room_key();
     let room = agent_collab::room_id(&key);
     let fragment = agent_collab::encode_room_key(&key);
+    // 本地 CLI 生成的房间不经服务端注册 write token → 中继按开放房间处理；
+    // 经 `agent --serve` 的 `/api/collab/room` 创建的房间才具备写权限校验。
+    // 这里仍打印 token 与两种链接形态，供用户了解权限模型。
+    let token = agent_collab::generate_write_token();
     let bind = &ctx.config.server.bind;
     eprintln!("{}", t!("collab.title"));
     eprintln!("{}", t!("collab.room", room = room));
     eprintln!("{}", t!("collab.fragment", fragment = fragment));
     eprintln!("{}", t!("collab.relay", bind = bind, room = room));
+    eprintln!("{}", t!("collab.write_link", bind = bind, room = room, token = token));
+    eprintln!("{}", t!("collab.view_link", bind = bind, room = room));
     eprintln!("{}", t!("collab.link", bind = bind, fragment = fragment));
     eprintln!("{}", t!("collab.footer"));
     eprintln!("{}", t!("collab.tip"));
+    eprintln!("{}", t!("collab.wt_tip"));
 }
 
 /// `/lang [code]`：查看 / 切换界面语言（en/zh/ru/ja）。直接作用于全局 i18n 状态，即时生效。

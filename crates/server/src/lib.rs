@@ -14,9 +14,9 @@ use agent::{Agent, AgentBuilder, PauseGate};
 use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
-    AskResponse, AssistantMessage, CompactionStrategy, ContextManager, LlmProvider, Mode,
-    ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage, Usage, UserContent,
-    UserMessage, Workspace,
+    AskResponse, AssistantMessage, CompactionStrategy, ContentBlock, ContextManager, LlmProvider,
+    Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage, Usage,
+    UserContent, UserMessage, Workspace,
 };
 use agent_supervisor::{SubAgentStatus, Supervisor};
 use agent_tools::Tool;
@@ -409,6 +409,13 @@ pub struct SessionManager {
     cwd: Arc<std::path::PathBuf>,
     /// 协同中继（端到端加密）：按不透明 room_id 广播密封字节，永不接触明文/密钥。
     relay: agent_collab::Relay,
+    /// host 侧房间机密（`room_id` → 房间密钥 + 规范 write token）。
+    ///
+    /// 本服务即 **host 进程**（对标 oh-my-pi 的 coding-agent 持密钥）：密钥由
+    /// [`new_collab_room`] 本地生成、从不外发，仅用于 WS 桥向 guest 单播
+    /// host 裁决帧（`Welcome` `read_only`）。中继 [`Relay`] 本身保持密钥盲视——
+    /// 只存密封字节；host 只密封自己的帧、永不解封他人帧。
+    collab_hosts: Arc<Mutex<HashMap<String, HostSecret>>>,
     /// 协同中继维护循环是否已启动（惰性，首次创建会话时拉起）。
     maintenance_started: Arc<std::sync::atomic::AtomicBool>,
     /// 进程级暂停门（共享单例）：注入每个会话的 Agent，由 `/api/pause` `/api/resume`
@@ -428,6 +435,7 @@ impl SessionManager {
             http,
             cwd,
             relay: agent_collab::Relay::new(),
+            collab_hosts: Arc::new(Mutex::new(HashMap::new())),
             maintenance_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_gate: PauseGate::new(),
         }
@@ -437,6 +445,12 @@ impl SessionManager {
     #[must_use]
     pub fn relay(&self) -> &agent_collab::Relay {
         &self.relay
+    }
+
+    /// 取房间的 host 机密（存在 = 本服务创建的房间，可裁决读写）。
+    #[must_use]
+    pub(crate) async fn collab_host(&self, room_id: &str) -> Option<HostSecret> {
+        self.collab_hosts.lock().await.get(room_id).cloned()
     }
 
     /// 工作区根目录（agent 打开的目录）。
@@ -912,7 +926,9 @@ async fn build_agent(
     // 进程级暂停门（共享单例；注入 Agent，由 `/api/pause` `/api/resume` 驱动）。
     pause_gate: Arc<PauseGate>,
 ) -> Result<(Agent, Arc<dyn agent_core::ContextManager>, SessionLlm), String> {
-    let profile = config.resolve_model(alias).map_err(|e| e.to_string())?;
+    // P2：模型 fallback 链（主 profile + `fallbacks` 引用依序展开；跨线协议族亦可）。
+    let chain = config.resolve_chain(alias).map_err(|e| e.to_string())?;
+    let profile = chain[0];
     use secrecy::ExposeSecret;
     let api_key: String = profile.resolve_api_key().expose_secret().to_string();
     let model = agent_core::Model {
@@ -926,6 +942,28 @@ async fn build_agent(
         supports_thinking: config.agent.enable_thinking,
         extra_body: profile.extra_body.clone(),
     };
+    // fallback 链模型 + key 轮换环（model id → key 列表；空 = 单 key 不轮换）。
+    let fallback_models: Vec<agent_core::Model> = chain
+        .iter()
+        .skip(1)
+        .map(|p| {
+            agent_core::Model {
+                id: p.id.clone(),
+                provider: "openai-compatible".into(),
+                api: p.api,
+                max_input_tokens: p.effective_max_input_tokens(),
+                max_output_tokens: p.max_output_tokens.unwrap_or(4096),
+                supports_tools: true,
+                supports_streaming: true,
+                supports_thinking: config.agent.enable_thinking,
+                extra_body: p.extra_body.clone(),
+            }
+        })
+        .collect();
+    let key_rings: std::collections::HashMap<String, Vec<String>> = chain
+        .iter()
+        .map(|p| (p.id.clone(), p.key_ring()))
+        .collect();
 
     let mut registry = agent_llm::ProviderRegistry::new();
     for p in agent_llm::collect_providers(http) {
@@ -1077,7 +1115,10 @@ async fn build_agent(
     // 长回复被中途截断（finish_reason=length）→ 误报「任务完成」。
     let max_output_tokens = model.max_output_tokens;
     let agent = assemble(
-        Agent::builder(model).steering(),
+        Agent::builder(model)
+            .steering()
+            .fallbacks(fallback_models)
+            .key_rings(key_rings),
         provider,
         tools,
         lsp_pool,
@@ -1143,7 +1184,8 @@ fn assemble(
         .context_guard(config.agent.context_window_guard)
         .catalog(catalog)
         .context_files(context_files)
-        .pause_gate(pause_gate);
+        .pause_gate(pause_gate)
+        .ttsr(ttsr_for(config, &workspace_root));
     // 注入思考模式（若 config 启用）—— 与 CLI 一致
     let builder = if config.agent.enable_thinking {
         builder.thinking(agent_core::ThinkingConfig::new(
@@ -1171,6 +1213,25 @@ fn assemble(
     } else {
         builder.build()
     }
+}
+
+/// 装配 TTSR 流规则协调器（与 CLI 装配一致）：发现 `<root>/.gyre/rules/*.md`，
+/// 缺省有规则即启用；`[ttsr] enabled = false` 或 `disabled_rules` 可关闭/过滤。
+fn ttsr_for(config: &agent_config::Config, workspace_root: &std::path::Path) -> Option<std::sync::Arc<agent_ttsr::TtsrCoordinator>> {
+    if !config.ttsr.enabled.unwrap_or(true) {
+        return None;
+    }
+    let rules = agent_ttsr::discover_rules(&workspace_root.join(".gyre/rules"));
+    if rules.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
+        agent_ttsr::TtsrConfig {
+            disabled_rules: config.ttsr.disabled_rules.clone(),
+            ..Default::default()
+        },
+        rules,
+    )))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1728,6 +1789,9 @@ fn collect_entries(dir: &std::path::Path) -> Result<Vec<serde_json::Value>, Stri
 struct SessionParams {
     #[serde(default)]
     token: Option<String>,
+    /// Collab write token（仅 `/collab/{room_id}` 使用；缺省 = 只读 view 链接）。
+    #[serde(default)]
+    wt: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// 恢复指定历史会话（会话 id）。
@@ -1739,6 +1803,10 @@ struct SessionParams {
     /// 模式覆盖（code|architect|ask|debug）。
     #[serde(default)]
     mode: Option<String>,
+    /// 会话绑定（仅 `/api/collab/room` 使用）：创建房间时绑定 agent 会话，
+    /// guest 连接时由 host 把会话历史以快照块下发（transcript 分页传输）。
+    #[serde(default)]
+    sid: Option<String>,
 }
 
 /// 会话 id 安全校验：仅允许 `[A-Za-z0-9_-]`，防路径穿越（`/` `\` `..` 等）。
@@ -1759,6 +1827,129 @@ fn parse_history_line(line: &str) -> Option<agent_core::AgentMessage> {
         return Some(node.message);
     }
     serde_json::from_str::<agent_core::AgentMessage>(line).ok()
+}
+
+/// 会话历史快照文本上限（字符）。
+///
+/// guest 连接时由 host 全量下发；超限截断保留**尾部（最新）**并加省略标记，
+/// 避免超大历史压垮 WS 流（48 KiB/块 × 数百块仍是可控的，但无限会话不设防）。
+const TRANSCRIPT_MAX_CHARS: usize = 4 * 1024 * 1024;
+
+/// 把一条 [`agent_core::AgentMessage`] 渲染为 guest 可读的一行（多行）文本。
+///
+/// 内部机制消息（`SoftRequirement`）与空文本返回空串（调用方跳过）。
+fn render_transcript_message(msg: &agent_core::AgentMessage) -> String {
+    match msg {
+        agent_core::AgentMessage::User(u) => {
+            let text: String = u
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    agent_core::UserContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let t = text.trim();
+            if t.is_empty() {
+                String::new()
+            } else {
+                format!("[user] {t}")
+            }
+        }
+        agent_core::AgentMessage::Assistant(a) => {
+            let mut out = Vec::new();
+            for block in &a.content {
+                match block {
+                    ContentBlock::Thinking { text, .. } if !text.trim().is_empty() => {
+                        out.push(format!("[thinking] {}", text.trim()));
+                    }
+                    ContentBlock::Text { text } if !text.trim().is_empty() => {
+                        out.push(format!("[assistant] {}", text.trim()));
+                    }
+                    ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => {
+                        let args = preview_text(&arguments.to_string(), 120);
+                        out.push(format!("[tool] {name} {args}"));
+                    }
+                    _ => {}
+                }
+            }
+            out.join("\n")
+        }
+        agent_core::AgentMessage::ToolResult(t) => {
+            let text = t.result.to_llm_text();
+            let text = text.trim();
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("[tool result] {}", preview_text(text, 2000))
+            }
+        }
+        agent_core::AgentMessage::Status(s) => {
+            let t = s.text.trim();
+            if t.is_empty() {
+                String::new()
+            } else {
+                format!("[status] {t}")
+            }
+        }
+        agent_core::AgentMessage::Ask(a) => {
+            let t = a.prompt.trim();
+            if t.is_empty() {
+                String::new()
+            } else {
+                format!("[ask] {t}")
+            }
+        }
+        agent_core::AgentMessage::SoftRequirement(_) => String::new(),
+    }
+}
+
+/// 把会话 JSONL 渲染为可读快照文本（guest transcript 分页传输的载荷）。
+///
+/// 与 [`read_history`] 同源（同一解析路径，新旧持久化格式兼容）；
+/// 超限时保留尾部最新内容并加省略标记。文件缺失/无可用消息 → `None`。
+fn render_session_transcript(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    for line in std::io::BufReader::new(file).lines().flatten() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(msg) = parse_history_line(trimmed) else {
+            continue;
+        };
+        let rendered = render_transcript_message(&msg);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let total: usize = parts.iter().map(|p| p.len() + 1).sum();
+    if total <= TRANSCRIPT_MAX_CHARS {
+        return Some(parts.join("\n"));
+    }
+    // 超限：从尾部累积保留最新内容，头部省略。
+    let mut kept: Vec<&str> = Vec::new();
+    let mut len = 0usize;
+    for p in parts.iter().rev() {
+        if len + p.len() + 1 > TRANSCRIPT_MAX_CHARS {
+            break;
+        }
+        len += p.len() + 1;
+        kept.push(p.as_str());
+    }
+    kept.reverse();
+    let dropped = parts.len() - kept.len();
+    let mut out = format!("…（较早 {dropped} 条已省略，仅显示最近内容）\n");
+    out.push_str(&kept.join("\n"));
+    Some(out)
 }
 
 /// 读取会话 JSONL 的首条用户文本（列表预览用）。
@@ -2405,9 +2596,23 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: Arc<Sessio
 // 协同中继（端到端加密）：按不透明 room_id 转发密封字节，永不接触明文/密钥
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// `GET /api/collab/room` → 生成房间密钥，返回派生 room_id 与 base64url 密钥片段。
+/// host 侧房间机密：房间密钥 + 规范 write token（[`new_collab_room`] 创建时登记）。
 ///
-/// 密钥仅返回给调用方；中继只用派生的 room_id 路由，无法解密。
+/// 本服务即 host 进程：密钥由服务本地生成、从不外发，仅用于向 guest 单播
+/// host 裁决帧（Welcome read_only）。中继保持密钥盲视——host 只密封自己的帧，
+/// 永不解封他人帧。
+#[derive(Clone)]
+struct HostSecret {
+    key: agent_collab::RoomKey,
+    write_token: String,
+    /// 绑定的 agent 会话 id（`/api/collab/room?sid=` 传入；缺省 = 纯聊天房间，不下发快照）。
+    session_id: Option<String>,
+}
+
+/// `GET /api/collab/room` → 生成房间密钥，返回派生 `room_id` 与 base64url 密钥片段。
+///
+/// 本服务作为 host 进程在内存保留密钥与规范 write token（[`SessionManager::collab_hosts`]），
+/// 供 WS 桥向 guest 单播 read_only 裁决；密钥本地生成、从不外发，中继仍只路由密封字节。
 async fn new_collab_room(
     State(state): State<SessionManager>,
     axum::extract::Query(auth): axum::extract::Query<SessionParams>,
@@ -2417,17 +2622,38 @@ async fn new_collab_room(
     }
     let key = agent_collab::generate_room_key();
     let room_id = agent_collab::room_id(&key);
+    let write_token = agent_collab::generate_write_token();
+    state.relay().set_write_token(&room_id, write_token.clone()).await;
+    // 可选会话绑定：guest 连接时由 host 下发会话历史快照块。
+    let session_id = auth.sid.filter(|s| is_safe_session_id(s));
+    state
+        .collab_hosts
+        .lock()
+        .await
+        .insert(
+            room_id.clone(),
+            HostSecret {
+                key,
+                write_token: write_token.clone(),
+                session_id,
+            },
+        );
     Json(serde_json::json!({
         "room_id": room_id,
         "key": agent_collab::encode_room_key(&key),
+        // 可写分享链接须携带（URL query `wt`）；不含此令牌的链接 = 只读 view。
+        "write_token": write_token,
         "ws_url": format!("/collab/{room_id}"),
     }))
     .into_response()
 }
 
-/// `GET /collab/{room_id}` → 升级为 WebSocket，桥接为协同中继。
+/// `GET /collab/{room_id}` → WebSocket 升级（协同中继桥）；普通浏览器 GET 返回 guest 页面。
+///
+/// guest 页面（单文件，无外部依赖）：从链接 `#` 片段取房间密钥，WebCrypto AES-GCM
+/// 解封/密封帧，断线指数退避重连。密钥不发给服务器（片段不出现在 HTTP 请求中）。
 async fn collab_ws_handler(
-    ws: axum::extract::ws::WebSocketUpgrade,
+    ws: OptionalWsUpgrade,
     Path(room_id): Path<String>,
     State(state): State<SessionManager>,
     axum::extract::Query(auth): axum::extract::Query<SessionParams>,
@@ -2435,13 +2661,97 @@ async fn collab_ws_handler(
     if let Err(resp) = check_auth(&state, &auth.token) {
         return resp;
     }
+    // 非 WS 请求（浏览器 GET，无 Upgrade 头）→ 渲染 guest 页面；否则升级为 WS 桥。
+    let Some(ws) = ws.0 else {
+        return (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8",
+            )],
+            COLLAB_GUEST_PAGE,
+        )
+            .into_response();
+    };
+    let wt = auth.wt.clone();
+    let host = state.collab_host(&room_id).await;
+    let cwd = state.cwd().to_path_buf();
     ws.max_message_size(256 * 1024)
-        .on_upgrade(move |socket| collab_relay(socket, room_id, state.relay.clone()))
+        .on_upgrade(move |socket| {
+            // `wt` = write token（房间创建时随可写链接分发的 32 hex 字符）；
+            // 缺省 = 只读 view 链接，publish 将被中继拒绝。
+            collab_relay(socket, room_id, state.relay.clone(), wt, host, cwd)
+        })
+}
+
+/// 可选 WebSocket 升级 extractor：非 WS 请求返回 `None`（浏览器 GET → guest 页面）。
+///
+/// axum 未导出 `WebSocketUpgrade` 的 rejection 类型（测试私有），无法用 `Result`
+/// extractor 区分「非 WS」与「握手不完整」；此 wrapper 自行判定 Upgrade 头，
+/// 缺失时短路为 `None`，完整握手仍委托 axum 原生 extractor（拒绝条件一致）。
+struct OptionalWsUpgrade(Option<axum::extract::ws::WebSocketUpgrade>);
+
+impl<S> axum::extract::FromRequestParts<S> for OptionalWsUpgrade
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let is_ws = axum::http::header::HeaderMap::get(
+            &parts.headers,
+            axum::http::header::UPGRADE,
+        )
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+        if !is_ws {
+            return Ok(Self(None));
+        }
+        // 握手不完整（缺 Sec-WebSocket-Key 等）→ 降级为 guest 页（无副作用，客户端自会报错）。
+        let Ok(ws) = axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, state).await
+        else {
+            return Ok(Self(None));
+        };
+        Ok(Self(Some(ws)))
+    }
+}
+
+/// 协同 guest 页面（浏览器端到端加密视图）。
+const COLLAB_GUEST_PAGE: &str = include_str!("collab_guest.html");
+
+/// host 侧 `read_only` 裁决：按连接 `wt` 对照房间规范令牌，密封 Welcome 握手帧。
+///
+/// 裁决与中继发布校验同源（[`Relay::set_write_token`] 登记的即此规范令牌），
+/// 故 UI 裁决与中继实际权限永远一致：错误/缺失 wt → `read_only: true`。
+/// 桥不解封任何帧——只 seal 自己的裁决帧（中继保持密钥盲视）。
+fn seal_host_welcome(
+    host: &HostSecret,
+    wt: Option<&str>,
+    ts: u64,
+    entry_count: usize,
+) -> Result<Vec<u8>, agent_collab::CollabError> {
+    let writable = wt.is_some_and(|t| t == host.write_token);
+    agent_collab::seal(
+        &host.key,
+        &agent_collab::WireFrame::Welcome {
+            client_id: "host".into(),
+            proto: 1,
+            read_only: !writable,
+            entry_count,
+            ts,
+        },
+    )
 }
 
 /// 双向桥接：中继广播 → 客户端；客户端密封字节 → 中继。
 ///
-/// 密封字节作为二进制 WS 帧承载；中继对内容盲视（仅按 room_id 路由）。
+/// 密封字节作为二进制 WS 帧承载；中继对内容盲视（仅按 `room_id` 路由）。
+/// 连接建立后先单播 host 裁决握手（本服务创建的房间），再补发历史密封帧，
+/// 最后进入广播循环；握手帧与历史均为单播直发（不走中继），不干扰其他 guest。
 /// 协同中继单条消息最大字节数。
 const COLLAB_MSG_MAX_SIZE: usize = 64 * 1024;
 /// 协同中继每秒消息数上限（速率限制窗口）。
@@ -2451,9 +2761,68 @@ async fn collab_relay(
     socket: axum::extract::ws::WebSocket,
     room_id: String,
     relay: agent_collab::Relay,
+    write_token: Option<String>,
+    host: Option<HostSecret>,
+    cwd: std::path::PathBuf,
 ) {
     let (mut sink, mut input) = socket.split();
-    let mut rx = relay.join(&room_id).await;
+
+    // host 握手：裁决读写 + 渲染绑定会话的 transcript（快照分块，entry_count 告知块数），
+    // 全部单播直发（不走中继），不干扰其他 guest。
+    if let Some(h) = &host {
+        let ts = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(0);
+        // 会话历史 → 快照分块（绑定 sid 且文件可读时；否则 0 块）。
+        let transcript: Option<String> = h.session_id.as_deref().and_then(|sid| {
+            let path = agent_context::SessionStore::for_cwd(&cwd).path_for(sid);
+            render_session_transcript(&path)
+        });
+        let frames: Vec<agent_collab::WireFrame> = transcript
+            .as_deref()
+            .map(|t| agent_collab::chunk_snapshot(t, agent_collab::SNAPSHOT_CHUNK_MAX))
+            .unwrap_or_default();
+        let entry_count = frames.len();
+        // Welcome 先发：read_only 裁决 + 快照块总数（guest 端据此显示加载进度）。
+        let sealed = seal_host_welcome(h, write_token.as_deref(), ts, entry_count);
+        if let Ok(sealed) = sealed {
+            if sink
+                .send(axum::extract::ws::Message::Binary(sealed.into()))
+                .await
+                .is_err()
+            {
+                return; // 握手帧发不出 → 连接已断，无需继续
+            }
+        }
+        // 快照块序列（seq 0..entry_count，final_chunk 收尾）：分页传输会话历史。
+        for frame in frames {
+            if let Ok(sealed) = agent_collab::seal(&h.key, &frame) {
+                if sink
+                    .send(axum::extract::ws::Message::Binary(sealed.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    // 原子取历史 + 订阅：新加入者先补发最近密封帧历史，再收实时广播。
+    let (history, mut rx) = relay.join_with_replay(&room_id).await;
+    for sealed in history {
+        if sink
+            .send(axum::extract::ws::Message::Binary(sealed.into()))
+            .await
+            .is_err()
+        {
+            return; // 客户端已断开，无需再开发送任务
+        }
+    }
 
     // 中继广播 → 客户端
     let send_task = tokio::spawn(async move {
@@ -2485,7 +2854,14 @@ async fn collab_relay(
                 if rate_count > COLLAB_MSG_RATE_LIMIT {
                     continue;
                 }
-                relay.publish(&room_id, b.to_vec()).await;
+                // 写权限校验：受管房间要求连接携带正确 wt（只读 view 连接被拒）。
+                if let Err(e) = relay
+                    .publish_with_token(&room_id, b.to_vec(), write_token.as_deref())
+                    .await
+                {
+                    tracing::warn!(room = %room_id, error = %e, "collab publish 被拒（只读连接）");
+                    continue;
+                }
             }
             axum::extract::ws::Message::Close(_) => break,
             _ => {}
@@ -2563,6 +2939,148 @@ mod tests {
         assert_eq!(kinds, vec!["thinking", "assistant"]);
         assert_eq!(items[0]["text"].as_str().unwrap(), "先思考一下");
         assert_eq!(items[1]["text"].as_str().unwrap(), "最终回答");
+    }
+
+    /// transcript 渲染：全部 role 前缀正确、SoftRequirement 跳过、tool_call 摘要截断。
+    #[test]
+    fn render_session_transcript_renders_all_roles() {
+        use agent_core::{
+            AgentMessage, AskKind, AskMessage, AssistantMessage, ContentBlock, SoftToolRequirement,
+            StatusKind, StatusMessage, ToolResult, ToolResultMessage, Usage, UserContent,
+            UserMessage,
+        };
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "agent_transcript_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let lines = [
+                serde_json::to_string(&AgentMessage::User(UserMessage {
+                    content: vec![UserContent::Text { text: "你好".into() }],
+                }))
+                .unwrap(),
+                serde_json::to_string(&AgentMessage::Assistant(AssistantMessage {
+                    content: vec![
+                        ContentBlock::Thinking {
+                            text: "想想".into(),
+                            signature: None,
+                        },
+                        ContentBlock::Text {
+                            text: "回答".into(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "t1".into(),
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({"path": "src/lib.rs"}),
+                        },
+                    ],
+                    usage: Usage::default(),
+                    model: "test".into(),
+                    stop_reason: None,
+                    stop_details: None,
+                }))
+                .unwrap(),
+                serde_json::to_string(&AgentMessage::ToolResult(ToolResultMessage {
+                    tool_call_id: "t1".into(),
+                    result: ToolResult::Text("文件内容".into()),
+                }))
+                .unwrap(),
+                serde_json::to_string(&AgentMessage::Status(StatusMessage {
+                    text: "进行中".into(),
+                    kind: StatusKind::Info,
+                }))
+                .unwrap(),
+                serde_json::to_string(&AgentMessage::Ask(AskMessage {
+                    id: "a1".into(),
+                    kind: AskKind::Followup,
+                    prompt: "确认？".into(),
+                }))
+                .unwrap(),
+                serde_json::to_string(&AgentMessage::SoftRequirement(SoftToolRequirement {
+                    id: "s1".into(),
+                    tool_name: "read_file".into(),
+                    reminder: "内部机制".into(),
+                }))
+                .unwrap(),
+            ];
+            for line in lines {
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+        let text = render_session_transcript(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("[user] 你好"));
+        assert!(text.contains("[thinking] 想想"));
+        assert!(text.contains("[assistant] 回答"));
+        assert!(text.contains("[tool] read_file {\"path\":\"src/lib.rs\"}"));
+        assert!(text.contains("[tool result] 文件内容"));
+        assert!(text.contains("[status] 进行中"));
+        assert!(text.contains("[ask] 确认？"));
+        assert!(!text.contains("内部机制"), "SoftRequirement 应跳过");
+    }
+
+    /// transcript 渲染：文件缺失 / 无可渲染消息 → None。
+    #[test]
+    fn render_session_transcript_missing_or_empty_returns_none() {
+        let missing = std::env::temp_dir().join(format!(
+            "agent_transcript_missing_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        assert_eq!(render_session_transcript(&missing), None, "缺失文件 → None");
+        use agent_core::{AgentMessage, SoftToolRequirement};
+        use std::io::Write;
+        let empty = std::env::temp_dir().join(format!(
+            "agent_transcript_empty_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        {
+            let mut f = std::fs::File::create(&empty).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&AgentMessage::SoftRequirement(SoftToolRequirement {
+                    id: "s1".into(),
+                    tool_name: "x".into(),
+                    reminder: "内部".into(),
+                }))
+                .unwrap()
+            )
+            .unwrap();
+        }
+        assert_eq!(render_session_transcript(&empty), None, "仅内部消息 → None");
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    /// host welcome 携带 entry_count（快照块总数，guest 端加载进度）。
+    #[test]
+    fn host_welcome_carries_entry_count() {
+        let host = HostSecret {
+            key: agent_collab::generate_room_key(),
+            write_token: "tok".into(),
+            session_id: None,
+        };
+        let sealed = seal_host_welcome(&host, None, 1, 7).unwrap();
+        let frame = agent_collab::open(&host.key, &sealed).unwrap();
+        match frame {
+            agent_collab::WireFrame::Welcome { entry_count, .. } => {
+                assert_eq!(entry_count, 7);
+            }
+            other => panic!("应为 Welcome，got {other:?}"),
+        }
     }
 
     /// 会话树格式（SessionNode JSONL）的会话：read_history 与 read_branch_tree
@@ -2648,5 +3166,105 @@ mod tests {
         // resume 处理器解除 → 恢复运行。
         let _ = resume_handler(State(mgr.clone())).await;
         assert!(!mgr.pause_gate().paused(), "resume 后应恢复运行");
+    }
+
+    /// 浏览器 GET `/collab/{room}`（无 WS Upgrade 头）→ 返回 guest 页面（HTML）。
+    #[tokio::test]
+    async fn collab_guest_page_served_for_plain_browser_get() {
+        use tower::ServiceExt;
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+        );
+        let router = app(mgr);
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/collab/0123456789abcdef0123456789abcdef")
+                    .body(axum::body::Body::empty())
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/html"),
+            "应为 HTML: {content_type}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .expect("读 body");
+        let html = String::from_utf8_lossy(&body);
+        // 关键元素：WebCrypto AES-GCM 解封 + 帧处理 + 断线重连。
+        for marker in ["AES-GCM", "snapshot_chunk", "重连中", "crypto.subtle.importKey"] {
+            assert!(html.contains(marker), "guest 页应含 {marker}");
+        }
+    }
+
+    /// guest 页面与 Rust codec 的密封布局常量一致（12B IV + ciphertext+tag，32B 密钥）。
+    #[test]
+    fn guest_page_sealed_layout_matches_rust_codec() {
+        assert!(COLLAB_GUEST_PAGE.contains("KEY_LEN = 32"), "密钥长度应一致");
+        assert!(COLLAB_GUEST_PAGE.contains("IV_LEN = 12"), "IV 长度应一致");
+        assert!(
+            COLLAB_GUEST_PAGE.contains("[12B IV][ciphertext+tag]"),
+            "布局注释应一致"
+        );
+    }
+
+    /// host 裁决：正确 wt → 可写；缺失/错误 wt → 只读；帧可被房间密钥解封。
+    #[test]
+    fn host_welcome_adjudicates_read_only_from_connection_wt() {
+        let host = HostSecret {
+            key: agent_collab::generate_room_key(),
+            write_token: "tok-canonical-0123456789abcdef".into(),
+            session_id: None,
+        };
+        // 正确 wt → read_only: false（可写）。
+        let sealed = seal_host_welcome(&host, Some("tok-canonical-0123456789abcdef"), 1, 0).unwrap();
+        let frame = agent_collab::open(&host.key, &sealed).expect("裁决帧应可解封");
+        match frame {
+            agent_collab::WireFrame::Welcome {
+                read_only, proto, ..
+            } => {
+                assert!(!read_only, "正确 wt 应判可写");
+                assert_eq!(proto, 1);
+            }
+            other => panic!("应为 Welcome，got {other:?}"),
+        }
+        // 缺失 wt（view 链接）→ read_only: true。
+        let sealed = seal_host_welcome(&host, None, 2, 0).unwrap();
+        let frame = agent_collab::open(&host.key, &sealed).unwrap();
+        assert!(
+            matches!(
+                frame,
+                agent_collab::WireFrame::Welcome {
+                    read_only: true,
+                    ..
+                }
+            ),
+            "view 链接应判只读"
+        );
+        // 错误 wt（过期/被篡改）→ read_only: true。
+        let sealed = seal_host_welcome(&host, Some("tok-wrong"), 3, 0).unwrap();
+        let frame = agent_collab::open(&host.key, &sealed).unwrap();
+        assert!(
+            matches!(
+                frame,
+                agent_collab::WireFrame::Welcome {
+                    read_only: true,
+                    ..
+                }
+            ),
+            "错误 wt 应判只读"
+        );
     }
 }
