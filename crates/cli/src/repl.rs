@@ -72,6 +72,17 @@ pub enum CommandOutcome {
         /// 是否启用。
         enabled: bool,
     },
+    /// `/enhance <draft>`：Roo-Code 风格的 LLM 草稿增强（单一动作，无 preset）。
+    /// `main` 负责打印结果（不注入为任务）。
+    Enhance {
+        /// 待增强的草稿文本。
+        draft: String,
+    },
+    /// `/suggest <query>`：按相关性给工作区文件评分排序并打印。
+    Suggest {
+        /// 查询草稿文本。
+        query: String,
+    },
 }
 
 /// 命令执行所需的只读上下文快照。
@@ -118,6 +129,8 @@ pub const fn builtin_commands() -> &'static [&'static str] {
         "/model",
         "/mode",
         "/paste",
+        "/enhance",
+        "/suggest",
         "/compact",
         "/mcp",
         "/skill",
@@ -313,6 +326,8 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             }
         },
         "/tools" => handle_tools(input, ctx),
+        "/enhance" => handle_enhance(input),
+        "/suggest" => handle_suggest(input),
         "/exit" | "/quit" => CommandOutcome::Quit,
         other if other.starts_with("/skill:") => {
             let skill_name = &other["/skill:".len()..];
@@ -931,6 +946,36 @@ fn handle_lang(input: &str) -> CommandOutcome {
     CommandOutcome::Handled
 }
 
+/// `/enhance <draft>`：解析草稿（Roo-Code 风格单一增强，无 preset / 无标志）。
+///
+/// 空草稿 → 打印用法并返回 [`CommandOutcome::Handled`]。
+fn handle_enhance(input: &str) -> CommandOutcome {
+    let draft: String = input
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if draft.is_empty() {
+        eprintln!("用法：/enhance <draft>   （Roo-Code 风格：让模型重写为更有效的 prompt）");
+        return CommandOutcome::Handled;
+    }
+    CommandOutcome::Enhance { draft }
+}
+
+/// `/suggest <query>`：解析查询草稿。空查询 → 打印用法并返回 Handled。
+fn handle_suggest(input: &str) -> CommandOutcome {
+    let query: String = input
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.is_empty() {
+        eprintln!("用法：/suggest <query>");
+        return CommandOutcome::Handled;
+    }
+    CommandOutcome::Suggest { query }
+}
+
 fn inject_skill(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx.skills.find(name) {
         Some(skill) => match std::fs::read_to_string(&skill.file_path) {
@@ -1376,5 +1421,42 @@ mod tests {
         assert!(is_known_tools_key("ast"));
         assert!(is_known_tools_key("github"));
         assert!(!is_known_tools_key("bogus"));
+    }
+
+    #[test]
+    fn parses_enhance_draft() {
+        // 多词草稿拼接。
+        let CommandOutcome::Enhance { draft } = handle_enhance("/enhance fix the login bug")
+        else {
+            panic!("期望 Enhance");
+        };
+        assert_eq!(draft, "fix the login bug");
+        // 空草稿 → Handled（打印用法）。
+        assert!(matches!(handle_enhance("/enhance"), CommandOutcome::Handled));
+        assert!(matches!(handle_enhance("/enhance   "), CommandOutcome::Handled));
+    }
+
+    #[test]
+    fn parses_suggest_query() {
+        let CommandOutcome::Suggest { query } = handle_suggest("/suggest auth login") else {
+            panic!("期望 Suggest");
+        };
+        assert_eq!(query, "auth login");
+        assert!(matches!(handle_suggest("/suggest"), CommandOutcome::Handled));
+    }
+
+
+    #[test]
+    fn completes_enhance_and_suggest_command_names() {
+        let h = ReplHelper::new(
+            vec!["/enhance".into(), "/suggest".into(), "/help".into()],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let (_, cands) = h.complete_line("/enha", "/enha".len());
+        assert!(cands.contains(&"/enhance".to_string()));
+        let (_, cands) = h.complete_line("/sugg", "/sugg".len());
+        assert!(cands.contains(&"/suggest".to_string()));
     }
 }

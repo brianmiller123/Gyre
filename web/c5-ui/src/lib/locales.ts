@@ -46,6 +46,11 @@ const en: Dict = {
   'composer.footer_cmd': "command",
   'composer.footer_paste': "paste image",
   'composer.footer_enter': "Enter to send",
+  'composer.enhance': 'Enhance prompt',
+  'composer.enhance_instant': 'Instant',
+  'composer.enhance_llm': 'Enhance (LLM)',
+  'composer.enhance_loading': 'Enhancing…',
+  'composer.enhance_error': 'Enhance failed',
 
   'settings.title': 'Settings',
   'settings.desc': 'Configure agent service connection and appearance',
@@ -289,6 +294,11 @@ const zh: Dict = {
   'composer.footer_cmd': "命令",
   'composer.footer_paste': "粘贴图片",
   'composer.footer_enter': "回车发送",
+  'composer.enhance': '增强提示',
+  'composer.enhance_instant': '即时',
+  'composer.enhance_llm': '增强（LLM）',
+  'composer.enhance_loading': '增强中…',
+  'composer.enhance_error': '增强失败',
 
   'settings.title': '设置',
   'settings.desc': '配置 agent 服务连接与界面外观',

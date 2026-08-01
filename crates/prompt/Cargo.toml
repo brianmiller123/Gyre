@@ -8,6 +8,8 @@ description = "Prompt template engine + system/mode prompts"
 
 [dependencies]
 agent-core = { workspace = true }
+futures = { workspace = true }
+serde     = { workspace = true }
 
 [lints]
 workspace = true

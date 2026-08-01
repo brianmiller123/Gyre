@@ -349,6 +349,16 @@ impl ApprovalPolicy for WebApprovalPolicy {
 // 会话与驱动
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// 会话级 LLM 句柄：供 `/enhance` 等只读端点直接调用模型，无需经驱动任务。
+pub struct SessionLlm {
+    /// 已装配的 Provider（与驱动 Agent 同源；路由到会话所选模型）。
+    pub provider: Arc<dyn LlmProvider>,
+    /// 单次调用的鉴权 / 网关上下文。
+    pub ctx: ProviderCallContext,
+    /// 会话当前模型（热切换模型后随 Agent 一起重建）。
+    pub model: agent_core::Model,
+}
+
 /// 一个会话：Agent + 双向信道 + 待审批表 + 子 Agent 监控总线。
 pub struct Session {
     /// 客户端帧入口。
@@ -373,10 +383,11 @@ pub struct Session {
     /// 会话上下文（共享同一份 `PersistentContext`，与驱动任务同源）。
     /// 供 `DELETE /api/sessions/{id}/messages/{line}` 在线删除单条消息使用。
     pub context: Arc<dyn agent_core::ContextManager>,
+    /// 会话级 LLM 句柄（`/enhance` 等只读端点用）。
+    pub llm: SessionLlm,
     /// 多模态图片上传句柄表（`POST /upload` 写、`new_task` 的 `ImageRef` 读，消费即清）。
     pub uploads: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
-
 impl Session {
     /// 中止驱动与监控转发任务，释放长时运行会话的后台资源（幂等）。
     pub async fn shutdown(&self) {
@@ -535,7 +546,7 @@ impl SessionManager {
         };
         let mcp: Arc<agent_mcp::McpRegistry> =
             Arc::new(agent_mcp::McpRegistry::load(&self.config.mcp).await);
-        let (agent, context) = build_agent(
+        let (agent, context, llm) = build_agent(
             &self.config,
             self.http.clone(),
             effective_cwd,
@@ -582,6 +593,7 @@ impl SessionManager {
             mcp,
             running,
             context,
+            llm,
             uploads,
         });
         let mut inner = self.inner.lock().await;
@@ -899,7 +911,7 @@ async fn build_agent(
     skill_catalog: Arc<agent_skills::SkillCatalog>,
     // 进程级暂停门（共享单例；注入 Agent，由 `/api/pause` `/api/resume` 驱动）。
     pause_gate: Arc<PauseGate>,
-) -> Result<(Agent, Arc<dyn agent_core::ContextManager>), String> {
+) -> Result<(Agent, Arc<dyn agent_core::ContextManager>, SessionLlm), String> {
     let profile = config.resolve_model(alias).map_err(|e| e.to_string())?;
     use secrecy::ExposeSecret;
     let api_key: String = profile.resolve_api_key().expose_secret().to_string();
@@ -928,6 +940,12 @@ async fn build_agent(
         api_key: Some(api_key),
         base_url: Some(profile.base_url.clone()),
         max_in_flight: None,
+    };
+    // 供只读端点（/enhance）直接调用模型，无需经驱动任务。
+    let session_llm = SessionLlm {
+        provider: Arc::clone(&provider),
+        ctx: provider_ctx.clone(),
+        model: model.clone(),
     };
     let mode = mode_override
         .map(|m| match m.trim().to_ascii_lowercase().as_str() {
@@ -1076,7 +1094,7 @@ async fn build_agent(
         memory,
         pause_gate,
     );
-    Ok((agent, context))
+    Ok((agent, context, session_llm))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,6 +1269,7 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/sessions/{id}/skills", get(list_skills))
         .route("/api/sessions/{id}/skill/{name}", get(skill_body))
         .route("/api/sessions/{id}/mcp", get(list_mcp))
+        .route("/api/sessions/{id}/enhance", post(enhance_prompt))
         .route("/api/sessions/{id}/upload", post(upload_image))
         .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/branches", get(session_branches))
@@ -1481,6 +1500,51 @@ async fn supervisor_forwarder(sup: Supervisor, tx: broadcast::Sender<ServerFrame
 // ──────────────────────────────────────────────────────────────────────────────
 // 文件浏览（只读）：工作区根信息 / 列目录 / 读文件。路径越界一律 403。
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ── 提示增强与上下文感知建议（Web ↔ CLI 同源，逻辑在 agent_prompt）──────────────
+
+/// `/enhance` 请求体。
+#[derive(Debug, Deserialize)]
+struct EnhanceBody {
+    /// 待增强的草稿。
+    draft: String,
+}
+
+/// `POST /api/sessions/{id}/enhance` → Roo-Code 风格的 LLM 草稿增强（镜像 CLI `/enhance`）。
+///
+/// body `{ "draft": "..." }`，返回 `{ "text": "..." }`（仅增强后的 prompt 文本）。
+/// 草稿为空返回 400。
+async fn enhance_prompt(
+    State(state): State<SessionManager>,
+    Path(id): Path<String>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+    axum::Json(body): axum::Json<EnhanceBody>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    if !is_safe_session_id(&id) {
+        return (StatusCode::BAD_REQUEST, "非法会话 id").into_response();
+    }
+    let Some(session) = state.get(&id).await else {
+        return (StatusCode::NOT_FOUND, "会话不存在").into_response();
+    };
+    let draft = body.draft.trim();
+    if draft.is_empty() {
+        return (StatusCode::BAD_REQUEST, "草稿为空").into_response();
+    }
+    match agent_prompt::enhance::enhance_collect(
+        draft,
+        session.llm.provider.as_ref(),
+        &session.llm.ctx,
+        &session.llm.model,
+    )
+    .await
+    {
+        Ok(text) => Json(serde_json::json!({ "text": text })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("模型调用失败: {e}")).into_response(),
+    }
+}
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB，超限只返回截断 + 标记
 

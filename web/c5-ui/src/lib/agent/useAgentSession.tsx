@@ -104,6 +104,10 @@ interface AgentSessionValue {
   switchBranch: (leafId: string, handoff?: boolean) => Promise<SessionOpResult>
   /** 生成端到端加密协同房间（`/api/collab/room`）。 */
   newCollabRoom: () => Promise<CollabRoom | null>
+  /** ✨ LLM 重写草稿（`POST /api/sessions/{id}/enhance`）。失败返回 null。 */
+  enhancePrompt: (draft: string) => Promise<string | null>
+  /** 经鉴权的 GET 拉取辅助（自动补 `?token=` / `&token=`），供 @-mention 展开复用。 */
+  apiGet: <T>(path: string) => Promise<T | null>
 }
 
 const AgentSessionContext = createContext<AgentSessionValue | null>(null)
@@ -860,20 +864,47 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     setTimeout(() => void connect(null, src), 60)
   }, [sessionId, clear, disconnect, connect])
 
-  /** REST 数据拉取辅助（自定义命令 / skill / mcp / 协同房间）。 */
+  /** REST 数据拉取辅助（自定义命令 / skill / mcp / 协同房间 / suggest / file / terminal）。
+   *
+   * `path` 可自带查询串（如 `/api/file?path=…`）；本辅助会按是否已有 `?` 选择 `&` 或 `?`
+   * 衔接 `token`，避免出现 `…?path=foo?token=…` 这种双 `?` 的损坏 URL。 */
   const apiGet = useCallback(async <T,>(path: string): Promise<T | null> => {
     const cfg = settingsRef.current
     const origin = cfg.serverUrl.replace(/\/$/, '')
     const qs = new URLSearchParams()
     if (cfg.token) qs.set('token', cfg.token)
+    const sep = path.includes('?') ? '&' : '?'
     try {
-      const res = await fetch(`${origin}${path}${qs.toString() ? `?${qs}` : ''}`)
+      const res = await fetch(`${origin}${path}${qs.toString() ? `${sep}${qs}` : ''}`)
       if (!res.ok) return null
       return (await res.json()) as T
     } catch {
       return null
     }
   }, [])
+
+  /** 经鉴权的 POST 辅助（`token` 入查询串，JSON body）。enhance 端点用。 */
+  const apiPost = useCallback(
+    async <T,>(path: string, body: unknown): Promise<T | null> => {
+      const cfg = settingsRef.current
+      const origin = cfg.serverUrl.replace(/\/$/, '')
+      const qs = new URLSearchParams()
+      if (cfg.token) qs.set('token', cfg.token)
+      const sep = path.includes('?') ? '&' : '?'
+      try {
+        const res = await fetch(`${origin}${path}${qs.toString() ? `${sep}${qs}` : ''}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        if (!res.ok) return null
+        return (await res.json()) as T
+      } catch {
+        return null
+      }
+    },
+    [],
+  )
 
   const fetchCustomCommands = useCallback(async () => {
     const d = await apiGet<{ commands: CustomCommandInfo[] }>('/api/commands')
@@ -951,6 +982,18 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     return d ?? null
   }, [apiGet])
 
+  /** ✨ Enhance：把草稿交给会话级 LLM 重写（`POST /sessions/{id}/enhance`）。 */
+  const enhancePrompt = useCallback(
+    async (draft: string): Promise<string | null> => {
+      if (!sessionId) return null
+      const d = await apiPost<{ text: string }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/enhance`,
+        { draft },
+      )
+      return d?.text ?? null
+    },
+    [apiPost, sessionId],
+  )
   const currentModel = useMemo(
     () => models.find((m) => m.alias === settings.model) ?? models[0] ?? null,
     [models, settings.model],
@@ -1010,6 +1053,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchBranches,
       switchBranch,
       newCollabRoom,
+      enhancePrompt,
+      apiGet,
     }),
     [
       items,
@@ -1054,6 +1099,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchBranches,
       switchBranch,
       newCollabRoom,
+      enhancePrompt,
+      apiGet,
     ],
   )
 

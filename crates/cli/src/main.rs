@@ -857,10 +857,64 @@ async fn main() -> Result<()> {
                     }
                     (String::new(), true)
                 }
+                CommandOutcome::Enhance { draft } => {
+                    // Roo-Code 风格：单一 LLM 增强（模板作为用户消息，见 agent_prompt::enhance）。
+                    match agent_prompt::enhance::enhance_collect(
+                        &draft,
+                        provider.as_ref(),
+                        &current_provider_ctx,
+                        &current_model,
+                    )
+                    .await
+                    {
+                        Ok(r) => println!("✨ Enhanced:\n{r}"),
+                        Err(e) => eprintln!("✨ 增强失败：{e}"),
+                    }
+                    (String::new(), true)
+                }
+                CommandOutcome::Suggest { query } => {
+                    // 与服务器一致：find_files（尊重 .gitignore）枚举，score_files 评分。
+                    let files: Vec<String> = agent_search::find_files(&cwd, None, None, 400)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    let suggestions = agent_prompt::suggest::score_files(&query, &files, 8);
+                    if suggestions.is_empty() {
+                        eprintln!("未找到与「{query}」相关的文件");
+                    } else {
+                        for s in &suggestions {
+                            println!("  {:<40} {:.1}  {}", s.path, s.score, s.reason);
+                        }
+                    }
+                    (String::new(), true)
+                }
                 CommandOutcome::Quit => break,
             }
         } else {
-            (line.to_string(), false)
+            // 非 slash 命令：作为任务发送前，先展开行内 @file 提及（与 Web 对齐）。
+            // 仅当文本含 @ 提及时才触发（零提及则原样返回，正常提示无额外开销）。
+            let mut text = line.to_string();
+            let mentions = agent_prompt::mentions::parse_mentions(&text);
+            if !mentions.is_empty() {
+                let mut blocks: Vec<String> = Vec::new();
+                for m in &mentions {
+                    if let agent_prompt::mentions::Mention::File(p) = m {
+                        match std::fs::read_to_string(cwd.join(p)) {
+                            Ok(content) => {
+                                blocks.push(agent_prompt::mentions::format_file_block(
+                                    p, &content,
+                                ));
+                            }
+                            Err(e) => eprintln!("@file {p} 读取失败，已跳过：{e}"),
+                        }
+                    }
+                }
+                if !blocks.is_empty() {
+                    text = agent_prompt::mentions::render_attached(&text, &blocks);
+                }
+            }
+            (text, false)
         };
         if skip_run {
             if let Some(msg) = pending_msg.take() {

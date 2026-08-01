@@ -14,6 +14,7 @@ import {
   type Command,
   type CommandContext,
 } from '@/lib/agent/commands'
+import { expandMentions, parseMentions } from '@/lib/agent/mentions'
 
 const MODE_OPTIONS = [
   { value: 'code', label: 'Code', icon: 'cpu' },
@@ -57,6 +58,8 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     fetchMcp,
     newCollabRoom,
     fetchCustomCommands,
+    enhancePrompt,
+    apiGet,
   } = useAgentSession()
   const { settings, update } = useSettings()
   const { t } = useI18n()
@@ -126,6 +129,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     setActive(0)
   }, [text])
 
+
   const ctx: CommandContext = useMemo(
     () => ({
       clear,
@@ -188,7 +192,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     setDismissed(false)
   }
 
-  function submit() {
+  async function submit() {
     if (!connected) return
     const t = text.trim()
     if (!t && images.length === 0) return
@@ -205,15 +209,21 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
       runCommand(cmd, p.arg)
       return
     }
-    // 多模态：有图片时走 sendContent。
+    // 非命令路径：若含 @file 提及，发送前展开为附加上下文块。
+    let body = t
+    if (parseMentions(t).length > 0) {
+      body = await expandMentions(t, { apiGet, say })
+    }
+    // 多模态：有图片时走 sendContent（已展开的文本作为 caption）。
     if (images.length > 0) {
-      sendContent(t, images)
+      sendContent(body, images)
       setImages([])
     } else {
-      send(t)
+      send(body)
     }
     setText('')
   }
+
 
   function pickActive() {
     if (!menuOpen || list.length === 0) {
@@ -395,6 +405,14 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
             >
               <Icon name="image" size={18} />
             </button>
+            <EnhanceButton
+              text={text}
+              setText={setText}
+              disabled={!connected}
+              enhancePrompt={enhancePrompt}
+              say={say}
+              t={t}
+            />
 
             <textarea
               ref={taRef}
@@ -490,5 +508,46 @@ function KbdMini({ children }: { children: React.ReactNode }) {
     <kbd className="mx-0.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-border bg-surface px-1 font-mono text-[10px] text-muted">
       {children}
     </kbd>
+  )
+}
+
+/** ✨ Enhance button (Roo-Code style): single LLM rewrite that replaces the draft. */
+function EnhanceButton({
+  text,
+  setText,
+  disabled,
+  enhancePrompt,
+  say,
+  t,
+}: {
+  text: string
+  setText: (v: string) => void
+  disabled: boolean
+  enhancePrompt: (draft: string) => Promise<string | null>
+  say: (msg: string, level?: string) => void
+  t: (key: string, args?: Record<string, string | number>) => string
+}) {
+  const [loading, setLoading] = useState(false)
+  const empty = text.trim() === ''
+
+  async function run() {
+    if (empty || loading) return
+    setLoading(true)
+    const out = await enhancePrompt(text.trim())
+    setLoading(false)
+    if (out !== null && out !== '') setText(out)
+    else say(t('composer.enhance_error'), 'warning')
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={run}
+      disabled={disabled || empty || loading}
+      title={t('composer.enhance')}
+      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface hover:text-text disabled:cursor-not-allowed"
+    >
+      <Icon name="sparkles" size={18} className={loading ? 'animate-pulse text-primary' : ''} />
+    </button>
   )
 }

@@ -6,6 +6,10 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
 
+pub mod enhance;
+pub mod mentions;
+pub mod suggest;
+
 use std::path::Path;
 
 use agent_core::Mode;
@@ -23,7 +27,7 @@ pub struct PromptCatalog;
 impl PromptCatalog {
     /// 构造。
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
