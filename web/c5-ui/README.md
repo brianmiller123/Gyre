@@ -47,8 +47,7 @@ npm run dev
 ```bash
 cd web/c5-ui
 npm install
-npm run build      # tsc 类型检查 + vite 构建 → dist/
-npm run deploy     # 将 dist/ 拷贝到 web/ 根目录
+npm run build      # tsc 类型检查 + vite 构建，产物直接写入 web/ 根目录
 # 之后 `agent --serve` 即在 http://127.0.0.1:8080 提供本控制台
 ```
 
