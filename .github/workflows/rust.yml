@@ -48,13 +48,6 @@ jobs:
         cache: 'npm'       # 自动缓存 npm 依赖，加速安装
         cache-dependency-path: 'web/c5-ui/package-lock.json'
 
-    # ✨ Windows 专用：package.json 的 deploy 脚本用了 rm -rf / cp -r（Unix 命令）
-    # 让 npm 用 Git Bash 执行 scripts，避免在 cmd.exe 下报 "'rm' 不是内部命令"
-    - name: Set npm script-shell to bash (Windows only)
-      if: runner.os == 'Windows'
-      shell: bash
-      run: npm config set script-shell bash
-
     - name: Set up Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
@@ -66,14 +59,15 @@ jobs:
       with:
         key: ${{ matrix.target }}   # 按平台分桶缓存，避免不同 target 的缓存互相污染
 
-    # ✨ 核心改进 2：拆分前端构建步骤，更易排查错误
-    - name: Build & Deploy Frontend
+    # ✨ 核心改进 2：构建前端。
+    # vite outDir 指向仓库根 web/（rust-embed 服务目录），`npm run build` 即完成部署，
+    # 无需（也不再有）独立的 deploy 脚本。
+    - name: Build Frontend
       working-directory: web/c5-ui   # 直接指定工作目录，无需手动 cd
       shell: bash                    # 统一用 bash，保证跨平台行为一致
       run: |
         npm install
         npm run build
-        npm run deploy
 
     # ✨ 核心改进 3：编译 Rust 后端
     - name: Build Rust Backend
