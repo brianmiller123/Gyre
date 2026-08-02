@@ -1,0 +1,19 @@
+[package]
+name        = "agent-dap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DAP（Debug Adapter Protocol）调试器客户端：stdio 传输、Content-Length 帧编解码、请求/响应按 id 配对，与 14 动作的 debug 工具（launch/attach/单步/断点/求值等）。对标 oh-my-pi coding-agent/src/dap 的最小集。"
+
+[dependencies]
+agent-core  = { workspace = true }
+agent-tools = { workspace = true }
+async-trait = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+[lints]
+workspace = true

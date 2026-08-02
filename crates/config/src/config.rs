@@ -48,6 +48,15 @@ pub struct Config {
     /// TTSR 流规则配置（`.gyre/rules` 发现；缺省段 = 有规则即启用）。
     #[serde(default)]
     pub ttsr: TtsrConfig,
+    /// goals 目标预算配置（token / 墙钟 / 硬停开关）。
+    #[serde(default)]
+    pub goals: GoalsConfig,
+    /// eval 内核配置（Python NDJSON 内核 + 环回桥）。
+    #[serde(default)]
+    pub eval: EvalConfig,
+    /// 压缩后端配置（`[compaction]`：summarize / snapcompact 图像化压缩）。
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl Config {
@@ -454,6 +463,9 @@ pub struct CommandRules {
     /// 命令拦截器：把 cat/grep/find/echo-redirect 等重定向到专用工具（移植 oh-my-pi bashInterceptor）。
     #[serde(default)]
     pub interceptor: InterceptorConfig,
+    /// 输出最小化器：git/cargo 等长输出压缩为摘要（省 token）。
+    #[serde(default)]
+    pub minimizer: MinimizerConfig,
 }
 
 /// 单条命令规则。
@@ -500,6 +512,31 @@ pub struct InterceptorConfig {
 impl Default for InterceptorConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `run_command` 输出最小化器配置（对应 TOML `[agent.commands.minimizer]`）。
+///
+/// 移植 oh-my-pi `pi-shell/src/minimizer/` 的理念：对 git/cargo 等已知冗长输出的命令，
+/// 把结果压缩为摘要（保留关键信息），降低模型 token 消耗。命中过滤器的输出会附带
+/// 「如需完整输出请重跑该命令」提示；`max_lines` 为通用长输出兜底（超出行数的输出
+/// 折叠为 head+tail，0 = 不启用通用截断，仅按命令类型过滤）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MinimizerConfig {
+    /// 是否启用（默认 `true`）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 通用长输出折叠阈值（行数，0 = 不折叠）。默认 `0`。
+    #[serde(default)]
+    pub max_lines: usize,
+}
+
+impl Default for MinimizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_lines: 0,
+        }
     }
 }
 
@@ -576,21 +613,40 @@ impl SkillsConfig {
     }
 }
 
+/// 记忆后端选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryBackend {
+    /// 本地 markdown 管道（MEMORY.md + notes.jsonl + 心智模型 + LLM 合并；默认，P1 既有）。
+    #[default]
+    Local,
+    /// 结构化记忆（records.jsonl + 向量融合检索 + 心智模型；无 LLM 合并，逐条积累）。
+    Structured,
+}
+
 /// 跨会话长期记忆配置（对应 `[memory]`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     /// 总开关（默认关；启用后按项目作用域跨会话积累记忆）。
     #[serde(default)]
     pub enabled: bool,
-    /// 任务结束时是否触发 LLM 合并 raw notes → MEMORY.md。
+    /// 记忆后端（`local` 默认；`structured` 启用向量记忆，需 `vec-embed` feature 编译才带 L2 语义嵌入，否则 L1 投影）。
     #[serde(default)]
+    pub backend: MemoryBackend,
+    /// 任务结束时是否触发 LLM 合并 raw notes → MEMORY.md（仅 local 后端生效）。
+    #[serde(default = "default_auto_consolidate")]
     pub auto_consolidate: bool,
+}
+
+fn default_auto_consolidate() -> bool {
+    true
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: MemoryBackend::Local,
             auto_consolidate: true,
         }
     }
@@ -884,6 +940,152 @@ fn default_acp_transport() -> String {
     "http".into()
 }
 
+/// goals 目标预算配置（对应 TOML `[goals]`）。
+///
+/// 累计记账口径 = input + cache_write + output（cache_read 为折扣价不计入，同 oh-my-pi
+/// GoalRuntime）；墙钟自 run 首次用量起计。超限后软模式在停止边界注入一条预算提醒并
+/// 续跑一轮（模型自行收尾），硬模式在下一停止边界直接结束。
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoalsConfig {
+    /// token 累计预算（0 = 不限）。
+    #[serde(default)]
+    pub token_budget: u64,
+    /// 墙钟预算（秒，0 = 不限）。
+    #[serde(default)]
+    pub time_budget_secs: u64,
+    /// 超限后硬停（true 停止；false 注入提醒后继续）。默认 `false`。
+    #[serde(default)]
+    pub hard_stop: bool,
+}
+
+impl Default for GoalsConfig {
+    fn default() -> Self {
+        Self {
+            token_budget: 0,
+            time_budget_secs: 0,
+            hard_stop: false,
+        }
+    }
+}
+
+/// eval 内核配置（对应 TOML `[eval]`）。
+///
+/// Python NDJSON 持久内核 + 127.0.0.1 环回桥（bearer token 按 run 注册，abort 屏蔽）。
+/// 默认关闭（工具不进 LLM 工具列表、零 Token 开销）；env `GYRE_EVAL=1` 或
+/// `[eval] enabled = true` 启用。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvalConfig {
+    /// 是否注册 eval 工具（默认 `false`）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// Python 解释器路径（默认 `python3`）。
+    #[serde(default = "default_eval_python")]
+    pub python: String,
+    /// 内核空闲超时（秒，默认 `300`）。
+    #[serde(default = "default_eval_idle_timeout")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for EvalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            python: default_eval_python(),
+            idle_timeout_secs: default_eval_idle_timeout(),
+        }
+    }
+}
+
+fn default_eval_python() -> String {
+    "python3".into()
+}
+
+fn default_eval_idle_timeout() -> u64 {
+    300
+}
+
+/// 压缩后端配置（对应 TOML `[compaction]`）。
+///
+/// `backend`：`summarize`（本地 LLM handoff 摘要，默认，向后兼容）或
+/// `snapcompact`（本地 PNG 帧渲染——确定性、无 LLM 调用，但要求视觉模型
+/// 读图回放；非视觉模型请勿启用）。
+///
+/// `remote_endpoint`（可选）：远程摘要端点。设置后 `summarize` 后端先 POST
+/// 远程生成摘要——路径以 `/chat/completions` 结尾走 OpenAI 兼容格式（覆盖
+/// llama.cpp / vLLM 自托管），其余走自定义 `{systemPrompt, prompt}` 格式；
+/// 远程失败（非 2xx / 超时 / 解析失败）或摘要为空时自动回退本地 LLM。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionConfig {
+    /// 压缩后端：`summarize` | `snapcompact`（默认 `summarize`）。
+    #[serde(default = "default_compaction_backend")]
+    pub backend: String,
+    /// 远程摘要端点（默认 `None` = 纯本地 LLM 摘要）。见 struct 文档的格式约定。
+    #[serde(default)]
+    pub remote_endpoint: Option<String>,
+    /// 视为视觉模型的 model id 通配模式（`*` 通配；仅 `snapcompact` 后端生效）。
+    /// 例如 `["claude-*", "gpt-4o*", "gemini-*"]`。空列表 = 任何模型都启用。
+    #[serde(default)]
+    pub vision_models: Vec<String>,
+    /// snapcompact 帧数预算（默认 80；超出丢中间帧保首尾）。
+    #[serde(default = "default_compaction_max_frames")]
+    pub max_frames: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_compaction_backend(),
+            remote_endpoint: None,
+            vision_models: Vec::new(),
+            max_frames: default_compaction_max_frames(),
+        }
+    }
+}
+
+fn default_compaction_backend() -> String {
+    "summarize".into()
+}
+
+fn default_compaction_max_frames() -> usize {
+    80
+}
+
+/// 通配匹配（`*` 匹配任意字符序列；`?` 匹配单字符）。用于视觉模型清单匹配
+/// 与 skill 文件名通配等配置驱动的模式匹配。
+///
+/// # Panics
+/// 无 panic；空 pattern 仅匹配空 text。
+#[must_use]
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => {
+                inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..]))
+            }
+            Some('?') => !t.is_empty() && inner(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    inner(&p, &t)
+}
+
+/// 解析压缩后端；未知值回退 `summarize` 并记录警告。
+#[must_use]
+pub fn parse_compaction_backend(raw: &str) -> agent_core::CompactionBackend {
+    match raw.trim() {
+        "snapcompact" => agent_core::CompactionBackend::Snapcompact,
+        _ => {
+            if raw.trim() != "summarize" {
+                tracing::warn!("未知压缩后端 '{raw}'，回退 summarize");
+            }
+            agent_core::CompactionBackend::Summarize
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1095,98 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    // P2：wildcard_match（`*` / `?` 通配，视觉模型清单匹配）。
+    #[test]
+    fn wildcard_match_basic() {
+        assert!(wildcard_match("claude-*", "claude-sonnet-4-5"));
+        assert!(!wildcard_match("claude-*", "claude"), "`claude-*` 要求 `-` 前缀");
+        assert!(wildcard_match("claude*", "claude"));
+        assert!(!wildcard_match("claude-*", "gpt-4o"));
+        assert!(wildcard_match("gpt-4o*", "gpt-4o-mini"));
+        assert!(wildcard_match("gemini-*-flash", "gemini-2.0-flash"));
+        assert!(wildcard_match("?pt-4o", "gpt-4o"));
+        assert!(!wildcard_match("?pt-4o", "xxpt-4o"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(!wildcard_match("", "anything"));
+        assert!(wildcard_match("", ""));
+        assert!(wildcard_match("a*b*c", "aXYbZc"));
+        assert!(!wildcard_match("a*b*c", "aXYbZd"));
+    }
+
+    // P2：压缩后端解析。
+    #[test]
+    fn compaction_backend_parse() {
+        assert_eq!(
+            parse_compaction_backend("summarize"),
+            agent_core::CompactionBackend::Summarize
+        );
+        assert_eq!(
+            parse_compaction_backend("snapcompact"),
+            agent_core::CompactionBackend::Snapcompact
+        );
+        assert_eq!(
+            parse_compaction_backend("  snapcompact  "),
+            agent_core::CompactionBackend::Snapcompact
+        );
+        // 未知值回退 summarize。
+        assert_eq!(
+            parse_compaction_backend("bogus"),
+            agent_core::CompactionBackend::Summarize
+        );
+    }
+
+    // P2：CompactionConfig 默认值。
+    #[test]
+    fn compaction_config_defaults() {
+        let c = CompactionConfig::default();
+        assert_eq!(c.backend, "summarize");
+        assert!(c.remote_endpoint.is_none(), "默认无远程端点");
+        assert!(c.vision_models.is_empty());
+        assert_eq!(c.max_frames, 80);
+    }
+
+    // P2：remote_endpoint 反序列化（远程压缩模式）。
+    #[test]
+    fn compaction_config_remote_endpoint_from_toml() {
+        let cfg: CompactionConfig = toml::from_str(
+            "remote_endpoint = \"http://127.0.0.1:8080/v1/chat/completions\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.remote_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/v1/chat/completions")
+        );
+        // 缺省为 None（旧配置向后兼容）。
+        let cfg2: CompactionConfig = toml::from_str("backend = \"summarize\"\n").unwrap();
+        assert!(cfg2.remote_endpoint.is_none());
+    }
+
+    // P2：CompactionConfig TOML 反序列化（含未知键容忍）。
+    #[test]
+    fn compaction_config_from_toml() {
+        let cfg: CompactionConfig =
+            toml::from_str("backend = \"snapcompact\"\nmax_frames = 16\n").unwrap();
+        assert_eq!(cfg.backend, "snapcompact");
+        assert_eq!(cfg.max_frames, 16);
+        assert!(cfg.vision_models.is_empty());
+    }
+
+    // P2：memory backend 反序列化与缺省（向量记忆接线）。
+    #[test]
+    fn memory_backend_from_toml() {
+        // 缺省 local（旧配置向后兼容）。
+        let cfg: MemoryConfig = toml::from_str("enabled = true\n").unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.backend, MemoryBackend::Local);
+        assert!(cfg.auto_consolidate);
+        // 显式 structured。
+        let cfg2: MemoryConfig =
+            toml::from_str("enabled = true\nbackend = \"structured\"\n").unwrap();
+        assert_eq!(cfg2.backend, MemoryBackend::Structured);
+        // 非法值报错（防手滑）。
+        assert!(toml::from_str::<MemoryConfig>("backend = \"sqlite\"\n").is_err());
     }
 
     #[test]

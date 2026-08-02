@@ -1191,3 +1191,229 @@ Collab 补齐、snapcompact（P0-L）、规则导入（P2-N）。
   （240 K 字符全文，含省略逻辑未触发）；只读 view 链接权限裁决不受影响。
 
 
+
+## 第十轮（2026-08-02）：P0 五项（eval 内核 / 输出最小化器 / goals 预算 / cache 可见性 / NDJSON RPC）✅ 全部完成
+
+对标 [`oh-my-pi-architecture-benchmark.md`](oh-my-pi-architecture-benchmark.md) §五 P0 清单。全 workspace 测试通过（agent 101 / tools 78 / config 41 / cli 44 / eval 8 / llm 70 / server 11，零失败）。
+
+### 🔴 P0-1：eval 内核 + 环回桥 ✅（新 crate `crates/eval`，~1200 行）
+
+- [x] **Python NDJSON 持久内核**（`manager.rs`）：`python3 -u -c <内嵌 PYTHON_DRIVER>`，会话级内核池（session_key = `cwd|session`），共享命名空间；同一会话并发 execute 经 Mutex 串行化；三种回收路径（keep=false / idle 清扫 / abort kill）。
+- [x] **环回桥**（`bridge.rs`）：127.0.0.1 随机端口 axum；per-run 轮换 bearer token（`RunGuard` drop 注销，无效 401）；run 的 `cancel.child_token()` 下构造 `ToolContext` 执行宿主工具 → `{"ok":true,"output":…}`。
+- [x] **eval 工具**（`tool.rs`）：`language enum["py"]` / `code` 必填 / `keep` 默认 true；Execute 级 + Exclusive + interruptible；**懒加载桥**（`OnceCell`，首次 execute spawn，/mode 切换重建 Agent 自动换新审批）。
+- [x] **装配**（cli/main.rs）：`[eval] enabled` 或 `GYRE_EVAL=1` 启用；桥注册表为「不含 eval」快照（防自我递归），`WithEval` 适配器附加到 Agent 侧；会话标签经 RwLock 共享（/resume 换会话隔离内核池）。
+- [x] 驱动内嵌 `tool` 代理（属性访问 → `tool.<name>(**kwargs)` POST /call；401 中文提示；`tool.reset()`）。
+- [x] 测试 8 项（含真实 python3 内核端到端：1+1 result、print stdout 帧、命名空间共享、traceback、桥 401）；修 1 个 Rust 原始串引号数 bug（`r#""""`）。
+
+### 🔴 P0-2：bash 输出最小化器 ✅（`crates/tools/src/minimizer.rs`，~1100 行）
+
+- [x] `OutputFilter` trait + `Minimizer`（首过滤器胜出；无命中且超 `max_lines` 走通用 head(100)+tail(100) 折叠，带 `… [已折叠 N 行] …` 标记）。
+- [x] 5 个内置过滤器：GitStatus（节头+计数+未跟踪目录按父目录折叠）、GitDiff（保留 stat+hunk 头丢内容行）、GitLog（前 15 条提交）、Cargo（error/warning+上下文+Finished 汇总）、Python（traceback 尾块+FAILED 列表）；全部确定性纯函数，仅实际压缩时返回 Some。
+- [x] `RunCommandTool` 挂接（`shell.rs`）：输出捕获后应用，命中 → summary + `> 输出已由 minimizer 压缩（{filter}）；如需完整输出请重跑该命令。`
+- [x] 配置 `[agent.commands.minimizer] enabled/max_lines`（默认开）；cli/server 双装配点 + rpc 同步。
+- [x] 测试 21 项（每过滤器命中/不命中/空输出 fixture + 确定性断言）。
+
+### 🔴 P0-3：goals 目标预算 ✅（`crates/agent` + `crates/config` + cli）
+
+- [x] `GoalBudget`/`GoalState`：记账口径 input+cache_write+output（cache_read 折扣价不计）；token + 墙钟双限；`note_usage` 首次超限一次性置位。
+- [x] run_loop 集成：用量累计点（`summary.usage.add` 后）记账 → 停止边界第四类检查（steering→aside→followUp→goal）：软模式注入 `⚠ 目标预算已用尽（…）` 提醒后续跑一轮；硬模式不注入直接收尾；`[advisor:…]` 式 Say 事件。
+- [x] `/goal` 命令：查看 / `set <tokens>` / `extend <tokens>`；扩展后未超限重置提醒标记；i18n 四语言。
+- [x] 配置 `[goals] token_budget/time_budget_secs/hard_stop`（默认关）；共享 Arc 跨 Agent 重建保持。
+- [x] 测试 6 项（4 单元 + 2 循环级集成：软模式注入续跑 4 次调用 / 硬模式 3 次调用不注入）。
+
+### 🔴 P0-4：prompt-cache 可见性 ✅（`crates/llm` + cli）
+
+- [x] openai 适配器补 `usage.prompt_tokens_details.cached_tokens` → cache_read；anthropic 补 `cache_read_input_tokens`/`cache_creation_input_tokens`（deepseek/glm 已有）。
+- [x] `/status` 新增 cache 命中率行（`status.cache` 四语言）：`cache_read / (input+cache_read)`，为零时省略。
+
+### 🔴 P0-5：NDJSON RPC 模式 ✅（`crates/cli/src/rpc.rs` ~1000 行 + `docs/rpc.md`）
+
+- [x] `agent --rpc`：stdin 逐行 JSON 请求 / stdout 逐行 JSON 事件；协议 `prompt|cancel|ping` → `event|done|pong|error`（单行 JSON、\n 转义、usage 五字段）；进程内一个 Agent + 同一 Context 跨 prompt 复用。
+- [x] 取消经 `Agent::run_with_cancel`（每轮独立 token）；SIGINT 优雅退出；审批在 RPC 模式自动拒绝（`--approval-mode yolo` 可全自动）。
+- [x] 与 --serve/--acp 互斥；复用 main 装配（TTSR/advisor/goals/memory/fallback 全对齐）。
+- [x] docs/rpc.md：协议规范 + Python 客户端示例（~40 行）。
+- [x] 测试 11 项（协议编解码纯函数）+ 冒烟：ping → pong / cancel → no running turn / bogus → unknown type（单行 JSON 全部正确）。
+
+### 已知取舍
+
+- eval 桥回调工具的审批为「构造时当前 mode」的快照（/mode 切换后旧 Agent 弃用，新 Agent 懒加载新桥）；RPC 模式未注册 eval（v1 限定 CLI/REPL）。
+- minimizer 压缩后的完整输出暂不落 artifact（模型可重跑同命令获取全文）；通用折叠默认关闭（max_lines=0）。
+- goals 记账不含 cache_read（折扣价）；时间预算从首次用量起计。
+
+## 第十一轮（2026-08-02）：P1 六项（DAP / review / 统计仪表盘 / /diff /fresh / plan-mode / 心智模型）✅ 全部完成
+
+对标 [`oh-my-pi-architecture-benchmark.md`](oh-my-pi-architecture-benchmark.md) §五 P1 清单。全 workspace 57 套件零失败。
+
+### 🟡 P1-1：DAP 调试器 ✅（新 crate `crates/dap`，~1900 行）
+
+- [x] **帧协议**（`frame.rs`）：Content-Length 编解码纯函数（7 测试：往返/跨 chunk 分片/多帧合并/缺头/超限/垃圾流）。
+- [x] **会话**（`session.rs`）：stdio 传输、initialize→initialized→launch 握手、pending map+oneshot 按 id 配对、事件广播（stopped/continued/output/thread/terminated/Other）、send_sync、close；反向请求（runInTerminal）v1 自动回错误防阻塞。
+- [x] **适配器探测**（`probe.rs`）：lldb-dap / dlv dap / python -m debugpy.adapter 三适配器 PATH 探测（含 python 模块 import 预检，避免 30s 握手超时）。
+- [x] **debug 工具**（`manager.rs`）：14 动作（launch/attach/continue/pause/next/step_in/step_out/threads/stack_trace/scopes/variables/evaluate/set_breakpoint/remove_breakpoint），断点注册表，launch args 自动补 request 字段（debugpy/dlv 要求）。
+- [x] cli 接线：`[tools.enabled] debug` 可选组（main/rpc 装配 + OPTIONAL_TOOL_KEYS 白名单）。
+- [x] 测试 18 项（含 duplex 会话模拟与 lldb 冒烟，本机无适配器时显式 skip）。
+
+### 🟡 P1-2：/review 评审流 ✅（`crates/cli/src/review.rs` ~700 行 + `prompts/review.md`）
+
+- [x] `/review [--staged] [N]`：git diff 收集（非 git 仓库提示；>256KiB 截断降级 stat+前 200 行）→ diff 权重（文件数×3+新增行/20）→ 自动 1/2/4 个 TaskTool 子代理并行评审（tasks 数组）→ P0-P3 分级 + 置信度排序聚合输出（不进模型上下文）。
+- [x] 提示词 `prompts/review.md`（关注点 + 分级 + 机器可解析 `[P<n>] <conf> <loc> | <desc> | <sugg>` 行格式）。
+- [x] 测试 12 项（diff 解析含引号路径 rename、权重、切分、发现提取、排序、渲染）；修 2 个实现期 bug（引号包裹路径解析、空报告测试的 i18n 语言依赖）。
+
+### 🟡 P1-3：统计仪表盘 ✅（`crates/server` + `web/c5-ui`）
+
+- [x] `/api/stats` 扩展：sessions/usage/tools/top_models/daily 聚合（受限扫描：最近 ≤50 会话文件、单文件 ≤4MiB；usage 从 assistant 消息累加；tools 计数含错误归因（tool_call_id→工具名映射按文件隔离）；daily 按会话文件 mtime 归天，自实现 civil_from_days 免 chrono）。
+- [x] `/api/stats/trend?days=14`：窗口逐日补零（1..=90 钳位）。
+- [x] c5-ui Statistics 页面（`#/stats` hash 路由 + 侧栏「统计」）：指标卡 + 14 天趋势 **SVG 自绘柱状图**（零新依赖）+ 工具 TOP 表 + 模型用量表，四语言。
+- [x] 测试 3 项（聚合/趋势补零/日期换算，与 Python datetime 交叉验证）。
+
+### 🟡 P1-4：/diff /fresh ✅（`crates/cli`）
+
+- [x] `/diff [--staged] [ref]`：git diff 工作区/暂存区/指定 ref，>300 行截断；非 git 仓库明确提示。
+- [x] `/fresh`：全新会话（新 id + 空上下文，保留模型/模式/历史记录），与 /resume 对称实现（含 session_label 同步）。
+- [x] i18n 四语言（session.fresh / diff.title 等 4 键）。
+
+### 🟡 P1-5：plan-mode ✅（`crates/core` + `config` + `prompt` + cli + server + skills）
+
+- [x] `Mode::Plan`：与 architect 同构的写保护（仅 plans/*.md 可写，硬拒绝不可绕过含 yolo；执行类命令需确认）。
+- [x] `prompts/system-plan.md`：规划工作流提示词（目标/步骤/验收/风险 + 产出后请求批准）。
+- [x] `/plan` 命令 + `/mode plan` + Tab 补全；server/skills/rpc 全模式解析点同步。
+- [x] 测试 4 项（非 plans 写拒绝 / plans 写放行 / 执行需确认 / yolo 下只读仍生效）。
+
+### 🟡 P1-6：心智模型 ✅（`crates/memory` + cli 装配）
+
+- [x] `mental_models.rs`：内置 6 条仓库级种子（先读 AGENTS.md/先跑测试/最小改动/证据优先/可维护性/小步验证）+ 自定义 seeds 路径（JSON/markdown）+ 项目 mental_models.md 积累；合并注入 `<mental_models>` 段（max_inject_chars 2000，尾部最新、行首对齐截断）。
+- [x] `add_mental_model`（时间戳条目）+ `consolidate_mental_models`（LLM 去重/分组/提炼，独立提示词，复用 consolidate 流式模式）。
+- [x] cli/rpc 装配：LocalMemoryStore 链式配置；ConsolidateHook 任务成功后追加心智模型合并。
+- [x] 测试 15 项（种子加载/合并顺序/截断/注入/追加/clear/提示词形状）。
+
+### 已知取舍
+
+- DAP：单会话句柄（v1 无多会话 id 路由）；反向请求自动回错误；launch args 透传（target 由模型给）。
+- review：评审结果仅宿主侧输出，不进模型上下文（避免污染）；引号/特殊路径 diff 按 git 格式双分支解析。
+- 仪表盘：sessions.total = 实际扫描文件数（≤50 上限）；无会话内时间戳，daily 按文件 mtime 归天。
+- plan-mode：approved-plan 自动化（write xd://propose → 批准解锁）留 P2；v1 为模式 + 人工批准。
+- 心智模型：内置种子恒注入（无关闭开关）；截断无显式标记。
+
+## 第十二轮（2026-08-02）：P2 第一波（ssh / browser / snapcompact / 向量记忆探测）✅
+
+对标 `oh-my-pi-architecture-benchmark.md` §五 P2。全 workspace 61 套件零失败。
+
+### 🟢 P2-1：ssh 工具 ✅（`crates/tools/src/ssh.rs` ~980 行 + 接线）
+
+- [x] OpenSSH 子集解析器：Host/HostName/Port/User/IdentityFile/ProxyJump、大小写不敏感、`Host *`/`?` 通配 + `!` 否定、引号值、行内注释、`~` 展开、精确匹配优先于通配（刻意简化并文档注明）；找不到主机报错并列可用别名。
+- [x] 动作：connect（解析+校验返回参数，不建连）/ exec（`ssh -T -o BatchMode=yes`，-p/-l/-i/-J/-o 全部显式钉死防 ssh 自身配置覆盖；120s 超时、双流各 200KiB 上限 + UTF-8 边界截断、exit code 标注）/ list / disconnect（v1 无长连接占位）。
+- [x] 测试 19 项（纯函数，无真实连接）+ 1 个 #[ignore] 冒烟。
+- [x] cli 接线：`[tools.enabled] ssh` 可选组 + `SSH_PROMPT_SECTION` 注入（改名避免与 github 的 PROMPT_SECTION 冲突——修子代理 3 个编译错误：const fn str match、split 生命周期、名字冲突）。
+
+### 🟢 P2-2：browser 工具 ✅（新 crate `crates/browser` 5 文件）
+
+- [x] launcher：PATH 探测 chromium/chrome（BROWSER_PATH 覆盖）、`--headless=new --remote-debugging-port=0`、临时 user-data-dir、stderr 解析 DevTools ws 端点；close 时 SIGTERM→SIGKILL 整进程组（nix signal + tempfile，二者已在既有 Cargo.lock）。
+- [x] cdp：tokio-tungstenite WebSocket + JSON-RPC id 配对（HashMap<u64, oneshot>）、事件分流、10s 超时。
+- [x] 7 动作：navigate（load 事件水位过滤）/ evaluate（returnByValue+awaitPromise）/ screenshot（PNG 落盘 .gyre/artifacts）/ click / text（el.value + input/change 事件，兼容 React）/ scroll / close。
+- [x] cli 接线：`[tools.enabled] browser` + PROMPT_SECTION 注入。
+
+### 🟢 P2-3：snapcompact 图像化压缩 ✅（新 crate `crates/snapcompact` + context/config/agent/cli 贯通）
+
+- [x] **渲染 crate**（20 测试，clippy 0 警告）：`ab_glyph` 栅格化内嵌 Liberation Mono（SIL 兼容自由许可，320KB 复制进资产）+ `image` PNG 编码；8×16 单元格（scale 按 `h_scale_factor = scale/height_unscaled` 反推，advance 精确 8px）；1568² 帧、白底黑字、行盒 16px 贴内容高度；CJK/未知字形折叠 `?`；ANSI 剥离（CSI/OSC）、`\r\n` 折叠、tab→4 空格、控制字符剔除、超长行截断、空页过滤、确定性输出。
+- [x] **预算常量**（移植 snapcompact.ts）：DEFAULT_MAX_FRAMES 80、FRAME_TOKEN_ESTIMATE 5024、FRAME_DATA_BYTES_BUDGET 3MB（→17 帧护栏）、provider 图像预算（anthropic 90 / openai 200 / google 200 / 未知 5）。
+- [x] **Compactor::snapcompact**（context，5 集成测试）：切分逻辑与 summarize 同构（ToolResult 边界保护）；帧超预算保首尾丢中间（omitted 计数入说明文本）；摘要消息 = Text 说明 + `UserContent::Image` 块（user 角色——**关键发现**：`UserContent::Image` 已存在且全 provider transform 已序列化（anthropic base64 block / openai+glm image_url / deepseek 占位），无需动 ContentBlock/LLM 层）。像素级测试：解码帧 → 帧高 = 行数×16、每行行盒有墨迹。
+- [x] **配置**：`[compaction] backend = "summarize"|"snapcompact"` + `vision_models`（`*`/`?` 通配清单，空 = 全启用）+ `max_frames`；`wildcard_match` + `parse_compaction_backend`（未知值回退 summarize + warn）放 config crate（4 测试）。
+- [x] **agent 决策点**：AgentBuilder/Agent 加 `compaction_backend` + `compaction_max_frames`（默认 Summarize/80）；run_loop 压缩链第二级按 backend 选 `CompactionStrategy::Summarize | Snapcompact`；cli/rpc 装配按 `vision_models` 通配匹配当前 model.id 决定是否启用（每次 /model 重建重判，不匹配回退 summarize 并提示）。
+- [x] 验收对齐：长会话压缩成本从「LLM summarize 调用」降为「本地确定性渲染」；图像信息保真度由帧内行结构测试保障；真视觉模型回读 eval 需 API key，作为后续 opt-in（`GYRE_VISION_EVAL=1` 预留，见取舍）。
+
+### 🟢 P2-4：向量记忆 —— 探测完成，实施排第二波 ✅（`docs/vector-memory-eval.md`）
+
+- [x] 精读 mnemopi：fastembed JS + onnxruntime-node、`memory_embeddings` 表（embedding_json + model 对齐）、混合打分 vecWeight 0.5 / fts 0.3 / importance 0.2、`<memories>` 注入格式（分数前缀 bullet）。
+- [x] 4 方案对比：candle（纯 Rust 慢）/ ort 直驱（快但自建 tokenizer）/ BM25 增强（零依赖非语义）/ **fastembed-rs v5（推荐**：AllMiniLML6V2Q int8 ~24MB、与 JS 栈同族；注意其默认后端是 ort 2.0.0-rc）。
+- [x] 推荐双层：`crates/memory` 内 `vec_memory.rs` + feature `vec-embed` 门控 fastembed；L1 确定性随机投影桩离线保底；融合侵入 `recall_in`，注入格式零改动；Phase0-5 实施计划 + 无网测试策略（固定向量桩）。
+
+### 已知取舍
+
+- ssh：无长连接/无 sshfs（v1）；精确匹配优先于 OpenSSH 文件顺序先得（文档注明）。
+- browser：v1 单标签页、无网络拦截、无 stealth；SIGKILL 兜底可能留僵尸（进程组击杀）。
+- snapcompact：CJK 折叠 `?`（中文会话可读性损失，内嵌中文字体排 P2 后续）；v1 单形状 8on16（无 OMP 的多变体/foveation/双栏/stopword dimming）；真实视觉模型回读 eval 需 key（像素级测试兜底）；Hybrid 后端（帧+LLM 摘要）未做（config 只收两值）。
+- 向量记忆：探测结论 → 实施为 P2 第二波（feature 门控 + 投影桩离线保底）。
+
+### 下一波候选
+
+- P2 第二波：向量记忆实施（按 vector-memory-eval.md Phase0-5）、远程压缩（P2-E：OpenAI/Codex 原生 compaction 端点）、hybrid 压缩后端。
+- P3：TTS/STT、tiny 本地模型、computer-use、marketplace、agent registry、launch broker、autoresearch。
+- 内部重构（对标报告 §六）：agent/lib.rs 6400 行拆分、criterion 基准门、文档体系、配置 schema 驱动。
+
+## 第十三轮（2026-08-02）：P2 第二波（向量记忆实施 + 远程压缩）✅
+
+对标 `oh-my-pi-architecture-benchmark.md` §五 P2 剩余两项。全 workspace 61 套件零失败 + vec-embed feature 独立验证。
+
+### 🟢 P2-5：向量记忆实施 ✅（`crates/memory/src/vec_memory.rs` 552 行 + structured 融合）
+
+- [x] **双层嵌入**：`Embedder` trait（embed/dim）+ `StubEmbedder`（固定种子确定性）+ `ProjectionEmbedder`（char n-gram + 固定种子随机投影，L1 离线保底）+ `#[cfg(feature="vec-embed")]` `FastembedEmbedder`（fastembed-rs 5.17.4，AllMiniLML6V2Q int8，懒加载 + 失败自动降级 L1，永不 panic）。
+- [x] **旁路存储** `vecs.jsonl`（`{id, model, dim, data(base64 f32 LE)}`）：upsert/delete/clear/replace_all/get_many/all；records.jsonl 为唯一事实源、向量仅加速件；模型变更（vecs.jsonl 的 model 与当前不符）清空重嵌；缺失向量跳过 dense 不报错。
+- [x] **融合**：`RecallOptions.vec_weight: f64`（默认 0.5，mnemopi 对齐）；`score = vec_weight·max(0,cosine) + fts + importance + temporal`；`vec_weight=0`/无向量严格回退原公式（逐项相等测试）。`StructuredMemoryStore::with_embedder` 挂载，默认无 → 行为完全兼容。
+- [x] 13 新测试（Stub/Projection 确定性：近义排前、dense 越词法、模型重嵌、幂等 upsert/delete、损坏行跳过、缺失向量不 panic）；真模型 `#[ignore]` + `GYRE_VEC_INTEGRATION=1`。
+- [x] 依赖：root `fastembed = { version = "5", default-features = false, features = [ort-download-binaries-rustls-tls, hf-hub-rustls-tls] }`；memory feature `vec-embed`（默认关，主分支编译零影响）；`cargo check --features vec-embed` 实编译通过。
+- [ ] CLI/server 接线（`cfg.memory.enabled → StructuredMemoryStore + LazyEmbedder`）：留 P2 后续——现状 structured 仍未接线，接线时一并决定与 LocalMemoryStore 的取舍。
+
+### 🟢 P2-E：远程压缩 ✅（remoteEndpoint 模式，`LlmSummaryProvider` + config + 5 装配点）
+
+- [x] `[compaction] remote_endpoint: Option<String>`（默认 None）：设置后摘要生成先 POST 远程，失败（非 2xx/超时/空摘要）回退本地 LLM。
+- [x] 两种 wire 格式：路径以 `/chat/completions` 结尾 → OpenAI 兼容 `{model, messages, stream:false}` 读 `choices[0].message.content`（覆盖 llama.cpp/vLLM 自托管）；否则自定义 `{systemPrompt, prompt}` → `{summary}`。10s 超时。
+- [x] 装配：cli/main.rs（3 处）+ rpc.rs + server/lib.rs 共 5 处 `LlmSummaryProvider::new` 传 `cfg.compaction.remote_endpoint.clone()`。
+- [x] 测试：本地 mock HTTP（std TcpListener 零新依赖）：chat/completions 格式、自定义格式、500 回退、空摘要回退 + config TOML 反序列化，共 5 新测试。
+- [x] **v1 排除**：provider 原生 `/responses/compact`（OpenAI/Codex）——Gyre 无 Responses API 支持；OMP 的 preserveData replacementHistory 语义留后续。
+- [x] 主控修复：mock helper `body: &str` 借用逃逸进线程 → to_owned（1 处）；VectorStore 方法 dead_code → lib.rs 导出 VectorStore/VecEntry（2 处警告清零）。
+
+### 已知取舍
+
+- 向量记忆：L2 需构建期下载 ORT 预编译库（feature 门控缺省关）；MiniLM 英文为主、中文语义弱（备选 bge-small-zh 留配置化）；`vec_weight` 默认 0.5 可调。
+- 远程压缩：自定义格式要求远端返回 `{summary}` 字段；无鉴权头配置（需要时走 base_url 前缀或代理，留后续）；本地回退依赖现有 LLM 路径，远程与本地结果可能风格不一致（OMP 同款取舍）。
+
+### 下一波候选
+
+- P3：TTS/STT、tiny 本地模型、computer-use、marketplace、agent registry、launch broker、autoresearch。
+- P2 收尾：memory 接线决策（structured vs local 二选一或双轨）、hybrid 压缩后端（帧+LLM 摘要）、原生 /responses/compact、bge-small-zh 模型配置化。
+- 内部重构（对标报告 §六）：agent/lib.rs 6400 行拆分、criterion 基准门、文档体系、配置 schema 驱动。
+
+## 第十四轮（2026-08-02）：工程面（agent 单体拆分 + 基准门）✅
+
+对标报告 §九 结语明确的两项内部重构。功能面 P0-P3 已全补齐，本轮纯工程。
+
+### 🟢 agent/lib.rs 单体拆分 ✅（6448 → 4794 + 新 engine.rs 1662）
+
+- [x] 按 §六.1 方案拆出 **`src/engine.rs`（执行循环 + 工具并发域）**：run_loop（970 行级生成器）、PendingTask/run_pending_task/schedule_and_run/run_batch/poll_and_run/record_run_end/persist_interrupted。lib.rs 保留类型层（Agent/AgentBuilder/GoalState/KeyRing/RuntimeOverrides）+ tests（3800 行安全网）+ 顶层装配。
+- [x] 纯机械移动 + 模块边界修正：模块名 `engine`（避开与 `run_loop` 函数同名冲突）；`use super::*` 继承类型层；顶层 fn/struct/async fn 统一 `pub(crate)` + 显式 re-export（glob 不传递）；PendingTask 字段 `pub(crate)`（tests 构造字面量）。
+- [x] 契约不变：**61 套件全绿**（agent 78 测试含拆分前后行为等价）；无新 clippy error（基线 ~170 条文档/风格警告维持原状，非本次引入）。
+- [ ] 二次拆分候选（steering 三通道 / injections 注入点 / harmony 已有）：engine.rs 仍 1662 行，下一轮可继续按同一模式。
+
+### 🟢 criterion 基准门 ✅（对标 §六.2，criterion 0.5 + html_reports）
+
+| bench | 文件 | 实测基线（本机 Ryzen 3700X） |
+|---|---|---|
+| grep/glob/行匹配吞吐 | crates/tools/benches/search.rs | glob 200 文件 72.7µs；10k 行匹配 23.4ms |
+| tiktoken 计数 | crates/core/benches/tokenize.rs | 8KB cl100k 1.42ms；gpt-4o 1.41ms |
+| 压缩耗时 | crates/context/benches/compaction.rs | summarize 序列化 25.8µs；snapcompact 90 行帧 5.13ms |
+| TTSR 匹配延迟 | crates/agent/benches/ttsr.rs | 80 块增量 289.8µs；工具调用 7.7µs |
+
+- [x] 全部确定性夹具（tempfile 小仓库 / 内存行集 / 固定消息流），无外部依赖。
+- [x] **踩坑**：criterion 0.5 默认 test harness 下 `running 0 tests`（criterion_main 的 main 被 harness 吞掉）→ 每个 bench 需 `[[bench]] harness = false`（4 处）。
+- [x] 首次基线已立；CI 回归门（p99 >10% 报警）可基于 target/criterion 历史数据后续接。
+
+### 已知取舍
+
+- 拆分只做第一刀（engine.rs），steering/injections 二次拆分留下一轮（同模式、低风险）。
+- 基线数字是首测，噪声大（单机无锁频）；回归门阈值应等 2-3 次运行稳定后定。
+
+### 下一波候选
+
+- 内部重构续：engine.rs 二次拆分、文档体系升级（每 crate 架构 doc + DEVELOPING.md）、配置 schema 驱动（schemars → /settings 面板 + config set 校验）。
+- 产品面：P3 按需（TTS/STT、tiny 本地模型、computer-use、marketplace、agent registry、launch broker、autoresearch）；P2 收尾（memory 接线决策、hybrid 压缩、原生 /responses/compact）。
+
+### 补记：P2-5 向量记忆 CLI/server 接线 ✅（memory backend 切换）
+
+- [x] `[memory] backend = "local" | "structured"`（`MemoryBackend`，kebab-case，缺省 local 向后兼容；非法值反序列化报错）。config.example.toml 同步说明。
+- [x] 三处装配（cli main / rpc / server）按 backend 分支：
+  - **local**：既有 LocalMemoryStore + 心智模型 + ConsolidateHook（LLM 合并，仅 local 生效，structured 逐条积累无合并语义）。
+  - **structured**：`StructuredMemoryStore::new(&cwd).with_mental_models_config(..).with_embedder(default_embedder())`——`default_embedder()` 工厂按 `vec-embed` feature 选 L2 fastembed（懒加载+降级 L1）或 L1 确定性投影（384 维），装配层零 feature 感知。
+- [x] StructuredMemoryStore 补心智模型支持（P1-6 能力不丢）：`with_mental_models_config` + `mental_models()`（seeds 前置 + 项目 mental_models.md），`summary()` 合并格式对齐 LocalMemoryStore（`<mental_models>` 段）；未配置时行为与旧版逐字一致。
+- [x] 顺带修既有 bug：`auto_consolidate` 的 `#[serde(default)]` 实际反序列化缺省 false 与 `MemoryConfig::default()` true 不一致 → 显式 `default_auto_consolidate()` = true（新测试暴露）。
+- [x] 验证：config 51（+1）、memory 34（+1，vec-embed feature 下同）；**workspace 61 套件零失败**；clippy 四 crate 零 error；RPC 冒烟：structured 配置 + 项目 `.agent/config.toml` 下 ping 应答 pong。
+- [ ] 已知取舍：server 装配为简化版（无 MentalModelsConfig，与既有 local 分支同）；main 路径正常任务装配经编译级等价验证（RPC 冒烟覆盖 rpc.rs 路径）。

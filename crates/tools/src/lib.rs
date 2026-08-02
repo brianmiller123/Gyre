@@ -10,6 +10,7 @@
 mod ast_tool;
 pub mod conflict;
 pub mod intercept;
+pub mod minimizer;
 mod fs;
 mod fuzzy_match;
 mod github;
@@ -20,6 +21,7 @@ mod lsp_tool;
 mod lsp_write_effect;
 mod search;
 mod shell;
+mod ssh;
 mod web_search;
 mod write;
 
@@ -36,11 +38,13 @@ pub use fuzzy_match::{
 pub use github::{GithubTool, PROMPT_SECTION};
 pub use image::{ImageGenTool, ReadImageTool};
 pub use list_tool::ListFilesTool;
+pub use minimizer::{Minimizer, Minimized, OutputFilter, default_filters, disabled};
 pub use lsp_apply::LspApplyTool;
 pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunCommandTool;
+pub use ssh::{SSH_PROMPT_SECTION, SshTool};
 pub use intercept::{CompiledRule, default_compiled};
 pub use web_search::{DuckDuckGoHtml, Searxng, SitePage, WebResult, WebSearchChain, WebSearchProvider, WebSearchTool, extract_site};
 pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
@@ -206,13 +210,16 @@ impl ToolRegistry for DefaultToolRegistry {
 ///
 /// `intercept` 为 `run_command` 的命令拦截规则（把 cat/grep/find/echo-redirect 重定向到
 /// 专用工具）；传空 Vec 即关闭拦截。装配层按配置 `[agent.commands.interceptor]` 决定。
+///
+/// `minimizer` 为 `run_command` 的输出最小化器（git/cargo/python 等冗长输出压缩为摘要）；
+/// 传 [`disabled`] 即关闭压缩。
 #[must_use]
-pub fn core_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
+pub fn core_tools(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> DefaultToolRegistry {
     DefaultToolRegistry::new()
         .with(Box::new(ReadFileTool))
         .with(Box::new(WriteFileTool))
         .with(Box::new(ListFilesTool))
-        .with(Box::new(RunCommandTool::new(intercept)))
+        .with(Box::new(RunCommandTool::new(intercept, minimizer)))
         .with(Box::new(GrepTool))
         .with(Box::new(GlobTool))
         .with(Box::new(WebSearchTool::new()))
@@ -245,9 +252,11 @@ pub fn lsp_tool(reg: DefaultToolRegistry) -> DefaultToolRegistry {
 ///
 /// 注意：可被装配层按需裁剪。生产装配应使用 [`core_tools`] + 各可选组构造器，
 /// 仅启用已配置的工具组，以严格控制初始上下文长度（避免无用 Token 开销）。
+///
+/// `minimizer` 透传给 [`core_tools`]（`run_command` 输出压缩）。
 #[must_use]
-pub fn builtin_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
-    let reg = core_tools(intercept);
+pub fn builtin_tools(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> DefaultToolRegistry {
+    let reg = core_tools(intercept, minimizer);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     lsp_tool(reg)
@@ -255,8 +264,11 @@ pub fn builtin_tools(intercept: Vec<CompiledRule>) -> DefaultToolRegistry {
 
 /// 与 [`builtin_tools`] 相同，但额外返回 `LspTool` 的共享 [`LspPool`]（供 `LspWriteEffect` 复用同一套语言服务器）。
 #[must_use]
-pub fn builtin_tools_with_pool(intercept: Vec<CompiledRule>) -> (DefaultToolRegistry, LspPool) {
-    let reg = core_tools(intercept);
+pub fn builtin_tools_with_pool(
+    intercept: Vec<CompiledRule>,
+    minimizer: Minimizer,
+) -> (DefaultToolRegistry, LspPool) {
+    let reg = core_tools(intercept, minimizer);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     let lsp = LspTool::new();
@@ -347,7 +359,7 @@ mod tests {
 
     #[test]
     fn registry_lists_and_finds() {
-        let reg = builtin_tools(vec![]);
+        let reg = builtin_tools(vec![], disabled());
         let specs = reg.specs();
         assert!(specs.iter().any(|s| s.name == "read_file"));
         assert!(reg.get("write_file").is_some());
@@ -358,7 +370,7 @@ mod tests {
 
     #[test]
     fn core_tools_excludes_optional() {
-        let reg = core_tools(vec![]);
+        let reg = core_tools(vec![], disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         for core in [
@@ -385,7 +397,7 @@ mod tests {
 
     #[test]
     fn ast_tools_adds_ast_group() {
-        let reg = ast_tools(core_tools(vec![]));
+        let reg = ast_tools(core_tools(vec![], disabled()));
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));

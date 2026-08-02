@@ -990,6 +990,7 @@ async fn build_agent(
             "architect" => Mode::Architect,
             "ask" => Mode::Ask,
             "debug" => Mode::Debug,
+            "plan" => Mode::Plan,
             _ => Mode::Code,
         })
         .unwrap_or(config.agent.mode);
@@ -1005,6 +1006,7 @@ async fn build_agent(
             Arc::clone(&provider),
             model.clone(),
             provider_ctx.clone(),
+            config.compaction.remote_endpoint.clone(),
         ),
     ))
     .await;
@@ -1034,8 +1036,10 @@ async fn build_agent(
     } else {
         Vec::new()
     };
+    // 输出最小化器（[agent.commands.minimizer] enabled/max_lines）。
+    let minimizer = compiled_minimizer(&config);
     // 子 Agent 工具集（builtin + MCP，不含 task 以防递归）
-    let mut sub_reg = agent_tools::builtin_tools(intercept.clone());
+    let mut sub_reg = agent_tools::builtin_tools(intercept.clone(), minimizer);
     if config.github.enabled {
         sub_reg = sub_reg.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,
@@ -1064,7 +1068,8 @@ async fn build_agent(
         None
     };
     // 父 Agent 工具集 = builtin + MCP + task（task 受开关控制）
-    let (mut tool_registry, lsp_pool) = agent_tools::builtin_tools_with_pool(intercept);
+    let (mut tool_registry, lsp_pool) =
+        agent_tools::builtin_tools_with_pool(intercept, compiled_minimizer(&config));
     if config.github.enabled {
         tool_registry = tool_registry.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,
@@ -1103,9 +1108,17 @@ async fn build_agent(
     if config.github.enabled {
         context_files.push(agent_tools::PROMPT_SECTION.to_string());
     }
-    // 长期记忆（可选；按 cwd 项目作用域）
+    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换；server 简化装配，无心智模型配置）。
     let memory: Option<Arc<dyn agent_core::MemoryStore>> = if config.memory.enabled {
-        Some(Arc::new(agent_memory::LocalMemoryStore::new(cwd)))
+        match config.memory.backend {
+            agent_config::MemoryBackend::Local => {
+                Some(Arc::new(agent_memory::LocalMemoryStore::new(cwd)))
+            }
+            agent_config::MemoryBackend::Structured => Some(Arc::new(
+                agent_memory::StructuredMemoryStore::new(cwd)
+                    .with_embedder(agent_memory::default_embedder()),
+            )),
+        }
     } else {
         None
     };
@@ -1216,6 +1229,18 @@ fn assemble(
 }
 
 /// 装配 TTSR 流规则协调器（与 CLI 装配一致）：发现 `<root>/.gyre/rules/*.md`，
+/// 从配置构造输出最小化器（`[agent.commands.minimizer] enabled/max_lines`）。
+/// 未启用时返回 [`agent_tools::disabled`]（apply 恒 None，零开销）。
+#[must_use]
+fn compiled_minimizer(config: &agent_config::Config) -> agent_tools::Minimizer {
+    let m = &config.agent.commands.minimizer;
+    if m.enabled {
+        agent_tools::Minimizer::new(agent_tools::default_filters(), m.max_lines)
+    } else {
+        agent_tools::disabled()
+    }
+}
+
 /// 缺省有规则即启用；`[ttsr] enabled = false` 或 `disabled_rules` 可关闭/过滤。
 fn ttsr_for(config: &agent_config::Config, workspace_root: &std::path::Path) -> Option<std::sync::Arc<agent_ttsr::TtsrCoordinator>> {
     if !config.ttsr.enabled.unwrap_or(true) {
@@ -1339,6 +1364,7 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/commands", get(list_commands))
         .route("/api/models", get(list_models))
         .route("/api/stats", get(stats))
+        .route("/api/stats/trend", get(stats_trend))
         .route("/api/pause", post(pause_handler))
         .route("/api/resume", post(resume_handler))
         .route("/api/workspace", get(workspace_info))
@@ -1354,6 +1380,12 @@ pub fn app(state: SessionManager) -> Router {
 }
 
 /// 运行时统计（本地可观测端点）。
+///
+/// 载荷在原有 `active_sessions` / `models_available`（设置页连接测试与 Inspector
+/// 仍在读）基础上扩展为完整聚合：`sessions`（扫描会话数 / 消息总数）、`usage`
+/// （token 与成本）、`tools`（工具调用/错误）、`top_models`（模型用量）、`daily`
+/// （按日 token/成本）。聚合数据来自 [`collect_stats`] 对会话 JSONL 的受限扫描
+/// （见 [`STATS_MAX_FILES`] / [`STATS_MAX_FILE_BYTES`]）。
 async fn stats(
     State(state): State<SessionManager>,
     axum::extract::Query(auth): axum::extract::Query<SessionParams>,
@@ -1361,11 +1393,360 @@ async fn stats(
     if let Err(resp) = check_auth(&state, &auth.token) {
         return resp;
     }
+    let store = agent_context::SessionStore::for_cwd(state.cwd());
+    let agg = collect_stats(&store, None);
     Json(serde_json::json!({
         "active_sessions": state.active_session_count().await,
         "models_available": state.models().len(),
+        "sessions": agg.sessions,
+        "usage": agg.usage,
+        "tools": agg.tools,
+        "top_models": agg.top_models,
+        "daily": agg.daily,
     }))
     .into_response()
+}
+
+/// `/api/stats/trend` 查询参数（`?days=14`）。
+#[derive(Debug, Deserialize)]
+struct TrendParams {
+    #[serde(default)]
+    token: Option<String>,
+    /// 统计窗口天数（1..=90，默认 14）。
+    #[serde(default)]
+    days: Option<u64>,
+}
+
+/// 按天聚合端点：`/api/stats/trend?days=14`。
+///
+/// 与 `/api/stats` 的 `daily` 同源（同一 [`collect_stats`] 扫描路径），`days` 控制
+/// 窗口：输出最近 `days` 天（含今天）逐日补齐的数组，缺数据的日期补零，保证前端
+/// 柱状图连续。
+async fn stats_trend(
+    State(state): State<SessionManager>,
+    axum::extract::Query(p): axum::extract::Query<TrendParams>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &p.token) {
+        return resp;
+    }
+    let days = p.days.unwrap_or(14).clamp(1, 90);
+    let window = recent_dates(days);
+    let store = agent_context::SessionStore::for_cwd(state.cwd());
+    let agg = collect_stats(&store, Some(&window));
+    Json(serde_json::json!({
+        "days": days,
+        "daily": agg.daily,
+    }))
+    .into_response()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 统计聚合（本地可观测：扫描会话 JSONL）
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 会话统计扫描上限：最多扫描**最近** 50 个会话文件（[`SessionStore::list`] 按
+/// mtime 倒序），会话超多时保证端点恒定有界——本地可观测不做全量扫描。
+const STATS_MAX_FILES: usize = 50;
+/// 单会话文件字节上限：超过 4 MiB 的文件跳过（巨型会话不阻塞统计）。
+const STATS_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// `tools` 最多返回条数（按调用次数倒序）。
+const STATS_MAX_TOOLS: usize = 50;
+/// `top_models` 最多返回条数（按 token 用量倒序）。
+const STATS_MAX_MODELS: usize = 10;
+
+/// 会话统计摘要。
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+struct SessionsSummary {
+    /// 本次统计扫描的会话文件数（受 [`STATS_MAX_FILES`] 上限约束；磁盘上会话
+    /// 更多时该值小于实际总数，前端以脚注说明）。
+    total: u64,
+    /// 扫描文件中解析出的消息总数。
+    total_messages: u64,
+}
+
+/// 单工具聚合。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ToolStat {
+    /// 工具名。
+    name: String,
+    /// 调用次数（assistant 消息中的 ToolCall 块计数）。
+    calls: u64,
+    /// 错误次数（对应 tool_call_id 的 ToolResult::Error 计数）。
+    errors: u64,
+}
+
+/// 单模型聚合。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ModelStat {
+    /// 模型 ID。
+    model: String,
+    /// LLM 轮次（assistant 消息条数，每条 = 一次模型请求）。
+    turns: u64,
+    /// 累计输入 token。
+    input_tokens: u64,
+    /// 累计输出 token。
+    output_tokens: u64,
+}
+
+/// 单日聚合（`date` 为 `YYYY-MM-DD`，UTC）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DailyStat {
+    date: String,
+    /// 输入 + 输出 token。
+    tokens: u64,
+    /// 预估成本（美元）。
+    cost: f64,
+}
+
+/// 统计聚合结果（`/api/stats` 载荷主体）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct StatsAgg {
+    sessions: SessionsSummary,
+    usage: Usage,
+    tools: Vec<ToolStat>,
+    top_models: Vec<ModelStat>,
+    daily: Vec<DailyStat>,
+}
+
+/// 聚合中间态（按会话文件流式累加）。
+#[derive(Default)]
+struct StatsAccumulator {
+    sessions: u64,
+    messages: u64,
+    usage: Usage,
+    tools: HashMap<String, ToolAgg>,
+    models: HashMap<String, ModelAgg>,
+    daily: HashMap<String, DayAgg>,
+}
+
+/// 单工具累加值。
+#[derive(Default)]
+struct ToolAgg {
+    calls: u64,
+    errors: u64,
+}
+
+/// 单模型累加值。
+#[derive(Default)]
+struct ModelAgg {
+    turns: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// 单日累加值。
+#[derive(Default)]
+struct DayAgg {
+    tokens: u64,
+    cost: f64,
+}
+
+impl StatsAccumulator {
+    /// 收敛为最终聚合结果。
+    ///
+    /// `window` 为 `Some` 时 `daily` 按窗口逐日补齐（趋势端点，缺数据补零）；
+    /// 为 `None` 时输出全部有数据的日期（总览端点，升序）。
+    fn finish(self, window: Option<&[String]>) -> StatsAgg {
+        let mut tools: Vec<ToolStat> = self
+            .tools
+            .into_iter()
+            .map(|(name, a)| ToolStat {
+                name,
+                calls: a.calls,
+                errors: a.errors,
+            })
+            .collect();
+        tools.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
+        tools.truncate(STATS_MAX_TOOLS);
+
+        let mut top_models: Vec<ModelStat> = self
+            .models
+            .into_iter()
+            .map(|(model, m)| ModelStat {
+                model,
+                turns: m.turns,
+                input_tokens: m.input_tokens,
+                output_tokens: m.output_tokens,
+            })
+            .collect();
+        top_models.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens)
+                .cmp(&(a.input_tokens + a.output_tokens))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        top_models.truncate(STATS_MAX_MODELS);
+
+        let daily = match window {
+            Some(dates) => dates
+                .iter()
+                .map(|date| {
+                    let d = self.daily.get(date);
+                    DailyStat {
+                        date: date.clone(),
+                        tokens: d.map_or(0, |x| x.tokens),
+                        cost: d.map_or(0.0, |x| x.cost),
+                    }
+                })
+                .collect(),
+            None => {
+                let mut v: Vec<DailyStat> = self
+                    .daily
+                    .into_iter()
+                    .map(|(date, d)| DailyStat {
+                        date,
+                        tokens: d.tokens,
+                        cost: d.cost,
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.date.cmp(&b.date));
+                v
+            }
+        };
+
+        StatsAgg {
+            sessions: SessionsSummary {
+                total: self.sessions,
+                total_messages: self.messages,
+            },
+            usage: self.usage,
+            tools,
+            top_models,
+            daily,
+        }
+    }
+}
+
+/// 扫描会话存储并聚合（受限：最近 [`STATS_MAX_FILES`] 个文件，单文件
+/// ≤ [`STATS_MAX_FILE_BYTES`]，超限跳过）。
+///
+/// `window`：`Some(日期列表)` 时 `daily` 按窗口补齐（趋势端点）；`None` 时输出
+/// 全部有数据的日期（总览端点）。
+fn collect_stats(store: &agent_context::SessionStore, window: Option<&[String]>) -> StatsAgg {
+    let mut acc = StatsAccumulator::default();
+    for info in store.list().into_iter().take(STATS_MAX_FILES) {
+        if info.bytes > STATS_MAX_FILE_BYTES {
+            continue;
+        }
+        let path = store.path_for(&info.id);
+        let lines = read_jsonl_lines(&path);
+        if lines.is_empty() {
+            // 空文件仍是磁盘上真实存在的会话：计入会话数，但不产生消息/用量。
+            acc.sessions += 1;
+            continue;
+        }
+        // 归属日期用会话文件的最后修改日期：JSONL 消息本身不携带时间戳，
+        // 按文件级日期归天是本地可观测下的务实口径。
+        let date = mtime_utc_date(info.mtime);
+        aggregate_file_lines(&mut acc, &lines, &date);
+    }
+    acc.finish(window)
+}
+
+/// 读取会话 JSONL 的全部非空行（文件缺失 → 空）。
+fn read_jsonl_lines(path: &std::path::Path) -> Vec<String> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .flatten()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// 聚合一个会话文件的全部行（纯函数：给定行集合 + 归属日期 → 累加进 `acc`）。
+///
+/// 与 [`read_history`] 同源解析（[`parse_history_line`]：新会话树 / 旧线性两种格式
+/// 都兼容）；无法解析的行跳过、不计入消息数。`tool_call_id → 工具名` 映射按文件
+/// 独立维护——不同会话/分支可能复用同一 tool_call_id。
+fn aggregate_file_lines(acc: &mut StatsAccumulator, lines: &[String], date: &str) {
+    acc.sessions += 1;
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        let Some(msg) = parse_history_line(line) else {
+            continue;
+        };
+        acc.messages += 1;
+        match &msg {
+            agent_core::AgentMessage::Assistant(a) => {
+                // token 用量与成本：每条 assistant 消息携带 provider 回填的 usage。
+                acc.usage.add(&a.usage);
+                let tokens = a.usage.total_tokens();
+                let cost = a.usage.cost_usd;
+                // 工具调用：直接取自 assistant 消息的 ToolCall 内容块。
+                for (id, name, _args) in a.tool_calls() {
+                    call_names.insert(id.to_string(), name.to_string());
+                    acc.tools.entry(name.to_string()).or_default().calls += 1;
+                }
+                // 模型聚合：每条 assistant 消息 = 一次模型请求（一轮）。
+                let m = acc.models.entry(a.model.clone()).or_default();
+                m.turns += 1;
+                m.input_tokens += a.usage.input_tokens;
+                m.output_tokens += a.usage.output_tokens;
+                // 按日聚合（归属会话文件的 mtime 日期）。
+                let d = acc.daily.entry(date.to_string()).or_default();
+                d.tokens += tokens;
+                d.cost += cost;
+            }
+            agent_core::AgentMessage::ToolResult(tr) => {
+                // 错误计数：按 tool_call_id 反查该文件内对应的工具名。
+                if let Some(name) = call_names.get(&tr.tool_call_id) {
+                    if matches!(tr.result, ToolResult::Error { .. }) {
+                        acc.tools.entry(name.clone()).or_default().errors += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 把 [`std::time::SystemTime`] 转为 UTC 日期字符串 `YYYY-MM-DD`（统计归天用）。
+fn mtime_utc_date(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    unix_to_utc_date(secs)
+}
+
+/// UNIX 纪元秒 → UTC 日期 `YYYY-MM-DD`（自实现，避免为本地可观测端点引入
+/// chrono 依赖）。采用 Howard Hinnant 的 civil_from_days 算法。
+fn unix_to_utc_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 自 1970-01-01 起的天数 → (年, 月, 日)。
+///
+/// 算法来源：<https://howardhinnant.github.io/date_algorithms.html#civil_from_days>。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 最近 `days` 个 UTC 日期（含今天，升序）——趋势窗口。
+fn recent_dates(days: u64) -> Vec<String> {
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        .div_euclid(86_400);
+    (0..days)
+        .rev()
+        .map(|offset| unix_to_utc_date((today - offset as i64) * 86_400))
+        .collect()
 }
 
 async fn create_session(
@@ -3266,5 +3647,180 @@ mod tests {
             ),
             "错误 wt 应判只读"
         );
+    }
+
+    /// 统计聚合纯函数：给定 JSONL 行集合（新旧两种持久化格式混合 + 无法解析的行）
+    /// → 正确的 sessions / usage / tools / top_models / daily 聚合。
+    #[test]
+    fn stats_aggregate_from_jsonl_lines() {
+        use agent_core::{
+            AgentMessage, AssistantMessage, ContentBlock, SessionNode, ToolResult,
+            ToolResultMessage, Usage, UserMessage,
+        };
+
+        // 会话树格式（SessionNode 包裹）下的用户消息（新格式）。
+        let user = SessionNode::root("n1".into(), AgentMessage::User(UserMessage::from_text("hi")));
+        let mut lines = vec![serde_json::to_string(&user).unwrap()];
+
+        // 旧线性格式（裸 AgentMessage）的 assistant：两次工具调用 + usage。
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 20,
+            cache_write_tokens: 10,
+            cost_usd: 0.003,
+        };
+        let asst = AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": "a.rs" }),
+                },
+                ContentBlock::ToolCall {
+                    id: "t2".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "cmd": "ls" }),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+            usage: usage.clone(),
+            model: "claude-sonnet".into(),
+            stop_reason: None,
+            stop_details: None,
+        });
+        lines.push(serde_json::to_string(&asst).unwrap());
+
+        // 工具结果：t1 错误、t2 成功——错误应归因到 read_file。
+        lines.push(
+            serde_json::to_string(&AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "t1".into(),
+                result: ToolResult::Error {
+                    recoverable: true,
+                    message: "boom".into(),
+                },
+            }))
+            .unwrap(),
+        );
+        lines.push(
+            serde_json::to_string(&AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "t2".into(),
+                result: ToolResult::text("ok"),
+            }))
+            .unwrap(),
+        );
+
+        // 另一模型的 assistant（无工具调用），验证模型聚合与 usage 累加。
+        lines.push(
+            serde_json::to_string(&AgentMessage::Assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall {
+                    id: "t3".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost_usd: 0.0001,
+                },
+                model: "deepseek-v3".into(),
+                stop_reason: None,
+                stop_details: None,
+            }))
+            .unwrap(),
+        );
+        // 无法解析的行：跳过且不计入消息数。
+        lines.push("这不是 JSON".into());
+
+        let mut acc = StatsAccumulator::default();
+        aggregate_file_lines(&mut acc, &lines, "2026-08-01");
+        // 再聚合一个空内容文件（同日期）：会话数 +1，消息/用量不变。
+        aggregate_file_lines(&mut acc, &[serde_json::to_string(&user).unwrap()], "2026-08-01");
+
+        let agg = acc.finish(None);
+        assert_eq!(agg.sessions.total, 2);
+        assert_eq!(agg.sessions.total_messages, 6, "坏行不应计入消息数");
+        assert_eq!(agg.usage.input_tokens, 110);
+        assert_eq!(agg.usage.output_tokens, 55);
+        assert_eq!(agg.usage.cache_read_tokens, 20);
+        assert_eq!(agg.usage.cache_write_tokens, 10);
+        assert!((agg.usage.cost_usd - 0.0031).abs() < 1e-9);
+
+        // tools：按调用次数降序；错误按 tool_call_id 归因到工具名。
+        assert_eq!(agg.tools.len(), 3);
+        let read_file = agg.tools.iter().find(|t| t.name == "read_file").unwrap();
+        assert_eq!(read_file.calls, 1);
+        assert_eq!(read_file.errors, 1, "Error 结果应计入错误");
+        let run = agg.tools.iter().find(|t| t.name == "run_command").unwrap();
+        assert_eq!(run.calls, 1);
+        assert_eq!(run.errors, 0, "Text 结果不算错误");
+
+        // top_models：按总 token 降序。
+        assert_eq!(agg.top_models[0].model, "claude-sonnet");
+        assert_eq!(agg.top_models[0].turns, 1);
+        assert_eq!(agg.top_models[0].input_tokens, 100);
+        assert_eq!(agg.top_models[0].output_tokens, 50);
+        assert_eq!(agg.top_models[1].model, "deepseek-v3");
+        assert_eq!(agg.top_models[1].turns, 1);
+
+        // daily：两文件同日期合并。
+        assert_eq!(agg.daily.len(), 1);
+        assert_eq!(agg.daily[0].date, "2026-08-01");
+        assert_eq!(agg.daily[0].tokens, 165);
+        assert!((agg.daily[0].cost - 0.0031).abs() < 1e-9);
+    }
+
+    /// 趋势窗口：daily 按窗口逐日补齐（缺数据的日期补零、升序且与窗口等长）。
+    #[test]
+    fn stats_trend_window_fills_missing_days() {
+        use agent_core::{AgentMessage, AssistantMessage, ContentBlock, Usage};
+        let asst = AgentMessage::Assistant(AssistantMessage {
+            content: vec![],
+            usage: Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.0,
+            },
+            model: "m".into(),
+            stop_reason: None,
+            stop_details: None,
+        });
+        let lines = vec![serde_json::to_string(&asst).unwrap()];
+
+        let mut acc = StatsAccumulator::default();
+        aggregate_file_lines(&mut acc, &lines, "2026-08-01");
+        let window = vec![
+            "2026-07-31".to_string(),
+            "2026-08-01".to_string(),
+            "2026-08-02".to_string(),
+        ];
+        let agg = acc.finish(Some(&window));
+        assert_eq!(agg.daily.len(), 3);
+        assert_eq!(agg.daily[0].date, "2026-07-31");
+        assert_eq!(agg.daily[0].tokens, 0, "窗口内缺数据的天应补零");
+        assert_eq!(agg.daily[1].tokens, 10);
+        assert_eq!(agg.daily[2].tokens, 0);
+    }
+
+    /// 日期换算：civil_from_days 基准值 + 趋势窗口今天收尾。
+    #[test]
+    fn unix_date_conversion() {
+        assert_eq!(unix_to_utc_date(0), "1970-01-01");
+        assert_eq!(unix_to_utc_date(1_704_067_200), "2024-01-01");
+        assert_eq!(unix_to_utc_date(1_700_000_000), "2023-11-14");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let window = recent_dates(3);
+        assert_eq!(window.len(), 3);
+        assert!(window[0] < window[1] && window[1] < window[2], "应升序");
+        assert_eq!(window[2], unix_to_utc_date(now), "窗口应以今天收尾");
     }
 }

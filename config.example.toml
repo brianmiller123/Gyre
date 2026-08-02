@@ -112,6 +112,12 @@ pattern = "docker *"
 [agent.commands.interceptor]
 enabled = true
 
+# 输出最小化器：git/cargo 等已知冗长命令的输出压缩为摘要（省 token）。默认开启；
+# 命中过滤器的输出附带「如需完整输出请重跑该命令」提示。max_lines=0 仅按命令类型过滤。
+[agent.commands.minimizer]
+enabled = true
+# max_lines = 1000   # 通用长输出折叠阈值（行数，0 = 不折叠）
+
 [server]
 bind = "127.0.0.1:8080"
 # auth_token = "${AGENT_SERVER_TOKEN}"
@@ -135,10 +141,14 @@ enable_commands = false
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
-# 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + LLM 合并）
+# 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + 后端按需合并）
 [memory]
 enabled = false          # 默认关；启用后跨会话积累技术决策/惯例/已踩坑
-auto_consolidate = true  # 任务结束触发 LLM 合并 raw notes → MEMORY.md
+# 后端：local（默认，MEMORY.md + notes.jsonl + LLM 合并）|
+#       structured（records.jsonl + 向量融合检索；L2 语义嵌入需以 --features vec-embed 编译，
+#                   否则回退 L1 确定性投影嵌入；无 LLM 合并，逐条积累）
+backend = "local"
+auto_consolidate = true  # 任务结束触发 LLM 合并 raw notes → MEMORY.md（仅 local 后端生效）
 
 # GitHub 工具（查询/操作 PR、issue、Actions(CI)），按需加载以控制上下文成本。
 # enabled = true 启动即注册工具并把使用指引注入 system prompt；
@@ -159,12 +169,35 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 # image    = true    # read_image / image_gen（后者需 IMAGE_API_KEY/OPENAI_API_KEY）
 # hashline = false   # 关闭 apply_hashline（默认启用：行锚定批量编辑，多文件多区间）
 # pty      = true    # run_pty_command（TTY 依赖命令：top/vim/交互式 REPL）
+# debug    = true    # debug 工具（DAP 调试器：自动探测 lldb-dap/dlv/debugpy，14 动作）
+# ssh      = true    # ssh 工具（解析 ~/.ssh/config，远程命令执行；BatchMode 非交互）
+# browser  = true    # browser 工具（CDP 驱动 chromium：navigate/evaluate/screenshot/click/text/scroll）
 
 # 子 Agent（task 委派 + swarm 多代理编排）统一配置。
 # 控制 task 工具开关、并发护栏、是否继承父 temperature/thinking、独立 token 预算。
 [ttsr]
 # enabled = true          # 缺省：存在规则即启用；false 关闭
 # disabled_rules = ["no-box-leak"]   # 按规则名禁用
+
+# goals 目标预算：累计记账（input + cache_write + output）与墙钟超限后注入提醒/硬停。
+# 软模式（默认）超限后在停止边界注入提醒并续跑一轮，模型自行收尾；硬模式直接停止。
+[goals]
+# token_budget = 200000    # 累计 token 上限（0 = 不限）
+# time_budget_secs = 1800  # 墙钟上限（秒，0 = 不限）
+# hard_stop = false        # 超限硬停（true 停止；false 注入提醒后继续）
+
+# [compaction]
+# backend       = "summarize"  # summarize（本地 LLM handoff 摘要，默认）| snapcompact（本地 PNG 帧渲染，要求视觉模型）
+# vision_models = ["claude-*", "gpt-4o*", "gemini-*"]  # snapcompact 时视为视觉模型的通配清单；空 = 任何模型
+# max_frames    = 80           # snapcompact 帧数预算（超出丢中间帧保首尾）
+# remote_endpoint = "http://127.0.0.1:8787/v1/chat/completions"  # 远程压缩端点（可选）：路径以 /chat/completions 结尾用 OpenAI 兼容格式，否则自定义 {systemPrompt, prompt} → {summary}；失败自动回退本地 LLM
+
+# eval 内核（Python NDJSON 持久内核 + 127.0.0.1 环回桥，可回调 agent 工具 tool.<name>）。
+# 默认关闭（零 Token 开销）；env GYRE_EVAL=1 亦可启用。
+[eval]
+# enabled = true
+# python = "python3"        # 解释器路径
+# idle_timeout_secs = 300   # 内核空闲回收（秒）
 [subagent]
 enabled            = true      # 总开关：false 则不注册 task 工具，且 /swarm 拒绝执行
 max_concurrent     = 4         # 同波/并行子 Agent 最大并发数（信号量护栏，防触发上游速率限制）

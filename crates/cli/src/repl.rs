@@ -7,6 +7,7 @@
 
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_config::{Config, CustomCommand, ModelProfile};
 use agent_context::SessionStore;
@@ -21,7 +22,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 
-const MODES: [&str; 4] = ["code", "architect", "ask", "debug"];
+const MODES: [&str; 5] = ["code", "architect", "ask", "debug", "plan"];
 
 /// 命令派发结果：`main` 据此决定是否改变运行时状态。
 pub enum CommandOutcome {
@@ -50,6 +51,15 @@ pub enum CommandOutcome {
     },
     /// 请求退出。
     Quit,
+    /// `/diff [--staged] [ref]`：展示 git 工作区/暂存区/与指定 ref 的差异（截断输出）。
+    Diff {
+        /// 是否只展示暂存区（`--staged`）。
+        staged: bool,
+        /// 对比 ref（可选；缺省对比 HEAD/工作区）。
+        ref_name: Option<String>,
+    },
+    /// `/fresh`：开启全新会话（新 id + 空上下文，保留模型/模式），不动本地历史记录。
+    Fresh,
     /// 按需切换 GitHub 功能开关：动态注册/注销 `GithubTool` 并注入/屏蔽工具提示词。
     ///
     /// 触发 `main` 更新运行时开关并重建 Agent——下一轮 `set_system` 即反映新状态：
@@ -82,6 +92,14 @@ pub enum CommandOutcome {
     Suggest {
         /// 查询草稿文本。
         query: String,
+    },
+    /// `/review [--staged] [N]`：评审 git diff（默认 HEAD；`--staged` 只评暂存区），
+    /// 按 diff 权重分配 1-N 个 TaskTool 子代理并行评审，聚合 P0-P3 报告（stderr 输出）。
+    Review {
+        /// 只评 staged diff（默认 HEAD）。
+        staged: bool,
+        /// 评审子代理数（1-4；`None` 按 diff 权重自动）。
+        reviewers: Option<usize>,
     },
 }
 
@@ -117,6 +135,8 @@ pub struct CommandContext<'a> {
     pub github_allow_write: bool,
     /// 可选工具组运行时开关（ast/lsp/image/hashline/pty；github 用上面两个字段）。
     pub optional: &'a std::collections::HashMap<String, bool>,
+    /// goals 目标预算共享状态（`/goal` 查看/调整；未配置时为 `None`）。
+    pub goal: Option<Arc<std::sync::Mutex<agent::GoalState>>>,
 }
 
 /// 内置命令名（带 `/`），用于补全与帮助。
@@ -126,11 +146,16 @@ pub const fn builtin_commands() -> &'static [&'static str] {
         "/h",
         "/help",
         "/status",
+        "/goal",
+        "/diff",
+        "/fresh",
         "/model",
         "/mode",
+        "/plan",
         "/paste",
         "/enhance",
         "/suggest",
+        "/review",
         "/compact",
         "/mcp",
         "/skill",
@@ -189,6 +214,7 @@ pub fn parse_mode(arg: &str) -> Option<Mode> {
         "architect" => Some(Mode::Architect),
         "ask" => Some(Mode::Ask),
         "debug" => Some(Mode::Debug),
+        "plan" => Some(Mode::Plan),
         _ => None,
     }
 }
@@ -232,6 +258,10 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
         }
         "/status" => {
             print_status(ctx);
+            CommandOutcome::Handled
+        }
+        "/goal" => {
+            handle_goal(input, ctx);
             CommandOutcome::Handled
         }
         "/agents" => CommandOutcome::Agents,
@@ -289,6 +319,23 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
                 }
             }
         }
+        "/plan" => {
+            // P1-5：进入计划模式（仅 plans/*.md 可写，执行类需确认；批准后 /mode code）。
+            eprintln!("{}", t!("plan.enter"));
+            CommandOutcome::SwitchMode(Mode::Plan)
+        }
+        "/diff" => {
+            // P1-4：git diff（工作区 / --staged / 指定 ref），截断展示。
+            let rest = input.strip_prefix("/diff").unwrap_or("").trim();
+            let staged = rest.split_whitespace().any(|t| t == "--staged");
+            let ref_name = rest
+                .split_whitespace()
+                .filter(|t| !t.starts_with("--"))
+                .next()
+                .map(str::to_string);
+            CommandOutcome::Diff { staged, ref_name }
+        }
+        "/fresh" => CommandOutcome::Fresh,
         "/swarm" => match input.split_whitespace().nth(1) {
             Some(f) if !f.is_empty() => CommandOutcome::Swarm(f.to_string()),
             _ => {
@@ -328,6 +375,7 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
         "/tools" => handle_tools(input, ctx),
         "/enhance" => handle_enhance(input),
         "/suggest" => handle_suggest(input),
+        "/review" => handle_review(input),
         "/exit" | "/quit" => CommandOutcome::Quit,
         other if other.starts_with("/skill:") => {
             let skill_name = &other["/skill:".len()..];
@@ -453,6 +501,7 @@ fn print_help(ctx: &CommandContext<'_>) {
     eprintln!("{}", t!("help.sessions"));
     eprintln!("{}", t!("help.session"));
     eprintln!("{}", t!("help.swarm"));
+    eprintln!("{}", t!("help.review"));
     eprintln!("{}", t!("help.collab"));
     eprintln!("{}", t!("help.github"));
     eprintln!("{}", t!("help.tools"));
@@ -515,6 +564,21 @@ fn print_status(ctx: &CommandContext<'_>) {
             cw = ctx.accumulated.cache_write_tokens
         )
     );
+    // P0-4：缓存命中率（cache_read / 提示词总量），为零时省略该行。
+    let prompt_total = ctx.accumulated.input_tokens + ctx.accumulated.cache_read_tokens;
+    if prompt_total > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let rate = ctx.accumulated.cache_read_tokens as f64 / prompt_total as f64 * 100.0;
+        eprintln!(
+            "{}",
+            t!(
+                "status.cache",
+                rate = format!("{:.1}", rate),
+                cr = ctx.accumulated.cache_read_tokens,
+                total = prompt_total
+            )
+        );
+    }
     eprintln!(
         "{}",
         t!(
@@ -523,6 +587,67 @@ fn print_status(ctx: &CommandContext<'_>) {
         )
     );
     eprintln!("{}", t!("status.footer"));
+}
+
+/// `/goal [set <tokens> | extend <tokens>]`：查看 / 调整 goals 目标预算。
+///
+/// - 无参数：显示当前预算、累计用量与是否超限。
+/// - `set <tokens>`：把 token 预算设为绝对值（0 = 不限）。
+/// - `extend <tokens>`：在现有预算上追加。
+///
+/// 预算调整即时生效（共享 `Arc<Mutex<GoalState>>`，无需重建 Agent）；若调整后未超限，
+/// 重置一次性提醒标记，允许后续再次超限时重新注入。
+fn handle_goal(input: &str, ctx: &CommandContext<'_>) {
+    let Some(goal) = ctx.goal.as_ref() else {
+        eprintln!("{}", t!("goal.disabled"));
+        return;
+    };
+    let rest = input.strip_prefix("/goal").unwrap_or("").trim();
+    if rest.is_empty() {
+        let g = goal.lock().expect("goal 锁中毒");
+        eprintln!("{}", t!("goal.title"));
+        eprintln!("{}", t!("goal.status", summary = g.summary()));
+        eprintln!(
+            "{}",
+            t!(
+                "goal.exceeded",
+                state = if g.exceeded() { "yes" } else { "no" }
+            )
+        );
+        eprintln!(
+            "{}",
+            t!(
+                "goal.mode",
+                mode = if g.budget.hard_stop { "hard" } else { "soft" }
+            )
+        );
+        eprintln!("{}", t!("goal.usage"));
+        return;
+    }
+    let tokens: u64 = rest
+        .split_whitespace()
+        .last()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let mut g = goal.lock().expect("goal 锁中毒");
+    if let Some(n) = rest.strip_prefix("set ") {
+        g.budget.token_budget = n.trim().parse().unwrap_or(0);
+    } else if let Some(n) = rest.strip_prefix("extend ") {
+        g.budget.token_budget = g.budget.token_budget.saturating_add(n.trim().parse().unwrap_or(0));
+    } else {
+        eprintln!("{}", t!("goal.usage"));
+        return;
+    }
+    // 调整后未超限则重置提醒标记（允许再次超限时重新注入）。
+    if !g.exceeded() {
+        g.notified = false;
+    }
+    drop(g);
+    let g = goal.lock().expect("goal 锁中毒");
+    eprintln!(
+        "{}",
+        t!("goal.updated", budget = g.budget.token_budget, tokens = tokens)
+    );
 }
 
 /// 打印 GitHub 工具运行时状态（启用/写权限/token）与按需切换提示。
@@ -983,6 +1108,34 @@ fn handle_suggest(input: &str) -> CommandOutcome {
     CommandOutcome::Suggest { query }
 }
 
+/// `/review [--staged] [N]`：解析评审参数。
+///
+/// - `--staged`：只评暂存区 diff（默认 HEAD）。
+/// - `N`：评审子代理数（1-4）；省略按 diff 权重自动。
+///
+/// 参数非法（N 越界 / 未知参数）→ 打印用法并返回 [`CommandOutcome::Handled`]。
+fn handle_review(input: &str) -> CommandOutcome {
+    let mut staged = false;
+    let mut reviewers: Option<usize> = None;
+    for tok in input.split_whitespace().skip(1) {
+        match tok {
+            "--staged" | "-s" => staged = true,
+            n if n.bytes().all(|b| b.is_ascii_digit()) => match n.parse::<usize>() {
+                Ok(v) if (1..=4).contains(&v) => reviewers = Some(v),
+                _ => {
+                    eprintln!("{}", t!("review.usage"));
+                    return CommandOutcome::Handled;
+                }
+            },
+            _ => {
+                eprintln!("{}", t!("review.usage"));
+                return CommandOutcome::Handled;
+            }
+        }
+    }
+    CommandOutcome::Review { staged, reviewers }
+}
+
 fn inject_skill(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx.skills.find(name) {
         Some(skill) => match std::fs::read_to_string(&skill.file_path) {
@@ -1021,6 +1174,7 @@ fn mode_label(m: Mode) -> String {
         Mode::Architect => t!("mode.architect"),
         Mode::Ask => t!("mode.ask"),
         Mode::Debug => t!("mode.debug"),
+        Mode::Plan => t!("mode.plan"),
     }
 }
 
@@ -1182,6 +1336,7 @@ mod tests {
         assert_eq!(parse_mode("code"), Some(Mode::Code));
         assert_eq!(parse_mode("architect"), Some(Mode::Architect));
         assert_eq!(parse_mode("  debug "), Some(Mode::Debug));
+        assert_eq!(parse_mode("plan"), Some(Mode::Plan));
         assert_eq!(parse_mode("bogus"), None);
     }
 
@@ -1452,6 +1607,55 @@ mod tests {
         assert!(matches!(handle_suggest("/suggest"), CommandOutcome::Handled));
     }
 
+    #[test]
+    fn parses_review_args() {
+        // 无参：默认 HEAD、自动子代理数。
+        let CommandOutcome::Review { staged, reviewers } = handle_review("/review") else {
+            panic!("期望 Review");
+        };
+        assert!(!staged);
+        assert_eq!(reviewers, None);
+
+        // 仅 N。
+        let CommandOutcome::Review { staged, reviewers } = handle_review("/review 2") else {
+            panic!("期望 Review");
+        };
+        assert!(!staged);
+        assert_eq!(reviewers, Some(2));
+
+        // --staged + N（任意顺序）。
+        let CommandOutcome::Review { staged, reviewers } = handle_review("/review --staged 3")
+        else {
+            panic!("期望 Review");
+        };
+        assert!(staged);
+        assert_eq!(reviewers, Some(3));
+
+        let CommandOutcome::Review { staged, reviewers } = handle_review("/review 4 --staged")
+        else {
+            panic!("期望 Review");
+        };
+        assert!(staged);
+        assert_eq!(reviewers, Some(4));
+
+        // N 越界 / 未知参数 → 用法 + Handled。
+        assert!(matches!(
+            handle_review("/review 0"),
+            CommandOutcome::Handled
+        ));
+        assert!(matches!(
+            handle_review("/review 5"),
+            CommandOutcome::Handled
+        ));
+        assert!(matches!(
+            handle_review("/review --staged 9"),
+            CommandOutcome::Handled
+        ));
+        assert!(matches!(
+            handle_review("/review --bogus"),
+            CommandOutcome::Handled
+        ));
+    }
 
     #[test]
     fn completes_enhance_and_suggest_command_names() {
@@ -1466,4 +1670,125 @@ mod tests {
         let (_, cands) = h.complete_line("/sugg", "/sugg".len());
         assert!(cands.contains(&"/suggest".to_string()));
     }
+
+    // ── P0-3（/goal 命令：未配置提示 / 查看 / set / extend）─────────────────
+
+    /// 持有 CommandContext 全部引用的测试夹具（生命周期由 &self 借出）。
+    struct GoalCtx {
+        model: agent_core::Model,
+        cfg: agent_config::Config,
+        inmem: agent_context::InMemoryContext,
+        mcp: agent_mcp::McpRegistry,
+        skills: agent_skills::SkillCatalog,
+        sessions: agent_context::SessionStore,
+        optional: std::collections::HashMap<String, bool>,
+        usage: agent_core::Usage,
+    }
+
+    impl GoalCtx {
+        fn new() -> Self {
+            let cfg = agent_config::Config {
+                default_model: agent_config::ModelProfile {
+                    id: "m".into(),
+                    alias: None,
+                    api: agent_core::Api::OpenAiCompletions,
+                    base_url: "http://localhost".into(),
+                    api_key: secrecy::SecretString::new("x".into()),
+                    api_keys: vec![],
+                    fallbacks: vec![],
+                    temperature: None,
+                    max_output_tokens: None,
+                    max_input_tokens: None,
+                    extra_body: None,
+                },
+                models: vec![],
+                agent: agent_config::AgentConfig::default(),
+                server: agent_config::ServerConfig::default(),
+                skills: agent_config::SkillsConfig::default(),
+                mcp: agent_config::McpConfig::default(),
+                memory: agent_config::MemoryConfig::default(),
+                github: agent_config::GithubConfig::default(),
+                tools: agent_config::ToolsSwitchConfig::default(),
+                subagent: agent_config::SubagentConfig::default(),
+                language: None,
+                acp: agent_config::AcpConfig::default(),
+                ttsr: agent_config::TtsrConfig::default(),
+                goals: agent_config::GoalsConfig::default(),
+                eval: agent_config::EvalConfig::default(),
+                compaction: agent_config::CompactionConfig::default(),
+            };
+            Self {
+                model: agent_core::Model::with_defaults(
+                    "m",
+                    "m",
+                    agent_core::Api::OpenAiCompletions,
+                ),
+                cfg,
+                inmem: agent_context::InMemoryContext::new(vec![]),
+                mcp: agent_mcp::McpRegistry::default(),
+                skills: agent_skills::SkillCatalog::default(),
+                sessions: agent_context::SessionStore::default(),
+                optional: std::collections::HashMap::new(),
+                usage: agent_core::Usage::default(),
+            }
+        }
+
+        fn ctx<'a>(
+            &'a self,
+            goal: Option<Arc<std::sync::Mutex<agent::GoalState>>>,
+        ) -> CommandContext<'a> {
+            CommandContext {
+                model: &self.model,
+                mode: Mode::Code,
+                context: &self.inmem,
+                accumulated: &self.usage,
+                mcp: &self.mcp,
+                skills: &self.skills,
+                config: &self.cfg,
+                commands: &[],
+                sessions: &self.sessions,
+                session_id: "s",
+                guard: 0.8,
+                cwd: std::path::Path::new("."),
+                github_enabled: false,
+                github_allow_write: false,
+                optional: &self.optional,
+                goal,
+            }
+        }
+    }
+
+    #[test]
+    fn goal_command_disabled_without_config() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        assert!(matches!(
+            handle_command("/goal", &ctx),
+            CommandOutcome::Handled
+        ));
+    }
+
+    #[test]
+    fn goal_command_set_and_extend_mutate_budget() {
+        let fixture = GoalCtx::new();
+        let goal = Arc::new(std::sync::Mutex::new(agent::GoalState::new(
+            agent::GoalBudget::unlimited(),
+        )));
+        let ctx = fixture.ctx(Some(Arc::clone(&goal)));
+        assert!(matches!(
+            handle_command("/goal set 5000", &ctx),
+            CommandOutcome::Handled
+        ));
+        assert_eq!(goal.lock().unwrap().budget.token_budget, 5000);
+        assert!(matches!(
+            handle_command("/goal extend 300", &ctx),
+            CommandOutcome::Handled
+        ));
+        assert_eq!(goal.lock().unwrap().budget.token_budget, 5300);
+        assert!(
+            !goal.lock().unwrap().notified,
+            "未超限时重置一次性提醒标记"
+        );
+    }
 }
+

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::intercept::{self, CompiledRule};
+use crate::minimizer::{self, Minimized, Minimizer};
 use crate::{Tool, ToolContext};
 
 /// 在工作区执行 shell 命令。
@@ -16,21 +17,24 @@ use crate::{Tool, ToolContext};
 pub struct RunCommandTool {
     /// 命令拦截规则（命中即在 spawn 前重定向到专用工具）。空 Vec = 不拦截。
     intercept: Vec<CompiledRule>,
+    /// 输出最小化器：git/cargo/python 等冗长命令输出压缩为摘要。传 [`minimizer::disabled`] 关闭。
+    minimizer: Minimizer,
 }
 
 impl RunCommandTool {
-    /// 构造带指定拦截规则的 `run_command` 工具。
+    /// 构造带指定拦截规则与输出最小化器的 `run_command` 工具。
     #[must_use]
-    pub fn new(intercept: Vec<CompiledRule>) -> Self {
-        Self { intercept }
+    pub fn new(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> Self {
+        Self { intercept, minimizer }
     }
 }
 
 impl Default for RunCommandTool {
-    /// 默认启用内置规则集（cat/grep/find/echo-redirect → 专用工具）。
+    /// 默认启用内置规则集（cat/grep/find/echo-redirect → 专用工具）；输出最小化默认关闭。
     fn default() -> Self {
         Self {
             intercept: intercept::default_compiled(),
+            minimizer: minimizer::disabled(),
         }
     }
 }
@@ -92,6 +96,9 @@ impl Tool for RunCommandTool {
             )));
         }
 
+        // 拆分命令名与参数，供输出最小化器做过滤器匹配（只读，命中才改写结果文本）。
+        let (cmd_name, cmd_args) = minimizer::split_command(command);
+
         let mut cmd = shell_command(command);
         cmd.current_dir(ctx.workspace.root())
             .stdout(Stdio::piped())
@@ -109,19 +116,25 @@ impl Tool for RunCommandTool {
             }
             output = tokio::time::timeout(CMD_TIMEOUT, run_command_capped(cmd)) => match output {
                 Ok(Ok(CmdOutput { status, combined })) => {
-                    if status.map_or(false, |s| s.success()) {
-                        // 成功且无输出（mkdir/touch/git config 等静默命令）：显式标注。
-                        // 既让模型明确「命令已成功执行」避免误判/重试，又在源头消除空文本
-                        // （序列化层另有兜底，此处为语义与 UI 改善）。
-                        let text = if combined.is_empty() {
+                    // 输出最小化：命中过滤器时以摘要替代完整输出（退出码语义由下方分支保留）。
+                    // 空输出不压缩（过滤器对空输出返回 None，落到原路径）。
+                    let text = match self.minimizer.apply(&cmd_name, &cmd_args, &combined) {
+                        Some(Minimized { summary, filter }) => format!(
+                            "{summary}\n> 输出已由 minimizer 压缩（{filter}）；如需完整输出请重跑该命令。"
+                        ),
+                        None if combined.is_empty() => {
+                            // 成功且无输出（mkdir/touch/git config 等静默命令）：显式标注。
+                            // 既让模型明确「命令已成功执行」避免误判/重试，又在源头消除空文本
+                            // （序列化层另有兜底，此处为语义与 UI 改善）。
                             "(命令成功，无输出)".to_string()
-                        } else {
-                            combined
-                        };
+                        }
+                        None => combined,
+                    };
+                    if status.map_or(false, |s| s.success()) {
                         Ok(ToolResult::text(text))
                     } else {
                         Ok(ToolResult::text(format!(
-                            "[exit {}]\n{combined}",
+                            "[exit {}]\n{text}",
                             status.and_then(|s| s.code()).unwrap_or(-1)
                         )))
                     }

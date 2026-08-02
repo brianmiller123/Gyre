@@ -193,6 +193,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "architect" => Some(Mode::Architect),
         "ask" => Some(Mode::Ask),
         "debug" => Some(Mode::Debug),
+        "plan" => Some(Mode::Plan),
         _ => None,
     }
 }

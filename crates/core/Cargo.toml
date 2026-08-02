@@ -18,5 +18,16 @@ tracing     = { workspace = true }
 tokio       = { workspace = true }
 dirs        = { workspace = true }
 
+[dev-dependencies]
+# 基准门：tiktoken 计数基准（benches/tokenize.rs）。真实实现位于 agent-context
+# （crates/context/src/token.rs）；core→context 的 dev 依赖边为 Cargo 允许的
+# dev-dependency 环（context 正常依赖 core，dev 边不参与常规依赖图）。
+agent-context = { workspace = true }
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "tokenize"
+harness = false

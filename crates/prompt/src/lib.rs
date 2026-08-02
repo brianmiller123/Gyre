@@ -19,6 +19,7 @@ const SYSTEM_CODE: &str = include_str!("../../../prompts/system-code.md");
 const SYSTEM_ARCHITECT: &str = include_str!("../../../prompts/system-architect.md");
 const SYSTEM_ASK: &str = include_str!("../../../prompts/system-ask.md");
 const SYSTEM_DEBUG: &str = include_str!("../../../prompts/system-debug.md");
+const SYSTEM_PLAN: &str = include_str!("../../../prompts/system-plan.md");
 
 /// Prompt 目录：返回稳定前缀主体 + 模板渲染。
 #[derive(Debug, Clone, Default)]
@@ -40,6 +41,7 @@ impl PromptCatalog {
                 Mode::Architect => SYSTEM_ARCHITECT,
                 Mode::Ask => SYSTEM_ASK,
                 Mode::Debug => SYSTEM_DEBUG,
+                Mode::Plan => SYSTEM_PLAN,
             }
             .to_string(),
         ]

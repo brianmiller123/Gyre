@@ -60,6 +60,12 @@ pub enum CompactionStrategy {
         /// 目标 token 上限。
         max_tokens: usize,
     },
+    /// 图像化压缩（P2）：旧对话渲染为 PNG 帧（本地、无 LLM 调用），
+    /// 视觉模型读图回放；非视觉模型应使用 [`CompactionStrategy::Summarize`]。
+    Snapcompact {
+        /// 帧数预算（超出丢中间帧）。
+        max_frames: usize,
+    },
     /// 裁剪：丢弃最旧的非保护消息（tool-protection 保留工具结果）。
     Prune {
         /// 保留最近 N 条。
@@ -67,6 +73,15 @@ pub enum CompactionStrategy {
     },
     /// 抖动：移除冗余/重复内容（shake）。
     Shake,
+}
+
+/// 压缩后端选择（装配期从配置解析，注入 AgentBuilder）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionBackend {
+    /// 本地 LLM handoff 摘要（默认，向后兼容）。
+    Summarize,
+    /// 本地 PNG 帧渲染（snapcompact；要求视觉模型）。
+    Snapcompact,
 }
 
 /// 会话树节点：把 [`AgentMessage`] 包上 `id` + `parent_id`，构成可分支的森林。

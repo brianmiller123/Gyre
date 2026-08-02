@@ -28,6 +28,27 @@ use crate::tool_protection::{
 /// 压缩器：纯函数，不直接调 LLM；summarize 的摘要由外部 `SummaryProvider` 注入。
 pub struct Compactor;
 
+/// 图像化压缩选项（v1 固定帧形状，仅暴露预算参数）。
+#[derive(Debug, Clone, Copy)]
+pub struct SnapcompactOptions {
+    /// 最大帧数（超出丢中间帧，保首尾；默认 80，对齐 snapcompact.ts）。
+    pub max_frames: usize,
+    /// 单帧最大行数（默认帧 1568² / 16px 行高 = 98）。
+    pub max_lines: usize,
+    /// 行内最大列数（默认帧 1568 / 8px 列宽 = 196）。
+    pub max_cols: usize,
+}
+
+impl Default for SnapcompactOptions {
+    fn default() -> Self {
+        Self {
+            max_frames: agent_snapcompact::DEFAULT_MAX_FRAMES,
+            max_lines: agent_snapcompact::DEFAULT_SHAPE.rows(),
+            max_cols: agent_snapcompact::DEFAULT_SHAPE.cols(),
+        }
+    }
+}
+
 /// 摘要提供器：对一批旧消息产出一份摘要文本（由 agent/llm 调用实现）。
 pub trait SummaryProvider: Send + Sync {
     /// 生成摘要。`old` 为待折叠的消息（已转文本）。
@@ -43,25 +64,115 @@ pub trait SummaryProvider: Send + Sync {
 /// 用 LLM 生成摘要的 [`SummaryProvider`] 实现（handoff 摘要）。
 ///
 /// 装配层（cli/server）构造后注入 `InMemoryContext::set_summarizer`。
+///
+/// 配置了 `remote_endpoint`（P2：远程压缩 / remoteEndpoint 模式）时，`summarize`
+/// 先 POST 远程端点生成摘要，失败（HTTP 非 2xx / 超时 / 解析失败）或摘要为空时
+/// 回退本地 LLM 流式生成：
+/// - 端点路径以 `/chat/completions` 结尾 → OpenAI 兼容格式
+///   `{model, messages, stream:false}`，摘要读 `choices[0].message.content`
+///   （覆盖 llama.cpp / vLLM 自托管）；
+/// - 其他路径 → 自定义格式 `{systemPrompt, prompt}`，响应 JSON 读 `summary` 字段。
 pub struct LlmSummaryProvider {
     provider: Arc<dyn LlmProvider>,
     model: Model,
     provider_ctx: ProviderCallContext,
+    remote_endpoint: Option<String>,
 }
 
+/// 摘要助手的系统提示（本地与远程共用）。
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "你是上下文摘要助手，严格按给定的 Markdown 结构输出交接摘要，不要输出任何额外文本。";
+
 impl LlmSummaryProvider {
-    /// 构造。
+    /// 构造。`remote_endpoint` 为 `None` 时纯本地 LLM 摘要（向后兼容）。
     #[must_use]
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         model: Model,
         provider_ctx: ProviderCallContext,
+        remote_endpoint: Option<String>,
     ) -> Self {
         Self {
             provider,
             model,
             provider_ctx,
+            remote_endpoint,
         }
+    }
+
+    /// 本地 LLM 流式摘要（远程未配置 / 不可用时的回退路径）。
+    async fn summarize_local(&self, prompt: &str) -> Result<String, String> {
+        let req = CompletionRequest {
+            model: self.model.clone(),
+            system: vec![SUMMARY_SYSTEM_PROMPT.to_string()],
+            messages: vec![ProviderMessage::User {
+                content: vec![UserContent::Text { text: prompt.to_string() }],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: 1024,
+            temperature: Some(0.0),
+            thinking: None,
+            cache_key: None,
+            stable_prefix_len: 0,
+        };
+        let mut stream = self
+            .provider
+            .stream(req, &self.provider_ctx)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = String::new();
+        while let Some(ev) = stream.next().await {
+            if let AssistantEvent::TextDelta(d) = ev {
+                out.push_str(&d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 远程端点摘要：成功返回 `Some(摘要)`；HTTP 非 2xx / 超时 / 解析失败 /
+    /// 摘要为空均返回 `None`（由调用方回退本地 LLM）。
+    async fn summarize_remote(&self, prompt: &str) -> Option<String> {
+        let endpoint = self.remote_endpoint.as_deref()?;
+        // 压缩频率低，每次新建客户端：10s 总超时（连接 + 请求 + 响应）兜底挂起。
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .ok()?;
+        let openai_compat = endpoint.ends_with("/chat/completions");
+        let body = if openai_compat {
+            // OpenAI 兼容格式（llama.cpp / vLLM 自托管）。
+            serde_json::json!({
+                "model": self.model.id,
+                "messages": [
+                    { "role": "system", "content": SUMMARY_SYSTEM_PROMPT },
+                    { "role": "user", "content": prompt },
+                ],
+                "stream": false,
+            })
+        } else {
+            // 自定义格式。
+            serde_json::json!({
+                "systemPrompt": SUMMARY_SYSTEM_PROMPT,
+                "prompt": prompt,
+            })
+        };
+        let resp = http.post(endpoint).json(&body).send().await.ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!("远程摘要端点返回非 2xx：{}（回退本地 LLM）", resp.status());
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        let raw = if openai_compat {
+            json["choices"][0]["message"]["content"].as_str()
+        } else {
+            json["summary"].as_str()
+        };
+        let summary = raw?.trim();
+        if summary.is_empty() {
+            return None;
+        }
+        Some(summary.to_string())
     }
 }
 
@@ -89,34 +200,14 @@ impl SummaryProvider for LlmSummaryProvider {
     {
         let prompt = summary_user_prompt(old);
         Box::pin(async move {
-            let req = CompletionRequest {
-                model: self.model.clone(),
-                system: vec![
-                    "你是上下文摘要助手，严格按给定的 Markdown 结构输出交接摘要，不要输出任何额外文本。"
-                        .to_string(),
-                ],
-                messages: vec![ProviderMessage::User {
-                    content: vec![UserContent::Text { text: prompt }],
-                }],
-                tools: vec![],
-                tool_choice: None,
-                max_tokens: 1024,
-                temperature: Some(0.0),
-                thinking: None,
-                cache_key: None,
-                stable_prefix_len: 0,            };
-            let mut stream = self
-                .provider
-                .stream(req, &self.provider_ctx)
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut out = String::new();
-            while let Some(ev) = stream.next().await {
-                if let AssistantEvent::TextDelta(d) = ev {
-                    out.push_str(&d);
+            // P2：配置了远程端点时先试远程摘要；失败/空摘要回退本地 LLM。
+            if self.remote_endpoint.is_some() {
+                if let Some(summary) = self.summarize_remote(&prompt).await {
+                    return Ok(summary);
                 }
+                tracing::warn!("远程摘要失败或返回空摘要，回退本地 LLM");
             }
-            Ok(out)
+            self.summarize_local(&prompt).await
         })
     }
 }
@@ -364,6 +455,89 @@ impl Compactor {
         result.push(AgentMessage::user_text(format!(
             "[上下文摘要] 此前的对话已被压缩为以下要点，请据此继续：\n\n{summary}"
         )));
+        result.extend(recent);
+        Ok(result)
+    }
+
+    /// Snapcompact：将旧消息渲染为 PNG 帧（本地、无 LLM 调用、确定性），
+    /// 摘要用户消息携带文本说明 + 图像块（最早→最新）。帧数超预算时丢中间帧
+    /// 保首尾（历史头部与最新进展比中部更有信息价值）。
+    ///
+    /// # Errors
+    /// 渲染或编码失败时返回错误字符串。
+    pub fn snapcompact(
+        log: Vec<AgentMessage>,
+        keep_recent: usize,
+        opts: &SnapcompactOptions,
+    ) -> Result<Vec<AgentMessage>, String> {
+        if log.len() <= keep_recent {
+            return Ok(log);
+        }
+        // 切分逻辑与 summarize 一致：recent 窗口起点不落在 ToolResult 上。
+        let mut split = log.len() - keep_recent;
+        while split > 0 && matches!(log.get(split), Some(AgentMessage::ToolResult(_))) {
+            split -= 1;
+        }
+        let old = &log[..split];
+        let recent = log[split..].to_vec();
+
+        // 旧消息 → 文本行 → 归一化 → 分页。
+        let old_text: Vec<String> = old.iter().map(message_to_summary_line).collect();
+        let joined = old_text.join("\n");
+        let normalized = agent_snapcompact::normalize(
+            &joined,
+            &agent_snapcompact::SerializeOptions {
+                max_cols: opts.max_cols,
+                ..agent_snapcompact::SerializeOptions::default()
+            },
+        );
+        let pages = agent_snapcompact::paginate(&normalized, opts.max_lines);
+
+        // 帧预算：超限时保留首尾，丢中间（omitted 计数进说明文本）。
+        let shape = agent_snapcompact::DEFAULT_SHAPE;
+        let keep: Vec<usize> = if pages.len() > opts.max_frames {
+            let head = opts.max_frames / 2;
+            let tail = opts.max_frames - head;
+            (0..head)
+                .chain(pages.len().saturating_sub(tail)..pages.len())
+                .collect()
+        } else {
+            (0..pages.len()).collect()
+        };
+        let omitted = pages.len() - keep.len();
+
+        let mut frames: Vec<agent_snapcompact::Frame> = Vec::with_capacity(keep.len());
+        for i in keep {
+            let page = &pages[i];
+            let frame = agent_snapcompact::render_frame(page, &shape)
+                .map_err(|e| format!("snapcompact 渲染失败（第 {i} 帧）: {e}"))?;
+            frames.push(frame);
+        }
+
+        // 摘要消息：文本说明 + 图像块（user 角色；UserContent::Image 全 provider 已支持）。
+        let mut content = vec![agent_core::UserContent::Text {
+            text: format!(
+                "[图像化压缩] 此前的对话已被渲染为 {} 帧 PNG（最早→最新，共 {} 行）。\n\
+                 请逐帧阅读图像恢复上下文；帧内为紧凑渲染的原始历史（含工具调用与结果）。\n\
+                 {}",
+                frames.len(),
+                old_text.len(),
+                if omitted > 0 {
+                    format!("帧数预算 {} 帧，中部省略 {} 帧（保留首尾）。", opts.max_frames, omitted)
+                } else {
+                    String::new()
+                },
+            ),
+        }];
+        for f in frames {
+            content.push(agent_core::UserContent::Image {
+                mime: "image/png".to_string(),
+                data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &f.data),
+            });
+        }
+
+        let mut result = Vec::with_capacity(recent.len() + 1);
+        result.push(AgentMessage::user(content));
         result.extend(recent);
         Ok(result)
     }
@@ -884,6 +1058,8 @@ pub(crate) fn message_to_summary_line(m: &AgentMessage) -> String {
 mod tests {
     use super::*;
     use agent_core::{AssistantMessage, StatusMessage, ToolResult, ToolResultMessage, Usage};
+    // P2 远程压缩测试需要：Api / LlmError / 事件流类型。
+    use agent_core::{Api, AssistantEventStream, LlmError};
 
     fn assistant(text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
@@ -892,6 +1068,28 @@ mod tests {
             model: "m".into(),
             stop_reason: None,
             stop_details: None,
+        })
+    }
+
+    // snapcompact 测试辅助：构造工具调用/结果对。
+    fn tool_call(id: &str, name: &str) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage::default(),
+            model: "m".into(),
+            stop_reason: None,
+            stop_details: None,
+        })
+    }
+
+    fn tool_result(id: &str, text: &str) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: id.into(),
+            result: ToolResult::text(text),
         })
     }
 
@@ -1064,6 +1262,165 @@ mod tests {
         assert!(out[0].text_unchecked().contains("上下文摘要"));
     }
 
+    // P2：snapcompact 图像化压缩——摘要消息携带可解码 PNG 图像块。
+    #[test]
+    fn snapcompact_produces_summary_with_decodable_images() {
+        let log = vec![
+            AgentMessage::user_text("q1"),
+            assistant("a1"),
+            AgentMessage::user_text("q2"),
+            assistant("a2"),
+            AgentMessage::user_text("q3"),
+        ];
+        let opts = SnapcompactOptions {
+            max_frames: 2,
+            ..SnapcompactOptions::default()
+        };
+        let out = Compactor::snapcompact(log, 1, &opts).unwrap();
+        // 1 摘要 + 1 保留
+        assert_eq!(out.len(), 2);
+        let AgentMessage::User(u) = &out[0] else {
+            panic!("摘要应为用户消息");
+        };
+        // 文本说明 + ≥1 图像块。
+        let text: String = u
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                agent_core::UserContent::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("图像化压缩"), "缺说明: {text}");
+        let images: Vec<&agent_core::UserContent> = u
+            .content
+            .iter()
+            .filter(|c| matches!(c, agent_core::UserContent::Image { .. }))
+            .collect();
+        assert!(!images.is_empty(), "摘要应含图像块");
+        // 每帧 base64 可解码为 PNG。
+        for img in images {
+            let agent_core::UserContent::Image { mime, data } = img else {
+                unreachable!()
+            };
+            assert_eq!(mime, "image/png");
+            let bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                data,
+            )
+            .expect("base64 可解码");
+            assert!(bytes.starts_with(b"\x89PNG"), "PNG 魔数");
+            let decoded = image::load_from_memory(&bytes).expect("PNG 可解码");
+            assert!(decoded.height() > 0 && decoded.height() <= 98 * 16, "帧高合理");
+        }
+    }
+
+    // 帧数预算：超限丢中间保首尾。
+    #[test]
+    fn snapcompact_omits_middle_frames_over_budget() {
+        let mut log = Vec::new();
+        for i in 0..6 {
+            log.push(AgentMessage::user_text(format!("行 {i}")));
+        }
+        let opts = SnapcompactOptions {
+            max_frames: 2,
+            max_lines: 1,
+            max_cols: 64,
+        };
+        let out = Compactor::snapcompact(log, 0, &opts).unwrap();
+        let AgentMessage::User(u) = &out[0] else {
+            panic!()
+        };
+        let text: String = u
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                agent_core::UserContent::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        // 6 页 → 保 1+1 帧，省略 4。
+        assert!(text.contains("省略 4 帧"), "缺省略计数: {text}");
+        let images = u
+            .content
+            .iter()
+            .filter(|c| matches!(c, agent_core::UserContent::Image { .. }))
+            .count();
+        assert_eq!(images, 2, "保留首尾各 1 帧");
+    }
+
+    // 帧内行结构保真：渲染行数 → 解码后帧高 = 行数 × 16px（行盒）。
+    #[test]
+    fn snapcompact_frame_height_reflects_line_count() {
+        let log: Vec<AgentMessage> = (0..5)
+            .map(|i| AgentMessage::user_text(format!("content line {i}")))
+            .collect();
+        let opts = SnapcompactOptions {
+            max_frames: 2,
+            max_lines: 98,
+            max_cols: 64,
+        };
+        let out = Compactor::snapcompact(log, 0, &opts).unwrap();
+        let AgentMessage::User(u) = &out[0] else {
+            panic!()
+        };
+        let agent_core::UserContent::Image { data, .. } = u
+            .content
+            .iter()
+            .find(|c| matches!(c, agent_core::UserContent::Image { .. }))
+            .expect("有图像块")
+        else {
+            unreachable!()
+        };
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(decoded.height(), 5 * 16, "帧高 = 行数 × 行盒");
+        assert_eq!(decoded.width(), 1568);
+        // 每行行盒内应有墨迹（行结构未丢失）。
+        let luma = decoded.to_luma8();
+        for row in 0..5 {
+            let y = row * 16 + 8; // 行盒中线
+            let dark = (0..luma.width())
+                .filter(|&x| luma.get_pixel(x, y)[0] < 128)
+                .count();
+            assert!(dark > 3, "第 {row} 行应有墨迹，实际 {dark}");
+        }
+    }
+
+    // 切分保护：ToolResult 不孤立（与 summarize 同语义）。
+    #[test]
+    fn snapcompact_keeps_recent_and_protects_tool_boundaries() {
+        let log = vec![
+            AgentMessage::user_text("q1"),
+            assistant("a1"),
+            tool_call("t1", "read_file"),
+            tool_result("t1", "内容"),
+            AgentMessage::user_text("q2"),
+        ];
+        let out = Compactor::snapcompact(log, 2, &SnapcompactOptions::default()).unwrap();
+        // 1 摘要 + 保留尾部（keep=2 向左扩展到 tool 边界：call+result+q2 = 3 条）。
+        assert_eq!(out.len(), 4);
+        let AgentMessage::Assistant(a) = &out[1] else {
+            panic!("工具调用消息保留");
+        };
+        assert!(
+            a.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolCall { id, .. } if id == "t1")),
+            "工具调用块保留"
+        );
+        assert!(matches!(out[2], AgentMessage::ToolResult(_)), "工具结果保留");
+    }
+
+    // 短日志不压缩。
+    #[test]
+    fn snapcompact_short_log_unchanged() {
+        let log = vec![AgentMessage::user_text("only")];
+        let out = Compactor::snapcompact(log, 2, &SnapcompactOptions::default()).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
     // P0-G：结构化 handoff 摘要提示词（移植 oh-my-pi compaction-summary 模板）。
     // 验证：指令含固定结构段落 + 强约束（路径/未答问题），且对话历史被内嵌。
     #[test]
@@ -1090,6 +1447,156 @@ mod tests {
             prompt.contains("用户问 X") && prompt.contains("助手答 Y"),
             "对话历史未内嵌: {prompt}"
         );
+    }
+
+    // ── P2：远程压缩（remoteEndpoint 模式）──────────────────────────────────
+
+    // 假 LLM provider：本地流式摘要直接输出固定文本（远程回退路径用）。
+    struct FakeStreamProvider {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeStreamProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn supports(&self) -> &[Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+            _ctx: &ProviderCallContext,
+        ) -> Result<AssistantEventStream, LlmError> {
+            Ok(agent_core::llm::once(AssistantEvent::TextDelta(self.text.clone())))
+        }
+    }
+
+    // 构造被测 LlmSummaryProvider：本地回退输出 `local_text`，远程端点可配置。
+    fn test_provider(remote: Option<String>, local_text: &str) -> LlmSummaryProvider {
+        let model = Model {
+            id: "test-model".into(),
+            provider: "test".into(),
+            api: Api::OpenAiCompletions,
+            max_input_tokens: 8192,
+            max_output_tokens: 1024,
+            supports_tools: false,
+            supports_streaming: true,
+            supports_thinking: false,
+            extra_body: None,
+        };
+        LlmSummaryProvider::new(
+            Arc::new(FakeStreamProvider {
+                text: local_text.into(),
+            }),
+            model,
+            ProviderCallContext::default(),
+            remote,
+        )
+    }
+
+    // 起本地 mock HTTP 服务器：收到任意 POST 即返回给定状态码与 JSON 响应体。
+    // 返回 `http://127.0.0.1:<port>` 地址；读完请求（头 + Content-Length 体）后应答并退出。
+    fn spawn_mock_http(status: u16, body: &str) -> String {
+        use std::io::{Read, Write};
+        let body = body.to_owned();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // JoinHandle 无需 join：服务器线程处理完单连接即退出（_ 前缀避免 unused_must_use 警告）。
+        let _server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // 读完整请求头 + 请求体，避免响应写回时客户端仍在发送。
+            let mut data = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else { break };
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                let Some(head_end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&data[..head_end]).to_ascii_lowercase();
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if data.len() >= head_end + 4 + content_len {
+                    break;
+                }
+            }
+            let reason = if status == 200 {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        format!("http://{addr}")
+    }
+
+    // OpenAI 兼容格式：/chat/completions 结尾 → 读 choices[0].message.content。
+    #[tokio::test]
+    async fn remote_summarize_chat_completions_format() {
+        let url = spawn_mock_http(200, r#"{"choices":[{"message":{"content":"mock 摘要"}}]}"#);
+        let provider =
+            test_provider(Some(format!("{url}/v1/chat/completions")), "本地回退摘要");
+        let out = provider
+            .summarize(&["用户问 X".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out, "mock 摘要");
+    }
+
+    // 自定义格式：非 /chat/completions 路径 → 读 summary 字段。
+    #[tokio::test]
+    async fn remote_summarize_custom_format() {
+        let url = spawn_mock_http(200, r#"{"summary":"mock 摘要"}"#);
+        let provider = test_provider(Some(format!("{url}/summarize")), "本地回退摘要");
+        let out = provider
+            .summarize(&["用户问 X".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out, "mock 摘要");
+    }
+
+    // 失败回退：远程 500 → 回退本地 LLM，不 panic。
+    #[tokio::test]
+    async fn remote_summarize_falls_back_on_http_error() {
+        let url = spawn_mock_http(500, r#"{"error":"boom"}"#);
+        let provider = test_provider(Some(format!("{url}/summarize")), "本地回退摘要");
+        let out = provider
+            .summarize(&["用户问 X".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out, "本地回退摘要");
+    }
+
+    // 空摘要回退：200 但 content 为空字符串 → 回退本地 LLM。
+    #[tokio::test]
+    async fn remote_summarize_falls_back_on_empty_summary() {
+        let url = spawn_mock_http(200, r#"{"choices":[{"message":{"content":""}}]}"#);
+        let provider =
+            test_provider(Some(format!("{url}/v1/chat/completions")), "本地回退摘要");
+        let out = provider
+            .summarize(&["用户问 X".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out, "本地回退摘要");
     }
 
     // 测试辅助：取消息文本（简化）

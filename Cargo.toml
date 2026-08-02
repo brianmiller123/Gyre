@@ -55,6 +55,7 @@ toml        = "0.8"
 
 # 错误与日志
 thiserror   = "2"
+ab_glyph   = "0.2"
 anyhow      = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -89,6 +90,8 @@ serde_yaml = "0.9"
 aes-gcm    = "0.10"
 rand       = { version = "0.8", features = ["std_rng"] }
 base64     = "0.22"
+# 可选语义嵌入（L2，默认不启用；启用时构建期需联网下载 ONNX Runtime 预编译库，rustls 免 OpenSSL）
+fastembed  = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 # 文本编码兜底（run_command 在 Windows 按 OEM 代码页解码非 UTF-8 输出，如 CP936/GBK）
 encoding_rs = "0.8"
 # 图像 / 剪贴板（CLI 图片粘贴：RGBA→PNG 编码 + 跨平台剪贴板读取）
@@ -98,6 +101,8 @@ arboard    = "3"
 sha2       = "0.10"
 # 跨平台 PTY（ConPTY / posix openpty）
 portable-pty = "0.8"
+# 进程组信号（browser 工具关闭时整树击杀 chromium）；nix 0.28 默认无 feature
+nix         = { version = "0.28", features = ["signal"] }
 # 遥测（OTel）
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
@@ -107,6 +112,7 @@ tracing-opentelemetry = "0.28"
 # 配置与跨平台
 secrecy     = { version = "0.10", features = ["serde"] }
 dirs        = "5"
+tempfile    = "3"            # browser 工具临时 --user-data-dir
 glob        = "0.3"            # 命令规则 glob 匹配
 uuid        = { version = "1", features = ["v4"] }
 
@@ -117,8 +123,14 @@ schemars    = "0.8"
 clap        = { version = "4", features = ["derive", "env"] }
 rustyline   = { version = "14", features = ["derive"] }
 
+# 基准门：热路径 criterion 基准（对标报告 §六.2；crates/*/benches/ 消费）
+criterion   = { version = "0.5", features = ["html_reports"] }
+
 # ── 内部 crate（path 引用）────────────────────────────────────────────────────
 agent-core    = { path = "crates/core" }
+agent-dap     = { path = "crates/dap" }
+agent-browser = { path = "crates/browser" }
+agent-snapcompact = { path = "crates/snapcompact" }
 agent-config  = { path = "crates/config" }
 agent-llm     = { path = "crates/llm" }
 agent-mcp     = { path = "crates/mcp" }
@@ -126,6 +138,7 @@ agent-memory  = { path = "crates/memory" }
 agent-context = { path = "crates/context" }
 agent-prompt  = { path = "crates/prompt" }
 agent-tools   = { path = "crates/tools" }
+agent-eval    = { path = "crates/eval" }
 agent-ast     = { path = "crates/ast" }
 agent-advisor = { path = "crates/advisor" }
 agent-discovery = { path = "crates/discovery" }

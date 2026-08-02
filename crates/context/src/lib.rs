@@ -540,6 +540,38 @@ impl ContextManager for InMemoryContext {
                     Err(e) => tracing::warn!("shake 落盘失败，保留原日志: {e}"),
                 }
             }
+            CompactionStrategy::Snapcompact { max_frames } => {
+                // 纯本地渲染（无网络），但为 CPU 密集且避免持锁阻塞 append，锁外执行。
+                let inner = self.inner.lock().await;
+                let Some(old_leaf) = inner.active_leaf.clone() else {
+                    return Ok(());
+                };
+                let path = inner.active_path_messages();
+                let keep = path.len().min(6);
+                let original = path.clone();
+                drop(inner);
+                let outcome = compaction::Compactor::snapcompact(
+                    path,
+                    keep,
+                    &compaction::SnapcompactOptions {
+                        max_frames,
+                        ..compaction::SnapcompactOptions::default()
+                    },
+                );
+                let (new_log, result) = match outcome {
+                    Ok(new_log) => (new_log, Ok::<(), ContextError>(())),
+                    Err(e) => (original, Err(ContextError::Compaction(e))),
+                };
+                let kept = {
+                    let mut inner = self.inner.lock().await;
+                    inner.compact_active_path(&old_leaf, new_log);
+                    inner.active_path_messages().len()
+                };
+                if result.is_ok() {
+                    tracing::info!(kept, max_frames, "已 snapcompact 图像化压缩（活跃分支）");
+                }
+                return result;
+            }
             CompactionStrategy::Summarize { .. } => {
                 // 阶段一（锁内）：取活跃路径 + summarizer + old_leaf。
                 let mut inner = self.inner.lock().await;

@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Cross-session long-term memory: per-project markdown store + LLM consolidation"
 
+[features]
+# L2 语义嵌入（fastembed AllMiniLML6V2Q）；默认关闭，缺省构建零影响
+vec-embed = ["dep:fastembed"]
+
 [dependencies]
 agent-core   = { workspace = true }
 async-trait  = { workspace = true }
@@ -15,6 +19,8 @@ tracing      = { workspace = true }
 serde_json   = { workspace = true }
 futures      = { workspace = true }
 uuid         = { workspace = true }
+base64       = { workspace = true }
+fastembed    = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

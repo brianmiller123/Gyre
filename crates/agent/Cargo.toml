@@ -15,6 +15,8 @@ agent-supervisor = { workspace = true }
 agent-tools  = { workspace = true }
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }
+# P2：snapcompact 帧数预算常量（DEFAULT_MAX_FRAMES）。
+agent-snapcompact = { workspace = true }
 async-trait  = { workspace = true }
 async-stream = { workspace = true }
 futures      = { workspace = true }
@@ -31,6 +33,12 @@ sha2         = { workspace = true }
 agent-context = { workspace = true }
 # 仅测试用：无中毒检查的快速锁（FallbackProbe 调用记录）。
 parking_lot = "0.12"
+# 基准门：TTSR 匹配延迟基准（benches/ttsr.rs）
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "ttsr"
+harness = false

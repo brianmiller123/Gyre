@@ -23,5 +23,15 @@ base64       = { workspace = true }
 regex        = { workspace = true }
 encoding_rs  = { workspace = true }
 
+[dev-dependencies]
+# 基准门：grep/glob 吞吐基准（benches/search.rs）
+criterion = { workspace = true }
+# 基准夹具：确定性临时小仓库
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "search"
+harness = false

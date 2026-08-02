@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Badge, Button, Dropdown, Modal } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { Sidebar } from '@/components/agent/Sidebar'
@@ -6,12 +6,16 @@ import { Transcript } from '@/components/agent/Transcript'
 import { Composer } from '@/components/agent/Composer'
 import { Inspector } from '@/components/agent/Inspector'
 import { SettingsPanel } from '@/components/agent/SettingsPanel'
+import { StatisticsPanel } from '@/components/agent/StatisticsPanel'
 import { WorkspacePanel } from '@/components/agent/WorkspacePanel'
 import { Toaster } from '@/components/Toaster'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact } from '@/lib/format'
 import { useI18n } from '@/lib/i18n'
+
+/** 统计页面的 URL 路由锚点（应用无路由库，用 `#/stats` hash 表达页面级导航）。 */
+const STATS_ROUTE = '#/stats'
 
 /** Full application frame: sidebar + chat column + inspector + overlays. */
 export function AgentShell() {
@@ -20,6 +24,25 @@ export function AgentShell() {
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [confirmModel, setConfirmModel] = useState<string | null>(null)
+  // 统计页：与 URL hash 同步（`#/stats` 直达 / 可刷新 / 可分享）。
+  const [statsOpen, setStatsOpen] = useState(() => window.location.hash === STATS_ROUTE)
+  useEffect(() => {
+    const onHash = () => setStatsOpen(window.location.hash === STATS_ROUTE)
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  const openStats = () => {
+    window.location.hash = STATS_ROUTE
+    setStatsOpen(true)
+  }
+  const closeStats = () => {
+    setStatsOpen(false)
+    // 清除 hash 但不触发 hashchange（避免重复 setState）。
+    if (window.location.hash === STATS_ROUTE) {
+      history.replaceState(null, '', window.location.pathname + window.location.search)
+    }
+  }
 
   const { state, usage, error, running, stopping, clear, cancel, items, models, currentModel, switchModel } =
     useAgentSession()
@@ -42,6 +65,7 @@ export function AgentShell() {
         <Sidebar
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenWorkspace={() => setWorkspaceOpen(true)}
+          onOpenStats={openStats}
         />
       </div>
 
@@ -53,6 +77,7 @@ export function AgentShell() {
             <Sidebar
               onOpenSettings={() => { setSettingsOpen(true); setMobileNav(false) }}
               onOpenWorkspace={() => { setWorkspaceOpen(true); setMobileNav(false) }}
+              onOpenStats={() => { openStats(); setMobileNav(false) }}
               onClose={() => setMobileNav(false)}
             />
           </div>
@@ -114,6 +139,8 @@ export function AgentShell() {
       )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+
+      {statsOpen && <StatisticsPanel onClose={closeStats} />}
 
       {workspaceOpen && <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />}
 

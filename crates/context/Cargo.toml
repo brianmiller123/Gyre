@@ -9,14 +9,25 @@ description = "Context memory: AppendOnlyLog + StablePrefix + tiktoken count + s
 [dependencies]
 agent-core  = { workspace = true }
 agent-prompt = { workspace = true }
+agent-snapcompact = { workspace = true }
 futures     = { workspace = true }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 serde_json  = { workspace = true }
+reqwest     = { workspace = true }
 tracing     = { workspace = true }
 tiktoken-rs = { workspace = true }
 
 base64   = { workspace = true }
 
+[dev-dependencies]
+image = { workspace = true }
+# 基准门：run-loop 压缩耗时基准（benches/compaction.rs）
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "compaction"
+harness = false

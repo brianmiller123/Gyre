@@ -35,7 +35,8 @@ pub mod workspace;
 pub mod write_effect;
 
 pub use context::{
-    CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode, TokenUsage,
+    CompactionBackend, CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode,
+    TokenUsage,
 };
 pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
 pub use hook::{Hook, HookEvent, TurnEndContext};

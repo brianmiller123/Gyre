@@ -29,6 +29,7 @@ import {
   type Usage,
 } from '@/lib/agent/types'
 import { bindWorkspaceContext } from '@/lib/agent/workspace'
+import { bindStatsContext } from '@/lib/agent/stats'
 import { useSettings } from '@/lib/settings'
 import { useI18n } from '@/lib/i18n'
 import type { Mode } from '@/lib/settings'
@@ -171,6 +172,10 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   // Keep the workspace API client pointed at the live server + token.
   useEffect(() => {
     bindWorkspaceContext(settings.serverUrl, settings.token)
+  }, [settings.serverUrl, settings.token])
+  // Same binding for the stats API client (Statistics 页面).
+  useEffect(() => {
+    bindStatsContext(settings.serverUrl, settings.token)
   }, [settings.serverUrl, settings.token])
   const [items, setItems] = useState<TranscriptItem[]>([])
   // items 真值引用：deleteMessage 解析行索引时读取最新列表，避免闭包捕获陈旧快照。

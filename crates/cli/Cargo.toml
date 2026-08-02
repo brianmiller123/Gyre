@@ -34,11 +34,15 @@ agent-hashline = { workspace = true }
 agent-pty    = { workspace = true }
 agent-collab = { workspace = true }
 agent-swarm  = { workspace = true }
+agent-eval   = { workspace = true }
+agent-dap    = { workspace = true }
+agent-browser = { workspace = true }
 async-trait  = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 reqwest      = { workspace = true }
 futures      = { workspace = true }
+serde        = { workspace = true }
 serde_json   = { workspace = true }
 axum         = { workspace = true }
 clap         = { workspace = true }

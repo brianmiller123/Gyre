@@ -269,6 +269,12 @@ struct UsageChunk {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    /// 缓存命中读取 token（Anthropic `cache_read_input_tokens`）。
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    /// 缓存写入 token（Anthropic `cache_creation_input_tokens`）。
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStream {
@@ -313,6 +319,11 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
                     "message_start" => {
                         if let Some(u) = ev.message.as_ref().and_then(|m| m.usage.as_ref()) {
                             usage.input_tokens = u.input_tokens.unwrap_or(0);
+                            // P0-4：Anthropic 流式 message_start 即给出 cache 计量。
+                            usage.cache_read_tokens =
+                                u.cache_read_input_tokens.unwrap_or(0);
+                            usage.cache_write_tokens =
+                                u.cache_creation_input_tokens.unwrap_or(0);
                         }
                     }
                     "content_block_start" => {

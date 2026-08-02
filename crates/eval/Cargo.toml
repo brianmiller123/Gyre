@@ -1,0 +1,23 @@
+[package]
+name        = "agent-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Python NDJSON 持久内核 + 127.0.0.1 环回桥 + eval 工具"
+
+[dependencies]
+agent-core   = { workspace = true }
+agent-tools  = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+axum         = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+
+[lints]
+workspace = true

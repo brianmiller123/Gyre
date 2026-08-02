@@ -1,0 +1,27 @@
+[package]
+name        = "agent-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CDP 最小客户端：headless chromium 的 browser 自动化工具"
+
+[dependencies]
+agent-core      = { workspace = true }
+agent-tools     = { workspace = true }
+async-trait     = { workspace = true }
+base64          = { workspace = true }
+futures-util    = { workspace = true }
+nix             = { workspace = true }
+serde_json      = { workspace = true }
+tempfile        = { workspace = true }
+thiserror       = { workspace = true }
+tokio           = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util      = { workspace = true }
+tracing         = { workspace = true }
+url             = { workspace = true }
+uuid            = { workspace = true }
+
+[lints]
+workspace = true

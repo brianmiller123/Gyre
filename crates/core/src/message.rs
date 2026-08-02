@@ -40,6 +40,9 @@ pub enum Mode {
     Ask,
     /// 调试模式。
     Debug,
+    /// 计划模式（P1-5）：仅 `plans/` 下 markdown 可写（与 architect 同构的写保护），
+    /// 执行类命令需确认——规划阶段不落代码，产出经批准后切回 code 执行。
+    Plan,
 }
 
 /// 停止原因。

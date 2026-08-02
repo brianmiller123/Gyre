@@ -303,6 +303,16 @@ struct FnDelta {
 struct UsageChunk {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// OpenAI 流式 `usage.prompt_tokens_details`（缓存计量）。
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    /// 缓存命中读取 token（`cached_tokens`）。
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStream {
@@ -433,6 +443,10 @@ fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
                 if let Some(u) = value.usage.as_ref() {
                     usage_acc.input_tokens = u.prompt_tokens;
                     usage_acc.output_tokens = u.completion_tokens;
+                    // P0-4：prompt_tokens_details.cached_tokens → cache_read（OpenAI 兼容端点）。
+                    if let Some(d) = u.prompt_tokens_details.as_ref() {
+                        usage_acc.cache_read_tokens = d.cached_tokens;
+                    }
                     yield AssistantEvent::Usage(usage_acc.clone());
                 }
             }

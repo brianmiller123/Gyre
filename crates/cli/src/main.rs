@@ -6,6 +6,8 @@
 mod agents_view;
 mod markdown;
 mod repl;
+mod review;
+mod rpc;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -61,9 +63,14 @@ struct Cli {
     ///
     /// - 单独使用（不带 `--serve`）：以纯 stdio 模式运行 ACP（供编辑器作为子进程调用；
     ///   stdin 读 JSON-RPC，stdout 写事件，无需 HTTP 端口）。最高优先级，不启动 HTTP。
-    /// - 与 `--serve` 配合：额外启用 HTTP+SSE 端点（亦受 `[acp].enabled` 控制）。
+    /// 与 `--serve` 配合：额外启用 HTTP+SSE 端点（亦受 `[acp].enabled` 控制）。
     #[arg(long)]
     acp: bool,
+    /// NDJSON 行协议模式（外部语言/机器人集成，见 docs/rpc.md）：stdin 逐行读 JSON 请求，
+    /// stdout 逐行写 JSON 事件/响应；进程内一个 Agent 与同一份 Context 跨 prompt 请求复用。
+    /// 与 --serve / --acp 互斥（stdout 是协议通道）。
+    #[arg(long)]
+    rpc: bool,
     /// 恢复历史会话（会话 id；用 --list-sessions 查看）。
     #[arg(long)]
     resume: Option<String>,
@@ -169,6 +176,15 @@ async fn main() -> Result<()> {
         };
     }
 
+    // NDJSON RPC 模式（--rpc）：外部语言/机器人集成的 stdio 行协议（见 docs/rpc.md）。
+    // stdout 是协议通道，与 --serve（HTTP）及 --acp（JSON-RPC stdio）互斥。
+    if cli.rpc && (cli.serve.is_some() || cli.acp) {
+        anyhow::bail!("--rpc 与 --serve / --acp 互斥，不能同时指定");
+    }
+    if cli.rpc {
+        return rpc::run_rpc(cfg, cwd).await;
+    }
+
     // 纯 stdio ACP 模式（--acp 且未指定 --serve）：编辑器作为子进程调用，不启动 HTTP。
     // 与 `--serve --acp`（HTTP+SSE）区分——stdio 优先，仅在没有 serve 时触发。
     if cli.acp && cli.serve.is_none() {
@@ -226,6 +242,9 @@ async fn main() -> Result<()> {
         agent_context::SessionStore::new_id()
     };
     eprintln!("{}", t!("session.label", id = session_id));
+    // eval 内核的会话标签：RwLock 共享（/resume 换会话后重建 Agent 时读到新标签，
+    // 内核池按新 session_key 隔离，避免跨会话共享命名空间）。
+    let session_label = Arc::new(std::sync::RwLock::new(session_id.clone()));
 
     // 2. 解析模型 profile（P2：含 fallback 链——主模型失败且错误可重试时依序换备用模型）
     let chain = cfg
@@ -282,6 +301,7 @@ async fn main() -> Result<()> {
             Arc::clone(&provider),
             model.clone(),
             provider_ctx.clone(),
+            cfg.compaction.remote_endpoint.clone(),
         ),
     ))
     .await;
@@ -306,9 +326,19 @@ async fn main() -> Result<()> {
         cfg.tools.effective("hashline", true),
     );
     optional.insert("pty".to_string(), cfg.tools.effective("pty", false));
+    // P1-1：DAP 调试器可选组（[tools.enabled] debug）。
+    optional.insert("debug".to_string(), cfg.tools.effective("debug", false));
+    // P2：SSH / browser 可选组（[tools.enabled] ssh / browser）。
+    optional.insert("ssh".to_string(), cfg.tools.effective("ssh", false));
+    optional.insert("browser".to_string(), cfg.tools.effective("browser", false));
     // 子 Agent 工具集（按启用态装配的可选工具 + MCP，不含 task 以防递归；与模型无关，构建一次）
-    let (mut sub_reg, _) =
-        assemble_builtin_tools(&optional, cfg.github.enabled, cfg.github.allow_write, cfg.agent.commands.interceptor.enabled);
+    let (mut sub_reg, _) = assemble_builtin_tools(
+        &optional,
+        cfg.github.enabled,
+        cfg.github.allow_write,
+        cfg.agent.commands.interceptor.enabled,
+        compiled_minimizer(&cfg),
+    );
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
     }
@@ -344,16 +374,36 @@ async fn main() -> Result<()> {
     if !commands.is_empty() {
         eprintln!("{}", t!("commands.loaded", count = commands.len()));
     }
-    // 4d. 装配长期记忆（可选；按 cwd 项目作用域）
-    let memory: Option<Arc<agent_memory::LocalMemoryStore>> = if cfg.memory.enabled {
-        let store = Arc::new(agent_memory::LocalMemoryStore::new(&cwd));
-        if let Ok(Some(_)) = store.summary().await {
+    // 4d. 装配长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
+    // local：markdown 管道 + LLM 合并（P1 既有）；structured：records.jsonl + 向量融合检索。
+    // 两者都带心智模型注入（P1-6，seeds + 项目 mental_models.md）。
+    let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
+    let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
+    if cfg.memory.enabled {
+        match cfg.memory.backend {
+            agent_config::MemoryBackend::Local => {
+                let store = Arc::new(
+                    agent_memory::LocalMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default()),
+                );
+                local_memory = Some(Arc::clone(&store));
+                memory = Some(store);
+            }
+            agent_config::MemoryBackend::Structured => {
+                // 向量记忆：L2 fastembed 语义嵌入（vec-embed feature 编译时）或 L1 投影（离线），
+                // 懒加载 + 失败降级，永不 panic。
+                let store = Arc::new(
+                    agent_memory::StructuredMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default())
+                        .with_embedder(agent_memory::default_embedder()),
+                );
+                memory = Some(store);
+            }
+        }
+        if let Ok(Some(_)) = memory.as_ref().unwrap().summary().await {
             eprintln!("{}", t!("memory.injected"));
         }
-        Some(store)
-    } else {
-        None
-    };
+    }
     // 5. 装配 Approval（规则引擎 + stdin 交互回调）
     let prompt_resolver: agent_config::PromptResolver = Arc::new(|ask: agent_core::AskMessage| {
         Box::pin(async move {
@@ -407,6 +457,39 @@ async fn main() -> Result<()> {
     // 子 Agent 监控总线：与 TaskTool / /agents 仪表盘共享同一份进程内状态。
     let supervisor = agent_supervisor::Supervisor::new();
 
+    // P0-3：goals 目标预算共享状态（跨 Agent 重建保持；`/goal` 查看/调整）。
+    // 预算为空（两者均为 0）时不注入，行为与未配置完全一致。
+    let goal_state: Option<Arc<std::sync::Mutex<agent::GoalState>>> =
+        if cfg.goals.token_budget > 0 || cfg.goals.time_budget_secs > 0 {
+            Some(Arc::new(std::sync::Mutex::new(agent::GoalState::new(
+                agent::GoalBudget {
+                    token_budget: cfg.goals.token_budget,
+                    time_budget: std::time::Duration::from_secs(cfg.goals.time_budget_secs),
+                    hard_stop: cfg.goals.hard_stop,
+                },
+            ))))
+        } else {
+            None
+        };
+
+    // P0-1：eval 内核管理器（`[eval] enabled` 或 env `GYRE_EVAL=1` 启用）。
+    // 内核池跨 Agent 重建存活（/model、/mode 切换不丢命名空间）；环回桥由 EvalTool
+    // 首次 execute 时按当前审批懒加载 spawn。
+    let eval_mgr: Option<Arc<agent_eval::EvalManager>> = if cfg.eval.enabled
+        || std::env::var("GYRE_EVAL").is_ok_and(|v| v == "1")
+    {
+        let mgr = Arc::new(agent_eval::EvalManager::new(
+            agent_eval::EvalSettings::from_parts(
+                cfg.eval.python.clone(),
+                cfg.eval.idle_timeout_secs,
+            ),
+        ));
+        mgr.ensure_sweeper();
+        Some(mgr)
+    } else {
+        None
+    };
+
     #[allow(clippy::too_many_arguments)]
     let build_agent = |mode: agent_core::Mode,
                        model: agent_core::Model,
@@ -441,8 +524,13 @@ async fn main() -> Result<()> {
         };
         let sub_max_output = subagent_max_output_override.unwrap_or(max_output);
         // 父 Agent 工具集 = 按启用态装配的可选工具 + MCP + task（task 受 [subagent].enabled 控制）
-        let (mut tool_registry, lsp_pool) =
-            assemble_builtin_tools(optional, github_enabled, github_allow_write, cfg.agent.commands.interceptor.enabled);
+        let (mut tool_registry, lsp_pool) = assemble_builtin_tools(
+            optional,
+            github_enabled,
+            github_allow_write,
+            cfg.agent.commands.interceptor.enabled,
+            compiled_minimizer(&cfg),
+        );
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
         }
@@ -467,7 +555,28 @@ async fn main() -> Result<()> {
             .with_approval(Arc::clone(&approval));
             tool_registry = tool_registry.with(Box::new(task_tool));
         }
-        let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
+        // P0-1：eval 工具（懒加载环回桥）。桥回调宿主工具用的注册表为「不含 eval」的快照
+        //（防自我递归）；eval 经 WithEval 适配器附加到 Agent 注册表之上。会话标签经
+        // RwLock 读取，/resume 换会话后重建 Agent 即用新标签隔离内核池。
+        let tools: Arc<dyn agent_tools::ToolRegistry> = if let Some(eval_mgr) = &eval_mgr {
+            let bridge_registry: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
+            let eval_tool = agent_eval::EvalTool::with_session(
+                Arc::clone(eval_mgr),
+                Arc::clone(&bridge_registry),
+                Arc::clone(&workspace),
+                Arc::clone(&approval),
+                session_label
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
+            Arc::new(WithEval {
+                inner: bridge_registry,
+                eval: Box::new(eval_tool),
+            })
+        } else {
+            Arc::new(tool_registry)
+        };
 
         // TTSR 流规则：发现 `<cwd>/.gyre/rules/*.md` 并装配协调器（缺省有规则即启用；
         // `[ttsr] enabled = false` 或 `disabled_rules` 可关闭/过滤）。规则零上下文成本：
@@ -533,6 +642,39 @@ async fn main() -> Result<()> {
                 github_enabled,
             ))
             .resources(Arc::clone(&mcp) as Arc<dyn agent_core::ResourceResolver>);
+        // P2：压缩后端——snapcompact 要求视觉模型（[compaction].vision_models 通配匹配，
+        // 空列表 = 任何模型启用）；不匹配回退 summarize（每次重建按当前 model 判断）。
+        let compaction_backend = {
+            let backend = agent_config::parse_compaction_backend(&cfg.compaction.backend);
+            if backend == agent_core::CompactionBackend::Snapcompact {
+                let vision = cfg.compaction.vision_models.is_empty()
+                    || cfg
+                        .compaction
+                        .vision_models
+                        .iter()
+                        .any(|p| agent_config::wildcard_match(p, &model.id));
+                if vision {
+                    backend
+                } else {
+                    eprintln!(
+                        "[compaction] backend=snapcompact 但模型 {} 不匹配 vision_models，回退 summarize",
+                        model.id
+                    );
+                    agent_core::CompactionBackend::Summarize
+                }
+            } else {
+                backend
+            }
+        };
+        let builder = builder
+            .compaction_backend(compaction_backend)
+            .compaction_max_frames(cfg.compaction.max_frames);
+        // P0-3：goals 预算注入（共享状态，`/goal` 可运行时调整）。
+        let builder = if let Some(gs) = &goal_state {
+            builder.goals_state(Arc::clone(gs))
+        } else {
+            builder
+        };
         // 编辑后 LSP writethrough：lsp 启用（lsp_pool 为 Some）且 edit 开启时，共享 LspTool 的 pool 注入。
         let builder = if lsp_pool.is_some()
             && (cfg.agent.tools.edit.format_on_write || cfg.agent.tools.edit.diagnostics_on_write)
@@ -549,11 +691,12 @@ async fn main() -> Result<()> {
             builder
         };
         let builder = if let Some(m) = &memory {
-            builder.memory(Arc::clone(m) as Arc<dyn agent_core::MemoryStore>)
+            builder.memory(Arc::clone(m))
         } else {
             builder
         };
-        let builder = if let Some(m) = &memory {
+        // LLM 合并钩子仅 local 后端有（structured 逐条积累，无合并语义）。
+        let builder = if let Some(m) = &local_memory {
             let hook = ConsolidateHook {
                 store: Arc::clone(m),
                 provider: Arc::clone(&provider),
@@ -675,6 +818,7 @@ async fn main() -> Result<()> {
                     github_enabled,
                     github_allow_write,
                     optional: &optional,
+                    goal: goal_state.clone(),
                 };
                 handle_command(line, &ctx)
             };
@@ -741,6 +885,7 @@ async fn main() -> Result<()> {
                                             Arc::clone(&provider),
                                             current_model.clone(),
                                             current_provider_ctx.clone(),
+                                            cfg.compaction.remote_endpoint.clone(),
                                         ),
                                     ))
                                     .await;
@@ -755,6 +900,8 @@ async fn main() -> Result<()> {
                                     Arc::new(new_pctx);
                                 context = new_context;
                                 session_id = id.clone();
+                                *session_label.write().unwrap_or_else(|e| e.into_inner()) =
+                                    id.clone();
                                 agent = build_agent(
                                     current_mode,
                                     current_model.clone(),
@@ -775,6 +922,61 @@ async fn main() -> Result<()> {
                             Err(e) => eprintln!("{}", t!("session.resume_failed", e = e)),
                         }
                     }
+                    (String::new(), true)
+                }
+                CommandOutcome::Fresh => {
+                    // P1-4：全新会话（新 id + 空上下文），保留模型/模式；本地历史记录不动。
+                    let fresh_id = agent_context::SessionStore::new_id();
+                    let path = session_store.path_for(&fresh_id);
+                    match agent_context::PersistentContext::open(
+                        prompts.system_with_platform(current_mode),
+                        &path,
+                    )
+                    .await
+                    {
+                        Ok(new_pctx) => {
+                            new_pctx
+                                .set_summarizer(Box::new(
+                                    agent_context::compaction::LlmSummaryProvider::new(
+                                        Arc::clone(&provider),
+                                        current_model.clone(),
+                                        current_provider_ctx.clone(),
+                                        cfg.compaction.remote_endpoint.clone(),
+                                    ),
+                                ))
+                                .await;
+                            new_pctx
+                                .set_shake_sink(Arc::new(
+                                    agent_context::compaction::DirSink::new(
+                                        cwd.join(".gyre").join("artifacts"),
+                                    ),
+                                ))
+                                .await;
+                            context = Arc::new(new_pctx);
+                            session_id = fresh_id.clone();
+                            *session_label.write().unwrap_or_else(|e| e.into_inner()) =
+                                fresh_id.clone();
+                            agent = build_agent(
+                                current_mode,
+                                current_model.clone(),
+                                current_provider_ctx.clone(),
+                                current_max_output,
+                                Arc::clone(&context),
+                                github_enabled,
+                                github_allow_write,
+                                &optional,
+                            );
+                            eprintln!("{}", t!("session.fresh", id = session_id));
+                        }
+                        Err(e) => eprintln!("{}", t!("session.fresh_failed", e = e)),
+                    }
+                    (String::new(), true)
+                }
+                CommandOutcome::Diff { staged, ref_name } => {
+                    // P1-4：git diff 展示（工作区 / --staged / 指定 ref），长输出截断。
+                    let diff = run_git_diff(&workspace.root(), staged, ref_name.as_deref());
+                    eprintln!("{}", t!("diff.title"));
+                    eprintln!("{diff}");
                     (String::new(), true)
                 }
                 CommandOutcome::Compact => {
@@ -944,6 +1146,54 @@ async fn main() -> Result<()> {
                     }
                     (String::new(), true)
                 }
+                CommandOutcome::Review { staged, reviewers } => {
+                    if !subagent_enabled {
+                        eprintln!("[review] 子 Agent 已由 [subagent].enabled = false 禁用");
+                        (String::new(), true)
+                    } else {
+                        // 评审子代理审批：Ask 模式规则（写操作硬拒绝，评审只读）；执行类经
+                        // TaskTool 委派审批自动放行（prompt 自动 Yes），避免子代理运行期阻塞在 stdin。
+                        let mut agent_cfg = cfg.agent.clone();
+                        agent_cfg.mode = agent_core::Mode::Ask;
+                        let rules = agent_config::RulesEngine::new(Arc::new(agent_cfg))
+                            .with_workspace_root(Some(workspace.root().to_path_buf()));
+                        let review_approval: Arc<dyn agent_core::ApprovalPolicy> =
+                            Arc::new(agent_config::RulesApprovalPolicy::new(
+                                rules,
+                                Arc::clone(&prompt_resolver),
+                            ));
+                        let review_env = review::ReviewEnv {
+                            cwd: &cwd,
+                            provider: &provider,
+                            sub_tools: &sub_tools,
+                            prompts: &prompts,
+                            workspace: &workspace,
+                            model: &current_model,
+                            provider_ctx: &current_provider_ctx,
+                            max_mistakes,
+                            context_guard,
+                            max_output: current_max_output,
+                            context_factory: &sub_context_factory,
+                            temperature: if subagent_inherit {
+                                profile_temperature
+                            } else {
+                                None
+                            },
+                            thinking: if subagent_inherit && enable_thinking {
+                                Some(agent_core::ThinkingConfig::new(
+                                    reasoning_budget.unwrap_or(16_000),
+                                ))
+                            } else {
+                                None
+                            },
+                            max_concurrent: subagent_max_concurrent,
+                            supervisor: supervisor.clone(),
+                            approval: review_approval,
+                        };
+                        review::run_review(staged, reviewers, &review_env).await;
+                        (String::new(), true)
+                    }
+                }
                 CommandOutcome::Quit => break,
             }
         } else {
@@ -1007,6 +1257,12 @@ fn optional_context_files(
     if *optional.get("pty").unwrap_or(&false) {
         files.push(agent_pty::PROMPT_SECTION.to_string());
     }
+    if *optional.get("ssh").unwrap_or(&false) {
+        files.push(agent_tools::SSH_PROMPT_SECTION.to_string());
+    }
+    if *optional.get("browser").unwrap_or(&false) {
+        files.push(agent_browser::PROMPT_SECTION.to_string());
+    }
     if github_enabled {
         files.push(agent_tools::PROMPT_SECTION.to_string());
     }
@@ -1016,6 +1272,107 @@ fn optional_context_files(
 /// 装配内置工具集：核心工具（始终启用）+ 按启用态追加的可选组（ast/lsp/image/hashline/pty/github）。
 ///
 /// 与 [`optional_context_files`] 配对：同一开关同时决定「工具是否注册」与「提示词是否注入」，
+/// P0-1：把 `eval` 工具附加到既有注册表之上的适配器。
+///
+/// 桥侧注册表（`inner`）不含 eval 自身（防 python 内 `tool.eval` 自我递归）；
+/// Agent 侧经本适配器看到完整工具面（含 eval）。
+struct WithEval {
+    inner: Arc<dyn agent_tools::ToolRegistry>,
+    eval: Box<dyn agent_tools::Tool>,
+}
+
+impl agent_tools::ToolRegistry for WithEval {
+    fn specs(&self) -> Vec<agent_core::ToolSpec> {
+        let mut specs = self.inner.specs();
+        specs.push(agent_core::ToolSpec::new(
+            self.eval.name(),
+            self.eval.description(),
+            self.eval.schema(),
+        ));
+        specs
+    }
+
+    fn get(&self, name: &str) -> Option<&dyn agent_tools::Tool> {
+        if name == self.eval.name() {
+            Some(self.eval.as_ref())
+        } else {
+            self.inner.get(name)
+        }
+    }
+}
+
+#[cfg(test)]
+mod with_eval_tests {
+    use super::*;
+    use agent_tools::ToolRegistry as _; // specs/get 方法解析
+
+    /// 桩工具：仅用于验证 WithEval 的 spec/get 分发与 eval 名隔离。
+    struct DummyTool;
+    #[async_trait::async_trait]
+    impl agent_tools::Tool for DummyTool {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn description(&self) -> &str {
+            "dummy tool"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability(&self) -> agent_core::CapabilityTier {
+            agent_core::CapabilityTier::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &agent_tools::ToolContext<'_>,
+        ) -> Result<agent_core::ToolResult, agent_core::ToolError> {
+            Ok(agent_core::ToolResult::text("ok"))
+        }
+    }
+
+    struct EvalStub;
+    #[async_trait::async_trait]
+    impl agent_tools::Tool for EvalStub {
+        fn name(&self) -> &str {
+            "eval"
+        }
+        fn description(&self) -> &str {
+            "eval stub"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability(&self) -> agent_core::CapabilityTier {
+            agent_core::CapabilityTier::Execute
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &agent_tools::ToolContext<'_>,
+        ) -> Result<agent_core::ToolResult, agent_core::ToolError> {
+            Ok(agent_core::ToolResult::text("ok"))
+        }
+    }
+
+    #[test]
+    fn with_eval_attaches_eval_and_delegates_rest() {
+        let inner = agent_tools::DefaultToolRegistry::new().with(Box::new(DummyTool));
+        let inner: Arc<dyn agent_tools::ToolRegistry> = Arc::new(inner);
+        let wrapped = WithEval {
+            inner: Arc::clone(&inner),
+            eval: Box::new(EvalStub),
+        };
+        let specs = wrapped.specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"dummy"), "桥注册表工具仍可见");
+        assert!(names.contains(&"eval"), "eval 附加到 Agent 侧");
+        assert!(wrapped.get("dummy").is_some(), "非 eval 名委托给桥注册表");
+        assert!(wrapped.get("eval").is_some(), "eval 名由适配器提供");
+    }
+}
+
+
 /// 确保未启用工具既不出现在 LLM 工具列表，也不占 system prompt Token。
 #[must_use]
 fn assemble_builtin_tools(
@@ -1023,6 +1380,7 @@ fn assemble_builtin_tools(
     github_enabled: bool,
     github_allow_write: bool,
     interceptor_enabled: bool,
+    minimizer: agent_tools::Minimizer,
 ) -> (
     agent_tools::DefaultToolRegistry,
     Option<agent_tools::LspPool>,
@@ -1032,7 +1390,7 @@ fn assemble_builtin_tools(
     } else {
         Vec::new()
     };
-    let mut reg = agent_tools::core_tools(intercept);
+    let mut reg = agent_tools::core_tools(intercept, minimizer);
     let mut lsp_pool: Option<agent_tools::LspPool> = None;
     if *optional.get("ast").unwrap_or(&false) {
         reg = agent_tools::ast_tools(reg);
@@ -1052,14 +1410,40 @@ fn assemble_builtin_tools(
     if *optional.get("pty").unwrap_or(&false) {
         reg = reg.with(Box::new(agent_pty::RunPtyTool));
     }
+    if *optional.get("debug").unwrap_or(&false) {
+        // P1-1：DAP 调试器（lldb-dap / dlv / debugpy 自动探测，14 动作）。
+        reg = reg.with(Box::new(agent_dap::DebugTool::new(
+            agent_dap::DapSettings::default(),
+        )));
+    }
+    if *optional.get("ssh").unwrap_or(&false) {
+        // P2：SSH 工具（解析 ~/.ssh/config，远程命令执行；BatchMode 非交互）。
+        reg = reg.with(Box::new(agent_tools::SshTool::new(None)));
+    }
+    if *optional.get("browser").unwrap_or(&false) {
+        // P2：browser 工具（CDP 驱动 chromium；懒启动，7 动作）。
+        reg = reg.with(Box::new(agent_browser::BrowserTool::new()));
+    }
     if github_enabled {
         reg = reg.with(Box::new(agent_tools::GithubTool::new(github_allow_write)));
     }
     (reg, lsp_pool)
 }
 
+/// 从配置构造输出最小化器（`[agent.commands.minimizer] enabled/max_lines`）。
+/// 未启用时返回 [`agent_tools::disabled`]（apply 恒 None，零开销）。
+#[must_use]
+fn compiled_minimizer(cfg: &agent_config::Config) -> agent_tools::Minimizer {
+    let m = &cfg.agent.commands.minimizer;
+    if m.enabled {
+        agent_tools::Minimizer::new(agent_tools::default_filters(), m.max_lines)
+    } else {
+        agent_tools::disabled()
+    }
+}
+
 /// 可选工具组 key 白名单（不含 `github`；github 由独立字段管理）。
-const OPTIONAL_TOOL_KEYS: &[&str] = &["ast", "lsp", "image", "hashline", "pty"];
+const OPTIONAL_TOOL_KEYS: &[&str] = &["ast", "lsp", "image", "hashline", "pty", "debug", "ssh", "browser"];
 
 /// 判断 key 是否为已知可选工具组（不含 github）。
 #[must_use]
@@ -1122,6 +1506,45 @@ async fn compact_context(context: &dyn agent_core::ContextManager) {
         "{}",
         t!("compact.done", current = u.current, limit = u.limit)
     );
+}
+
+/// `/diff` 执行 git diff 并截断长输出（工作区 / `--staged` / 指定 ref）。
+/// 非 git 仓库返回提示文本。
+#[must_use]
+fn run_git_diff(root: &std::path::Path, staged: bool, ref_name: Option<&str>) -> String {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("diff");
+    if staged {
+        cmd.arg("--cached");
+    }
+    if let Some(r) = ref_name {
+        cmd.arg(r);
+    }
+    let out = match cmd.current_dir(root).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) if o.status.code() == Some(128) => {
+            return "当前目录不是 git 仓库（git diff 退出码 128）".to_string();
+        }
+        Ok(o) => format!(
+            "git diff 失败（exit {}）: {}",
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => return format!("无法执行 git: {e}"),
+    };
+    // 长输出截断：保留前 300 行 + 省略标记。
+    const MAX_LINES: usize = 300;
+    let lines: Vec<&str> = out.lines().collect();
+    if lines.len() > MAX_LINES {
+        let head: Vec<&str> = lines.iter().take(MAX_LINES).copied().collect();
+        format!(
+            "{}\n… [diff 过长，已截断 {} 行；可用完整命令重跑] …",
+            head.join("\n"),
+            lines.len() - MAX_LINES
+        )
+    } else {
+        out
+    }
 }
 
 /// 恢复会话后回显对话历史（仅 user/assistant 轮次；超长只显示最近 60 条）。
@@ -1267,6 +1690,14 @@ impl Hook for ConsolidateHook {
             if let Err(e) = self
                 .store
                 .consolidate(&self.provider, &self.model, &self.provider_ctx)
+                .await
+            {
+                eprintln!("{}", t!("memory.merge_failed", e = e));
+            }
+            // P1-6：心智模型 LLM 合并（去重/分组/提炼），独立于 MEMORY.md 合并。
+            if let Err(e) = self
+                .store
+                .consolidate_mental_models(&self.provider, &self.model, &self.provider_ctx)
                 .await
             {
                 eprintln!("{}", t!("memory.merge_failed", e = e));
@@ -1506,7 +1937,7 @@ mod tests {
     #[test]
     fn assemble_defaults_to_core_only() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, false, false, false);
+        let (reg, _) = assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
@@ -1529,7 +1960,7 @@ mod tests {
     fn assemble_enables_ast_group() {
         let mut optional = std::collections::HashMap::new();
         optional.insert("ast".to_string(), true);
-        let (reg, _) = assemble_builtin_tools(&optional, false, false, false);
+        let (reg, _) = assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));
@@ -1542,7 +1973,7 @@ mod tests {
     #[test]
     fn assemble_github_independent_of_optional_map() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, true, true, false);
+        let (reg, _) = assemble_builtin_tools(&optional, true, true, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(

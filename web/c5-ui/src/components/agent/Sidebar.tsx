@@ -19,10 +19,12 @@ import type { LocaleCode } from '@/lib/locales'
 export function Sidebar({
   onOpenSettings,
   onOpenWorkspace,
+  onOpenStats,
   onClose,
 }: {
   onOpenSettings: () => void
   onOpenWorkspace: () => void
+  onOpenStats: () => void
   onClose?: () => void
 }) {
   const { connected, connecting, newChat, clear, error, sessionId } = useAgentSession()
@@ -107,8 +109,9 @@ export function Sidebar({
         {error && <p className="mt-1 text-[10px] text-danger">{error}</p>}
       </div>
 
-      {/* 操作（浏览 / 设置 / 清空） */}
-      <nav className="mt-2 grid shrink-0 grid-cols-3 gap-1 px-3">
+      {/* 操作（统计 / 浏览 / 设置 / 清空） */}
+      <nav className="mt-2 grid shrink-0 grid-cols-4 gap-1 px-3">
+        <NavAction icon="bar-chart" label={t('sidebar.stats')} onClick={() => { onOpenStats(); onClose?.() }} />
         <NavAction icon="layers" label={t('sidebar.browse')} onClick={() => { onOpenWorkspace(); onClose?.() }} />
         <NavAction icon="settings" label={t('sidebar.settings')} onClick={() => { onOpenSettings(); onClose?.() }} />
         <NavAction icon="trash" label={t('sidebar.clear')} danger onClick={() => { clear(); onClose?.() }} />

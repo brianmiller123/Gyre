@@ -70,13 +70,13 @@ impl RulesEngine {
             Mode::Ask => Some(ApprovalDecision::Deny(
                 "ask 模式为只读，禁止任何写操作",
             )),
-            Mode::Architect => {
+            Mode::Architect | Mode::Plan => {
                 if architect_write_allowed(request.tool, request.args, self.workspace_root.as_deref())
                 {
                     Some(ApprovalDecision::Allow)
                 } else {
                     Some(ApprovalDecision::Deny(
-                        "architect 模式仅允许编辑 plans/ 目录下的 markdown 文件",
+                        "architect/plan 模式仅允许编辑 plans/ 目录下的 markdown 文件",
                     ))
                 }
             }
@@ -507,6 +507,7 @@ ask = []
             deny: vec![],
             ask: vec![CommandPattern::Simple("docker *".into())],
             interceptor: Default::default(),
+            minimizer: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -546,6 +547,7 @@ ask = []
             deny: vec![CommandPattern::Simple("rm -rf *".into())],
             ask: vec![],
             interceptor: Default::default(),
+            minimizer: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -575,6 +577,7 @@ ask = []
             deny: vec![],
             ask: vec![],
             interceptor: Default::default(),
+            minimizer: Default::default(),
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -795,6 +798,48 @@ ask = []
     fn architect_readonly_survives_yolo() {
         // architect 非 plans/ 写入在 yolo 下仍被拒。
         let e = engine_with(Mode::Architect, ApprovalMode::Yolo);
+        let args = json!({"path": "src/main.rs"});
+        assert!(matches!(
+            e.decide(&req_args("write_file", CapabilityTier::Write, &args)),
+            ApprovalDecision::Deny(_)
+        ));
+    }
+
+    // ── P1-5（plan 模式：与 architect 同构的 plans/ 写保护）───────────────
+
+    #[test]
+    fn plan_mode_blocks_non_plans_write() {
+        let e = engine_with(Mode::Plan, ApprovalMode::AlwaysAsk);
+        let args = json!({"path": "src/main.rs", "content": ""});
+        assert!(matches!(
+            e.decide(&req_args("write_file", CapabilityTier::Write, &args)),
+            ApprovalDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn plan_mode_allows_plans_markdown_write() {
+        let e = engine_with(Mode::Plan, ApprovalMode::AlwaysAsk);
+        let args = json!({"path": "plans/roadmap.md", "content": "# 计划"});
+        assert!(matches!(
+            e.decide(&req_args("write_file", CapabilityTier::Write, &args)),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn plan_mode_execute_requires_confirmation() {
+        // 执行类命令不自动放行（规划阶段需确认）。
+        let e = engine_with(Mode::Plan, ApprovalMode::AlwaysAsk);
+        assert!(matches!(
+            e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
+            ApprovalDecision::Ask
+        ));
+    }
+
+    #[test]
+    fn plan_mode_readonly_survives_yolo() {
+        let e = engine_with(Mode::Plan, ApprovalMode::Yolo);
         let args = json!({"path": "src/main.rs"});
         assert!(matches!(
             e.decide(&req_args("write_file", CapabilityTier::Write, &args)),
