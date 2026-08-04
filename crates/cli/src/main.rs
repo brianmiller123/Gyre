@@ -18,7 +18,7 @@ use agent_core::{
     Usage,
 };
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use futures::StreamExt;
 use tokio::io::AsyncBufReadExt;
 use rustyline::Editor;
@@ -33,67 +33,115 @@ use repl::{
     session_history_lines,
 };
 
-/// 高性能 Rust 智能体 CLI。
+/// High-performance Rust agent CLI.
 #[derive(Parser, Debug)]
 #[command(
     name = "agent",
     version,
-    about = "高性能 Rust 智能体（融合 Zoo-Code + oh-my-pi）"
+    about = "High-performance Rust agent (Zoo-Code + oh-my-pi)"
 )]
 struct Cli {
-    /// 任务文本（省略则从 stdin 读取一行）。
+    /// Task text (reads one line from stdin if omitted).
     task: Option<String>,
-    /// 模型别名（对应 config 的 `[[models]] alias`）。
+    /// Model alias (matches `[[models]] alias` in config).
     #[arg(long)]
     model: Option<String>,
-    /// 工作目录（默认当前目录）。
+    /// Working directory (defaults to the current directory).
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// 审批模式覆盖：always-ask / write / yolo。
+    /// Approval mode override: always-ask / write / yolo.
     #[arg(long)]
     approval_mode: Option<String>,
-    /// 界面语言覆盖（en / zh / ru / ja）；省略则用 config 或系统语言。
+    /// UI language override (en / zh / ru / ja); falls back to config or system language.
     #[arg(long)]
     lang: Option<String>,
-    /// 启动 Web 服务（HTTP + WebSocket + 前端），而非运行单次任务。
-    /// 不带值时监听配置文件 `[server].bind` 地址；带值则覆盖监听地址（如 `--serve 0.0.0.0:80`）。
+    /// Start the web service (HTTP + WebSocket + frontend) instead of running a one-shot task.
+    /// Without a value, binds to `[server].bind` in config; with a value, overrides the bind
+    /// address (e.g. `--serve 0.0.0.0:80`).
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     serve: Option<String>,
-    /// ACP（Agent Client Protocol）。
+    /// ACP (Agent Client Protocol).
     ///
-    /// - 单独使用（不带 `--serve`）：以纯 stdio 模式运行 ACP（供编辑器作为子进程调用；
-    ///   stdin 读 JSON-RPC，stdout 写事件，无需 HTTP 端口）。最高优先级，不启动 HTTP。
-    /// 与 `--serve` 配合：额外启用 HTTP+SSE 端点（亦受 `[acp].enabled` 控制）。
+    /// - Standalone (without `--serve`): runs ACP in pure stdio mode (for editors invoking it
+    ///   as a subprocess; reads JSON-RPC from stdin, writes events to stdout, no HTTP port).
+    ///   Highest priority; does not start HTTP.
+    /// - With `--serve`: additionally enables HTTP+SSE endpoints (also controlled by
+    ///   `[acp].enabled`).
     #[arg(long)]
     acp: bool,
-    /// NDJSON 行协议模式（外部语言/机器人集成，见 docs/rpc.md）：stdin 逐行读 JSON 请求，
-    /// stdout 逐行写 JSON 事件/响应；进程内一个 Agent 与同一份 Context 跨 prompt 请求复用。
-    /// 与 --serve / --acp 互斥（stdout 是协议通道）。
+    /// NDJSON line protocol mode (external language/robot integration, see docs/rpc.md): reads
+    /// JSON requests line by line from stdin, writes JSON events/responses line by line to
+    /// stdout; one Agent with the same Context is reused across prompts in-process.
+    /// Mutually exclusive with --serve / --acp (stdout is the protocol channel).
     #[arg(long)]
     rpc: bool,
-    /// 恢复历史会话（会话 id；用 --list-sessions 查看）。
+    /// Resume a historical session (session id; list with --list-sessions).
     #[arg(long)]
     resume: Option<String>,
-    /// 列出历史会话后退出。
+    /// List historical sessions and exit.
     #[arg(long)]
     list_sessions: bool,
-    /// 复制会话为新 id 后继续（fork）。
+    /// Copy a session to a new id and continue (fork).
     #[arg(long)]
     fork: Option<String>,
-    /// OpenTelemetry OTLP 端点（如 http://localhost:4317）；省略则仅本地日志。
+    /// OpenTelemetry OTLP endpoint (e.g. http://localhost:4317); omitted → local logs only.
     #[arg(long)]
     otlp: Option<String>,
-    /// SOCKS5 代理（`host:port`，如 `127.0.0.1:1080`；IPv6 用方括号 `[::1]:1080`）。
-    /// 覆盖配置 `[socks5].host/.port`，给出即视为启用（压过持久化开关与配置默认）。
-    /// 仅影响后端出站 HTTP/HTTPS 请求，前端自身访问不经代理。
+    /// SOCKS5 proxy (`host:port`, e.g. `127.0.0.1:1080`; IPv6 uses brackets `[::1]:1080`).
+    /// Overrides `[socks5].host/.port` in config; presence implies enabled (overrides the
+    /// persisted toggle and config default).
+    /// Only affects backend outbound HTTP/HTTPS requests; the frontend is never proxied.
     #[arg(long, value_name = "HOST:PORT")]
     socks: Option<String>,
-    /// SOCKS5 代理用户名（可选；设置即启用 RFC1929 认证）。
+    /// SOCKS5 proxy username (optional; setting it enables RFC1929 auth).
     #[arg(long)]
     socks_user: Option<String>,
-    /// SOCKS5 代理密码（可选；仅 CLI 进程内使用，不落盘、不进日志）。
+    /// SOCKS5 proxy password (optional; in-process CLI only, never persisted or logged).
     #[arg(long)]
     socks_pass: Option<String>,
+}
+
+/// clap 参数 id → i18n 词条 key（仅非 en 语言使用；en 直接用 derive 英文注释）。
+/// 注意：clap derive 的参数 id 默认是字段名（snake_case），与 long flag（kebab-case）不同。
+const CLI_HELP_KEYS: &[(&str, &str)] = &[
+    ("task", "cli.help.arg.task"),
+    ("model", "cli.help.arg.model"),
+    ("cwd", "cli.help.arg.cwd"),
+    ("approval_mode", "cli.help.arg.approval-mode"),
+    ("lang", "cli.help.arg.lang"),
+    ("serve", "cli.help.arg.serve"),
+    ("acp", "cli.help.arg.acp"),
+    ("rpc", "cli.help.arg.rpc"),
+    ("resume", "cli.help.arg.resume"),
+    ("list_sessions", "cli.help.arg.list-sessions"),
+    ("fork", "cli.help.arg.fork"),
+    ("otlp", "cli.help.arg.otlp"),
+    ("socks", "cli.help.arg.socks"),
+    ("socks_user", "cli.help.arg.socks-user"),
+    ("socks_pass", "cli.help.arg.socks-pass"),
+];
+
+/// 按激活语言本地化 clap 帮助文本。英文直接用 derive 注释（en 是词表回退语言，无需词条）；
+/// 其余语言（zh/ru/ja）从 i18n 词表替换 about 与各参数 help。
+fn localize_cli_help(mut cmd: clap::Command) -> clap::Command {
+    if agent_i18n::current_locale() == "en" {
+        return cmd;
+    }
+    cmd = cmd.about(agent_i18n::t!("cli.help.about"));
+    // 收集 id 后逐个 mut_arg 替换（避免在不可变迭代期间修改命令）。
+    let ids: Vec<String> = cmd.get_arguments().map(|a| a.get_id().to_string()).collect();
+    for id in ids {
+        if let Some((_, key)) = CLI_HELP_KEYS.iter().find(|(i, _)| *i == id) {
+            cmd = cmd.mut_arg(&id, |arg| arg.help(agent_i18n::tr(key, &[])));
+        }
+    }
+    cmd
+}
+
+/// 解析 CLI 参数：帮助文本先按系统语言本地化（--lang 覆盖运行期文本，帮助跟随系统语言）。
+fn parse_cli() -> Cli {
+    let matches = localize_cli_help(Cli::command()).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 /// 装配 SOCKS5 运行时控制器（共享单例）。
@@ -135,16 +183,33 @@ fn parse_socks_spec(spec: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
-/// 启动时打印脱敏的 SOCKS5 代理状态（绝不出现密码）。
+/// 启动时打印脱敏的 SOCKS5 代理状态（绝不出现密码；文案随激活语言）。
 fn print_socks5_status(socks5: &Option<Arc<agent_proxy::Socks5Controller>>) {
     match socks5 {
         Some(c) => eprintln!(
-            "SOCKS5 代理: {} ({})",
-            c.redacted(),
-            if c.enabled() { "已启用" } else { "已禁用" }
+            "{}",
+            agent_i18n::t!(
+                "socks5.status",
+                url = c.redacted(),
+                state = if c.enabled() {
+                    agent_i18n::t!("socks5.state_enabled")
+                } else {
+                    agent_i18n::t!("socks5.state_disabled")
+                }
+            )
         ),
-        None => eprintln!("SOCKS5 代理: 未配置（可经 config.toml [socks5] 或 --socks host:port 启用）"),
+        None => eprintln!("{}", agent_i18n::t!("socks5.status_unconfigured")),
     }
+}
+
+/// 启动时打印生效的审批模式（含来源：持久化/CLI 覆盖时可见）。
+fn print_approval_status(cfg: &agent_config::Config) {
+    let mode = match cfg.agent.approval_mode {
+        agent_core::ApprovalMode::AlwaysAsk => agent_i18n::t!("approval.mode.always-ask"),
+        agent_core::ApprovalMode::Write => agent_i18n::t!("approval.mode.write"),
+        agent_core::ApprovalMode::Yolo => agent_i18n::t!("approval.mode.yolo"),
+    };
+    eprintln!("{}", agent_i18n::t!("approval.status", mode = mode));
 }
 
 /// 启动 Web 服务。`acp` 为 true（或配置启用）时合并 ACP HTTP+SSE 路由。
@@ -159,6 +224,7 @@ async fn run_server(
     // SOCKS5 代理控制器（Web 设置页开关经 /api/socks5 驱动；切换实时生效、落盘持久化）。
     let socks5 = build_socks5_controller(&cfg, &cwd, socks_override);
     print_socks5_status(&socks5);
+    print_approval_status(&cfg);
     // 服务端共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时。该客户端
     // 专供流式 LLM 调用——总超时会切断仍在正常输出的慢速长流（收不到 `data: [DONE]`
     // 终止帧而误判「未收到结束标记」）；真正的「上游挂起」由各 SSE 适配器的按 chunk
@@ -199,6 +265,7 @@ async fn run_acp_stdio(
 ) -> Result<()> {
     let socks5 = build_socks5_controller(&cfg, &cwd, socks_override);
     print_socks5_status(&socks5);
+    print_approval_status(&cfg);
     // 流式 LLM 客户端：不设整条请求总超时（会误杀慢速长流），上游静默由按 chunk 空闲
     // 读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
     let http = agent_proxy::build_http_client(socks5.clone(), |b| {
@@ -215,10 +282,9 @@ async fn run_acp_stdio(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // i18n：先用系统语言初始化（配置加载前的报错也能本地化）。
+    // i18n：parse 前先按系统语言初始化（clap 帮助文本本地化需要；配置加载后 --lang 覆盖在下方）。
     agent_i18n::init(None);
+    let cli = parse_cli();
 
     // 遥测初始化：--otlp 启用 OTLP span 导出，否则仅本地日志
     let _telemetry_guard =
@@ -242,12 +308,20 @@ async fn main() -> Result<()> {
         opts.threshold = cfg.agent.tools.edit.fuzzy_threshold;
         agent_tools::set_fuzzy_opts(opts);
     }
+    // 审批模式：CLI --approval-mode 显式值 ＞ `.gyre/approval-mode.state` 持久化 ＞ 配置默认。
+    // （Web 设置页开关写入 sidecar——忘记每次指定时下次启动自动恢复；CLI 显式给出时压过它。）
+    let persisted_approval = agent_config::ApprovalModeController::new(Some(
+        cwd.join(".gyre").join("approval-mode.state"),
+    ))
+    .current();
     if let Some(mode) = &cli.approval_mode {
         cfg.agent.approval_mode = match mode.as_str() {
             "yolo" => agent_core::ApprovalMode::Yolo,
             "write" => agent_core::ApprovalMode::Write,
             _ => agent_core::ApprovalMode::AlwaysAsk,
         };
+    } else if let Some(m) = persisted_approval {
+        cfg.agent.approval_mode = m;
     }
     // SOCKS5 CLI 覆盖（--socks 给出即覆盖 host/port 并隐含启用；`--socks-user/--socks-pass`
     // 覆盖认证字段。启用覆盖在装配层以 cli_override 传入控制器，避免压过 `.gyre/socks5.state`
@@ -355,6 +429,7 @@ async fn main() -> Result<()> {
     // SOCKS5 代理控制器（仅影响后端出站请求；开关经 --socks / 配置 / sidecar）。
     let socks5 = build_socks5_controller(&cfg, &cwd, socks_cli_override);
     print_socks5_status(&socks5);
+    print_approval_status(&cfg);
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
     // LLM 调用，总超时会切断仍在正常输出的慢速长流（收不到终止帧而误判「未收到结束标记」）；
     // 真正的「上游挂起」由各 SSE 适配器的按 chunk 空闲读超时（STREAM_IDLE_TIMEOUT）兜底。
@@ -2124,4 +2199,49 @@ mod tests {
         assert!(parse_socks_spec(":1080").is_err(), "空 host 应拒绝");
         assert!(parse_socks_spec("host:").is_err(), "空端口应拒绝");
     }
+
+    #[test]
+    fn help_localizes_by_locale() {
+        // zh：词表替换（与既有中文文案一致）。
+        agent_i18n::init(Some("zh"));
+        let cmd = localize_cli_help(Cli::command());
+        let socks_help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "socks")
+            .expect("socks 参数")
+            .get_help()
+            .expect("help 应存在")
+            .to_string();
+        assert!(socks_help.contains("SOCKS5 代理"), "zh help 应为中文: {socks_help}");
+        let about = cmd.get_about().expect("about").to_string();
+        assert!(about.contains("智能体"), "zh about 应为中文: {about}");
+
+        // en：derive 英文注释（en 为回退语言，不经词表）。
+        agent_i18n::init(Some("en"));
+        let cmd = localize_cli_help(Cli::command());
+        let socks_help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "socks")
+            .expect("socks 参数")
+            .get_help()
+            .expect("help 应存在")
+            .to_string();
+        assert!(socks_help.contains("SOCKS5 proxy"), "en help 应为英文: {socks_help}");
+
+        // ru：词表替换，且与 en 不同。
+        agent_i18n::init(Some("ru"));
+        let cmd = localize_cli_help(Cli::command());
+        let socks_help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "socks")
+            .expect("socks 参数")
+            .get_help()
+            .expect("help 应存在")
+            .to_string();
+        assert!(socks_help.contains("SOCKS5-прокси"), "ru help 应来自词表: {socks_help}");
+
+        // 恢复系统探测，避免影响其它测试。
+        agent_i18n::init(None);
+    }
 }
+

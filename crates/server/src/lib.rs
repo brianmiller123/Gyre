@@ -13,10 +13,10 @@ use std::sync::Arc;
 use agent::{Agent, AgentBuilder, PauseGate};
 use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
-    AgentEvent, AgentState, ApprovalDecision, ApprovalPolicy, ApprovalRequest, AskMessage,
-    AskResponse, AssistantMessage, CompactionStrategy, ContentBlock, ContextManager, LlmProvider,
-    Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage, Usage,
-    UserContent, UserMessage, Workspace,
+    AgentEvent, AgentState, ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest,
+    AskMessage, AskResponse, AssistantMessage, CompactionStrategy, ContentBlock, ContextManager,
+    LlmProvider, Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult,
+    ToolResultMessage, Usage, UserContent, UserMessage, Workspace,
 };
 use agent_supervisor::{SubAgentStatus, Supervisor};
 use agent_tools::Tool;
@@ -426,6 +426,9 @@ pub struct SessionManager {
     /// SOCKS5 出站代理运行时控制器（共享单例；`/api/socks5` 路由驱动其开关，
     /// 实时生效并持久化）。`None` = 未配置（代理不可用，前端不显示开关）。
     socks5: Option<Arc<agent_proxy::Socks5Controller>>,
+    /// 审批模式运行时控制器（共享单例；`/api/approval-mode` 路由驱动，实时生效并
+    /// 持久化到 `.gyre/approval-mode.state`）。恒存在——默认档 always-ask 始终可用。
+    approval: Arc<agent_config::ApprovalModeController>,
 }
 
 impl SessionManager {
@@ -437,6 +440,8 @@ impl SessionManager {
         cwd: Arc<std::path::PathBuf>,
         socks5: Option<Arc<agent_proxy::Socks5Controller>>,
     ) -> Self {
+        // 审批模式持久化路径：`<cwd>/.gyre/approval-mode.state`（与 SOCKS5 开关同目录）。
+        let approval_path = cwd.join(".gyre").join("approval-mode.state");
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config,
@@ -447,7 +452,16 @@ impl SessionManager {
             maintenance_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_gate: PauseGate::new(),
             socks5,
+            approval: Arc::new(agent_config::ApprovalModeController::new(Some(
+                approval_path,
+            ))),
         }
+    }
+
+    /// 审批模式控制器句柄（`/api/approval-mode` 路由驱动；会话创建时取其生效值）。
+    #[must_use]
+    pub fn approval(&self) -> &Arc<agent_config::ApprovalModeController> {
+        &self.approval
     }
 
     /// SOCKS5 代理控制器句柄（`/api/socks5` 路由驱动其开关；`None` = 未配置）。
@@ -588,6 +602,7 @@ impl SessionManager {
             Arc::clone(&mcp),
             Arc::clone(&skill_catalog),
             Arc::clone(&self.pause_gate),
+            &self.approval,
         )
         .await?;
 
@@ -940,6 +955,8 @@ async fn build_agent(
     skill_catalog: Arc<agent_skills::SkillCatalog>,
     // 进程级暂停门（共享单例；注入 Agent，由 `/api/pause` `/api/resume` 驱动）。
     pause_gate: Arc<PauseGate>,
+    // 审批模式控制器（共享单例；取其生效值作会话初始档 + 注入原子供运行时切换）。
+    approval: &Arc<agent_config::ApprovalModeController>,
 ) -> Result<(Agent, Arc<dyn agent_core::ContextManager>, SessionLlm), String> {
     // P2：模型 fallback 链（主 profile + `fallbacks` 引用依序展开；跨线协议族亦可）。
     let chain = config.resolve_chain(alias).map_err(|e| e.to_string())?;
@@ -1038,8 +1055,12 @@ async fn build_agent(
     // 模式时审批门槛不跟随。
     let mut agent_cfg = config.agent.clone();
     agent_cfg.mode = mode;
+    // 审批模式初始档取控制器生效值（覆盖优先，否则配置默认）；共享原子注入引擎后，
+    // Web 开关的运行时切换对已建会话实时生效（无需重建 Agent / 会话）。
+    agent_cfg.approval_mode = approval.effective(agent_cfg.approval_mode);
     let rules = RulesEngine::new(Arc::new(agent_cfg))
-        .with_workspace_root(Some(workspace.root().to_path_buf()));
+        .with_workspace_root(Some(workspace.root().to_path_buf()))
+        .with_approval_override(approval.shared());
     let approval: Arc<dyn ApprovalPolicy> = Arc::new(WebApprovalPolicy::new(
         rules,
         broadcast_tx.clone(),
@@ -1417,6 +1438,79 @@ async fn socks5_set(
     .into_response()
 }
 
+/// `GET /api/approval-mode`：审批模式状态。
+///
+/// - `mode`：运行时覆盖（`"always-ask" | "write" | "yolo"`；`null` = 未覆盖，用配置默认）。
+/// - `effective`：当前实际生效档（会话创建与 `decide` 均取此值）。
+/// - `config_default`：配置 `[agent].approval_mode` 默认档（供前端标注「恢复默认」）。
+async fn approval_mode_status(
+    State(state): State<SessionManager>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    let default = state.config.agent.approval_mode;
+    Json(serde_json::json!({
+        "configured": true,
+        "mode": state.approval().current().map(mode_json),
+        "effective": mode_json(state.approval().effective(default)),
+        "config_default": mode_json(default),
+    }))
+    .into_response()
+}
+
+/// `POST /api/approval-mode` 请求体：`{ "mode": "always-ask" | "write" | "yolo" | null }`。
+/// `null` 恢复配置默认（清覆盖 + 删除 sidecar）。
+#[derive(serde::Deserialize)]
+struct ApprovalModeSetBody {
+    mode: Option<String>,
+}
+
+/// `POST /api/approval-mode`：运行时切换审批模式（实时生效 + 落盘持久化，下次启动保留）。
+/// 非法档位 → 400。
+async fn approval_mode_set(
+    State(state): State<SessionManager>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+    axum::Json(body): axum::Json<ApprovalModeSetBody>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    let mode = match body.mode.as_deref() {
+        None => None,
+        Some("always-ask") => Some(ApprovalMode::AlwaysAsk),
+        Some("write") => Some(ApprovalMode::Write),
+        Some("yolo") => Some(ApprovalMode::Yolo),
+        Some(other) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("无效审批模式: {other:?}（可用: always-ask / write / yolo / null）"),
+            )
+                .into_response();
+        }
+    };
+    state.approval().set(mode);
+    let default = state.config.agent.approval_mode;
+    Json(serde_json::json!({
+        "configured": true,
+        "mode": state.approval().current().map(mode_json),
+        "effective": mode_json(state.approval().effective(default)),
+        "config_default": mode_json(default),
+    }))
+    .into_response()
+}
+
+/// ApprovalMode → JSON 字符串（`"always-ask"` 等，与 serde kebab-case 一致）。
+fn mode_json(mode: ApprovalMode) -> serde_json::Value {
+    serde_json::Value::String(match mode {
+        ApprovalMode::AlwaysAsk => "always-ask",
+        ApprovalMode::Write => "write",
+        ApprovalMode::Yolo => "yolo",
+    }
+    .to_string())
+}
+
 /// 构建 axum Router（静态前端内嵌于二进制，运行时无需 `web/` 目录）。
 #[must_use]
 pub fn app(state: SessionManager) -> Router {
@@ -1444,6 +1538,10 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/pause", post(pause_handler))
         .route("/api/resume", post(resume_handler))
         .route("/api/socks5", get(socks5_status).post(socks5_set))
+        .route(
+            "/api/approval-mode",
+            get(approval_mode_status).post(approval_mode_set),
+        )
         .route("/api/workspace", get(workspace_info))
         .route("/api/fs", get(list_dir))
         .route("/api/file", get(read_file))
@@ -4038,6 +4136,115 @@ mod tests {
                     .uri("/api/socks5")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"enabled":true}"#))
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// 测试用临时 cwd（避免在仓库根写 `.gyre/approval-mode.state`）。
+    fn tmp_cwd(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gyre-server-approval-{}-{name}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// GET /api/approval-mode：未覆盖时 mode=null、effective=配置默认；形状正确。
+    #[tokio::test]
+    async fn approval_mode_status_route_reports_state() {
+        use tower::ServiceExt;
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(tmp_cwd("status")),
+            None,
+        );
+        let router = app(mgr);
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/approval-mode")
+                    .body(axum::body::Body::empty())
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读响应体");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(v["configured"], true);
+        assert_eq!(v["mode"], serde_json::Value::Null);
+        assert_eq!(v["effective"], "always-ask");
+        assert_eq!(v["config_default"], "always-ask");
+    }
+
+    /// POST /api/approval-mode：切换实时生效（控制器 + sidecar 落盘）；null 恢复默认；非法值 400。
+    #[tokio::test]
+    async fn approval_mode_set_route_toggles_controller() {
+        use tower::ServiceExt;
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let cwd = tmp_cwd("set");
+        let sidecar = cwd.join(".gyre").join("approval-mode.state");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(cwd),
+            None,
+        );
+        let approval = mgr.approval().clone();
+        let router = app(mgr);
+
+        // 切到 yolo：控制器实时生效 + sidecar 落盘。
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/approval-mode")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"mode":"yolo"}"#))
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(approval.current(), Some(ApprovalMode::Yolo));
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).expect("sidecar 应已写入"),
+            "yolo"
+        );
+
+        // 恢复默认：mode=null + sidecar 删除。
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/approval-mode")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"mode":null}"#))
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(approval.current(), None);
+        assert!(!sidecar.exists(), "恢复默认应删除 sidecar");
+
+        // 非法档位 → 400。
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/approval-mode")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"mode":"reckless"}"#))
                     .expect("构造请求"),
             )
             .await

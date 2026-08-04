@@ -23,7 +23,7 @@ const accents = [
 /** Connection + appearance settings modal. */
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { settings, update } = useSettings()
-  const { disconnect, connect, clear, socks5Status, refreshSocks5Status, setSocks5Enabled } =
+  const { disconnect, connect, clear, socks5Status, refreshSocks5Status, setSocks5Enabled, approvalModeStatus, refreshApprovalModeStatus, setApprovalMode } =
     useAgentSession()
   const { theme, setTheme } = useTheme()
   const { toast } = useNotifications()
@@ -34,14 +34,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const [testing, setTesting] = useState(false)
   // SOCKS5 开关在途状态（防止连点；请求失败 toast 提示）。
   const [socks5Busy, setSocks5Busy] = useState(false)
+  // 审批模式切换在途状态。
+  const [approvalBusy, setApprovalBusy] = useState(false)
 
   useEffect(() => {
     if (open) {
       setDraft(settings)
-      // 打开面板时主动刷新代理状态（不依赖 WS 连接），保证开关即时显示。
+      // 打开面板时主动刷新代理状态与审批模式（不依赖 WS 连接），保证控件即时显示。
       void refreshSocks5Status()
+      void refreshApprovalModeStatus()
     }
-  }, [open, settings, refreshSocks5Status])
+  }, [open, settings, refreshSocks5Status, refreshApprovalModeStatus])
 
   useEffect(() => {
     const saved = localStorage.getItem('agent-accent') || 'Teal'
@@ -170,6 +173,52 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   }}
                 />
               )}
+            </div>
+            {/* 审批模式：写/执行操作的审批门槛。切换实时生效（已建会话立即跟随）并由
+                服务端持久化（.gyre/approval-mode.state）——下次启动自动记住，无需 CLI 指定。 */}
+            <div className="rounded-lg border border-border bg-surface-2/50 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-text-1">{t('settings.approval_title')}</p>
+                  <p className="mt-0.5 text-xs text-muted">{t('settings.approval_desc')}</p>
+                </div>
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <Select
+                  value={approvalModeStatus?.effective ?? 'always-ask'}
+                  disabled={approvalBusy || !approvalModeStatus}
+                  onChange={(e) => {
+                    const v = e.target.value as 'always-ask' | 'write' | 'yolo'
+                    setApprovalBusy(true)
+                    void setApprovalMode(v).then((ok) => {
+                      setApprovalBusy(false)
+                      if (!ok)
+                        toast({ title: t('settings.approval_fail'), severity: 'danger' })
+                    })
+                  }}
+                >
+                  <option value="always-ask">{t('settings.approval_always_ask')}</option>
+                  <option value="write">{t('settings.approval_write')}</option>
+                  <option value="yolo">{t('settings.approval_yolo')}</option>
+                </Select>
+                {approvalModeStatus?.mode && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={approvalBusy}
+                    onClick={() => {
+                      setApprovalBusy(true)
+                      void setApprovalMode(null).then((ok) => {
+                        setApprovalBusy(false)
+                        if (!ok)
+                          toast({ title: t('settings.approval_fail'), severity: 'danger' })
+                      })
+                    }}
+                  >
+                    {t('settings.approval_reset')}
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
         </div>

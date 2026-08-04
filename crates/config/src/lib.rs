@@ -8,9 +8,12 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
 
+mod approval;
 mod config;
 mod env;
 mod rules;
+
+pub use approval::ApprovalModeController;
 
 pub use config::{
     AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config, EditToolsConfig,

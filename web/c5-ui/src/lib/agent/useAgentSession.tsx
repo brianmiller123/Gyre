@@ -49,6 +49,19 @@ export interface Socks5Status {
   redacted?: string
 }
 
+/** 审批模式档位（与后端 `ApprovalMode` kebab-case 一致）。 */
+export type ApprovalModeValue = 'always-ask' | 'write' | 'yolo'
+
+/** 审批模式状态（GET /api/approval-mode，服务端权威）。 */
+export interface ApprovalModeStatus {
+  configured: boolean
+  /** 运行时覆盖（null = 未覆盖，用配置默认）。 */
+  mode: ApprovalModeValue | null
+  /** 当前实际生效档（会话创建与 decide 均取此值）。 */
+  effective: ApprovalModeValue
+  config_default: ApprovalModeValue
+}
+
 interface AgentSessionValue {
   items: TranscriptItem[]
   state: AgentStateName | string
@@ -125,6 +138,12 @@ interface AgentSessionValue {
   refreshSocks5Status: () => Promise<void>
   /** 运行时切换 SOCKS5 代理开关（`POST /api/socks5`，实时生效 + 服务端持久化）。成功返回 true。 */
   setSocks5Enabled: (on: boolean) => Promise<boolean>
+  /** 审批模式状态（null = 尚未拉取）。 */
+  approvalModeStatus: ApprovalModeStatus | null
+  /** 拉取审批模式状态（`/api/approval-mode`）。 */
+  refreshApprovalModeStatus: () => Promise<void>
+  /** 运行时切换审批模式（`POST /api/approval-mode`，实时生效 + 落盘持久化；null 恢复配置默认）。 */
+  setApprovalMode: (mode: ApprovalModeValue | null) => Promise<boolean>
 }
 
 const AgentSessionContext = createContext<AgentSessionValue | null>(null)
@@ -206,6 +225,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
   const [socks5Status, setSocks5Status] = useState<Socks5Status | null>(null)
+  const [approvalModeStatus, setApprovalModeStatus] = useState<ApprovalModeStatus | null>(null)
   const [agents, setAgents] = useState<SubAgentStatus[]>([])
   const [sessions, setSessions] = useState<SessionListItem[]>([])
   const [contextUsage, setContextUsage] = useState<{ current: number; limit: number } | null>(null)
@@ -951,6 +971,17 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [],
   )
 
+  /** 拉取审批模式状态（服务端权威）。定义在 apiGet 之后以避开 TDZ。 */
+  const refreshApprovalModeStatus = useCallback(async () => {
+    const d = await apiGet<ApprovalModeStatus>('/api/approval-mode')
+    if (d) setApprovalModeStatus(d)
+  }, [apiGet])
+
+  // 挂载即拉取一次审批模式状态（不依赖 WS 连接）。
+  useEffect(() => {
+    void refreshApprovalModeStatus()
+  }, [refreshApprovalModeStatus])
+
   /** 运行时切换代理开关：POST /api/socks5（实时生效 + 服务端持久化），成功后乐观更新本地。 */
   const setSocks5Enabled = useCallback(
     async (on: boolean): Promise<boolean> => {
@@ -964,6 +995,17 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       return true
     },
     [apiPost, update],
+  )
+
+  /** 运行时切换审批模式：POST /api/approval-mode（实时生效 + 服务端持久化）。 */
+  const setApprovalMode = useCallback(
+    async (mode: ApprovalModeValue | null): Promise<boolean> => {
+      const d = await apiPost<ApprovalModeStatus>('/api/approval-mode', { mode })
+      if (!d) return false
+      setApprovalModeStatus(d)
+      return true
+    },
+    [apiPost],
   )
 
   const fetchCustomCommands = useCallback(async () => {
@@ -1121,6 +1163,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       socks5Status,
       refreshSocks5Status,
       setSocks5Enabled,
+      approvalModeStatus,
+      refreshApprovalModeStatus,
+      setApprovalMode,
     }),
     [
       items,

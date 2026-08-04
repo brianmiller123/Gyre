@@ -15,6 +15,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use agent_core::{
     ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest, AskResponse, CapabilityTier,
@@ -29,6 +30,10 @@ use crate::config::{AgentConfig, CommandPattern, ToolApproval};
 pub struct RulesEngine {
     /// 引用的 agent 配置（含逐工具覆盖与命令规则）。
     pub agent: Arc<AgentConfig>,
+    /// 运行时审批模式覆盖（0 = 未设置，用 `agent.approval_mode`；1..=3 = 强制
+    /// AlwaysAsk/Write/Yolo）。由 Web 开关（`.gyre/approval-mode.state`）注入共享原子，
+    /// `decide` 每次实时读取——切换后对已建会话立即生效，无需重建 Agent。
+    approval_override: Arc<AtomicU8>,
     /// 工作区根（解析写入路径，判定 architect 模式的 `plans/` 约束）。
     /// `None`（如单测）时退化为词法相对路径判定。
     workspace_root: Option<PathBuf>,
@@ -40,7 +45,27 @@ impl RulesEngine {
     pub fn new(agent: Arc<AgentConfig>) -> Self {
         Self {
             agent,
+            approval_override: Arc::new(AtomicU8::new(0)),
             workspace_root: None,
+        }
+    }
+
+    /// 注入运行时审批模式覆盖的共享原子（生产装配由 [`crate::ApprovalModeController`]
+    /// 提供；不注入时引擎使用 `agent.approval_mode` 静态值，行为与从前一致）。
+    #[must_use]
+    pub fn with_approval_override(mut self, shared: Arc<AtomicU8>) -> Self {
+        self.approval_override = shared;
+        self
+    }
+
+    /// 当前生效的审批模式：运行时覆盖（非 0）优先，否则 `agent.approval_mode`。
+    #[must_use]
+    pub fn effective_approval_mode(&self) -> ApprovalMode {
+        match self.approval_override.load(Ordering::Relaxed) {
+            1 => ApprovalMode::AlwaysAsk,
+            2 => ApprovalMode::Write,
+            3 => ApprovalMode::Yolo,
+            _ => self.agent.approval_mode,
         }
     }
 
@@ -97,8 +122,8 @@ impl RulesEngine {
         //      - 逐工具 deny（[agent.tools.approval] 写 "deny"）
         //      - 命令 deny 黑名单（[agent.commands.deny]）
         //      - 模式写入硬约束（ask 只读 / architect 仅 plans/.md）
-        //    三者在 yolo 下也照常拦截。若要连 deny 也一并压过（绝对放行），删除对应 deny 规则即可。
-        if self.agent.approval_mode == ApprovalMode::Yolo {
+        // 三者在 yolo 下也照常拦截。若要连 deny 也一并压过（绝对放行），删除对应 deny 规则即可。
+        if self.effective_approval_mode() == ApprovalMode::Yolo {
             return self.decide_deny_only(request);
         }
 
@@ -156,7 +181,7 @@ impl RulesEngine {
         // 「写一个文件问一次」的体验割裂。ask/architect 的写操作已在步骤 2 被模式约束拦截
         // （ask 硬拒、architect 仅 plans/.md），此处仅决定 code/debug 的写类放行与其余的询问。
         // （yolo 已在步骤 0 短路，此处 Yolo 分支不可达，保留以满足穷尽匹配。）
-        match self.agent.approval_mode {
+        match self.effective_approval_mode() {
             ApprovalMode::Yolo => ApprovalDecision::Allow,
             ApprovalMode::Write => {
                 if request.capability == CapabilityTier::Write {
@@ -477,6 +502,35 @@ ask = []
             )),
             ApprovalDecision::Allow
         ));
+    }
+
+    #[test]
+    fn runtime_override_reroutes_decide_without_rebuild() {
+        // always-ask 下 execute 需询问；注入共享原子后同一引擎立即放行（yolo）……
+        let e = engine(ApprovalMode::AlwaysAsk);
+        assert!(matches!(
+            e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
+            ApprovalDecision::Ask
+        ));
+        // …切到 yolo 再切回，均无需重建引擎。
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let e = e.with_approval_override(std::sync::Arc::clone(&shared));
+        shared.store(3, std::sync::atomic::Ordering::Relaxed); // yolo
+        assert!(matches!(
+            e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
+            ApprovalDecision::Allow
+        ));
+        shared.store(2, std::sync::atomic::Ordering::Relaxed); // write：写放行、执行仍询问
+        assert!(matches!(
+            e.decide(&req("write_file", CapabilityTier::Write, None)),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
+            ApprovalDecision::Ask
+        ));
+        shared.store(0, std::sync::atomic::Ordering::Relaxed); // 恢复静态值
+        assert_eq!(e.effective_approval_mode(), ApprovalMode::AlwaysAsk);
     }
 
     #[test]

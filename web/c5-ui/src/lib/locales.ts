@@ -13,6 +13,13 @@ export type LocaleCode = 'en' | 'zh' | 'ru' | 'ja'
 type Dict = Record<string, string>
 
 const en: Dict = {
+  'settings.approval_title': "Approval mode",
+  'settings.approval_desc': "Gate for write/execute actions. Applies immediately; remembered for next start.",
+  'settings.approval_always_ask': "Always ask",
+  'settings.approval_write': "Auto-approve writes",
+  'settings.approval_yolo': "Yolo (auto everything)",
+  'settings.approval_reset': "Reset to config default",
+  'settings.approval_fail': "Failed to switch approval mode",
   'common.copy': 'Copy',
   'common.copied': 'Copied',
   'common.delete': 'Delete',
@@ -292,6 +299,13 @@ const en: Dict = {
 }
 
 const zh: Dict = {
+  'settings.approval_title': "审批模式",
+  'settings.approval_desc': "写/执行操作的审批门槛。切换立即生效，下次启动自动记住。",
+  'settings.approval_always_ask': "总是询问",
+  'settings.approval_write': "写入自动放行",
+  'settings.approval_yolo': "Yolo（全部自动）",
+  'settings.approval_reset': "恢复配置默认",
+  'settings.approval_fail': "切换审批模式失败",
   'common.copy': '复制',
   'common.copied': '已复制',
   'common.delete': '删除',
@@ -568,6 +582,13 @@ const zh: Dict = {
 }
 
 const ru: Dict = {
+  'settings.approval_title': "Режим одобрения",
+  'settings.approval_desc': "Гейт для операций записи/выполнения. Применяется сразу; запоминается до следующего запуска.",
+  'settings.approval_always_ask': "Всегда спрашивать",
+  'settings.approval_write': "Авто-одобрение записей",
+  'settings.approval_yolo': "Yolo (всё автоматически)",
+  'settings.approval_reset': "Сбросить к умолчанию из config",
+  'settings.approval_fail': "Не удалось переключить режим одобрения",
   'common.copy': 'Копировать',
   'common.copied': 'Скопировано',
   'common.delete': 'Удалить',
@@ -830,6 +851,13 @@ const ru: Dict = {
 }
 
 const ja: Dict = {
+  'settings.approval_title': "承認モード",
+  'settings.approval_desc': "書き込み・実行操作の承認ゲート。即時適用、次回起動時も記憶。",
+  'settings.approval_always_ask': "常に確認",
+  'settings.approval_write': "書き込みを自動承認",
+  'settings.approval_yolo': "Yolo（すべて自動）",
+  'settings.approval_reset': "config の既定に戻す",
+  'settings.approval_fail': "承認モードの切り替えに失敗",
   'common.copy': 'コピー',
   'common.copied': 'コピー済み',
   'common.delete': '削除',
