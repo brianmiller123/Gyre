@@ -39,6 +39,16 @@ interface Stats {
   models_available: number
 }
 
+/** SOCKS5 出站代理状态（GET /api/socks5，服务端权威，响应绝不含密码）。 */
+export interface Socks5Status {
+  configured: boolean
+  enabled: boolean
+  host?: string
+  port?: number | null
+  username?: string | null
+  redacted?: string
+}
+
 interface AgentSessionValue {
   items: TranscriptItem[]
   state: AgentStateName | string
@@ -109,6 +119,12 @@ interface AgentSessionValue {
   enhancePrompt: (draft: string) => Promise<string | null>
   /** 经鉴权的 GET 拉取辅助（自动补 `?token=` / `&token=`），供 @-mention 展开复用。 */
   apiGet: <T>(path: string) => Promise<T | null>
+  /** SOCKS5 代理状态（null = 尚未拉取）。 */
+  socks5Status: Socks5Status | null
+  /** 拉取 SOCKS5 代理状态（`/api/socks5`）。 */
+  refreshSocks5Status: () => Promise<void>
+  /** 运行时切换 SOCKS5 代理开关（`POST /api/socks5`，实时生效 + 服务端持久化）。成功返回 true。 */
+  setSocks5Enabled: (on: boolean) => Promise<boolean>
 }
 
 const AgentSessionContext = createContext<AgentSessionValue | null>(null)
@@ -189,6 +205,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
+  const [socks5Status, setSocks5Status] = useState<Socks5Status | null>(null)
   const [agents, setAgents] = useState<SubAgentStatus[]>([])
   const [sessions, setSessions] = useState<SessionListItem[]>([])
   const [contextUsage, setContextUsage] = useState<{ current: number; limit: number } | null>(null)
@@ -344,6 +361,28 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  /** 拉取 SOCKS5 代理状态（服务端权威；同步本地乐观镜像）。连接建立时调用。 */
+  const refreshSocks5Status = useCallback(async () => {
+    const cfg = settingsRef.current
+    const origin = cfg.serverUrl.replace(/\/$/, '')
+    const qs = new URLSearchParams()
+    if (cfg.token) qs.set('token', cfg.token)
+    try {
+      const r = await fetch(`${origin}/api/socks5${qs.toString() ? `?${qs}` : ''}`)
+      if (!r.ok) return
+      const d = (await r.json()) as Socks5Status
+      setSocks5Status(d)
+      update({ socks5Enabled: d.enabled })
+    } catch {
+      /* 静默：状态拉取失败不影响主流程 */
+    }
+  }, [update])
+
+  // 挂载即拉取一次 SOCKS5 状态（不依赖 WS 连接）：设置页开关在未连接时也能显示。
+  useEffect(() => {
+    void refreshSocks5Status()
+  }, [refreshSocks5Status])
+
   /** 拉取某会话的历史消息列表（含日志行索引 line）。 */
   const fetchHistoryList = useCallback(
     async (id: string): Promise<SessionHistoryItem[]> => {
@@ -429,6 +468,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         // best-effort metadata
         fetch(`${origin}/api/models`).then((r) => r.json()).then(setModels).catch(() => {})
         fetch(`${origin}/api/stats${tokenOnly}`).then((r) => r.json()).then(setStats).catch(() => {})
+        void refreshSocks5Status()
         refreshSessions()
       }
       ws.onclose = () => {
@@ -542,7 +582,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       setError(err instanceof Error ? err.message : String(err))
     }
     // guard 已改用 ref，deps 仅保留实际用到的稳定回调；connect 不再随 connecting/connected 重建。
-  }, [closeOpen, appendDelta, pushItem, refreshSessions])
+  }, [closeOpen, appendDelta, pushItem, refreshSessions, refreshSocks5Status])
 
   const sendFrame = useCallback((frame: ClientFrame) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -911,6 +951,21 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [],
   )
 
+  /** 运行时切换代理开关：POST /api/socks5（实时生效 + 服务端持久化），成功后乐观更新本地。 */
+  const setSocks5Enabled = useCallback(
+    async (on: boolean): Promise<boolean> => {
+      const d = await apiPost<{ configured: boolean; enabled: boolean; redacted?: string }>(
+        '/api/socks5',
+        { enabled: on },
+      )
+      if (!d) return false
+      setSocks5Status((s) => (s ? { ...s, ...d } : d))
+      update({ socks5Enabled: d.enabled })
+      return true
+    },
+    [apiPost, update],
+  )
+
   const fetchCustomCommands = useCallback(async () => {
     const d = await apiGet<{ commands: CustomCommandInfo[] }>('/api/commands')
     return d?.commands ?? []
@@ -1063,6 +1118,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       newCollabRoom,
       enhancePrompt,
       apiGet,
+      socks5Status,
+      refreshSocks5Status,
+      setSocks5Enabled,
     }),
     [
       items,
@@ -1109,6 +1167,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       newCollabRoom,
       enhancePrompt,
       apiGet,
+      socks5Status,
+      refreshSocks5Status,
+      setSocks5Enabled,
     ],
   )
 

@@ -83,23 +83,92 @@ struct Cli {
     /// OpenTelemetry OTLP 端点（如 http://localhost:4317）；省略则仅本地日志。
     #[arg(long)]
     otlp: Option<String>,
+    /// SOCKS5 代理（`host:port`，如 `127.0.0.1:1080`；IPv6 用方括号 `[::1]:1080`）。
+    /// 覆盖配置 `[socks5].host/.port`，给出即视为启用（压过持久化开关与配置默认）。
+    /// 仅影响后端出站 HTTP/HTTPS 请求，前端自身访问不经代理。
+    #[arg(long, value_name = "HOST:PORT")]
+    socks: Option<String>,
+    /// SOCKS5 代理用户名（可选；设置即启用 RFC1929 认证）。
+    #[arg(long)]
+    socks_user: Option<String>,
+    /// SOCKS5 代理密码（可选；仅 CLI 进程内使用，不落盘、不进日志）。
+    #[arg(long)]
+    socks_pass: Option<String>,
+}
+
+/// 装配 SOCKS5 运行时控制器（共享单例）。
+///
+/// 优先级：CLI `--socks` 显式值 ＞ `.gyre/socks5.state` 持久化开关 ＞ 配置默认。
+/// 配置不完整（host/port 缺失）→ 内部告警并返回 `None`（代理自动禁用，不阻断启动）。
+fn build_socks5_controller(
+    cfg: &agent_config::Config,
+    cwd: &std::path::Path,
+    cli_override: Option<bool>,
+) -> Option<Arc<agent_proxy::Socks5Controller>> {
+    agent_proxy::Socks5Controller::new(
+        &cfg.socks5,
+        Some(cwd.join(".gyre").join("socks5.state")),
+        cli_override,
+    )
+}
+
+/// 解析 `--socks` 的 `host:port`（IPv6 需方括号 `[::1]:1080`）。
+/// 返回 `(host, port)`；host 去方括号，port 必须为 1..=65535。
+fn parse_socks_spec(spec: &str) -> Result<(String, u16), String> {
+    let spec = spec.trim();
+    let (host, port_str) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| "缺少端口，期望 host:port（如 127.0.0.1:1080）".to_string())?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("端口无效: {port_str:?}"))?;
+    if port == 0 {
+        return Err("端口必须 > 0".into());
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        return Err("host 为空".into());
+    }
+    Ok((host.to_string(), port))
+}
+
+/// 启动时打印脱敏的 SOCKS5 代理状态（绝不出现密码）。
+fn print_socks5_status(socks5: &Option<Arc<agent_proxy::Socks5Controller>>) {
+    match socks5 {
+        Some(c) => eprintln!(
+            "SOCKS5 代理: {} ({})",
+            c.redacted(),
+            if c.enabled() { "已启用" } else { "已禁用" }
+        ),
+        None => eprintln!("SOCKS5 代理: 未配置（可经 config.toml [socks5] 或 --socks host:port 启用）"),
+    }
 }
 
 /// 启动 Web 服务。`acp` 为 true（或配置启用）时合并 ACP HTTP+SSE 路由。
-async fn run_server(cfg: agent_config::Config, cwd: PathBuf, acp: bool) -> Result<()> {
+async fn run_server(
+    cfg: agent_config::Config,
+    cwd: PathBuf,
+    acp: bool,
+    socks_override: Option<bool>,
+) -> Result<()> {
     let bind = cfg.server.bind.clone();
     let acp_enabled = acp || cfg.acp.enabled;
+    // SOCKS5 代理控制器（Web 设置页开关经 /api/socks5 驱动；切换实时生效、落盘持久化）。
+    let socks5 = build_socks5_controller(&cfg, &cwd, socks_override);
+    print_socks5_status(&socks5);
     // 服务端共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时。该客户端
     // 专供流式 LLM 调用——总超时会切断仍在正常输出的慢速长流（收不到 `data: [DONE]`
     // 终止帧而误判「未收到结束标记」）；真正的「上游挂起」由各 SSE 适配器的按 chunk
     // 空闲读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .context(t!("error.build_http"))?;
-    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd));
+    let http = agent_proxy::build_http_client(socks5.clone(), |b| {
+        b.tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+    })
+    .context(t!("error.build_http"))?;
+    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd), socks5);
     // ACP 路由在组装层合并（agent-acp 依赖 agent-server，故不能在 server crate 内 merge，
     // 否则循环依赖）。
     let app = if acp_enabled {
@@ -123,16 +192,21 @@ async fn run_server(cfg: agent_config::Config, cwd: PathBuf, acp: bool) -> Resul
 }
 
 /// 纯 stdio 模式运行 ACP（编辑器作为子进程调用：stdin 读 JSON-RPC，stdout 写事件）。
-async fn run_acp_stdio(cfg: agent_config::Config, cwd: PathBuf) -> Result<()> {
+async fn run_acp_stdio(
+    cfg: agent_config::Config,
+    cwd: PathBuf,
+    socks_override: Option<bool>,
+) -> Result<()> {
+    let socks5 = build_socks5_controller(&cfg, &cwd, socks_override);
+    print_socks5_status(&socks5);
     // 流式 LLM 客户端：不设整条请求总超时（会误杀慢速长流），上游静默由按 chunk 空闲
     // 读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .context(t!("error.build_http"))?;
-    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd));
+    let http = agent_proxy::build_http_client(socks5.clone(), |b| {
+        b.tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+    })
+    .context(t!("error.build_http"))?;
+    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd), socks5);
     agent_acp::run_stdio(state)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -175,6 +249,22 @@ async fn main() -> Result<()> {
             _ => agent_core::ApprovalMode::AlwaysAsk,
         };
     }
+    // SOCKS5 CLI 覆盖（--socks 给出即覆盖 host/port 并隐含启用；`--socks-user/--socks-pass`
+    // 覆盖认证字段。启用覆盖在装配层以 cli_override 传入控制器，避免压过 `.gyre/socks5.state`
+    // 持久化开关的读取逻辑——CLI 显式给出时 CLI 优先，未给时 sidecar 生效）。
+    let socks_cli_override = cli.socks.as_ref().map(|_| true); // 给出 --socks 即视为显式启用
+    if let Some(spec) = &cli.socks {
+        let (host, port) =
+            parse_socks_spec(spec).map_err(|e| anyhow::anyhow!("--socks 格式无效: {spec:?} — {e}"))?;
+        cfg.socks5.host = host;
+        cfg.socks5.port = Some(port);
+    }
+    if let Some(u) = &cli.socks_user {
+        cfg.socks5.username = Some(u.clone());
+    }
+    if let Some(p) = &cli.socks_pass {
+        cfg.socks5.password = secrecy::SecretString::from(p.clone());
+    }
 
     // NDJSON RPC 模式（--rpc）：外部语言/机器人集成的 stdio 行协议（见 docs/rpc.md）。
     // stdout 是协议通道，与 --serve（HTTP）及 --acp（JSON-RPC stdio）互斥。
@@ -182,13 +272,13 @@ async fn main() -> Result<()> {
         anyhow::bail!("--rpc 与 --serve / --acp 互斥，不能同时指定");
     }
     if cli.rpc {
-        return rpc::run_rpc(cfg, cwd).await;
+        return rpc::run_rpc(cfg, cwd, socks_cli_override).await;
     }
 
     // 纯 stdio ACP 模式（--acp 且未指定 --serve）：编辑器作为子进程调用，不启动 HTTP。
     // 与 `--serve --acp`（HTTP+SSE）区分——stdio 优先，仅在没有 serve 时触发。
     if cli.acp && cli.serve.is_none() {
-        return run_acp_stdio(cfg, cwd).await;
+        return run_acp_stdio(cfg, cwd, socks_cli_override).await;
     }
 
     // Web 服务模式
@@ -210,7 +300,7 @@ async fn main() -> Result<()> {
             };
             cfg.server.bind = resolved;
         }
-        return run_server(cfg, cwd, cli.acp).await;
+        return run_server(cfg, cwd, cli.acp, socks_cli_override).await;
     }
 
     // 会话持久化：按 cwd 项目隔离（/sessions 只列出当前项目的历史会话）
@@ -262,15 +352,17 @@ async fn main() -> Result<()> {
         .collect();
 
     // 3. 装配 Provider（registry + OpenAI Chat Completions 适配器）
+    // SOCKS5 代理控制器（仅影响后端出站请求；开关经 --socks / 配置 / sidecar）。
+    let socks5 = build_socks5_controller(&cfg, &cwd, socks_cli_override);
+    print_socks5_status(&socks5);
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
     // LLM 调用，总超时会切断仍在正常输出的慢速长流（收不到终止帧而误判「未收到结束标记」）；
     // 真正的「上游挂起」由各 SSE 适配器的按 chunk 空闲读超时（STREAM_IDLE_TIMEOUT）兜底。
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .context(t!("error.build_http"))?;
+    let client = agent_proxy::build_http_client(socks5, |b| {
+        b.tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+    })
+    .context(t!("error.build_http"))?;
     let mut registry = agent_llm::ProviderRegistry::new();
     for p in agent_llm::collect_providers(client) {
         registry.register(p);
@@ -2013,5 +2105,23 @@ mod tests {
         // github 不在此白名单（由独立字段管理）
         assert!(!is_known_optional_key("github"));
         assert!(!is_known_optional_key("bogus"));
+    }
+
+    #[test]
+    fn parse_socks_spec_ok() {
+        assert_eq!(parse_socks_spec("127.0.0.1:1080"), Ok(("127.0.0.1".into(), 1080)));
+        assert_eq!(parse_socks_spec(" proxy.example.com:8080 "), Ok(("proxy.example.com".into(), 8080)));
+        assert_eq!(parse_socks_spec("[::1]:1080"), Ok(("::1".into(), 1080)));
+        assert_eq!(parse_socks_spec("1.2.3.4:65535"), Ok(("1.2.3.4".into(), 65535)));
+    }
+
+    #[test]
+    fn parse_socks_spec_rejects_bad_input() {
+        assert!(parse_socks_spec("127.0.0.1").is_err(), "缺端口应拒绝");
+        assert!(parse_socks_spec("127.0.0.1:0").is_err(), "端口 0 应拒绝");
+        assert!(parse_socks_spec("127.0.0.1:abc").is_err(), "非数字端口应拒绝");
+        assert!(parse_socks_spec("127.0.0.1:70000").is_err(), "端口超范围应拒绝");
+        assert!(parse_socks_spec(":1080").is_err(), "空 host 应拒绝");
+        assert!(parse_socks_spec("host:").is_err(), "空端口应拒绝");
     }
 }

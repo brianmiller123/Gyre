@@ -106,9 +106,9 @@ pattern = "rm -rf *"
 [[agent.commands.ask]]
 pattern = "docker *"
 
-# 命令拦截器：把 cat/head/tail→read_file、grep/rg→grep、find/fd -name→glob、
-# echo/printf>文件→write_file 等有专用工具等价物的 shell 命令，在执行前重定向到专用工具
-# （移植 oh-my-pi bashInterceptor）。默认开启；置 false 关闭。
+# 命令拦截器：把 cat/head/tail、sed -n 'A,Bp'→read_file，grep/rg→grep，find/fd -name→glob，
+# ls→list_files，echo/printf>文件、sed -i→write_file 等有专用工具等价物的 shell 命令，
+# 在执行前重定向到专用工具（移植 oh-my-pi bashInterceptor）。默认开启；置 false 关闭。
 [agent.commands.interceptor]
 enabled = true
 
@@ -204,3 +204,17 @@ max_concurrent     = 4         # 同波/并行子 Agent 最大并发数（信号
 inherit_parent     = true      # 子 Agent 是否继承父 temperature / thinking（消除「父思考、子不思考」割裂）
 # max_output_tokens = 8192     # 子 Agent 独立输出 token 预算；留空则回退到 [default_model].max_output_tokens
 # task 工具支持单任务（task）与并行多任务（tasks 数组）；多任务按 max_concurrent 并发执行后聚合。
+
+# SOCKS5 出站代理（仅影响后端发出的 HTTP/HTTPS 请求，如 LLM API；前端浏览器自身访问
+# 不经此代理）。host/port 齐全才算「已配置」；配置不完整时自动禁用代理并在启动时告警，
+# 不阻断启动。Web 设置页检测到已配置时会显示「启用 SOCKS5 代理」开关，切换实时生效
+# （无需重启），选择持久化到 <cwd>/.gyre/socks5.state，下次启动自动恢复。
+# 优先级：CLI（--socks host:port 给出即启用；认证另用 --socks-user/--socks-pass）
+# ＞ 持久化开关 ＞ 本配置。
+[socks5]
+enabled            = false          # 总开关（默认关；Web 可在已配置时运行时切换）
+# host               = "127.0.0.1"     # 代理主机（host/port 齐全才算「已配置」）
+# port               = 1080            # 代理端口
+# username           = "user"          # 可选；设置即启用 RFC1929 用户名/密码认证
+# password           = "${SOCKS5_PASSWORD}"  # 可选；支持 ${ENV} 展开，SecretString 存储，永不进日志；仅密码无用户名会被忽略
+# connect_timeout_secs = 10            # 代理连接（含 SOCKS5 握手）超时，默认 10

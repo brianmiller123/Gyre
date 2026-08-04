@@ -82,6 +82,9 @@ const en: Dict = {
   'settings.light_theme': "Light",
   'settings.dark_theme': "Dark",
   'settings.clear_conversation': "Clear current conversation",
+  'settings.socks5_title': 'SOCKS5 proxy (outbound)',
+  'settings.socks5_unconfigured': 'Not configured (add [socks5] in config.toml or --socks host:port)',
+  'settings.socks5_fail': 'Failed to toggle SOCKS5 proxy',
 
   'ui.status.running': 'Running',
   'ui.status.pending': 'Pending',
@@ -357,6 +360,9 @@ const zh: Dict = {
   'settings.light_theme': "浅色",
   'settings.dark_theme': "深色",
   'settings.clear_conversation': "清空当前对话",
+  'settings.socks5_title': 'SOCKS5 出站代理',
+  'settings.socks5_unconfigured': '未配置（可在 config.toml [socks5] 段或 --socks host:port 配置）',
+  'settings.socks5_fail': '切换 SOCKS5 代理失败',
 
   'ui.status.running': '运行中',
   'ui.status.pending': '处理中',
@@ -626,6 +632,9 @@ const ru: Dict = {
   'settings.light_theme': "Светлая",
   'settings.dark_theme': "Тёмная",
   'settings.clear_conversation': "Очистить текущий диалог",
+  'settings.socks5_title': 'SOCKS5-прокси (исходящий)',
+  'settings.socks5_unconfigured': 'Не настроен (добавьте [socks5] в config.toml или --socks host:port)',
+  'settings.socks5_fail': 'Не удалось переключить SOCKS5-прокси',
 
   'ui.status.running': 'Выполняется',
   'ui.status.pending': 'В ожидании',
@@ -884,6 +893,9 @@ const ja: Dict = {
   'settings.light_theme': "ライト",
   'settings.dark_theme': "ダーク",
   'settings.clear_conversation': "現在の会話を消去",
+  'settings.socks5_title': 'SOCKS5 プロキシ（送信）',
+  'settings.socks5_unconfigured': '未設定（config.toml の [socks5] か --socks host:port で設定）',
+  'settings.socks5_fail': 'SOCKS5 プロキシの切替に失敗',
 
   'ui.status.running': '実行中',
   'ui.status.pending': '処理中',

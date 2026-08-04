@@ -364,7 +364,11 @@ async fn run_turn_rpc(
 }
 
 /// 主入口：装配（镜像 `main()` 的单次任务路径）后进入 NDJSON 行循环。
-pub async fn run_rpc(cfg: agent_config::Config, cwd: PathBuf) -> Result<()> {
+pub async fn run_rpc(
+    cfg: agent_config::Config,
+    cwd: PathBuf,
+    socks_override: Option<bool>,
+) -> Result<()> {
     // ── 装配：模型 profile（默认链）→ Provider → Tools / Context / Prompt ──
     let chain = cfg
         .resolve_chain(None)
@@ -377,13 +381,15 @@ pub async fn run_rpc(cfg: agent_config::Config, cwd: PathBuf) -> Result<()> {
     let key_rings: std::collections::HashMap<String, Vec<String>> =
         chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
 
+    // SOCKS5 代理控制器（仅影响后端出站请求；开关经 --socks / 配置 / sidecar）。
+    let socks5 = super::build_socks5_controller(&cfg, &cwd, socks_override);
+    super::print_socks5_status(&socks5);
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时（专供流式 LLM 调用）。
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .context("构建 HTTP 客户端失败")?;
+    let client = agent_proxy::build_http_client(socks5, |b| {
+        b.tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+    })
+    .context("构建 HTTP 客户端失败")?;
     let mut registry = agent_llm::ProviderRegistry::new();
     for p in agent_llm::collect_providers(client) {
         registry.register(p);

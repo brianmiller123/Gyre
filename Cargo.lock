@@ -176,6 +176,7 @@ dependencies = [
  "agent-mcp",
  "agent-memory",
  "agent-prompt",
+ "agent-proxy",
  "agent-pty",
  "agent-search",
  "agent-server",
@@ -415,6 +416,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-proxy"
+version = "0.1.0"
+dependencies = [
+ "agent-config",
+ "futures",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "agent-pty"
 version = "0.1.0"
 dependencies = [
@@ -453,6 +471,7 @@ dependencies = [
  "agent-mcp",
  "agent-memory",
  "agent-prompt",
+ "agent-proxy",
  "agent-skills",
  "agent-supervisor",
  "agent-tools",

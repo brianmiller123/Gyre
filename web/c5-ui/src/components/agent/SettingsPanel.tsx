@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Modal, Field, Input, Select, Button, Divider } from '@/components/ui'
+import { Modal, Field, Input, Select, Button, Divider, Switch } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useSettings } from '@/lib/settings'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
@@ -23,7 +23,8 @@ const accents = [
 /** Connection + appearance settings modal. */
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { settings, update } = useSettings()
-  const { disconnect, connect, clear } = useAgentSession()
+  const { disconnect, connect, clear, socks5Status, refreshSocks5Status, setSocks5Enabled } =
+    useAgentSession()
   const { theme, setTheme } = useTheme()
   const { toast } = useNotifications()
   const { t, preference, setPreference } = useI18n()
@@ -31,10 +32,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const [draft, setDraft] = useState(settings)
   const [accent, setAccent] = useState('Teal')
   const [testing, setTesting] = useState(false)
+  // SOCKS5 开关在途状态（防止连点；请求失败 toast 提示）。
+  const [socks5Busy, setSocks5Busy] = useState(false)
 
   useEffect(() => {
-    if (open) setDraft(settings)
-  }, [open, settings])
+    if (open) {
+      setDraft(settings)
+      // 打开面板时主动刷新代理状态（不依赖 WS 连接），保证开关即时显示。
+      void refreshSocks5Status()
+    }
+  }, [open, settings, refreshSocks5Status])
 
   useEffect(() => {
     const saved = localStorage.getItem('agent-accent') || 'Teal'
@@ -136,6 +143,33 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
               <Button variant="outline" leftIcon="wifi" loading={testing} onClick={testConnection}>
                 {t('settings.test_connection')}
               </Button>
+            </div>
+            {/* SOCKS5 出站代理：仅影响后端发出的 HTTP/HTTPS 请求（LLM API 等），
+                前端浏览器自身访问不经此代理。切换实时生效并由服务端持久化。 */}
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface-2/50 p-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-text-1">{t('settings.socks5_title')}</p>
+                <p className="mt-0.5 truncate text-xs text-muted">
+                  {socks5Status?.configured
+                    ? (socks5Status.redacted ?? '')
+                    : t('settings.socks5_unconfigured')}
+                </p>
+              </div>
+              {socks5Status?.configured && (
+                <Switch
+                  checked={socks5Status.enabled}
+                  disabled={socks5Busy}
+                  label={t('settings.socks5_title')}
+                  onChange={(on) => {
+                    setSocks5Busy(true)
+                    void setSocks5Enabled(on).then((ok) => {
+                      setSocks5Busy(false)
+                      if (!ok)
+                        toast({ title: t('settings.socks5_fail'), severity: 'danger' })
+                    })
+                  }}
+                />
+              )}
             </div>
           </div>
         </div>

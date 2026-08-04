@@ -4,7 +4,7 @@ use std::path::Path;
 
 use agent_core::platform::{config_dir, project_config_dir_name};
 use agent_core::{Api, ApprovalMode, ConfigError, Mode};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 /// 顶层配置。
@@ -57,6 +57,9 @@ pub struct Config {
     /// 压缩后端配置（`[compaction]`：summarize / snapcompact 图像化压缩）。
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// SOCKS5 出站代理配置（`[socks5]`；仅影响后端出站 HTTP/HTTPS，可运行时切换）。
+    #[serde(default)]
+    pub socks5: Socks5Config,
 }
 
 impl Config {
@@ -498,8 +501,9 @@ impl CommandPattern {
 
 /// `run_command` 命令拦截器配置（对应 TOML `[agent.commands.interceptor]`）。
 ///
-/// 开启后，`run_command` 在 spawn 前把 `cat/head/tail` → `read_file`、`grep/rg` → `grep`、
-/// `find/fd -name` → `glob`、`echo/printf > 文件` → `write_file`（移植 oh-my-pi `bashInterceptor`）。
+/// 开启后，`run_command` 在 spawn 前把 `cat/head/tail`、`sed -n 'A,Bp'` → `read_file`、
+/// `grep/rg` → `grep`、`find/fd -name` → `glob`、`ls` → `list_files`、`echo/printf > 文件`、
+/// `sed -i` → `write_file`（移植 oh-my-pi `bashInterceptor`）。
 /// 默认开启。规则集由工具层内置，目标均为始终启用的核心工具，故任何装配下都安全；如需关闭
 /// （例如某些工作流确实需要 `cat`），置 `enabled = false`。
 #[derive(Debug, Clone, Deserialize)]
@@ -1050,6 +1054,83 @@ fn default_compaction_max_frames() -> usize {
     80
 }
 
+/// SOCKS5 出站代理配置（对应 TOML `[socks5]`）。
+///
+/// 仅影响后端发出的出站 HTTP/HTTPS 请求（LLM API 等），前端浏览器自身访问不经此代理。
+/// `host`/`port` 齐全才算「已配置」；配置不完整时 [`Self::is_configured`] 返回 `false`，
+/// 装配层据此自动禁用代理（不阻断启动）。密码经 `SecretString` + `${ENV}` 展开存储，
+/// 永不进入日志；仅配置密码而无用户名时按 `[Self::auth]` 忽略密码并告警。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Socks5Config {
+    /// 总开关（默认关闭；Web 设置页可在已配置时运行时切换，选择持久化到 sidecar）。
+    pub enabled: bool,
+    /// 代理主机（空 = 未配置）。
+    pub host: String,
+    /// 代理端口（`None`/`0` = 未配置）。
+    pub port: Option<u16>,
+    /// 可选用户名；设置即启用 RFC 1929 用户名/密码认证。
+    pub username: Option<String>,
+    /// 可选密码（`SecretString`，支持 `${ENV}` 展开，永不进日志）。
+    pub password: SecretString,
+    /// 代理连接（含 SOCKS5 握手）超时秒数，默认 10。
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for Socks5Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: None,
+            username: None,
+            password: SecretString::default(),
+            connect_timeout_secs: default_socks5_connect_timeout(),
+        }
+    }
+}
+
+fn default_socks5_connect_timeout() -> u64 {
+    10
+}
+
+impl Socks5Config {
+    /// 是否已配置（host 非空且 port > 0）。不完整配置视为未配置。
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.host.trim().is_empty() && self.port.is_some_and(|p| p > 0)
+    }
+
+    /// 认证信息：`username` 有值才返回（密码经 `${ENV}` 展开）；
+    /// 仅配置密码而无用户名 → 记警告并忽略密码。
+    #[must_use]
+    pub fn auth(&self) -> Option<(String, String)> {
+        let user = self.username.as_deref().unwrap_or("").trim();
+        if user.is_empty() {
+            if !self.password.expose_secret().is_empty() {
+                tracing::warn!("SOCKS5: 配置了密码但未配置用户名，密码将被忽略");
+            }
+            return None;
+        }
+        let pass = crate::env::expand_env(self.password.expose_secret());
+        Some((user.to_string(), pass))
+    }
+
+    /// 脱敏描述（日志/API 展示用）：`socks5://user:***@host:port`，**绝不出现明文密码**。
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        if !self.is_configured() {
+            return "socks5://<未配置>".into();
+        }
+        let auth = self
+            .username
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .map_or(String::new(), |u| format!("{u}:***@"));
+        format!("socks5://{auth}{}:{}", self.host, self.port.unwrap_or(0))
+    }
+}
+
 /// 通配匹配（`*` 匹配任意字符序列；`?` 匹配单字符）。用于视觉模型清单匹配
 /// 与 skill 文件名通配等配置驱动的模式匹配。
 ///
@@ -1483,5 +1564,95 @@ api_keys = ["k1", "k2"]
         assert_eq!(m.api, super::Api::OpenAiCompletions);
         assert_eq!(m.max_input_tokens, 128_000);
         assert_eq!(m.max_output_tokens, 4096);
+    }
+
+    // SOCKS5 代理配置：默认值 / 全字段 / 缺端口 / 未知字段容忍 / ${ENV} 展开 / 脱敏。
+    #[test]
+    fn socks5_defaults_and_boundaries() {
+        // 空段 → 默认：未配置、开关关、超时 10s。
+        let cfg: Config = toml::from_str("[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://api.deepseek.com\"").expect("无 [socks5] 段应可解析");
+        assert!(!cfg.socks5.is_configured(), "空段应视为未配置");
+        assert!(!cfg.socks5.enabled);
+        assert_eq!(cfg.socks5.connect_timeout_secs, 10);
+
+        // 全字段 + 未知字段容忍（serde 默认忽略未知键）。
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+[socks5]
+enabled = true
+host = "127.0.0.1"
+port = 1080
+username = "user"
+password = "s3cret"
+connect_timeout_secs = 3
+future_field = "ignored"
+"#;
+        let cfg: Config = toml::from_str(src).expect("全字段 [socks5] 应可解析");
+        assert!(cfg.socks5.is_configured());
+        assert!(cfg.socks5.enabled);
+        assert_eq!(cfg.socks5.host, "127.0.0.1");
+        assert_eq!(cfg.socks5.port, Some(1080));
+        assert_eq!(cfg.socks5.connect_timeout_secs, 3);
+        let (user, pass) = cfg.socks5.auth().expect("有用户名应返回认证");
+        assert_eq!(user, "user");
+        assert_eq!(pass, "s3cret");
+
+        // 缺端口 / 端口 0 → 未配置。
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[socks5]\nhost = \"127.0.0.1\"";
+        let cfg: Config = toml::from_str(src).expect("缺端口应可解析");
+        assert!(!cfg.socks5.is_configured());
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[socks5]\nhost = \"127.0.0.1\"\nport = 0";
+        let cfg: Config = toml::from_str(src).expect("port=0 应可解析");
+        assert!(!cfg.socks5.is_configured());
+
+        // 空 host → 未配置。
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[socks5]\nhost = \"\"\nport = 1080";
+        let cfg: Config = toml::from_str(src).expect("空 host 应可解析");
+        assert!(!cfg.socks5.is_configured());
+    }
+
+    // ${ENV} 密码展开 + 仅密码无用户名 → 忽略 + 脱敏恒不含明文密码。
+    // （env.rs 同款 `#[allow(unsafe_code)]` 测试惯例：edition 2024 的 env 变更需 unsafe。）
+    #[test]
+    #[allow(unsafe_code)]
+    fn socks5_env_password_and_redaction() {
+        // SAFETY: 测试专用环境变量，单线程测试函数内读写，无并发竞争。
+        unsafe { std::env::set_var("GYRE_TEST_SOCKS5_PASS", "p@ss:w/rd") };
+
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "x"
+[socks5]
+host = "proxy.example.com"
+port = 1080
+username = "u"
+password = "${GYRE_TEST_SOCKS5_PASS}"
+"#;
+        let cfg: Config = toml::from_str(src).expect("解析");
+        let (_, pass) = cfg.socks5.auth().expect("有用户名应返回认证");
+        assert_eq!(pass, "p@ss:w/rd", "ENV 模板应展开为真实密码");
+
+        // 脱敏描述：含用户名 → `u:***@`，不含明文密码。
+        let red = cfg.socks5.redacted();
+        assert!(red.contains("u:***@"), "应显示脱敏用户名: {red}");
+        assert!(red.contains("proxy.example.com:1080"));
+        assert!(!red.contains("p@ss"), "脱敏描述不得含明文密码");
+
+        // 仅密码无用户名 → auth() 返回 None（密码被忽略）。
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[socks5]\nhost = \"h\"\nport = 1080\npassword = \"secret\"";
+        let cfg: Config = toml::from_str(src).expect("解析");
+        assert!(cfg.socks5.auth().is_none(), "仅密码时应忽略密码");
+
+        // 未配置 → redacted 明示未配置。
+        let cfg: Config = toml::from_str("[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"").expect("解析");
+        assert!(cfg.socks5.redacted().contains("未配置"));
+
+        // SAFETY: 同上，仅本测试函数使用该变量。
+        unsafe { std::env::remove_var("GYRE_TEST_SOCKS5_PASS") };
     }
 }

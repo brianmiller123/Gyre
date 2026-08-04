@@ -1716,6 +1716,7 @@ mod tests {
                 goals: agent_config::GoalsConfig::default(),
                 eval: agent_config::EvalConfig::default(),
                 compaction: agent_config::CompactionConfig::default(),
+                socks5: agent_config::Socks5Config::default(),
             };
             Self {
                 model: agent_core::Model::with_defaults(

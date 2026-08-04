@@ -29,6 +29,7 @@ agent-memory = { workspace = true }
 agent-search = { workspace = true }
 agent-server = { workspace = true }
 agent-acp    = { workspace = true }
+agent-proxy  = { workspace = true }
 agent-telemetry = { workspace = true }
 agent-hashline = { workspace = true }
 agent-pty    = { workspace = true }

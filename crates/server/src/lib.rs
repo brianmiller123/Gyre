@@ -423,12 +423,20 @@ pub struct SessionManager {
     /// park，在途 provider 流与已启动工具跑完后冻结，resume 后从原处继续（零丢失）。
     /// 移植 oh-my-pi `AgentPauseGate`。
     pause_gate: Arc<PauseGate>,
+    /// SOCKS5 出站代理运行时控制器（共享单例；`/api/socks5` 路由驱动其开关，
+    /// 实时生效并持久化）。`None` = 未配置（代理不可用，前端不显示开关）。
+    socks5: Option<Arc<agent_proxy::Socks5Controller>>,
 }
 
 impl SessionManager {
     /// 构造。
     #[must_use]
-    pub fn new(config: Arc<Config>, http: reqwest::Client, cwd: Arc<std::path::PathBuf>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        http: reqwest::Client,
+        cwd: Arc<std::path::PathBuf>,
+        socks5: Option<Arc<agent_proxy::Socks5Controller>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config,
@@ -438,7 +446,14 @@ impl SessionManager {
             collab_hosts: Arc::new(Mutex::new(HashMap::new())),
             maintenance_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_gate: PauseGate::new(),
+            socks5,
         }
+    }
+
+    /// SOCKS5 代理控制器句柄（`/api/socks5` 路由驱动其开关；`None` = 未配置）。
+    #[must_use]
+    pub fn socks5(&self) -> &Option<Arc<agent_proxy::Socks5Controller>> {
+        &self.socks5
     }
 
     /// 协同中继句柄（供路由直接 join/publish）。
@@ -1341,6 +1356,67 @@ async fn resume_handler(State(state): State<SessionManager>) -> Response {
     .into_response()
 }
 
+/// `GET /api/socks5`：SOCKS5 出站代理状态（`configured` / `enabled` / `host` / `port` /
+/// `username` / `redacted`）。响应**不含密码**——任何字段都不携带 `SecretString`。
+async fn socks5_status(
+    State(state): State<SessionManager>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    match &state.socks5 {
+        Some(c) => Json(serde_json::json!({
+            "configured": true,
+            "enabled": c.enabled(),
+            "host": c.host(),
+            "port": c.port(),
+            "username": c.username(),
+            "redacted": c.redacted(),
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({
+            "configured": false,
+            "enabled": false,
+            "redacted": "socks5://<未配置>",
+        }))
+        .into_response(),
+    }
+}
+
+/// `POST /api/socks5` 请求体：`{ "enabled": bool }`。
+#[derive(serde::Deserialize)]
+struct Socks5SetBody {
+    enabled: bool,
+}
+
+/// `POST /api/socks5`：运行时切换代理开关（实时生效 + 落盘持久化，下次启动保留）。
+/// 未配置（host/port 缺失）→ 400 说明缺失项。
+async fn socks5_set(
+    State(state): State<SessionManager>,
+    axum::extract::Query(auth): axum::extract::Query<SessionParams>,
+    axum::Json(body): axum::Json<Socks5SetBody>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &auth.token) {
+        return resp;
+    }
+    let Some(c) = &state.socks5 else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "SOCKS5 代理未配置（缺少 host/port；请在 config.toml [socks5] 段或 \
+             --socks host:port 补齐）",
+        )
+            .into_response();
+    };
+    c.set_enabled(body.enabled);
+    Json(serde_json::json!({
+        "configured": true,
+        "enabled": c.enabled(),
+        "redacted": c.redacted(),
+    }))
+    .into_response()
+}
+
 /// 构建 axum Router（静态前端内嵌于二进制，运行时无需 `web/` 目录）。
 #[must_use]
 pub fn app(state: SessionManager) -> Router {
@@ -1367,6 +1443,7 @@ pub fn app(state: SessionManager) -> Router {
         .route("/api/stats/trend", get(stats_trend))
         .route("/api/pause", post(pause_handler))
         .route("/api/resume", post(resume_handler))
+        .route("/api/socks5", get(socks5_status).post(socks5_set))
         .route("/api/workspace", get(workspace_info))
         .route("/api/fs", get(list_dir))
         .route("/api/file", get(read_file))
@@ -3539,6 +3616,7 @@ mod tests {
             Arc::new(cfg),
             reqwest::Client::new(),
             Arc::new(std::path::PathBuf::from(".")),
+            None,
         );
         assert!(!mgr.pause_gate().paused(), "初始应为运行态");
         // pause 处理器驱动共享门 → 冻结。
@@ -3559,6 +3637,7 @@ mod tests {
             Arc::new(cfg),
             reqwest::Client::new(),
             Arc::new(std::path::PathBuf::from(".")),
+            None,
         );
         let router = app(mgr);
         let resp = router
@@ -3822,5 +3901,147 @@ mod tests {
         assert_eq!(window.len(), 3);
         assert!(window[0] < window[1] && window[1] < window[2], "应升序");
         assert_eq!(window[2], unix_to_utc_date(now), "窗口应以今天收尾");
+    }
+
+    fn socks5_cfg(enabled: bool) -> agent_config::Socks5Config {
+        agent_config::Socks5Config {
+            enabled,
+            host: "127.0.0.1".into(),
+            port: Some(1080),
+            username: Some("user".into()),
+            password: secrecy::SecretString::from("s3cret"),
+            connect_timeout_secs: 5,
+        }
+    }
+
+    /// GET /api/socks5：已配置 → 载荷形状正确且绝不含密码；未配置 → configured=false。
+    #[tokio::test]
+    async fn socks5_status_route_reports_state_without_password() {
+        use tower::ServiceExt;
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let ctrl = agent_proxy::Socks5Controller::new(&socks5_cfg(true), None, None)
+            .expect("已配置应构造控制器");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+            Some(ctrl),
+        );
+        let router = app(mgr);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/socks5")
+                    .body(axum::body::Body::empty())
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读响应体");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(v["configured"], true);
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["host"], "127.0.0.1");
+        assert_eq!(v["port"], 1080);
+        assert_eq!(v["username"], "user");
+        assert!(
+            !body.windows(6).any(|w| w == b"s3cret"),
+            "响应体不得含明文密码"
+        );
+        assert!(
+            v["redacted"].as_str().is_some_and(|r| r.contains("user:***@")),
+            "redacted 应脱敏: {v}"
+        );
+
+        // 未配置 → configured=false。
+        let mgr2 = SessionManager::new(
+            Arc::new(Config {
+                socks5: agent_config::Socks5Config {
+                    enabled: false,
+                    ..socks5_cfg(false)
+                },
+                ..toml::from_str(include_str!("../../../config.example.toml"))
+                    .expect("示例配置应可解析为 Config")
+            }),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+            None,
+        );
+        let router2 = app(mgr2);
+        let resp = router2
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/socks5")
+                    .body(axum::body::Body::empty())
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读响应体");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["enabled"], false);
+    }
+
+    /// POST /api/socks5：切换控制器开关；未配置 → 400。
+    #[tokio::test]
+    async fn socks5_set_route_toggles_controller() {
+        use tower::ServiceExt;
+        let cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        let ctrl = agent_proxy::Socks5Controller::new(&socks5_cfg(false), None, None)
+            .expect("已配置应构造控制器");
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+            Some(Arc::clone(&ctrl)),
+        );
+        let router = app(mgr);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/socks5")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"enabled":true}"#))
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(ctrl.enabled(), "控制器开关应被路由驱动为 true");
+
+        // 未配置 → 400 说明缺失。
+        let mgr2 = SessionManager::new(
+            Arc::new(toml::from_str(include_str!("../../../config.example.toml")).unwrap()),
+            reqwest::Client::new(),
+            Arc::new(std::path::PathBuf::from(".")),
+            None,
+        );
+        let router2 = app(mgr2);
+        let resp = router2
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/socks5")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"enabled":true}"#))
+                    .expect("构造请求"),
+            )
+            .await
+            .expect("路由可达");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

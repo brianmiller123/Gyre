@@ -52,12 +52,16 @@ impl CompiledRule {
 }
 
 /// 内置默认规则集：把 `cat/head/tail` → `read_file`、`grep/rg` → `grep`、
-/// `find/fd -name` → `glob`、`echo/printf > 文件` → `write_file`。
+/// `find/fd -name` → `glob`、`sed -n 'A,Bp'` → `read_file`、`echo/printf > 文件` → `write_file`、
+/// `sed -i` → `write_file`、`ls` → `list_files`。
 ///
-/// 刻意只覆盖**核心工具作目标**的命令：`read_file` / `grep` / `glob` / `write_file` 均为
-/// 始终启用的核心工具，故这套默认规则在任何装配下都安全（不会把模型引向未注册的工具）。
-/// `sed -i` → `apply_hashline` 因目标为可选工具而不纳入默认集，避免在未启用 hashline 时
-/// 困住模型；需要时可由装配层按可用性追加。
+/// 刻意只覆盖**核心工具作目标**的命令：`read_file` / `grep` / `glob` / `write_file` /
+/// `list_files` 均为始终启用的核心工具，故这套默认规则在任何装配下都安全（不会把模型引向
+/// 未注册的工具）。`sed -i` 目标取 `write_file`（而非可选的 `apply_hashline`），避免在未
+/// 启用 hashline 时困住模型；教学提示中会同时给出 `apply_hashline`（启用时更合适）。
+///
+/// 规则集的演进依据实测会话：模型常用的「读文件区间」是 `sed -n 'A,Bp'`（而非 cat），
+/// 「原地编辑」是 `sed -i`，故两者与 `ls` 一并纳入。
 #[must_use]
 pub fn default_compiled() -> Vec<CompiledRule> {
     let mut rules = Vec::new();
@@ -82,11 +86,32 @@ pub fn default_compiled() -> Vec<CompiledRule> {
     ) {
         rules.push(r);
     }
+    if let Some(r) = CompiledRule::regex(
+        "read_file",
+        "read_file 支持按行号分段读取（等价 sed -n 'A,Bp'），还能识别二进制/图片，比 sed 更安全",
+        r"^\s*sed\s+-n\s+",
+    ) {
+        rules.push(r);
+    }
+    if let Some(r) = CompiledRule::regex(
+        "list_files",
+        "list_files 工具提供结构化目录列表（含大小/修改时间），比 ls 更适合定位文件",
+        r"^\s*ls\b",
+    ) {
+        rules.push(r);
+    }
     rules.push(CompiledRule::custom(
         "write_file",
         "write_file 处理编码并提供整文件创建/覆写，比 echo/printf/heredoc 重定向更安全",
         is_write_redirect,
     ));
+    if let Some(r) = CompiledRule::regex(
+        "write_file",
+        "原地编辑请用 apply_hashline（启用时）或 write_file 重写该文件；sed -i 易出转义错误且不留审计",
+        r"^\s*sed\s+-i",
+    ) {
+        rules.push(r);
+    }
     rules
 }
 
@@ -283,11 +308,46 @@ mod tests {
     }
 
     #[test]
+    fn intercepts_sed_n_read_ranges_to_read_file() {
+        let rules = default_compiled();
+        // 实测高频：模型用 sed -n 'A,Bp' 读文件区间。
+        assert_eq!(hit("sed -n '3425,3440p' Cargo.lock", &rules), Some("read_file"));
+        assert_eq!(hit("sed -n '55,75p' crates/config/src/config.rs", &rules), Some("read_file"));
+        assert_eq!(hit("sed -n 1,15p file", &rules), Some("read_file"));
+        assert_eq!(hit("sed -n '574p' main.rs", &rules), Some("read_file"));
+        assert_eq!(hit("sed -n '/foo/,/bar/p' x.rs", &rules), Some("read_file"));
+        // cd 前缀不能绕过。
+        assert_eq!(hit("cd src && sed -n '1,5p' main.rs", &rules), Some("read_file"));
+    }
+
+    #[test]
+    fn intercepts_sed_i_inplace_edit_to_write_file() {
+        let rules = default_compiled();
+        // 实测高频：模型用 sed -i 做原地编辑。
+        assert_eq!(hit("sed -i 's/x/y/' file.txt", &rules), Some("write_file"));
+        assert_eq!(hit("sed -i '63,117d' src/lib.rs", &rules), Some("write_file"));
+        assert_eq!(hit("sed -i.bak 's/a/b/' f", &rules), Some("write_file"));
+        // 不带 -n/-i 的 sed（过滤管道，输出到 stdout）不拦截。
+        assert_eq!(hit("sed 's/x/y/' | sort", &rules), None);
+    }
+
+    #[test]
+    fn intercepts_ls_to_list_files() {
+        let rules = default_compiled();
+        assert_eq!(hit("ls -la", &rules), Some("list_files"));
+        assert_eq!(hit("ls dist", &rules), Some("list_files"));
+        assert_eq!(hit("ls .. | head -30", &rules), Some("list_files"));
+        // 避免误伤：非 ls 开头的命令不受影响。
+        assert_eq!(hit("lsblk", &rules), None);
+    }
+
+    #[test]
     fn leaves_unrelated_commands_alone() {
         let rules = default_compiled();
         assert_eq!(hit("cargo build", &rules), None);
         assert_eq!(hit("git status", &rules), None);
-        assert_eq!(hit("ls -la", &rules), None);
         assert_eq!(hit("echo hello world", &rules), None);
+        assert_eq!(hit("wc -l Cargo.lock", &rules), None);
+        assert_eq!(hit("python3 -c 'import os; print(os.listdir())'", &rules), None);
     }
 }
