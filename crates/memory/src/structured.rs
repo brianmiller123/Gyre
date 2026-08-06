@@ -13,7 +13,7 @@
 //! 向量（dense）项仅在挂载 [`crate::vec_memory::Embedder`] 且 `vec_weight > 0` 时参与；
 //! 嵌入失败/向量缺失一律静默跳过，严格回退词法公式（行为兼容）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use crate::intent::{adjust_weights, classify_intent};
 use crate::mental_models::{load_seeds, merge_mental_models, MentalModelsConfig};
 use crate::mmr::{containment_similarity, jaccard_similarity, mmr_rerank_indices, strip_cjk_stop_chars};
 use crate::synonyms::canonicalize_tokens;
-use crate::temporal::{extract_temporal, temporal_boost};
+use crate::temporal::{extract_temporal, query_asks_current, temporal_boost};
 use crate::vec_memory::{
     cosine_similarity, decode_f32s, encode_f32s, Embedder, VecEntry, VectorStore,
 };
@@ -353,13 +353,22 @@ impl StructuredMemoryStore {
         } else {
             (opts.fts_weight, opts.importance_weight, opts.temporal_weight, opts.vec_weight)
         };
-        // P1：时间表达解析——`yesterday`/`3 days ago` 等将时间信号切换为相对目标日期
-        let query_time_ms = if query_tokens.is_empty() {
+        // P1：时间表达解析——`yesterday`/`3 days ago`/`三天前`/`上周一` 等将时间信号
+        // 切换为相对目标日期。P1b：queryAsksCurrent——`now/latest/recent/current` 类
+        // 查询把时间锚点固定为当前时刻并抬升 temporal 权重到至少 0.45（直译 omp
+        // `queryTime ??= now` + `temporalWeight ??= 0.45`；Gyre 默认时间锚即当前，
+        // 可观测效果=权重抬升，显式配置 >0.45 的权重保持不变）。
+        let now = now_ms();
+        let temporal = if query_tokens.is_empty() {
             None
         } else {
-            extract_temporal(query, None).event_date_ms
+            Some(extract_temporal(query, None))
         };
-        let now = now_ms();
+        let (query_time_ms, temp_w) = match temporal {
+            Some(t) if query_asks_current(query) => (t.event_date_ms.or(Some(now)), temp_w.max(0.45)),
+            Some(t) => (t.event_date_ms, temp_w),
+            None => (None, temp_w),
+        };
         let now_hours = now as f64 / 3_600_000.0;
         // 向量（dense）融合：仅挂载嵌入器、vec_weight > 0 且查询非空时启用；
         // 嵌入失败/向量缺失一律静默降级，严格回退词法公式（行为兼容）。
@@ -419,6 +428,50 @@ impl StructuredMemoryStore {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             hits.retain(|h| h.score > 0.0);
+        }
+        // P1b：diversifyByCoverage（直译 omp：MMR 前的查询词覆盖贪心）——查询 ≥4 词且
+        // 候选多于 limit 时，逐轮选 `score + 0.06×新增查询词覆盖数` 最大的候选，选中后
+        // 其命中的查询词标记已覆盖。与 MMR 互补：MMR 压重复，覆盖贪心保查询词全盖。
+        if query_tokens.len() >= 4 && hits.len() > opts.limit {
+            let query_set: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+            let mut covered: HashSet<String> = HashSet::new();
+            let mut selected: Vec<(RecallHit, Vec<String>)> = Vec::with_capacity(opts.limit);
+            let mut pool: Vec<(RecallHit, Vec<String>)> = std::mem::take(&mut hits)
+                .into_iter()
+                .map(|h| {
+                    let tokens = if opts.use_synonyms {
+                        canonicalize_tokens(tokenize(&h.record.content))
+                    } else {
+                        tokenize(&h.record.content)
+                    };
+                    (h, tokens)
+                })
+                .collect();
+            while !pool.is_empty() && selected.len() < opts.limit {
+                let mut best_idx = 0usize;
+                let mut best_score = f64::NEG_INFINITY;
+                for (i, (row, tokens)) in pool.iter().enumerate() {
+                    let additions = tokens
+                        .iter()
+                        .filter(|t| query_set.contains(t.as_str()) && !covered.contains(*t))
+                        .count();
+                    // 新增覆盖词数 ≤ 查询词数（个位数级），f64 精度损失无影响
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = (additions as f64).mul_add(0.06, row.score);
+                    if score > best_score {
+                        best_score = score;
+                        best_idx = i;
+                    }
+                }
+                let (picked, picked_tokens) = pool.remove(best_idx);
+                for t in &picked_tokens {
+                    if query_set.contains(t.as_str()) {
+                        covered.insert(t.clone());
+                    }
+                }
+                selected.push((picked, picked_tokens));
+            }
+            hits = selected.into_iter().map(|(h, _)| h).collect();
         }
         // P1：MMR 多样性重排（λ·relevance − (1−λ)·maxSim）；首元素恒为相关性第一，
         // 空查询（浏览模式）无相关性锚点，跳过。中文调优（2026-08）：
@@ -1322,5 +1375,89 @@ mod tests {
         let s3 = s3.with_mental_models_config(crate::MentalModelsConfig::default());
         assert!(s3.summary().await.unwrap().is_none());
         assert!(s3.mental_models().is_some());
+    }
+
+    // P1b：queryAsksCurrent——「latest/current」类查询把 temporal 权重抬到 0.45。
+    // 构造：两记录内容/词法命中相同，旧记录重要性更高（imp 4 vs 3）；
+    // temporal 权重 0.0 时旧记录领先（recency 无效），current 查询抬权后新记录反超。
+    #[tokio::test]
+    async fn recall_current_query_boosts_recency_weight() {
+        let s = store();
+        s.retain(rec_at("system latest status record", 4, 600)).unwrap(); // 旧，r≈0.29
+        s.retain(rec_at("system latest status record", 3, 1)).unwrap(); // 新，r≈1
+        let opts = RecallOptions {
+            mmr_lambda: None,
+            use_intent: false,
+            temporal_weight: 0.0,
+            ..Default::default()
+        };
+        // 无 current 词：recency 无权重 → 重要性高的旧记录在前
+        let plain = s.recall("status", &opts);
+        assert_eq!(plain[0].record.importance, 4, "对照前提：旧记录领先");
+        // current 词：temporal 权重抬到 0.45 → 新记录（recency≈1）反超
+        let cur = s.recall("latest status", &opts);
+        assert_eq!(cur[0].record.importance, 3, "current 查询应抬 temporal 权重");
+        assert_eq!(cur[0].record.content, "system latest status record");
+    }
+
+    // P1b：diversifyByCoverage——查询 ≥4 词且候选多于 limit 时，覆盖贪心按
+    // `score + 0.06×新增覆盖词数` 择优。构造：C 纯分数第三（0.902），但覆盖
+    // gamma/delta/epsilon 三个新词（+0.18）→ 第二轮反超 B（beta 已被 A 覆盖）。
+    #[tokio::test]
+    async fn recall_diversifies_query_coverage() {
+        let s = store();
+        s.retain(rec_at("alpha record", 5, 1)).unwrap(); // 1.507，覆盖 alpha
+        s.retain(rec_at("beta record", 3, 1)).unwrap(); // 1.307，覆盖 beta
+        s.retain(
+            rec_at("gamma delta epsilon r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 record", 2, 1),
+        )
+        .unwrap(); // 1.275，覆盖 gamma/delta/epsilon
+        s.retain(rec_at("delta r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 record", 0, 1))
+            .unwrap(); // 0.577，覆盖 delta（已被 C 覆盖）
+        let opts = RecallOptions {
+            mmr_lambda: None,
+            use_intent: false,
+            limit: 3,
+            ..Default::default()
+        };
+        // 覆盖贪心：A 最高分先选；第二轮 C（1.275+0.18）胜过 B（1.307+0.06）
+        let div = s.recall("alpha beta gamma delta epsilon", &opts);
+        assert!(div[0].record.content.starts_with("alpha"), "{}: {}", div[0].record.content, div[0].score);
+        assert!(
+            div[1].record.content.starts_with("gamma"),
+            "覆盖贪心应把多词覆盖的 C 提前: {:?}",
+            div.iter().map(|h| (&h.record.content, h.score)).collect::<Vec<_>>()
+        );
+        assert!(div[2].record.content.starts_with("beta"));
+        // 对照：limit=4（候选 4 ≤ limit → 不触发覆盖贪心）→ 纯分数序 [A, B, C, D]
+        let no_div = RecallOptions { limit: 4, ..opts };
+        let plain = s.recall("alpha beta gamma delta epsilon", &no_div);
+        assert!(plain[1].record.content.starts_with("beta"), "对照前提：纯分数序");
+    }
+
+    // P1b：中文时间表达——「三天前」把时间信号切到相对目标日（72h）。
+    // 构造：alpha 300h/imp5（对 now 很近→默认查询靠重要性领先），beta 88h/imp1
+    // （距目标日仅 16h）。无时间词时重要性主导 → alpha 前；「三天前」查询下
+    // recency 相对目标日衰减，beta（0.953）反超 alpha（0.508）→ 顺序翻转，
+    // 证明信号切换生效（temporal_boost 对目标日之后的记录满值 1.0，
+    // 故用目标日过去侧的记录构造对比）。
+    #[tokio::test]
+    async fn recall_chinese_temporal_query_switches_signal() {
+        let s = store();
+        s.retain(rec_at("部署排障记录 alpha", 5, 300)).unwrap();
+        s.retain(rec_at("部署排障记录 beta", 1, 88)).unwrap();
+        let plain = RecallOptions {
+            use_intent: false,
+            ..Default::default()
+        };
+        let hits = s.recall("部署排障", &plain);
+        assert_eq!(hits[0].record.content, "部署排障记录 alpha", "对照前提：无时间词时重要性主导");
+        let near = RecallOptions {
+            use_intent: false,
+            temporal_weight: 2.0,
+            ..Default::default()
+        };
+        let hits = s.recall("三天前部署排障", &near);
+        assert_eq!(hits[0].record.content, "部署排障记录 beta", "beta 距目标日（72h）更近");
     }
 }
