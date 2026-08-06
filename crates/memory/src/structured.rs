@@ -22,7 +22,11 @@ use agent_core::{MemoryNote, MemoryStore};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::intent::{adjust_weights, classify_intent};
 use crate::mental_models::{load_seeds, merge_mental_models, MentalModelsConfig};
+use crate::mmr::{containment_similarity, jaccard_similarity, mmr_rerank_indices, strip_cjk_stop_chars};
+use crate::synonyms::canonicalize_tokens;
+use crate::temporal::{extract_temporal, temporal_boost};
 use crate::vec_memory::{
     cosine_similarity, decode_f32s, encode_f32s, Embedder, VecEntry, VectorStore,
 };
@@ -78,6 +82,12 @@ pub struct RecallOptions {
     pub halflife_hours: f64,
     /// 返回 top-K。
     pub limit: usize,
+    /// MMR 多样性重排强度（λ）；`None` 关闭。
+    pub mmr_lambda: Option<f64>,
+    /// 查询意图分类偏置（时间/偏好等类别调整四维权重）。
+    pub use_intent: bool,
+    /// 同义词归一化（查询与内容 token 映射到 canonical）。
+    pub use_synonyms: bool,
 }
 
 impl Default for RecallOptions {
@@ -89,6 +99,9 @@ impl Default for RecallOptions {
             vec_weight: 0.5, // 对齐 mnemopi 默认向量权重
             halflife_hours: 24.0 * 14.0, // 两周
             limit: 8,
+            mmr_lambda: Some(0.7), // 对齐 mnemopi recallEnhanced 默认
+            use_intent: true,
+            use_synonyms: true,
         }
     }
 }
@@ -124,6 +137,26 @@ pub struct MemoryStats {
     pub banks: BTreeMap<String, usize>,
     /// 最近一条时间戳。
     pub last_ts: Option<u64>,
+}
+
+/// 会话末维护报告（[`StructuredMemoryStore::sleep`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SleepReport {
+    /// 处理的 bank 数。
+    pub banks: usize,
+    /// 清理的过期记录数（`valid_until` 已到）。
+    pub expired_removed: usize,
+    /// 去重合并的记录数（内容归一化相同，保留高重要性/新时间戳/长正文）。
+    pub duplicates_removed: usize,
+}
+
+/// 内容归一化去重键：折叠空白 + 小写。
+fn normalize_dedupe_key(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Mnemopi 结构化记忆存储（按项目 cwd 哈希作用域，JSONL 持久化）。
@@ -301,13 +334,37 @@ impl StructuredMemoryStore {
     /// 指定 bank 检索。
     #[must_use]
     pub fn recall_in(&self, bank: &str, query: &str, opts: &RecallOptions) -> Vec<RecallHit> {
-        let query_tokens = tokenize(query);
+        // P1：同义词归一化（查询侧）——`db` 查询命中 `database` 文档
+        let query_tokens = if opts.use_synonyms {
+            canonicalize_tokens(tokenize(query))
+        } else {
+            tokenize(query)
+        };
+        // P1：意图偏置——偏好类查询更重视 importance，流程类更重视词法命中
+        let (fts_w, imp_w, temp_w, vec_w) = if opts.use_intent && !query_tokens.is_empty() {
+            let intent = classify_intent(query);
+            adjust_weights(
+                opts.fts_weight,
+                opts.importance_weight,
+                opts.temporal_weight,
+                opts.vec_weight,
+                &intent,
+            )
+        } else {
+            (opts.fts_weight, opts.importance_weight, opts.temporal_weight, opts.vec_weight)
+        };
+        // P1：时间表达解析——`yesterday`/`3 days ago` 等将时间信号切换为相对目标日期
+        let query_time_ms = if query_tokens.is_empty() {
+            None
+        } else {
+            extract_temporal(query, None).event_date_ms
+        };
         let now = now_ms();
         let now_hours = now as f64 / 3_600_000.0;
         // 向量（dense）融合：仅挂载嵌入器、vec_weight > 0 且查询非空时启用；
         // 嵌入失败/向量缺失一律静默降级，严格回退词法公式（行为兼容）。
         let dense: Option<(Vec<f32>, HashMap<String, VecEntry>)> =
-            if opts.vec_weight > 0.0 && !query_tokens.is_empty() {
+            if vec_w > 0.0 && !query_tokens.is_empty() {
                 self.prepare_dense(bank, query)
             } else {
                 None
@@ -317,20 +374,28 @@ impl StructuredMemoryStore {
             .into_iter()
             .filter(|r| r.valid_until.is_none_or(|v| v >= now))
             .map(|record| {
-                let content_tokens = tokenize(&record.content);
+                let content_tokens = if opts.use_synonyms {
+                    canonicalize_tokens(tokenize(&record.content))
+                } else {
+                    tokenize(&record.content)
+                };
                 let relevance = bm25_relevance(&query_tokens, &content_tokens);
-                let recency = 2f64
-                    .powf(-((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours));
+                let recency = match query_time_ms {
+                    // P1：查询含时间表达 → 指数衰减相对目标时刻（过去衰减、当天/未来满值）
+                    Some(qt) => temporal_boost(record.ts, qt, opts.halflife_hours),
+                    None => 2f64
+                        .powf(-((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours)),
+                };
                 let importance = f64::from(record.importance.min(5)) / 5.0;
-                let mut score = opts.fts_weight * relevance
-                    + opts.importance_weight * importance
-                    + opts.temporal_weight * recency.clamp(0.0, 1.0);
+                let mut score = fts_w * relevance
+                    + imp_w * importance
+                    + temp_w * recency.clamp(0.0, 1.0);
                 // dense 融合：`vec_weight · max(0, cosine)`；缺失/损坏向量只跳过，不报错
                 if let Some((qv, by_id)) = &dense {
                     if let Some(entry) = by_id.get(&record.id) {
                         if let Some(v) = decode_f32s(&entry.data) {
                             if v.len() == qv.len() {
-                                score += opts.vec_weight * cosine_similarity(qv, &v).max(0.0);
+                                score += vec_w * cosine_similarity(qv, &v).max(0.0);
                             }
                         }
                     }
@@ -354,6 +419,63 @@ impl StructuredMemoryStore {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             hits.retain(|h| h.score > 0.0);
+        }
+        // P1：MMR 多样性重排（λ·relevance − (1−λ)·maxSim）；首元素恒为相关性第一，
+        // 空查询（浏览模式）无相关性锚点，跳过。中文调优（2026-08）：
+        // ① 近重复折叠：与更高分记录 content 近同（containment ≥ 0.9）的候选压到尾部，
+        //    让独立话题上位——中文单字级 Jaccard 对「追加型重复」低估（0.85 级），
+        //    MMR 惩罚压不过词法分数差，折叠直接攻击重复概念（对齐 mnemopi 语义级
+        //    向量相似度对同源记录 ≈1 的行为）；
+        // ② 保序分数缩放（÷max）：Gyre 词法分数无界（omp 有界），缩放让 (1−λ)·sim
+        //    惩罚与 λ·rel 同尺度，否则重复压制在分数差大时数学上不可能；
+        // ③ 相似度输入过滤中文停用字：去掉“的/了”等共享虚词的假交集。
+        if !query_tokens.is_empty() {
+            if let Some(lambda) = opts.mmr_lambda {
+                if hits.len() > 1 {
+                    let mut kept: Vec<RecallHit> = Vec::new();
+                    let mut dup: Vec<RecallHit> = Vec::new();
+                    for h in &hits {
+                        let t = strip_cjk_stop_chars(&tokenize(&h.record.content));
+                        let is_dup = kept.iter().any(|k| {
+                            let kt = strip_cjk_stop_chars(&tokenize(&k.record.content));
+                            containment_similarity(&kt, &t) >= 0.9
+                        });
+                        if is_dup {
+                            dup.push(h.clone());
+                        } else {
+                            kept.push(h.clone());
+                        }
+                    }
+                    // 先落位：kept（无近重复）在前、dup 按原分数序在后；
+                    // MMR 仅在前 folded 项上重排（dup 不参与，避免被相关性再提回）
+                    let dup_len = dup.len();
+                    hits = kept;
+                    hits.append(&mut dup);
+                    let folded = hits.len() - dup_len;
+                    let max_score = hits.iter().map(|h| h.score).fold(0.0f64, f64::max);
+                    let scores: Vec<f64> = if max_score > 0.0 {
+                        hits.iter().map(|h| h.score / max_score).collect()
+                    } else {
+                        hits.iter().map(|h| h.score).collect()
+                    };
+                    let contents: Vec<Vec<String>> = hits
+                        .iter()
+                        .map(|h| strip_cjk_stop_chars(&tokenize(&h.record.content)))
+                        .collect();
+                    let indices = mmr_rerank_indices(
+                        folded,
+                        &scores[..folded],
+                        |a, b| jaccard_similarity(&contents[a], &contents[b]),
+                        lambda,
+                        opts.limit,
+                    );
+                    let mut out: Vec<RecallHit> =
+                        indices.into_iter().map(|i| hits[i].clone()).collect();
+                    out.extend(hits[folded..].iter().cloned());
+                    out.truncate(opts.limit.max(1));
+                    return out;
+                }
+            }
         }
         hits.truncate(opts.limit.max(1));
         hits
@@ -443,7 +565,67 @@ impl StructuredMemoryStore {
         }
     }
 
+    /// 会话末维护（对齐 mnemopi `sleep` 的轻量版，无 LLM 合并）：
+    /// 逐 bank 清理过期记录、按内容归一化去重（保留高重要性 / 较新时间戳 / 较长正文），
+    /// 并在嵌入模型变更时全量重嵌（复用 recall 惰性重嵌的判定）。
+    ///
+    /// # Errors
+    /// 重写任一 bank 的 records.jsonl 失败时返回 IO 错误。
+    pub fn sleep(&self) -> std::io::Result<SleepReport> {
+        let mut report = SleepReport::default();
+        for bank in self.list_banks() {
+            let path = self.records_path(&bank);
+            let records = read_records(&path);
+            if records.is_empty() {
+                continue;
+            }
+            report.banks += 1;
+            let now = now_ms();
+            let original = records.len();
+            let mut kept: Vec<MemoryRecord> = Vec::new();
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            for r in records {
+                if r.valid_until.is_some_and(|v| v < now) {
+                    report.expired_removed += 1;
+                    continue;
+                }
+                let norm = normalize_dedupe_key(&r.content);
+                if let Some(&idx) = seen.get(&norm) {
+                    let existing = &mut kept[idx];
+                    if r.importance > existing.importance {
+                        existing.importance = r.importance;
+                    }
+                    if r.ts > existing.ts {
+                        existing.ts = r.ts;
+                    }
+                    if r.content.len() > existing.content.len() {
+                        existing.content = r.content.clone();
+                    }
+                    report.duplicates_removed += 1;
+                } else {
+                    seen.insert(norm, kept.len());
+                    kept.push(r);
+                }
+            }
+            if kept.len() != original {
+                rewrite_records(&path, &kept)?;
+            }
+            // 嵌入模型变更 → 全量重嵌（按清理后的存活集重嵌）。
+            if let Some(embedder) = &self.embedder {
+                let vs = VectorStore::new(&self.bank_dir(&bank));
+                let entries = vs.all();
+                let need = entries.is_empty()
+                    || entries.iter().any(|e| e.model != embedder.model_name());
+                if need {
+                    self.reembed(&bank, embedder.as_ref());
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// 把命中/记录渲染为 Markdown 列表（供 system prompt 注入）。
+    /// 对齐 oh-my-pi 注入格式：`- [score] content`（分数保留两位，语义锚点）。
     #[must_use]
     pub fn render_summary(hits: &[RecallHit]) -> String {
         if hits.is_empty() {
@@ -452,9 +634,8 @@ impl StructuredMemoryStore {
         let mut out = String::from("# 长期记忆（相关条目）\n\n");
         for h in hits {
             out.push_str(&format!(
-                "- [{}·{}] {}\n",
-                h.record.source,
-                h.record.importance,
+                "- [{:.2}] {}\n",
+                h.score,
                 h.record.content.replace('\n', " ")
             ));
         }
@@ -466,20 +647,52 @@ impl StructuredMemoryStore {
 impl MemoryStore for StructuredMemoryStore {
     async fn summary(&self) -> Result<Option<String>, std::io::Error> {
         let hits = self.recall("", &RecallOptions::default());
-        let base = if hits.is_empty() {
+        Ok(if hits.is_empty() {
             None
         } else {
             Some(Self::render_summary(&hits))
-        };
-        let mental = self.mental_models();
-        Ok(match (base, mental) {
-            (None, None) => None,
-            (Some(base), None) => Some(base),
-            (None, Some(mental)) => Some(format!("<mental_models>\n{mental}\n</mental_models>")),
-            (Some(base), Some(mental)) => {
-                Some(format!("{base}\n\n<mental_models>\n{mental}\n</mental_models>"))
-            }
         })
+    }
+
+    async fn mental_models(&self) -> Option<String> {
+        self.mental_models()
+    }
+
+    async fn recall(&self, query: &str, limit: usize) -> Vec<agent_core::MemoryHit> {
+        let opts = RecallOptions {
+            limit: limit.max(1),
+            ..RecallOptions::default()
+        };
+        self.recall_in(DEFAULT_BANK, query, &opts)
+            .into_iter()
+            .map(|h| agent_core::MemoryHit {
+                id: h.record.id,
+                content: h.record.content,
+                score: h.score,
+                source: h.record.source,
+                importance: h.record.importance,
+            })
+            .collect()
+    }
+
+    async fn retain(
+        &self,
+        content: &str,
+        importance: u8,
+        source: &str,
+    ) -> Result<(), std::io::Error> {
+        let record = MemoryRecord {
+            id: String::new(),
+            content: content.to_string(),
+            source: source.to_string(),
+            importance: importance.min(5),
+            scope: String::new(),
+            metadata: BTreeMap::new(),
+            tags: Vec::new(),
+            ts: now_ms(),
+            valid_until: None,
+        };
+        self.retain(record)
     }
 
     async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
@@ -525,6 +738,25 @@ impl MemoryStore for StructuredMemoryStore {
     fn root_dir(&self) -> &PathBuf {
         &self.root
     }
+
+    async fn add_mental_model(&self, text: &str) -> Result<(), std::io::Error> {
+        use std::io::Write;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let line = format!(
+            "- [{}] {}\n",
+            crate::mental_models::format_ts(now_ms() / 1000),
+            text
+        );
+        let path = self.root.join(MENTAL_MODELS_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        f.write_all(line.as_bytes())
+    }
 }
 
 // ── 评分与工具 ─────────────────────────────────────────────────────────────
@@ -551,12 +783,40 @@ fn bm25_relevance(query_tokens: &[String], content_tokens: &[String]) -> f64 {
     overlap as f64 / n.sqrt()
 }
 
-/// 小写化 + 非字母数字切分。
+/// 小写化 + 非字母数字切分；CJK 表意字符逐字切分（无空格中文不粘连成整串），
+/// 拉丁/数字保持连续词。P1 起启用：同义词/MMR/Jaccard 对中文内容才有意义。
 fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_ascii_lowercase())
-        .collect()
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32,
+            0x3400..=0x4DBF   // CJK 扩展 A
+            | 0x4E00..=0x9FFF // CJK 统一表意文字
+            | 0xF900..=0xFAFF // CJK 兼容表意文字
+            | 0x3040..=0x30FF // 平假名/片假名
+            | 0xAC00..=0xD7AF // 谚文音节
+        )
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if is_cjk(c) {
+                if !current.is_empty() {
+                    out.push(current.to_ascii_lowercase());
+                    current.clear();
+                }
+                out.push(c.to_string());
+            } else {
+                current.push(c);
+            }
+        } else if !current.is_empty() {
+            out.push(current.to_ascii_lowercase());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        out.push(current.to_ascii_lowercase());
+    }
+    out
 }
 
 fn read_records(path: &Path) -> Vec<MemoryRecord> {
@@ -620,8 +880,12 @@ mod tests {
 
     /// 返回 (store, root)；root 供直接检查旁路 vecs.jsonl。
     fn store_root() -> (StructuredMemoryStore, PathBuf) {
+        // 纳秒时钟实际精度为微秒级：并行测试可能同微秒取到相同 nano → 同 root 互相踩踏。
+        // 加原子序号保证目录唯一。
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = std::env::temp_dir().join(format!(
-            "agent-mnemopi-{}-{:#x}",
+            "agent-mnemopi-{}-{seq}-{:#x}",
             std::process::id(),
             nano()
         ));
@@ -648,6 +912,36 @@ mod tests {
             ts: now_ms(),
             valid_until: None,
         }
+    }
+
+    // P0-4：会话末维护——清理过期 + 内容去重（保留高重要性/新时间戳）。
+    #[tokio::test]
+    async fn sleep_cleans_expired_and_deduplicates() {
+        let s = store();
+        let mut expired = rec("过期条目", 3);
+        expired.valid_until = Some(now_ms() - 1); // 已过期
+        s.retain(expired).unwrap();
+        s.retain(rec("用户偏好 Rust 2024 edition", 1)).unwrap();
+        let mut dup_low = rec("用户偏好 Rust 2024 edition", 1);
+        dup_low.ts = now_ms() + 10; // 更新但低重要性
+        s.retain(dup_low).unwrap();
+        let mut dup_high = rec("用户偏好 Rust 2024 edition", 4);
+        dup_high.ts = now_ms() + 20;
+        s.retain(dup_high).unwrap();
+        s.retain(rec("另一个独立条目", 2)).unwrap();
+
+        let report = s.sleep().unwrap();
+        assert_eq!(report.expired_removed, 1);
+        assert_eq!(report.duplicates_removed, 2);
+        assert_eq!(report.banks, 1);
+
+        let rest = s.read_bank("default");
+        assert_eq!(rest.len(), 2, "应为 去重后 1 条 + 独立 1 条");
+        let kept = rest.iter().find(|r| r.content.contains("Rust 2024")).unwrap();
+        assert_eq!(kept.importance, 4, "保留最高重要性");
+        // 幂等：再次 sleep 无操作。
+        let again = s.sleep().unwrap();
+        assert_eq!(again.expired_removed + again.duplicates_removed, 0);
     }
 
     #[tokio::test]
@@ -724,6 +1018,103 @@ mod tests {
     fn bm25_zero_on_disjoint() {
         assert_eq!(bm25_relevance(&tokenize("foo"), &tokenize("bar baz")), 0.0);
         assert!(bm25_relevance(&tokenize("foo"), &tokenize("foo bar")) > 0.0);
+    }
+
+    // ── P1：同义词 / 意图 / 时间 / MMR 集成 ─────────────────────────────────
+
+    fn rec_at(content: &str, importance: u8, age_hours: u64) -> MemoryRecord {
+        let mut r = rec(content, importance);
+        r.ts = now_ms() - age_hours * 3_600_000;
+        r
+    }
+
+    #[test]
+    fn recall_synonym_expansion_hits_canonical() {
+        let s = store();
+        s.retain(rec("database 连接超时排查记录", 2)).unwrap();
+        // 查询用同义词 `db`：canonical 归一化后 `db`→`database` 词面命中
+        let opts = RecallOptions::default();
+        let hits = s.recall("db 连接超时", &opts);
+        assert!(
+            hits.iter().any(|h| h.record.content.contains("database")),
+            "同义词扩展应命中 database 文档"
+        );
+        // 对照组：关闭同义词时 `db` 不映射，词法命中少一词 → 分数更低
+        let opts_off = RecallOptions { use_synonyms: false, ..opts };
+        let on_score = hits.first().map_or(0.0, |h| h.score);
+        let off_score = s.recall("db 连接超时", &opts_off).first().map_or(0.0, |h| h.score);
+        assert!(on_score > off_score, "同义词扩展应提升词法命中分数");
+    }
+
+    #[test]
+    fn recall_preference_intent_boosts_importance() {
+        let s = store();
+        // 内容不含查询词（纯 importance 信号）+ 一条含词但低重要性
+        s.retain(rec_at("用户签名偏好确认", 5, 24)).unwrap();
+        s.retain(rec_at("用户偏好", 1, 24)).unwrap();
+        let opts = RecallOptions { use_intent: true, ..RecallOptions::default() };
+        let hits = s.recall("which approach do you recommend?", &opts);
+        // 无词面重叠时 relevance=0；importance bias 1.5 让高重要性记录胜出
+        assert!(!hits.is_empty());
+        assert!(hits[0].record.content.contains("签名偏好确认"));
+    }
+
+    #[test]
+    fn recall_temporal_query_boosts_matching_age() {
+        let s = store();
+        // 3 天前的记录 vs 30 天前的记录（内容均与查询无词面重叠）
+        s.retain(rec_at("部署排障记录 alpha", 1, 72)).unwrap();
+        s.retain(rec_at("部署排障记录 beta", 1, 720)).unwrap();
+        let opts = RecallOptions { temporal_weight: 0.5, ..RecallOptions::default() };
+        let hits = s.recall("yesterday 之前发生了什么", &opts);
+        // 查询解析出 yesterday（03-04 类目标日）→ 3 天前记录 boost 高，排前
+        assert_eq!(hits[0].record.content, "部署排障记录 alpha");
+        assert_eq!(hits[1].record.content, "部署排障记录 beta");
+    }
+
+    #[test]
+    fn recall_mmr_diversifies_duplicate_content() {
+        // 注：词级（英文）验证与 mnemopi 测试同构；中文近重复走折叠路径
+        // （见 recall_mmr_folds_chinese_near_duplicates）。
+        let s = store();
+        s.retain(rec("fix the login auth bug", 2)).unwrap();
+        s.retain(rec("fix the login auth bug please", 2)).unwrap();
+        s.retain(rec("login payment provider", 2)).unwrap();
+        let opts = RecallOptions::default();
+        let hits = s.recall("login auth", &opts);
+        assert_eq!(hits.len(), 3);
+        // 相关性第一为原始第一名（MMR 首元素 = 最高分候选）
+        assert_eq!(hits[0].record.content, "fix the login auth bug");
+        // 对照组：关闭 MMR 时两条 login/auth 兄弟记录相邻（分数序）
+        let mmr_off = RecallOptions { mmr_lambda: None, ..opts };
+        let plain = s.recall("login auth", &mmr_off);
+        assert!(plain[0].record.content.contains("auth"));
+        assert!(plain[1].record.content.contains("auth"), "对照组前提：重复记录相邻");
+        // MMR 开：重复兄弟记录被多样性压后，独立话题（login payment provider）上位
+        assert_eq!(hits[1].record.content, "login payment provider");
+        assert_eq!(hits[2].record.content, "fix the login auth bug please");
+    }
+
+    #[test]
+    fn recall_mmr_folds_chinese_near_duplicates() {
+        // 中文近重复：单字级 Jaccard 对「追加型重复」只有 0.85 级，MMR 惩罚（λ=0.7）
+        // 压不过词法分数差；折叠路径（containment ≥ 0.9）把重复记录压到尾部，
+        // 独立话题（importance 5）上位第二。
+        let s = store();
+        s.retain(rec_at("修复了登录页的认证问题", 2, 1)).unwrap();
+        s.retain(rec_at("修复了登录页的认证问题请尽快处理", 2, 1)).unwrap();
+        s.retain(rec_at("部署了新的支付网关", 5, 1)).unwrap();
+        let opts = RecallOptions::default();
+        let hits = s.recall("登录认证", &opts);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].record.content, "修复了登录页的认证问题");
+        assert_eq!(hits[1].record.content, "部署了新的支付网关", "重复记录应被压后");
+        assert_eq!(hits[2].record.content, "修复了登录页的认证问题请尽快处理");
+        // 对照组（关闭 MMR）：不折叠，重复兄弟按分数相邻。
+        let mmr_off = RecallOptions { mmr_lambda: None, ..opts };
+        let plain = s.recall("登录认证", &mmr_off);
+        assert!(plain[0].record.content.contains("登录页"));
+        assert!(plain[1].record.content.contains("登录页"), "对照组前提：重复记录相邻");
     }
 
     /// 测试用固定向量嵌入器：手工指定「文本 → 向量」，便于构造 dense 高分/低分场景。
@@ -902,7 +1293,8 @@ mod tests {
         assert_eq!(hits[0].score, base[0].score);
     }
 
-    // 接线：心智模型配置后 summary 注入 seeds + 项目积累（对齐 LocalMemoryStore 格式）。
+    // 接线：心智模型走 trait `mental_models()`（engine 单独注入，排在 `<memories>` 之前）；
+    // summary() 只含记忆摘要（对齐 oh-my-pi：稳定语义锚点在前、易变召回在后）。
     #[tokio::test]
     async fn summary_merges_mental_models_when_configured() {
         let (s, root) = store_root();
@@ -912,21 +1304,23 @@ mod tests {
         let plain = s.summary().await.unwrap().unwrap();
         assert!(plain.contains("rust workspace notes"));
         assert!(!plain.contains("<mental_models>"));
-        // 配置后：项目积累条目注入（内置 seeds 非空，必然出现 mental 段）。
+        // 配置后：项目积累条目经 trait 注入（内置 seeds 非空，必然出现）。
         std::fs::write(
             root.join(MENTAL_MODELS_FILE),
             "- [2026-08-02 12:00:00] 项目约定：先读 AGENTS.md 再动手\n",
         )
         .unwrap();
         let s2 = s.with_mental_models_config(crate::MentalModelsConfig::default());
+        let mental = s2.mental_models().unwrap();
+        assert!(mental.contains("项目约定"), "缺少项目积累: {mental}");
+        // summary() 不再吞 mental 段（顺序交由 engine 组装）。
         let merged = s2.summary().await.unwrap().unwrap();
-        assert!(merged.contains("<mental_models>"), "缺少 mental 段: {merged}");
-        assert!(merged.contains("项目约定"), "缺少项目积累: {merged}");
+        assert!(!merged.contains("<mental_models>"), "summary 不应含 mental 段: {merged}");
         assert!(merged.contains("rust workspace notes"), "记录摘要被覆盖");
-        // 空记忆 + 配置心智模型：只出 mental 段。
+        // 空记忆 + 配置心智模型：summary 为 None，mental 仍可注入。
         let (s3, _) = store_root();
         let s3 = s3.with_mental_models_config(crate::MentalModelsConfig::default());
-        let m3 = s3.summary().await.unwrap().unwrap();
-        assert!(m3.starts_with("<mental_models>"));
+        assert!(s3.summary().await.unwrap().is_none());
+        assert!(s3.mental_models().is_some());
     }
 }

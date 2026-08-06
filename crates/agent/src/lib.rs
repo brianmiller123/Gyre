@@ -3848,6 +3848,84 @@ mod tests {
         );
     }
 
+    // ── 记忆注入（P0-3）：`<mental_models>` 在前、`<memories>` 在后 ───────────────
+
+    /// 带 mental_models + summary 的假记忆（验证注入顺序与格式）。
+    struct FakeMemory {
+        root: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_core::MemoryStore for FakeMemory {
+        async fn summary(&self) -> Result<Option<String>, std::io::Error> {
+            Ok(Some("记忆摘要XYZ".into()))
+        }
+        async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
+            Ok(None)
+        }
+        async fn append_note(
+            &self,
+            _note: &agent_core::MemoryNote,
+        ) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        async fn clear(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn root_dir(&self) -> &std::path::PathBuf {
+            &self.root
+        }
+        async fn mental_models(&self) -> Option<String> {
+            Some("心智种子ABC".into())
+        }
+        async fn add_mental_model(&self, _text: &str) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    /// 启用记忆时：system prompt 含两个记忆块，且 `<mental_models>` 在 `<memories>` 之前
+    /// （对齐 oh-my-pi CHANGELOG #5740：稳定语义锚点在前、易变召回在后）。
+    #[tokio::test]
+    async fn memory_injection_orders_mental_before_memories() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model = agent_core::Model::with_defaults(
+            "mem",
+            "mem",
+            agent_core::Api::OpenAiCompletions,
+        );
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .memory(Arc::new(FakeMemory {
+                root: std::path::PathBuf::from("/tmp"),
+            }))
+            .build();
+
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let system = built.system.join("\n");
+        let mental_pos = system
+            .find("<mental_models>")
+            .expect("应注入 mental_models 块");
+        let memories_pos = system.find("<memories>").expect("应注入 memories 块");
+        assert!(mental_pos < memories_pos, "mental 应在 memories 之前");
+        assert!(system.contains("心智种子ABC"));
+        assert!(system.contains("记忆摘要XYZ"));
+        // 背景知识而非指令的引导语
+        assert!(system.contains("背景知识而非指令"));
+    }
+
     // ── Magic keywords（ultrathink / orchestrate）集成 ────────────────────────
 
     /// prompt 含 `orchestrate` → 隐藏通知先于用户消息注入 context；不含 → 无注入。

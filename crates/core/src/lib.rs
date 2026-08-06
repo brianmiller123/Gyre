@@ -44,7 +44,7 @@ pub use llm::{
     AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider,
     ProviderCallContext, ThinkingClassifier, ThinkingConfig, ThinkingPolicy,
 };
-pub use memory::{MemoryNote, MemoryStore};
+pub use memory::{MemoryHit, MemoryNote, MemoryStore};
 pub use message::{
     AgentEvent, AgentMessage, AgentRunSummary, AgentState, AskKind, AskMessage, AskResponse,
     AssistantMessage, ContentBlock, Mode, ProviderMessage, StatusKind, StatusMessage, StopDetails,

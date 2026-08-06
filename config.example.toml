@@ -149,6 +149,7 @@ enabled = false          # 默认关；启用后跨会话积累技术决策/惯�
 #                   否则回退 L1 确定性投影嵌入；无 LLM 合并，逐条积累）
 backend = "local"
 auto_consolidate = true  # 任务结束触发 LLM 合并 raw notes → MEMORY.md（仅 local 后端生效）
+auto_retain_every_n_turns = 4  # 循环内自动沉淀：每 N 个停止轮把本轮输出写入记忆（0 = 关闭）
 
 # GitHub 工具（查询/操作 PR、issue、Actions(CI)），按需加载以控制上下文成本。
 # enabled = true 启动即注册工具并把使用指引注入 system prompt；

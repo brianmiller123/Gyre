@@ -18,19 +18,28 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
 
+mod intent;
 mod mental_models;
+mod mmr;
 mod store;
 mod structured;
+mod synonyms;
+mod temporal;
 mod vec_memory;
 
+pub use intent::{classify_intent, adjust_weights, IntentCategory, IntentWeights, QueryIntent};
 pub use mental_models::{
     format_ts, load_seeds, merge_mental_models, mental_model_consolidation_prompt, MentalModelsConfig,
     SeedEntry, MENTAL_MODEL_CONSOLIDATION_PROMPT, SEEDS_JSON,
 };
+pub use mmr::{jaccard_similarity, mmr_rerank_indices};
 pub use store::{consolidation_prompt, LocalMemoryStore};
 pub use structured::{
-    MemoryRecord, MemoryStats, RecallHit, RecallOptions, SearchFilter, StructuredMemoryStore,
+    MemoryRecord, MemoryStats, RecallHit, RecallOptions, SearchFilter, SleepReport,
+    StructuredMemoryStore,
 };
+pub use synonyms::{canonical_of, canonicalize_tokens, get_synonyms};
+pub use temporal::{extract_temporal, parse_nl_date, temporal_boost, ParsedDate, TemporalInfo};
 pub use vec_memory::{Embedder, ProjectionEmbedder, StubEmbedder, VecEntry, VectorStore};
 #[cfg(feature = "vec-embed")]
 pub use vec_memory::FastembedEmbedder;

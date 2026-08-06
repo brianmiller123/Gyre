@@ -12,6 +12,7 @@ agent-search = { workspace = true }
 agent-lsp    = { workspace = true }
 reqwest      = { workspace = true }
 agent-ast    = { workspace = true }
+futures      = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 async-trait  = { workspace = true }
@@ -28,6 +29,9 @@ encoding_rs  = { workspace = true }
 criterion = { workspace = true }
 # 基准夹具：确定性临时小仓库
 tempfile = { workspace = true }
+# 记忆工具往返测试（retain→recall 闭环）
+agent-memory = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

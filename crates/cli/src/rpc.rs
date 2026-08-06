@@ -26,8 +26,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::compiled_minimizer;
 use crate::{
-    ConsolidateHook, apply_model_switch, assemble_builtin_tools, load_skill_catalog,
-    optional_context_files,
+    AutoRetainHook, ConsolidateHook, StructuredSleepHook, apply_model_switch,
+    assemble_builtin_tools, load_skill_catalog, optional_context_files,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -470,9 +470,10 @@ pub async fn run_rpc(
     let mut base_context_files = agent_config::discover_context_files(&cwd);
     base_context_files.extend(foreign_sections);
 
-    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换；RPC 无 LLM 合并钩子）。
+    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
     let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
     let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
+    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
     if cfg.memory.enabled {
         match cfg.memory.backend {
             agent_config::MemoryBackend::Local => {
@@ -484,11 +485,13 @@ pub async fn run_rpc(
                 memory = Some(store);
             }
             agent_config::MemoryBackend::Structured => {
-                memory = Some(Arc::new(
+                let store = Arc::new(
                     agent_memory::StructuredMemoryStore::new(&cwd)
                         .with_mental_models_config(agent_memory::MentalModelsConfig::default())
                         .with_embedder(agent_memory::default_embedder()),
-                ));
+                );
+                structured_memory = Some(Arc::clone(&store));
+                memory = Some(store);
             }
         }
     }
@@ -581,6 +584,12 @@ pub async fn run_rpc(
         );
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
+        }
+        // 记忆工具面（P0-1）：recall / retain（仅父 Agent；子 Agent 工具集不含）。
+        if let Some(m) = &memory {
+            tool_registry = tool_registry
+                .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
+                .with(Box::new(agent_tools::MemoryRetainTool::new(Arc::clone(m))));
         }
         if subagent_enabled {
             let task_tool = agent::TaskTool::new(
@@ -717,18 +726,36 @@ pub async fn run_rpc(
         } else {
             builder
         };
-        // LLM 合并钩子仅 local 后端有（structured 逐条积累，无合并语义）。
-        let builder = if let Some(m) = &local_memory {
-            let hook = ConsolidateHook {
+        // 记忆 hooks（P0-2/P0-4）：auto-retain（每 N 个停止轮）+ 会话末维护。
+        // local：ConsolidateHook（LLM 合并，原语义保留）；structured：StructuredSleepHook。
+        let mut hooks: Vec<Arc<dyn agent_core::Hook>> = Vec::new();
+        if let Some(m) = &local_memory {
+            hooks.push(Arc::new(ConsolidateHook {
                 store: Arc::clone(m),
                 provider: Arc::clone(&provider),
                 model: model.clone(),
                 provider_ctx: provider_ctx.clone(),
                 auto_consolidate,
-            };
-            builder.hooks(vec![Arc::new(hook) as Arc<dyn agent_core::Hook>])
-        } else {
+            }));
+        }
+        if let Some(m) = &structured_memory {
+            hooks.push(Arc::new(StructuredSleepHook {
+                store: Arc::clone(m),
+            }));
+        }
+        if let Some(m) = &memory {
+            if cfg.memory.auto_retain_every_n_turns > 0 {
+                hooks.push(Arc::new(AutoRetainHook {
+                    store: Arc::clone(m),
+                    every_n_turns: cfg.memory.auto_retain_every_n_turns,
+                    final_rounds: std::sync::atomic::AtomicUsize::new(0),
+                }));
+            }
+        }
+        let builder = if hooks.is_empty() {
             builder
+        } else {
+            builder.hooks(hooks)
         };
         if enable_thinking {
             let static_cfg = agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000));

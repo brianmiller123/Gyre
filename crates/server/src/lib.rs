@@ -1138,12 +1138,6 @@ async fn build_agent(
         .with_approval(Arc::clone(&approval));
         tool_registry = tool_registry.with(Box::new(task_tool));
     }
-    let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
-
-    let mut context_files = agent_config::discover_context_files(cwd);
-    if config.github.enabled {
-        context_files.push(agent_tools::PROMPT_SECTION.to_string());
-    }
     // 长期记忆（可选；按 cwd 项目作用域，backend 可切换；server 简化装配，无心智模型配置）。
     let memory: Option<Arc<dyn agent_core::MemoryStore>> = if config.memory.enabled {
         match config.memory.backend {
@@ -1158,6 +1152,25 @@ async fn build_agent(
     } else {
         None
     };
+    // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect（仅父 Agent；子 Agent 工具集不含）。
+    // 放在 memory 装配之后，仅启用记忆时注册（零上下文成本）。
+    if let Some(m) = &memory {
+        tool_registry = tool_registry
+            .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
+            .with(Box::new(agent_tools::MemoryRetainTool::new(Arc::clone(m))))
+            .with(Box::new(agent_tools::MemoryReflectTool::new(
+                Arc::clone(m),
+                Arc::clone(&provider),
+                model.clone(),
+                provider_ctx.clone(),
+            )));
+    }
+    let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
+
+    let mut context_files = agent_config::discover_context_files(cwd);
+    if config.github.enabled {
+        context_files.push(agent_tools::PROMPT_SECTION.to_string());
+    }
 
     // 模型的输出 token 预算（来自 profile.max_output_tokens，回退 4096）须下发给
     // Agent 作为每轮请求的 max_tokens；否则 assemble 未设置会回落到硬编码 4096，

@@ -19,6 +19,7 @@ mod list_tool;
 mod lsp_apply;
 mod lsp_tool;
 mod lsp_write_effect;
+mod memory_tool;
 mod search;
 mod shell;
 mod ssh;
@@ -42,6 +43,7 @@ pub use minimizer::{Minimizer, Minimized, OutputFilter, default_filters, disable
 pub use lsp_apply::LspApplyTool;
 pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
+pub use memory_tool::{MemoryRecallTool, MemoryReflectTool, MemoryRetainTool};
 pub use search::{GlobTool, GrepTool};
 pub use shell::RunCommandTool;
 pub use ssh::{SSH_PROMPT_SECTION, SshTool};

@@ -17,6 +17,21 @@ pub struct MemoryNote {
     pub source: String,
 }
 
+/// 一条检索命中（`recall` 工具 / 注入渲染用）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryHit {
+    /// 记录 id。
+    pub id: String,
+    /// 正文。
+    pub content: String,
+    /// 综合得分（0..=1 量级，词法/重要性/时间/向量融合）。
+    pub score: f64,
+    /// 来源（如 "session:<id>"、"auto-retain"）。
+    pub source: String,
+    /// 重要性 0..=5。
+    pub importance: u8,
+}
+
 /// 记忆存储端口（按项目作用域）。
 ///
 /// 实现负责按 cwd（或其哈希）划分独立记忆库，跨会话持久化。
@@ -48,4 +63,41 @@ pub trait MemoryStore: Send + Sync {
 
     /// 该项目记忆库根目录（调试/`memory://` 用）。
     fn root_dir(&self) -> &PathBuf;
+
+    /// 心智模型注入段（seeds + 项目积累，`<mental_models>` 块内容）；无则 `None`。
+    /// 默认无（未配置心智模型的实现 / 装配场景）。
+    async fn mental_models(&self) -> Option<String> {
+        None
+    }
+
+    /// 语义检索（`recall` 工具 / 注入用）：按查询返回 top-K 命中。
+    /// 默认空（local 后端无检索能力，与 oh-my-pi 一致：recall 工具仅 structured 系后端启用）。
+    async fn recall(&self, _query: &str, _limit: usize) -> Vec<MemoryHit> {
+        Vec::new()
+    }
+
+    /// 显式保留一条事实（`retain` 工具）：importance 0..=5。
+    /// 默认路由 [`Self::append_note`]（local 语义：进入 raw notes，任务末 LLM 合并）。
+    ///
+    /// # Errors
+    /// 写入失败时返回 IO 错误。
+    async fn retain(
+        &self,
+        content: &str,
+        _importance: u8,
+        source: &str,
+    ) -> Result<(), std::io::Error> {
+        self.append_note(&MemoryNote {
+            content: content.to_string(),
+            source: source.to_string(),
+        })
+        .await
+    }
+
+    /// 追加一条心智模型（`reflect` 工具 / LLM 提炼用）：写入项目 `mental_models.md`，
+    /// 下次会话经 [`Self::mental_models`] 注入 system prompt。
+    ///
+    /// # Errors
+    /// 写入失败时返回 IO 错误。
+    async fn add_mental_model(&self, text: &str) -> Result<(), std::io::Error>;
 }

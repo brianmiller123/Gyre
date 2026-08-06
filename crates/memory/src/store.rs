@@ -217,16 +217,13 @@ impl LocalMemoryStore {
 #[async_trait]
 impl MemoryStore for LocalMemoryStore {
     async fn summary(&self) -> Result<Option<String>, std::io::Error> {
-        let base = read_text(&self.summary_path());
-        let mental = self.mental_models().await;
-        Ok(match (base, mental) {
-            (None, None) => None,
-            (Some(base), None) => Some(base),
-            (None, Some(mental)) => Some(format!("<mental_models>\n{mental}\n</mental_models>")),
-            (Some(base), Some(mental)) => Some(format!(
-                "{base}\n\n<mental_models>\n{mental}\n</mental_models>"
-            )),
-        })
+        // 只返回已合并摘要（memory_summary.md）；心智模型经 trait `mental_models()`
+        // 由 engine 单独注入（对齐 oh-my-pi：`<mental_models>` 排在 `<memories>` 之前）。
+        Ok(read_text(&self.summary_path()))
+    }
+
+    async fn mental_models(&self) -> Option<String> {
+        self.mental_models().await
     }
 
     async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
@@ -260,6 +257,11 @@ impl MemoryStore for LocalMemoryStore {
 
     fn root_dir(&self) -> &PathBuf {
         &self.root
+    }
+
+    async fn add_mental_model(&self, text: &str) -> Result<(), std::io::Error> {
+        // 固有方法优先于 trait 方法解析：调用下方的固有 add_mental_model，不递归。
+        self.add_mental_model(text).await
     }
 }
 
@@ -350,9 +352,17 @@ mod tests {
             .as_nanos()
     }
 
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn tmp() -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("agent-mem-{}-{:#x}", std::process::id(), nano()));
+        // 纳秒时钟实际精度为微秒级：并行测试可能同微秒取到相同 nano → 同 root 互相踩踏。
+        // 加原子序号保证目录唯一。
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "agent-mem-{}-{seq}-{:#x}",
+            std::process::id(),
+            nano()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -375,27 +385,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_injects_mental_models_block() {
+    async fn summary_and_mental_models_split() {
         let root = tmp();
         let store = LocalMemoryStore::with_root(root.clone());
-        // 无 memory_summary.md 时，内置 seeds 仍使 summary 非空并携带 <mental_models> 段
-        let s = store.summary().await.unwrap().unwrap();
-        assert!(s.contains("<mental_models>"));
-        assert!(s.contains("</mental_models>"));
-        assert!(s.contains("先读 AGENTS.md 再动手"));
+        // 无 memory_summary.md：summary 为 None；心智模型走独立 trait 方法（seeds 非空）。
+        assert!(store.summary().await.unwrap().is_none());
+        let mm = store.mental_models().await.unwrap();
+        assert!(mm.contains("先读 AGENTS.md 再动手"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
-    async fn summary_keeps_existing_memory_and_appends_block() {
+    async fn summary_keeps_existing_memory_without_mental_block() {
         let root = tmp();
         let store = LocalMemoryStore::with_root(root.clone());
         std::fs::write(store.summary_path(), "既有摘要\n第二行").unwrap();
         let s = store.summary().await.unwrap().unwrap();
         assert!(s.contains("既有摘要"));
-        assert!(s.contains("<mental_models>"));
-        // 心智模型段在摘要之后
-        assert!(s.find("既有摘要").unwrap() < s.find("<mental_models>").unwrap());
+        // 心智模型不再混入 summary（engine 单独注入，顺序 mental 在前）。
+        assert!(!s.contains("<mental_models>"));
+        assert!(store.mental_models().await.is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -476,14 +485,11 @@ mod tests {
         std::fs::write(store.memory_path(), "memory").unwrap();
         std::fs::write(store.mental_models_path(), "心智模型条目").unwrap();
         store.clear().await.unwrap();
-        // 摘要与心智模型条目被清除；但内置 seeds 使 summary 仍携带 <mental_models> 段
-        let s = store.summary().await.unwrap().unwrap();
-        assert!(!s.contains("summary"));
-        assert!(!s.contains("心智模型条目"));
-        assert!(s.contains("<mental_models>"));
+        // 摘要与心智模型条目被清除（内置 seeds 仍使 mental_models() 非空，但 summary 为空）。
+        assert!(store.summary().await.unwrap().is_none());
+        assert!(!store.mental_models_path().exists());
         assert!(store.read_full().await.unwrap().is_none());
         assert!(read_notes(&store.notes_path()).unwrap().is_empty());
-        assert!(!store.mental_models_path().exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

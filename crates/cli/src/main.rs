@@ -546,6 +546,7 @@ async fn main() -> Result<()> {
     // 两者都带心智模型注入（P1-6，seeds + 项目 mental_models.md）。
     let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
     let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
+    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
     if cfg.memory.enabled {
         match cfg.memory.backend {
             agent_config::MemoryBackend::Local => {
@@ -564,6 +565,7 @@ async fn main() -> Result<()> {
                         .with_mental_models_config(agent_memory::MentalModelsConfig::default())
                         .with_embedder(agent_memory::default_embedder()),
                 );
+                structured_memory = Some(Arc::clone(&store));
                 memory = Some(store);
             }
         }
@@ -700,6 +702,20 @@ async fn main() -> Result<()> {
         );
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
+        }
+        // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect 经 ToolContext.memory
+        // 访问同一存储；未启用记忆时不注册（零上下文成本）。子 Agent 工具集（sub_reg）
+        // 不含记忆工具。
+        if let Some(m) = &memory {
+            tool_registry = tool_registry
+                .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
+                .with(Box::new(agent_tools::MemoryRetainTool::new(Arc::clone(m))))
+                .with(Box::new(agent_tools::MemoryReflectTool::new(
+                    Arc::clone(m),
+                    Arc::clone(&provider),
+                    model.clone(),
+                    provider_ctx.clone(),
+                )));
         }
         if subagent_enabled {
             let task_tool = agent::TaskTool::new(
@@ -862,18 +878,37 @@ async fn main() -> Result<()> {
         } else {
             builder
         };
-        // LLM 合并钩子仅 local 后端有（structured 逐条积累，无合并语义）。
-        let builder = if let Some(m) = &local_memory {
-            let hook = ConsolidateHook {
+        // 记忆 hooks（P0-2/P0-4）：auto-retain（每 N 个停止轮沉淀本轮输出）+ 会话末维护。
+        // local：ConsolidateHook（LLM 合并 raw notes → MEMORY.md + 心智模型提炼）；
+        // structured：StructuredSleepHook（清理过期 + 去重 + 模型变更重嵌）。
+        let mut hooks: Vec<Arc<dyn agent_core::Hook>> = Vec::new();
+        if let Some(m) = &local_memory {
+            hooks.push(Arc::new(ConsolidateHook {
                 store: Arc::clone(m),
                 provider: Arc::clone(&provider),
                 model: model.clone(),
                 provider_ctx: provider_ctx.clone(),
                 auto_consolidate,
-            };
-            builder.hooks(vec![Arc::new(hook) as Arc<dyn agent_core::Hook>])
-        } else {
+            }));
+        }
+        if let Some(m) = &structured_memory {
+            hooks.push(Arc::new(StructuredSleepHook {
+                store: Arc::clone(m),
+            }));
+        }
+        if let Some(m) = &memory {
+            if cfg.memory.auto_retain_every_n_turns > 0 {
+                hooks.push(Arc::new(AutoRetainHook {
+                    store: Arc::clone(m),
+                    every_n_turns: cfg.memory.auto_retain_every_n_turns,
+                    final_rounds: std::sync::atomic::AtomicUsize::new(0),
+                }));
+            }
+        }
+        let builder = if hooks.is_empty() {
             builder
+        } else {
+            builder.hooks(hooks)
         };
         if enable_thinking {
             let static_cfg = agent_core::ThinkingConfig::new(reasoning_budget.unwrap_or(16_000));
@@ -1840,7 +1875,119 @@ fn print_swarm_result(result: &agent_swarm::PipelineResult) {
     }
 }
 
-/// 长期记忆合并 Hook：任务成功结束时触发 LLM consolidate。
+/// 循环内 auto-retain Hook（P0-2）：每 N 个「停止轮」（will_continue=false，即用户轮次
+/// 的最终模型答复）把本轮 assistant 输出沉淀到记忆；工具轮（will_continue=true）跳过
+/// （中间推理噪音）。对齐 oh-my-pi `retainEveryNTurns` 语义的 Hook 层实现——
+/// 转写 strip `<memories>`/`<mental_models>` 块，防记忆自反馈回路。
+struct AutoRetainHook {
+    store: Arc<dyn agent_core::MemoryStore>,
+    every_n_turns: usize,
+    final_rounds: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Hook for AutoRetainHook {
+    async fn on_event(&self, _event: &HookEvent) {}
+
+    async fn on_turn_end(&self, ctx: &agent_core::TurnEndContext<'_>) {
+        if ctx.will_continue {
+            return; // 工具轮：中间推理噪音，不沉淀
+        }
+        let n = self
+            .final_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n % self.every_n_turns != 0 {
+            return;
+        }
+        // 组装沉淀内容：assistant 最终答复（strip 记忆块）+ 工具调用摘要。
+        let mut parts: Vec<String> = Vec::new();
+        let text = strip_memory_blocks(&ctx.message.text());
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+        for (id, name, args) in ctx.message.tool_calls() {
+            let _ = id;
+            let arg_preview: String = args
+                .to_string()
+                .chars()
+                .take(120)
+                .collect();
+            parts.push(format!("- tool {name}({arg_preview})"));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        // 防爆库：单条上限 4000 字符（对齐 mnemopi 长内容 head 保留）。
+        let content: String = parts.join("\n").chars().take(4000).collect();
+        let note = agent_core::MemoryNote {
+            content,
+            source: "auto-retain".into(),
+        };
+        if let Err(e) = self.store.append_note(&note).await {
+            tracing::warn!(error = %e, "auto-retain 写入失败");
+        }
+    }
+}
+
+/// 结构化记忆会话末维护 Hook（P0-4）：任务成功结束时清理过期记录 + 内容去重 + 模型变更重嵌。
+/// 对齐 mnemopi `sleep` 的轻量版（无 LLM 合并）。
+struct StructuredSleepHook {
+    store: Arc<agent_memory::StructuredMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl Hook for StructuredSleepHook {
+    async fn on_event(&self, event: &HookEvent) {
+        if matches!(event, HookEvent::Stop { success: true }) {
+            match self.store.sleep() {
+                Ok(report) => {
+                    tracing::info!(
+                        banks = report.banks,
+                        expired_removed = report.expired_removed,
+                        duplicates_removed = report.duplicates_removed,
+                        "记忆会话末维护完成"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "记忆会话末维护失败"),
+            }
+        }
+    }
+}
+
+/// 剥除 `<memories>…</memories>` 与 `<mental_models>…</mental_models>` 块（非贪婪，
+/// 大小写不敏感）——防记忆自反馈回路（omp `hindsight/content.ts` 的 strip 语义）。
+fn strip_memory_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let lower = text.to_lowercase();
+    let markers: [&str; 2] = ["<memories>", "<mental_models>"];
+    let mut pos = 0usize;
+    while pos < text.len() {
+        // 找下一个开启标记（大小写不敏感，取原文的实际偏移）。
+        let mut open: Option<(usize, &str)> = None;
+        for m in &markers {
+            if let Some(rel) = lower[pos..].find(m) {
+                let cand = pos + rel;
+                if open.is_none_or(|(o, _)| cand < o) {
+                    open = Some((cand, m));
+                }
+            }
+        }
+        let Some((start, m)) = open else {
+            out.push_str(&text[pos..]);
+            break;
+        };
+        out.push_str(&text[pos..start]);
+        // 找对应结束标记 `</memories>` / `</mental_models>`。
+        let close_tag = format!("</{}>", &m[1..m.len() - 1]);
+        let rest = &lower[start + m.len()..];
+        let close_len = rest.find(&close_tag).map_or(0, |c| c + close_tag.len());
+        pos = start + m.len() + close_len;
+    }
+    out
+}
+
+/// 长期记忆合并 Hook：任务成功结束时触发 LLM consolidate（仅 local 后端）。
 #[derive(Clone)]
 struct ConsolidateHook {
     store: Arc<agent_memory::LocalMemoryStore>,
@@ -2242,6 +2389,124 @@ mod tests {
 
         // 恢复系统探测，避免影响其它测试。
         agent_i18n::init(None);
+    }
+
+    // ── P0-2：auto-retain hook ──────────────────────────────────────────────
+
+    /// 记录 append_note 的 mock 存储。
+    struct MockStore {
+        notes: Arc<std::sync::Mutex<Vec<String>>>,
+        root: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_core::MemoryStore for MockStore {
+        async fn summary(&self) -> Result<Option<String>, std::io::Error> {
+            Ok(None)
+        }
+        async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
+            Ok(None)
+        }
+        async fn append_note(&self, note: &agent_core::MemoryNote) -> Result<(), std::io::Error> {
+            self.notes.lock().unwrap().push(note.content.clone());
+            Ok(())
+        }
+        async fn clear(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn root_dir(&self) -> &PathBuf {
+            &self.root
+        }
+        async fn add_mental_model(&self, _text: &str) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    fn assistant_with_text(text: &str) -> agent_core::AssistantMessage {
+        agent_core::AssistantMessage {
+            content: vec![agent_core::ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: agent_core::Usage::default(),
+            model: "test".into(),
+            stop_reason: None,
+            stop_details: None,
+        }
+    }
+
+    fn turn_ctx<'a>(
+        msg: &'a agent_core::AssistantMessage,
+        will_continue: bool,
+    ) -> agent_core::TurnEndContext<'a> {
+        agent_core::TurnEndContext {
+            message: msg,
+            tool_results: &[],
+            will_continue,
+        }
+    }
+
+    #[test]
+    fn strip_memory_blocks_removes_memories_and_mental() {
+        let text = "前面正文\n<memories>\n1. [0.92] 旧召回\n</memories>\n中间\n<mental_models>种子</mental_models>\n结尾";
+        let stripped = strip_memory_blocks(text);
+        assert!(stripped.contains("前面正文"));
+        assert!(stripped.contains("中间"));
+        assert!(stripped.contains("结尾"));
+        assert!(!stripped.contains("旧召回"));
+        assert!(!stripped.contains("<memories>"));
+        assert!(!stripped.contains("<mental_models>"));
+        // 大小写不敏感
+        let mixed = strip_memory_blocks("<MEMORIES>内容</MEMORIES>保留");
+        assert!(!mixed.contains("内容"));
+        assert!(mixed.contains("保留"));
+        // 无块时不改动
+        assert_eq!(strip_memory_blocks("纯文本"), "纯文本");
+    }
+
+    #[tokio::test]
+    async fn auto_retain_counts_final_rounds_only() {
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = Arc::new(MockStore {
+            notes: Arc::clone(&notes),
+            root: PathBuf::from("/tmp/mock"),
+        });
+        let hook = AutoRetainHook {
+            store,
+            every_n_turns: 4,
+            final_rounds: std::sync::atomic::AtomicUsize::new(0),
+        };
+        // 工具轮（will_continue=true）不计数不沉淀。
+        let tool_msg = assistant_with_text("正在检查…");
+        hook.on_turn_end(&turn_ctx(&tool_msg, true)).await;
+        // 停止轮 1..=3：不触发。
+        for i in 1..=3 {
+            let msg = assistant_with_text(&format!("答复 {i}"));
+            hook.on_turn_end(&turn_ctx(&msg, false)).await;
+        }
+        assert!(notes.lock().unwrap().is_empty(), "前 3 个停止轮不应沉淀");
+        // 停止轮 4：触发沉淀（内容 = assistant 文本 + 工具摘要）。
+        let mut msg = assistant_with_text("决定用 structured 后端");
+        msg.content.push(agent_core::ContentBlock::ToolCall {
+            id: "t1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({ "path": "Cargo.toml" }),
+        });
+        hook.on_turn_end(&turn_ctx(&msg, false)).await;
+        let got = notes.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("决定用 structured 后端"));
+        assert!(got[0].contains("- tool write_file("), "应含工具摘要");
+        assert!(got[0].chars().count() <= 4000, "防爆库截断");
+        // 停止轮 5..=7 不触发，8 再触发。
+        drop(got);
+        for i in 5..=7 {
+            let m = assistant_with_text(&format!("答复 {i}"));
+            hook.on_turn_end(&turn_ctx(&m, false)).await;
+        }
+        assert_eq!(notes.lock().unwrap().len(), 1);
+        let m8 = assistant_with_text("收尾总结");
+        hook.on_turn_end(&turn_ctx(&m8, false)).await;
+        assert_eq!(notes.lock().unwrap().len(), 2);
     }
 }
 

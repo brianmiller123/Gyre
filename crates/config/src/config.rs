@@ -640,10 +640,18 @@ pub struct MemoryConfig {
     /// 任务结束时是否触发 LLM 合并 raw notes → MEMORY.md（仅 local 后端生效）。
     #[serde(default = "default_auto_consolidate")]
     pub auto_consolidate: bool,
+    /// 循环内自动沉淀：每 N 个停止轮把本轮 assistant 输出写入记忆（0 = 关闭）。
+    /// 对齐 oh-my-pi `retainEveryNTurns`；两个后端均生效（local → raw notes，structured → 记录）。
+    #[serde(default = "default_auto_retain_every_n_turns")]
+    pub auto_retain_every_n_turns: usize,
 }
 
 fn default_auto_consolidate() -> bool {
     true
+}
+
+fn default_auto_retain_every_n_turns() -> usize {
+    4
 }
 
 impl Default for MemoryConfig {
@@ -652,6 +660,7 @@ impl Default for MemoryConfig {
             enabled: false,
             backend: MemoryBackend::Local,
             auto_consolidate: true,
+            auto_retain_every_n_turns: 4,
         }
     }
 }
