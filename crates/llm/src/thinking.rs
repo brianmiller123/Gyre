@@ -2,7 +2,7 @@
 //!
 //! 移植 oh-my-pi [`auto-thinking/classifier.ts`]：用 tiny/smol 模型把用户 prompt 分到
 //! [`Effort`] 档（low/medium/high/xhigh），映射为 `budget_tokens` 并钳到模型范围。
-//! 实现 [`ThinkingClassifier`] trait，供 [`ThinkingPolicy::Auto`] 经 run_loop 每轮解析。
+//! 实现 [`ThinkingClassifier`] trait，供 [`ThinkingPolicy::Auto`] 经 `run_loop` 每轮解析。
 //!
 //! 设计要点（对齐 oh-my-pi）：
 //! - **单次 8-token 输出**：分类是单词任务，预算极小（`ANSWER_MAX_TOKENS=8`）。
@@ -101,7 +101,6 @@ impl ThinkingClassifier for LlmThinkingClassifier {
 mod tests {
     use super::*;
     use agent_core::{AssistantMessage, LlmError, Usage};
-    use futures::stream::StreamExt;
 
     /// 桩 Provider：流式下发预设文本，用于测试分类器解析。
     struct StubClassifierProvider {

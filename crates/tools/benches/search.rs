@@ -1,11 +1,11 @@
 //! 基准门：grep / glob 吞吐（对标报告 §六.2 热路径基准）。
 //!
-//! 真实热路径函数（crates/tools/src/search.rs 的 GrepTool / GlobTool 经
+//! 真实热路径函数（crates/tools/src/search.rs 的 `GrepTool` / `GlobTool` 经
 //! `spawn_blocking` 委托到 agent-search）：
 //! - `agent_search::grep(root, pattern, max_hits)`：crates/search/src/lib.rs:42
 //!   （ignore 并行遍历 + 逐行正则匹配；工具调用参数 `(root, pattern, 50)`）
 //! - `agent_search::glob_match(root, pattern, max)`：crates/search/src/lib.rs:105
-//!   （globset 匹配 + fs_cache 扫描缓存；工具调用参数 `(root, pattern, 100)`）
+//!   （globset 匹配 + `fs_cache` 扫描缓存；工具调用参数 `(root, pattern, 100)`）
 //! - 内存行匹配内核 `agent_search::highlight_match(line, pattern)`：
 //!   crates/search/src/lib.rs:137（grep 结果渲染复用的同一正则匹配内核）
 //!
@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::path::Path;
 
 use agent_search::{glob_match, grep, highlight_match};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 /// 小仓库规模：200 个文件（约 8k 行），模拟一次轻量工作区遍历。
 const FILE_COUNT: usize = 200;
@@ -28,7 +28,7 @@ const GREP_PATTERN: &str = "TODO";
 const GLOB_PATTERN: &str = "**/*.rs";
 
 /// xorshift64*：确定性伪随机（夹具内容可复现，无外部依赖）。
-fn rng(seed: &mut u64) -> u64 {
+const fn rng(seed: &mut u64) -> u64 {
     *seed ^= *seed >> 12;
     *seed ^= *seed << 25;
     *seed ^= *seed >> 27;
@@ -85,8 +85,8 @@ fn bench_glob(c: &mut Criterion) {
     build_fixture(dir.path());
     c.bench_function("glob_match/rs_200_files", |b| {
         b.iter(|| {
-            let files = glob_match(dir.path(), GLOB_PATTERN, FILE_COUNT)
-                .expect("glob 基准模式合法");
+            let files =
+                glob_match(dir.path(), GLOB_PATTERN, FILE_COUNT).expect("glob 基准模式合法");
             black_box(files);
         });
     });

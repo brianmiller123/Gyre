@@ -7,7 +7,7 @@ version      = "0.1.0"
 edition      = "2024"
 license      = "MIT"
 authors      = ["agent-project"]
-repository   = "https://github.com/agent-project/agent-project"
+repository   = "https://github.com/brianmiller123/Gyre"
 rust-version = "1.85"
 
 [workspace.lints.rust]
@@ -16,20 +16,21 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 all         = { level = "warn", priority = -1 }
 correctness = { level = "deny", priority = -1 }
-pedantic    = { level = "warn", priority = -1 }
-nursery     = { level = "warn", priority = -1 }
-# 务实放宽：与 oh-my-pi 一致的工程化取舍
-module_name_repetitions    = "allow"
-must_use_candidate         = "allow"
-missing_errors_doc         = "allow"
-missing_panics_doc         = "allow"
-cast_possible_truncation   = "allow"
-cast_possible_wrap         = "allow"
-cast_sign_loss             = "allow"
-cast_precision_loss        = "allow"
-needless_pass_by_value     = "allow"
-fn_params_excessive_bools  = "allow"
-struct_excessive_bools     = "allow"
+perf        = { level = "deny", priority = -1 }
+suspicious  = { level = "warn", priority = -1 }
+complexity  = { level = "warn", priority = -1 }
+style       = { level = "warn", priority = -1 }
+# pedantic / nursery 整组不作为执法基线：83k 行存量从未在其下维护（2026-09 前 CI 为
+# -A warnings），整组开启会产生 600+ 风格噪音且 nursery 官方自述接受不稳定 lint。
+# 有真实收益的项显式入选（下方精选），修完后可逐项升回。
+pedantic    = { level = "allow", priority = -1 }
+nursery     = { level = "allow", priority = -1 }
+unchecked_time_subtraction      = "warn"
+mutex_integer                  = "warn"
+mem_forget                     = "warn"
+rc_buffer                      = "warn"
+vec_box                        = "warn"
+option_option                  = "warn"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 共享依赖（crates 内通过 `dep.workspace = true` 引用）
@@ -40,6 +41,7 @@ similar     = "3.1"
 
 # 异步与并发
 tokio       = { version = "1", features = ["full"] }
+parking_lot = "0.12"
 tokio-util  = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 async-stream = "0.3"
@@ -113,6 +115,11 @@ tracing-opentelemetry = "0.28"
 secrecy     = { version = "0.10", features = ["serde"] }
 dirs        = "5"
 tempfile    = "3"            # browser 工具临时 --user-data-dir
+# read_file 二进制格式面（对齐 omp read：归档/SQLite）
+zip         = { version = "2", default-features = false, features = ["deflate"] }
+tar         = "0.4"
+flate2      = "1"            # .tar.gz 解压
+rusqlite    = { version = "0.32", default-features = false, features = ["bundled"] }
 glob        = "0.3"            # 命令规则 glob 匹配
 uuid        = { version = "1", features = ["v4"] }
 
@@ -159,6 +166,17 @@ agent-acp     = { path = "crates/acp" }
 agent-i18n    = { path = "crates/i18n" }
 agent-ttsr    = { path = "crates/ttsr" }
 agent-cli     = { path = "crates/cli" }
+
+agent-shell  = { path = "crates/shell" }
+
+# ── 进程内工具（vendor 自 oh-my-pi，见 docs/oh-my-pi-*）────────────────────────
+pi-shell     = { path = "vendor/pi-shell" }
+pi-builtins  = { path = "vendor/pi-builtins" }
+pi-walker    = { path = "vendor/pi-walker" }
+brush-core   = { path = "vendor/brush-core" }
+
+[patch.crates-io]
+brush-core = { path = "vendor/brush-core" }
 
 [profile.release]
 opt-level     = 3

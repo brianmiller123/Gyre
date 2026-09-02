@@ -8,18 +8,18 @@
 //!   （normalize + paginate + `agent_snapcompact::render_frame` 渲染 PNG 帧；帧形状固定
 //!   1568² / 8×16 单元格，单帧行数上限 98——基准按 ~92 行构造单页小帧，控制渲染时长）
 //!
-//! 输入确定性：消息日志在 bench 内构造（user / assistant / tool_call / tool_result 混合），
+//! 输入确定性：消息日志在 bench 内构造（user / assistant / `tool_call` / `tool_result` 混合），
 //! 不依赖外部文件或网络。
 
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::Pin;
 
+use agent_context::compaction::{Compactor, SnapcompactOptions, SummaryProvider};
 use agent_core::{
     AgentMessage, AssistantMessage, ContentBlock, ToolResult, ToolResultMessage, Usage,
 };
-use agent_context::compaction::{Compactor, SnapcompactOptions, SummaryProvider};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 /// 固定摘要 provider：不调 LLM，返回确定性摘要——基准聚焦消息序列化本身。
@@ -73,7 +73,9 @@ fn build_log(n: usize) -> Vec<AgentMessage> {
     let mut log = Vec::with_capacity(n + n / 4);
     for i in 0..n {
         match i % 4 {
-            0 => log.push(AgentMessage::user_text(format!("问题 {i}：如何实现 {i} 号功能？"))),
+            0 => log.push(AgentMessage::user_text(format!(
+                "问题 {i}：如何实现 {i} 号功能？"
+            ))),
             1 => log.push(assistant(&format!(
                 "方案：实现 {i} 号功能，注意边界条件与性能，随后自测验证。"
             ))),
@@ -81,7 +83,10 @@ fn build_log(n: usize) -> Vec<AgentMessage> {
                 let id = format!("call-{i}");
                 let tool = if i % 2 == 0 { "read_file" } else { "grep" };
                 log.push(tool_call(&id, tool));
-                log.push(tool_result(&id, &format!("命中 {i} 行，含关键信息 TODO：检查点 {i}。")));
+                log.push(tool_result(
+                    &id,
+                    &format!("命中 {i} 行，含关键信息 TODO：检查点 {i}。"),
+                ));
             }
             _ => log.push(assistant(&format!("已确认第 {i} 项完成，下一步继续推进。"))),
         }
@@ -89,7 +94,7 @@ fn build_log(n: usize) -> Vec<AgentMessage> {
     log
 }
 
-/// summarize：旧消息序列化 + 摘要消息拼接（keep_recent 窗口保留在日志中）。
+/// summarize：旧消息序列化 + `摘要消息拼接（keep_recent` 窗口保留在日志中）。
 fn bench_summarize(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime 创建失败");
     let log = build_log(120);

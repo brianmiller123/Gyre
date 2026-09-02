@@ -18,17 +18,28 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::{MemoryNote, MemoryStore};
+use agent_core::{
+    AssistantEvent, CompletionRequest, LlmProvider, MemoryNote, MemoryStore, Model,
+    ProviderCallContext, ProviderMessage, UserContent,
+};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::consolidate::{
+    CONSOLIDATE_BATCH_MAX, CONSOLIDATE_CHARS_BUDGET, CONSOLIDATE_MIN_RECORDS, ConsolidateReport,
+    structured_consolidation_prompt,
+};
+
 use crate::intent::{adjust_weights, classify_intent};
-use crate::mental_models::{load_seeds, merge_mental_models, MentalModelsConfig};
-use crate::mmr::{containment_similarity, jaccard_similarity, mmr_rerank_indices, strip_cjk_stop_chars};
+use crate::mental_models::{MentalModelsConfig, load_seeds, merge_mental_models};
+use crate::mmr::{
+    containment_similarity, jaccard_similarity, mmr_rerank_indices, strip_cjk_stop_chars,
+};
 use crate::synonyms::canonicalize_tokens;
 use crate::temporal::{extract_temporal, query_asks_current, temporal_boost};
 use crate::vec_memory::{
-    cosine_similarity, decode_f32s, encode_f32s, Embedder, VecEntry, VectorStore,
+    Embedder, VecEntry, VectorStore, cosine_similarity, decode_f32s, encode_f32s,
 };
 
 const DEFAULT_BANK: &str = "default";
@@ -61,6 +72,9 @@ pub struct MemoryRecord {
     /// 失效毫秒时间戳（None 表示永久）。
     #[serde(default)]
     pub valid_until: Option<u64>,
+    /// 已沉淀毫秒时间戳（None = 工作记忆，待 LLM 提炼）；沉淀后标记，避免重复吸收。
+    #[serde(default)]
+    pub consolidated_at: Option<u64>,
 }
 
 fn default_importance() -> u8 {
@@ -96,7 +110,7 @@ impl Default for RecallOptions {
             fts_weight: 1.0,
             importance_weight: 0.5,
             temporal_weight: 0.3,
-            vec_weight: 0.5, // 对齐 mnemopi 默认向量权重
+            vec_weight: 0.5,             // 对齐 mnemopi 默认向量权重
             halflife_hours: 24.0 * 14.0, // 两周
             limit: 8,
             mmr_lambda: Some(0.7), // 对齐 mnemopi recallEnhanced 默认
@@ -227,7 +241,11 @@ impl StructuredMemoryStore {
         query: &str,
     ) -> Option<(Vec<f32>, HashMap<String, VecEntry>)> {
         let embedder = self.embedder.as_ref()?;
-        let qv = embedder.embed(&[query.to_string()]).ok()?.into_iter().next()?;
+        let qv = embedder
+            .embed(&[query.to_string()])
+            .ok()?
+            .into_iter()
+            .next()?;
         let vs = VectorStore::new(&self.bank_dir(bank));
         let entries = vs.all();
         let need_reembed =
@@ -351,7 +369,12 @@ impl StructuredMemoryStore {
                 &intent,
             )
         } else {
-            (opts.fts_weight, opts.importance_weight, opts.temporal_weight, opts.vec_weight)
+            (
+                opts.fts_weight,
+                opts.importance_weight,
+                opts.temporal_weight,
+                opts.vec_weight,
+            )
         };
         // P1：时间表达解析——`yesterday`/`3 days ago`/`三天前`/`上周一` 等将时间信号
         // 切换为相对目标日期。P1b：queryAsksCurrent——`now/latest/recent/current` 类
@@ -365,7 +388,9 @@ impl StructuredMemoryStore {
             Some(extract_temporal(query, None))
         };
         let (query_time_ms, temp_w) = match temporal {
-            Some(t) if query_asks_current(query) => (t.event_date_ms.or(Some(now)), temp_w.max(0.45)),
+            Some(t) if query_asks_current(query) => {
+                (t.event_date_ms.or(Some(now)), temp_w.max(0.45))
+            }
             Some(t) => (t.event_date_ms, temp_w),
             None => (None, temp_w),
         };
@@ -392,13 +417,13 @@ impl StructuredMemoryStore {
                 let recency = match query_time_ms {
                     // P1：查询含时间表达 → 指数衰减相对目标时刻（过去衰减、当天/未来满值）
                     Some(qt) => temporal_boost(record.ts, qt, opts.halflife_hours),
-                    None => 2f64
-                        .powf(-((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours)),
+                    None => 2f64.powf(
+                        -((now_hours - record.ts as f64 / 3_600_000.0) / opts.halflife_hours),
+                    ),
                 };
                 let importance = f64::from(record.importance.min(5)) / 5.0;
-                let mut score = fts_w * relevance
-                    + imp_w * importance
-                    + temp_w * recency.clamp(0.0, 1.0);
+                let mut score =
+                    fts_w * relevance + imp_w * importance + temp_w * recency.clamp(0.0, 1.0);
                 // dense 融合：`vec_weight · max(0, cosine)`；缺失/损坏向量只跳过，不报错
                 if let Some((qv, by_id)) = &dense {
                     if let Some(entry) = by_id.get(&record.id) {
@@ -566,7 +591,7 @@ impl StructuredMemoryStore {
                     || filter.tags.iter().any(|t| r.tags.iter().any(|rt| rt == t))
             })
             .collect();
-        out.sort_by(|a, b| b.ts.cmp(&a.ts));
+        out.sort_by_key(|b| std::cmp::Reverse(b.ts));
         out
     }
 
@@ -667,12 +692,128 @@ impl StructuredMemoryStore {
             if let Some(embedder) = &self.embedder {
                 let vs = VectorStore::new(&self.bank_dir(&bank));
                 let entries = vs.all();
-                let need = entries.is_empty()
-                    || entries.iter().any(|e| e.model != embedder.model_name());
+                let need =
+                    entries.is_empty() || entries.iter().any(|e| e.model != embedder.model_name());
                 if need {
                     self.reembed(&bank, embedder.as_ref());
                 }
             }
+        }
+        Ok(report)
+    }
+
+    /// LLM 沉淀（working → episodic 提炼）：把各 bank 未沉淀记录批量提炼为精炼
+    /// 长期记忆记录（`source="consolidated"`、`metadata.tier="episodic"`、重要性取批内
+    /// 最大值、标签取并集），并把原记录标记 `consolidated_at` 防重复吸收。
+    ///
+    /// 批次预算：[`CONSOLIDATE_BATCH_MAX`] 条 / [`CONSOLIDATE_CHARS_BUDGET`] 字符；
+    /// 少于 [`CONSOLIDATE_MIN_RECORDS`] 条跳过（不值得一次 LLM 调用）。
+    /// 原记录保留可召回（不删除、不改 `valid_until`）——召回面只增不减。
+    ///
+    /// # Errors
+    /// LLM 调用或落盘失败时返回错误。
+    pub async fn consolidate(
+        &self,
+        provider: &Arc<dyn LlmProvider>,
+        model: &Model,
+        provider_ctx: &ProviderCallContext,
+    ) -> Result<ConsolidateReport, String> {
+        let mut report = ConsolidateReport::default();
+        for bank in self.list_banks() {
+            let now = now_ms();
+            let path = self.records_path(&bank);
+            let records = read_records(&path);
+            // 未沉淀 + 未过期，按时间升序（最旧先吸收）。
+            let mut batch: Vec<MemoryRecord> = records
+                .iter()
+                .filter(|r| r.consolidated_at.is_none())
+                .filter(|r| r.valid_until.is_none_or(|v| v >= now))
+                .cloned()
+                .collect();
+            batch.sort_by_key(|r| r.ts);
+            batch.truncate(CONSOLIDATE_BATCH_MAX);
+            // 字符预算：从旧到新累计，超预算截尾。
+            let mut budget = CONSOLIDATE_CHARS_BUDGET;
+            batch.retain(|r| {
+                if budget >= r.content.len() {
+                    budget -= r.content.len();
+                    true
+                } else {
+                    false
+                }
+            });
+            if batch.len() < CONSOLIDATE_MIN_RECORDS {
+                continue;
+            }
+            let prompt = structured_consolidation_prompt(&batch);
+            let req = CompletionRequest {
+                model: model.clone(),
+                system: vec![crate::consolidate::CONSOLIDATION_SYSTEM.to_string()],
+                messages: vec![ProviderMessage::User {
+                    content: vec![UserContent::Text { text: prompt }],
+                }],
+                tools: vec![],
+                tool_choice: None,
+                max_tokens: 1024,
+                temperature: Some(0.0),
+                thinking: None,
+                cache_key: None,
+                stable_prefix_len: 0,
+            };
+            let mut stream = provider
+                .stream(req, provider_ctx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut distilled = String::new();
+            while let Some(ev) = stream.next().await {
+                if let AssistantEvent::TextDelta(d) = ev {
+                    distilled.push_str(&d);
+                }
+            }
+            let distilled = distilled.trim();
+            if distilled.is_empty() {
+                // 空输出视为跳过：原记录不动，下轮重试。
+                continue;
+            }
+            let importance = batch.iter().map(|r| r.importance).max().unwrap_or(1);
+            let tags: Vec<String> = {
+                let mut seen = HashSet::new();
+                batch
+                    .iter()
+                    .flat_map(|r| r.tags.iter().cloned())
+                    .filter(|t| seen.insert(t.clone()))
+                    .collect()
+            };
+            let mut metadata = BTreeMap::new();
+            metadata.insert("tier".to_string(), "episodic".to_string());
+            let distilled_id = uuid::Uuid::new_v4().to_string();
+            let episodic = MemoryRecord {
+                id: distilled_id.clone(),
+                content: distilled.to_string(),
+                source: "consolidated".to_string(),
+                importance,
+                scope: String::new(),
+                metadata,
+                tags,
+                ts: now,
+                valid_until: None,
+                consolidated_at: Some(now), // 已沉淀，不再参与后续提炼
+            };
+            // 原记录标记 consolidated_at（时间戳），保留可召回。
+            let mut out: Vec<MemoryRecord> = records
+                .into_iter()
+                .map(|mut r| {
+                    if batch.iter().any(|b| b.id == r.id) {
+                        r.consolidated_at = Some(now);
+                    }
+                    r
+                })
+                .collect();
+            out.push(episodic);
+            rewrite_records(&path, &out).map_err(|e| e.to_string())?;
+            report.banks += 1;
+            report.absorbed += batch.len();
+            report.distilled += 1;
         }
         Ok(report)
     }
@@ -744,8 +885,24 @@ impl MemoryStore for StructuredMemoryStore {
             tags: Vec::new(),
             ts: now_ms(),
             valid_until: None,
+            consolidated_at: None,
         };
         self.retain(record)
+    }
+
+    async fn forget(&self, id: &str) -> Result<bool, std::io::Error> {
+        // 记录 id 为 UUID（全局唯一）：逐 bank 扫描，命中即删
+        //（forget_in 未命中不重写文件，扫描无副作用）。
+        for bank in self.list_banks() {
+            if self.forget_in(&bank, id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn banks(&self) -> Vec<String> {
+        self.list_banks()
     }
 
     async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
@@ -777,6 +934,7 @@ impl MemoryStore for StructuredMemoryStore {
             tags: Vec::new(),
             ts: now_ms(),
             valid_until: None,
+            consolidated_at: None,
         };
         self.retain(record)
     }
@@ -807,7 +965,10 @@ impl MemoryStore for StructuredMemoryStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         f.write_all(line.as_bytes())
     }
 }
@@ -964,6 +1125,7 @@ mod tests {
             tags: vec![],
             ts: now_ms(),
             valid_until: None,
+            consolidated_at: None,
         }
     }
 
@@ -990,11 +1152,128 @@ mod tests {
 
         let rest = s.read_bank("default");
         assert_eq!(rest.len(), 2, "应为 去重后 1 条 + 独立 1 条");
-        let kept = rest.iter().find(|r| r.content.contains("Rust 2024")).unwrap();
+        let kept = rest
+            .iter()
+            .find(|r| r.content.contains("Rust 2024"))
+            .unwrap();
         assert_eq!(kept.importance, 4, "保留最高重要性");
         // 幂等：再次 sleep 无操作。
         let again = s.sleep().unwrap();
         assert_eq!(again.expired_removed + again.duplicates_removed, 0);
+    }
+
+    /// 固定回显的桩 LLM（测试 consolidate 管线用）。
+    struct EchoProvider {
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for EchoProvider {
+        fn id(&self) -> &'static str {
+            "echo"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+            _ctx: &ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::TextDelta(self.reply.to_string()),
+            ])))
+        }
+    }
+
+    fn echo_provider() -> Arc<dyn LlmProvider> {
+        Arc::new(EchoProvider {
+            reply: "- 用户偏好 Bun 运行时\n- 依赖升级先跑 minor",
+        })
+    }
+
+    fn model() -> Model {
+        Model::with_defaults("m", "test", agent_core::Api::OpenAiCompletions)
+    }
+
+    fn provider_ctx() -> ProviderCallContext {
+        ProviderCallContext {
+            api_key: None,
+            base_url: None,
+            max_in_flight: None,
+        }
+    }
+
+    // P0-5：LLM 沉淀——未沉淀记录批量提炼为 episodic 记录并标记原记录。
+    #[tokio::test]
+    async fn consolidate_distills_unconsolidated_records() {
+        let s = store();
+        s.retain(rec("用户偏好 Bun", 3)).unwrap();
+        s.retain(rec("依赖升级先跑 minor", 4)).unwrap();
+
+        let report = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.absorbed, 2);
+        assert_eq!(report.distilled, 1);
+        assert_eq!(report.banks, 1);
+
+        let rest = s.read_bank("default");
+        assert_eq!(rest.len(), 3, "原 2 条保留 + 1 条提炼记录");
+        let epi = rest.iter().find(|r| r.source == "consolidated").unwrap();
+        assert_eq!(epi.importance, 4, "重要性取批内最大值");
+        assert_eq!(
+            epi.metadata.get("tier").map(String::as_str),
+            Some("episodic")
+        );
+        assert!(epi.consolidated_at.is_some(), "提炼记录自身已沉淀");
+        assert!(epi.content.contains("Bun"));
+        // 原记录标记 consolidated_at，仍可召回。
+        let orig = rest
+            .iter()
+            .find(|r| r.content.contains("依赖升级"))
+            .unwrap();
+        assert!(orig.consolidated_at.is_some());
+        let hits = s.recall("依赖升级", &RecallOptions::default());
+        assert!(hits.iter().any(|h| h.record.content.contains("依赖升级")));
+        // 幂等：再次沉淀无新吸收。
+        let again = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert_eq!(again.absorbed, 0);
+        assert_eq!(again.distilled, 0);
+    }
+
+    #[tokio::test]
+    async fn consolidate_skips_below_min_records() {
+        let s = store();
+        s.retain(rec("单条记录", 2)).unwrap();
+        let report = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.absorbed, 0, "不足 2 条不触发 LLM");
+        let rest = s.read_bank("default");
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].consolidated_at.is_none(), "未沉淀标记保持 None");
+    }
+
+    #[tokio::test]
+    async fn consolidate_respects_chars_budget() {
+        let s = store();
+        // 超预算的旧记录应被截掉，只吸收预算内记录。
+        let mut big = rec("旧的大记录：".repeat(2000).as_str(), 1);
+        big.ts = now_ms() - 1000;
+        s.retain(big).unwrap();
+        s.retain(rec("新小记录", 2)).unwrap();
+        // 预算 8000：大记录 14000 字超预算且在最旧 → 只剩 1 条 → 跳过。
+        let report = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.absorbed, 0);
     }
 
     #[tokio::test]
@@ -1040,8 +1319,7 @@ mod tests {
         let s = store();
         let r = rec("to be forgotten", 1);
         let id = if r.id.is_empty() {
-            let id = uuid::Uuid::new_v4().to_string();
-            id
+            uuid::Uuid::new_v4().to_string()
         } else {
             r.id.clone()
         };
@@ -1050,6 +1328,40 @@ mod tests {
         s.retain(r).unwrap();
         assert!(s.forget(&id).unwrap());
         assert!(!s.forget(&id).unwrap());
+    }
+
+    // P0：trait forget/banks（memory_edit 工具面）——跨 bank 扫描真实删除。
+    // 显式走 trait 方法（UFCS）：`s.forget` 会优先解析到内在方法（仅 default bank）。
+    #[tokio::test]
+    async fn trait_forget_scans_banks_and_lists() {
+        let s = store();
+        s.retain(rec("默认库条目", 3)).unwrap();
+        let mut b = rec("项目库条目", 2);
+        b.id = "fixed-id-proj".into();
+        s.retain_in("proj", b).unwrap();
+
+        // banks 列出实际存在的库目录。
+        let banks = agent_core::MemoryStore::banks(&s).await;
+        assert!(banks.contains(&"default".to_string()), "{banks:?}");
+        assert!(banks.contains(&"proj".to_string()), "{banks:?}");
+
+        // 未命中：不报错、不改库。
+        assert!(
+            !agent_core::MemoryStore::forget(&s, "no-such-id")
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.read_bank("proj").len(), 1);
+        assert_eq!(s.read_bank("default").len(), 1);
+
+        // 非 default bank 的 id 也能删（trait forget 全库扫描）。
+        assert!(
+            agent_core::MemoryStore::forget(&s, "fixed-id-proj")
+                .await
+                .unwrap()
+        );
+        assert!(s.read_bank("proj").is_empty(), "proj 条目应被真实删除");
+        assert_eq!(s.read_bank("default").len(), 1, "default 不受影响");
     }
 
     #[tokio::test]
@@ -1093,9 +1405,15 @@ mod tests {
             "同义词扩展应命中 database 文档"
         );
         // 对照组：关闭同义词时 `db` 不映射，词法命中少一词 → 分数更低
-        let opts_off = RecallOptions { use_synonyms: false, ..opts };
+        let opts_off = RecallOptions {
+            use_synonyms: false,
+            ..opts
+        };
         let on_score = hits.first().map_or(0.0, |h| h.score);
-        let off_score = s.recall("db 连接超时", &opts_off).first().map_or(0.0, |h| h.score);
+        let off_score = s
+            .recall("db 连接超时", &opts_off)
+            .first()
+            .map_or(0.0, |h| h.score);
         assert!(on_score > off_score, "同义词扩展应提升词法命中分数");
     }
 
@@ -1105,7 +1423,10 @@ mod tests {
         // 内容不含查询词（纯 importance 信号）+ 一条含词但低重要性
         s.retain(rec_at("用户签名偏好确认", 5, 24)).unwrap();
         s.retain(rec_at("用户偏好", 1, 24)).unwrap();
-        let opts = RecallOptions { use_intent: true, ..RecallOptions::default() };
+        let opts = RecallOptions {
+            use_intent: true,
+            ..RecallOptions::default()
+        };
         let hits = s.recall("which approach do you recommend?", &opts);
         // 无词面重叠时 relevance=0；importance bias 1.5 让高重要性记录胜出
         assert!(!hits.is_empty());
@@ -1118,7 +1439,10 @@ mod tests {
         // 3 天前的记录 vs 30 天前的记录（内容均与查询无词面重叠）
         s.retain(rec_at("部署排障记录 alpha", 1, 72)).unwrap();
         s.retain(rec_at("部署排障记录 beta", 1, 720)).unwrap();
-        let opts = RecallOptions { temporal_weight: 0.5, ..RecallOptions::default() };
+        let opts = RecallOptions {
+            temporal_weight: 0.5,
+            ..RecallOptions::default()
+        };
         let hits = s.recall("yesterday 之前发生了什么", &opts);
         // 查询解析出 yesterday（03-04 类目标日）→ 3 天前记录 boost 高，排前
         assert_eq!(hits[0].record.content, "部署排障记录 alpha");
@@ -1139,10 +1463,16 @@ mod tests {
         // 相关性第一为原始第一名（MMR 首元素 = 最高分候选）
         assert_eq!(hits[0].record.content, "fix the login auth bug");
         // 对照组：关闭 MMR 时两条 login/auth 兄弟记录相邻（分数序）
-        let mmr_off = RecallOptions { mmr_lambda: None, ..opts };
+        let mmr_off = RecallOptions {
+            mmr_lambda: None,
+            ..opts
+        };
         let plain = s.recall("login auth", &mmr_off);
         assert!(plain[0].record.content.contains("auth"));
-        assert!(plain[1].record.content.contains("auth"), "对照组前提：重复记录相邻");
+        assert!(
+            plain[1].record.content.contains("auth"),
+            "对照组前提：重复记录相邻"
+        );
         // MMR 开：重复兄弟记录被多样性压后，独立话题（login payment provider）上位
         assert_eq!(hits[1].record.content, "login payment provider");
         assert_eq!(hits[2].record.content, "fix the login auth bug please");
@@ -1155,19 +1485,29 @@ mod tests {
         // 独立话题（importance 5）上位第二。
         let s = store();
         s.retain(rec_at("修复了登录页的认证问题", 2, 1)).unwrap();
-        s.retain(rec_at("修复了登录页的认证问题请尽快处理", 2, 1)).unwrap();
+        s.retain(rec_at("修复了登录页的认证问题请尽快处理", 2, 1))
+            .unwrap();
         s.retain(rec_at("部署了新的支付网关", 5, 1)).unwrap();
         let opts = RecallOptions::default();
         let hits = s.recall("登录认证", &opts);
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].record.content, "修复了登录页的认证问题");
-        assert_eq!(hits[1].record.content, "部署了新的支付网关", "重复记录应被压后");
+        assert_eq!(
+            hits[1].record.content, "部署了新的支付网关",
+            "重复记录应被压后"
+        );
         assert_eq!(hits[2].record.content, "修复了登录页的认证问题请尽快处理");
         // 对照组（关闭 MMR）：不折叠，重复兄弟按分数相邻。
-        let mmr_off = RecallOptions { mmr_lambda: None, ..opts };
+        let mmr_off = RecallOptions {
+            mmr_lambda: None,
+            ..opts
+        };
         let plain = s.recall("登录认证", &mmr_off);
         assert!(plain[0].record.content.contains("登录页"));
-        assert!(plain[1].record.content.contains("登录页"), "对照组前提：重复记录相邻");
+        assert!(
+            plain[1].record.content.contains("登录页"),
+            "对照组前提：重复记录相邻"
+        );
     }
 
     /// 测试用固定向量嵌入器：手工指定「文本 → 向量」，便于构造 dense 高分/低分场景。
@@ -1368,7 +1708,10 @@ mod tests {
         assert!(mental.contains("项目约定"), "缺少项目积累: {mental}");
         // summary() 不再吞 mental 段（顺序交由 engine 组装）。
         let merged = s2.summary().await.unwrap().unwrap();
-        assert!(!merged.contains("<mental_models>"), "summary 不应含 mental 段: {merged}");
+        assert!(
+            !merged.contains("<mental_models>"),
+            "summary 不应含 mental 段: {merged}"
+        );
         assert!(merged.contains("rust workspace notes"), "记录摘要被覆盖");
         // 空记忆 + 配置心智模型：summary 为 None，mental 仍可注入。
         let (s3, _) = store_root();
@@ -1383,8 +1726,10 @@ mod tests {
     #[tokio::test]
     async fn recall_current_query_boosts_recency_weight() {
         let s = store();
-        s.retain(rec_at("system latest status record", 4, 600)).unwrap(); // 旧，r≈0.29
-        s.retain(rec_at("system latest status record", 3, 1)).unwrap(); // 新，r≈1
+        s.retain(rec_at("system latest status record", 4, 600))
+            .unwrap(); // 旧，r≈0.29
+        s.retain(rec_at("system latest status record", 3, 1))
+            .unwrap(); // 新，r≈1
         let opts = RecallOptions {
             mmr_lambda: None,
             use_intent: false,
@@ -1396,7 +1741,10 @@ mod tests {
         assert_eq!(plain[0].record.importance, 4, "对照前提：旧记录领先");
         // current 词：temporal 权重抬到 0.45 → 新记录（recency≈1）反超
         let cur = s.recall("latest status", &opts);
-        assert_eq!(cur[0].record.importance, 3, "current 查询应抬 temporal 权重");
+        assert_eq!(
+            cur[0].record.importance, 3,
+            "current 查询应抬 temporal 权重"
+        );
         assert_eq!(cur[0].record.content, "system latest status record");
     }
 
@@ -1408,12 +1756,18 @@ mod tests {
         let s = store();
         s.retain(rec_at("alpha record", 5, 1)).unwrap(); // 1.507，覆盖 alpha
         s.retain(rec_at("beta record", 3, 1)).unwrap(); // 1.307，覆盖 beta
-        s.retain(
-            rec_at("gamma delta epsilon r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 record", 2, 1),
-        )
+        s.retain(rec_at(
+            "gamma delta epsilon r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 record",
+            2,
+            1,
+        ))
         .unwrap(); // 1.275，覆盖 gamma/delta/epsilon
-        s.retain(rec_at("delta r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 record", 0, 1))
-            .unwrap(); // 0.577，覆盖 delta（已被 C 覆盖）
+        s.retain(rec_at(
+            "delta r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 record",
+            0,
+            1,
+        ))
+        .unwrap(); // 0.577，覆盖 delta（已被 C 覆盖）
         let opts = RecallOptions {
             mmr_lambda: None,
             use_intent: false,
@@ -1422,17 +1776,27 @@ mod tests {
         };
         // 覆盖贪心：A 最高分先选；第二轮 C（1.275+0.18）胜过 B（1.307+0.06）
         let div = s.recall("alpha beta gamma delta epsilon", &opts);
-        assert!(div[0].record.content.starts_with("alpha"), "{}: {}", div[0].record.content, div[0].score);
+        assert!(
+            div[0].record.content.starts_with("alpha"),
+            "{}: {}",
+            div[0].record.content,
+            div[0].score
+        );
         assert!(
             div[1].record.content.starts_with("gamma"),
             "覆盖贪心应把多词覆盖的 C 提前: {:?}",
-            div.iter().map(|h| (&h.record.content, h.score)).collect::<Vec<_>>()
+            div.iter()
+                .map(|h| (&h.record.content, h.score))
+                .collect::<Vec<_>>()
         );
         assert!(div[2].record.content.starts_with("beta"));
         // 对照：limit=4（候选 4 ≤ limit → 不触发覆盖贪心）→ 纯分数序 [A, B, C, D]
         let no_div = RecallOptions { limit: 4, ..opts };
         let plain = s.recall("alpha beta gamma delta epsilon", &no_div);
-        assert!(plain[1].record.content.starts_with("beta"), "对照前提：纯分数序");
+        assert!(
+            plain[1].record.content.starts_with("beta"),
+            "对照前提：纯分数序"
+        );
     }
 
     // P1b：中文时间表达——「三天前」把时间信号切到相对目标日（72h）。
@@ -1451,13 +1815,19 @@ mod tests {
             ..Default::default()
         };
         let hits = s.recall("部署排障", &plain);
-        assert_eq!(hits[0].record.content, "部署排障记录 alpha", "对照前提：无时间词时重要性主导");
+        assert_eq!(
+            hits[0].record.content, "部署排障记录 alpha",
+            "对照前提：无时间词时重要性主导"
+        );
         let near = RecallOptions {
             use_intent: false,
             temporal_weight: 2.0,
             ..Default::default()
         };
         let hits = s.recall("三天前部署排障", &near);
-        assert_eq!(hits[0].record.content, "部署排障记录 beta", "beta 距目标日（72h）更近");
+        assert_eq!(
+            hits[0].record.content, "部署排障记录 beta",
+            "beta 距目标日（72h）更近"
+        );
     }
 }

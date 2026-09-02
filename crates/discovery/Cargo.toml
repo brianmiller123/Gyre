@@ -7,3 +7,6 @@ rust-version.workspace = true
 description = "Discover and convert foreign agent-tool configs (AGENTS.md / CLAUDE.md / Cursor .mdc / Cline) into Gyre context sections"
 
 [dependencies]
+
+[lints]
+workspace = true

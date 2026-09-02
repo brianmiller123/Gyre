@@ -32,27 +32,57 @@ pub struct IntentWeights {
 pub const INTENT_WEIGHTS: [(IntentCategory, IntentWeights); 6] = [
     (
         IntentCategory::Temporal,
-        IntentWeights { vec_bias: 0.6, fts_bias: 1.5, importance_bias: 0.8, temporal_bias: 1.3 },
+        IntentWeights {
+            vec_bias: 0.6,
+            fts_bias: 1.5,
+            importance_bias: 0.8,
+            temporal_bias: 1.3,
+        },
     ),
     (
         IntentCategory::Factual,
-        IntentWeights { vec_bias: 1.0, fts_bias: 1.2, importance_bias: 0.9, temporal_bias: 1.0 },
+        IntentWeights {
+            vec_bias: 1.0,
+            fts_bias: 1.2,
+            importance_bias: 0.9,
+            temporal_bias: 1.0,
+        },
     ),
     (
         IntentCategory::Entity,
-        IntentWeights { vec_bias: 1.1, fts_bias: 1.0, importance_bias: 1.3, temporal_bias: 0.8 },
+        IntentWeights {
+            vec_bias: 1.1,
+            fts_bias: 1.0,
+            importance_bias: 1.3,
+            temporal_bias: 0.8,
+        },
     ),
     (
         IntentCategory::Preference,
-        IntentWeights { vec_bias: 0.9, fts_bias: 0.8, importance_bias: 1.5, temporal_bias: 0.6 },
+        IntentWeights {
+            vec_bias: 0.9,
+            fts_bias: 0.8,
+            importance_bias: 1.5,
+            temporal_bias: 0.6,
+        },
     ),
     (
         IntentCategory::Procedural,
-        IntentWeights { vec_bias: 1.3, fts_bias: 0.9, importance_bias: 0.7, temporal_bias: 1.0 },
+        IntentWeights {
+            vec_bias: 1.3,
+            fts_bias: 0.9,
+            importance_bias: 0.7,
+            temporal_bias: 1.0,
+        },
     ),
     (
         IntentCategory::General,
-        IntentWeights { vec_bias: 1.0, fts_bias: 1.0, importance_bias: 1.0, temporal_bias: 1.0 },
+        IntentWeights {
+            vec_bias: 1.0,
+            fts_bias: 1.0,
+            importance_bias: 1.0,
+            temporal_bias: 1.0,
+        },
     ),
 ];
 
@@ -165,7 +195,12 @@ pub fn classify_intent(query: &str) -> QueryIntent {
         .find(|(c, _)| *c == best_category)
         .map(|(_, w)| *w)
         .expect("类别必在权重表");
-    QueryIntent { category: best_category, confidence: best_score, signals, weights }
+    QueryIntent {
+        category: best_category,
+        confidence: best_score,
+        signals,
+        weights,
+    }
 }
 
 /// 调整四维权重（不归一化——Gyre 权重是加性结构，同除总量不影响排序）。
@@ -184,7 +219,6 @@ pub fn adjust_weights(
         vec * intent.weights.vec_bias,
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -240,9 +274,6 @@ mod tests {
     }
 
     fn approx(actual: f64, expected: f64) {
-        assert!(
-            (actual - expected).abs() < 1e-12,
-            "{actual} ≈ {expected}"
-        );
+        assert!((actual - expected).abs() < 1e-12, "{actual} ≈ {expected}");
     }
 }

@@ -262,7 +262,7 @@ impl SessionStore {
                 bytes: meta.len(),
             });
         }
-        out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
         out
     }
 
@@ -498,9 +498,9 @@ pub async fn delete_message_in_file(
     path: &std::path::Path,
     index: usize,
 ) -> Result<usize, std::io::Error> {
-    let nodes = load_jsonl(path).await.map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("加载会话失败: {e}"))
-    })?;
+    let nodes = load_jsonl(path)
+        .await
+        .map_err(|e| std::io::Error::other(format!("加载会话失败: {e}")))?;
     let Some(new_nodes) = crate::tree::remove_node_with_orphans(&nodes, index) else {
         return Ok(0);
     };

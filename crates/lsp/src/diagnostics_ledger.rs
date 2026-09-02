@@ -33,7 +33,7 @@ impl DiagnosticsLedger {
         for d in diagnostics {
             let identity = diagnostic_identity(d);
             current.insert(identity.clone());
-            let is_fresh = previous.as_ref().map_or(true, |p| !p.contains(&identity));
+            let is_fresh = previous.as_ref().is_none_or(|p| !p.contains(&identity));
             if is_fresh {
                 fresh.push(d.clone());
             }

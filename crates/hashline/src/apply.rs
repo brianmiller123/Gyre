@@ -123,7 +123,7 @@ pub fn apply_section(text: &str, section: &FileSection) -> ApplyResult {
                     note(&mut first_changed, a.saturating_add(1));
                 }
             },
-            Hunk::File(FileOp::Remove) | Hunk::File(FileOp::Move { .. }) => {}
+            Hunk::File(FileOp::Remove | FileOp::Move { .. }) => {}
         }
     }
 

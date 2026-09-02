@@ -1,13 +1,13 @@
 //! Token 度量（tiktoken-rs，OpenAI BPE 近似）。
 //!
-//! 对 GPT-3.5/4 系（cl100k_base）精确；对其它 provider（Anthropic/Gemini…）为合理近似，
+//! 对 GPT-3.5/4 `系（cl100k_base）精确；对其它` provider（Anthropic/Gemini…）为合理近似，
 //! 供搜索结果展示「这批命中约 N tokens」、上下文预算估算等场景使用。
 
 use std::sync::OnceLock;
 
 use tiktoken_rs::cl100k_base;
 
-/// 近似 token 计数（cl100k_base，含特殊 token 计数）。
+/// 近似 token `计数（cl100k_base，含特殊` token 计数）。
 ///
 /// # Errors
 /// BPE 词表加载失败时返回错误。

@@ -3,7 +3,7 @@
 //! 移植自 [`oh-my-pi pi-natives/fs_cache.rs`](../../../third/oh-my-pi/crates/pi-natives/src/fs_cache.rs:1)（精简：
 //! Minimal detail、`Mutex<HashMap>` 而非 DashMap、无 N-API）。
 //!
-//! glob / list_files 经 [`get_or_scan`] 共享同一份扫描结果，避免对同一根的重复遍历。
+//! glob / `list_files` 经 [`get_or_scan`] 共享同一份扫描结果，避免对同一根的重复遍历。
 //! 写工具改文件后可调 [`invalidate`] 失效（当前主由短 TTL 兜底陈旧）。
 
 use std::collections::HashMap;

@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::mental_models::{
-    format_ts, load_seeds, merge_mental_models, mental_model_consolidation_prompt,
-    MentalModelsConfig,
+    MentalModelsConfig, format_ts, load_seeds, mental_model_consolidation_prompt,
+    merge_mental_models,
 };
 
 const SUMMARY_FILE: &str = "memory_summary.md";
@@ -429,10 +429,7 @@ mod tests {
     async fn add_mental_model_appends_timestamped_entry() {
         let root = tmp();
         let store = LocalMemoryStore::with_root(root.clone());
-        store
-            .add_mental_model("写测试先于实现")
-            .await
-            .unwrap();
+        store.add_mental_model("写测试先于实现").await.unwrap();
         let mm = store.mental_models().await.unwrap();
         assert!(mm.contains("写测试先于实现"));
         // 带时间戳条目

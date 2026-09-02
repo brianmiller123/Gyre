@@ -26,7 +26,7 @@ pub fn parse_tag(tag: &str) -> Result<u32, String> {
         chars.next();
     }
     // 标记前缀 '>' '+' '-' '*'
-    while matches!(chars.peek(), Some('>') | Some('+') | Some('-') | Some('*')) {
+    while matches!(chars.peek(), Some('>' | '+' | '-' | '*')) {
         chars.next();
     }
     // 标记与数字间空白
@@ -87,10 +87,7 @@ pub fn format_full_anchor_requirement(raw: Option<&str>) -> String {
     };
     format!(
         "a bare line number from read/search output plus the section header content-hash tag \
-         (for example {p}src/foo.ts{s}1A2B{e} and line \"160\"){received}",
-        p = HL_FILE_PREFIX,
-        s = HL_FILE_HASH_SEP,
-        e = HL_FILE_SUFFIX,
+         (for example {HL_FILE_PREFIX}src/foo.ts{HL_FILE_HASH_SEP}1A2B{HL_FILE_SUFFIX} and line \"160\"){received}",
     )
 }
 

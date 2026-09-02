@@ -99,7 +99,11 @@ impl Advisor {
 
     /// 自定义快照上限（测试用）。
     #[must_use]
-    pub fn with_limits(mut self, max_message_chars: usize, max_snapshot_chars: usize) -> Self {
+    pub const fn with_limits(
+        mut self,
+        max_message_chars: usize,
+        max_snapshot_chars: usize,
+    ) -> Self {
         self.max_message_chars = max_message_chars;
         self.max_snapshot_chars = max_snapshot_chars;
         self
@@ -185,9 +189,15 @@ impl Advisor {
                     let mut parts = Vec::new();
                     for block in &a.content {
                         match block {
-                            agent_core::ContentBlock::Text { text } => parts.push(truncate_chars(text, self.max_message_chars)),
-                            agent_core::ContentBlock::Thinking { text, .. } => parts.push(format!("(思考) {}", truncate_chars(text, 400))),
-                            agent_core::ContentBlock::ToolCall { name, .. } => parts.push(format!("工具调用: {name}")),
+                            agent_core::ContentBlock::Text { text } => {
+                                parts.push(truncate_chars(text, self.max_message_chars))
+                            }
+                            agent_core::ContentBlock::Thinking { text, .. } => {
+                                parts.push(format!("(思考) {}", truncate_chars(text, 400)))
+                            }
+                            agent_core::ContentBlock::ToolCall { name, .. } => {
+                                parts.push(format!("工具调用: {name}"))
+                            }
                         }
                     }
                     if parts.is_empty() {
@@ -325,7 +335,7 @@ mod tests {
         let msgs = vec![
             AgentMessage::user_text("hello"),
             AgentMessage::Assistant(agent_core::AssistantMessage {
-                content: vec![agent_core::ContentBlock::Text { text: long.clone() }],
+                content: vec![agent_core::ContentBlock::Text { text: long }],
                 usage: agent_core::Usage::default(),
                 model: "test".into(),
                 stop_reason: None,
@@ -344,7 +354,9 @@ mod tests {
             Arc::new(agent_core::llm::UnconfiguredProvider),
             Model::with_defaults("t", "t", agent_core::Api::OpenAiCompletions),
         );
-        let msgs = vec![AgentMessage::user_text("use api_key=sk-abcdef1234567890 now")];
+        let msgs = vec![AgentMessage::user_text(
+            "use api_key=sk-abcdef1234567890 now",
+        )];
         let snap = a.render_snapshot(&msgs);
         assert!(!snap.contains("sk-abcdef1234567890"), "{snap}");
         assert!(snap.contains("<redacted>"), "{snap}");

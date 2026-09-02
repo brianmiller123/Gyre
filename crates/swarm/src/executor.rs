@@ -119,7 +119,7 @@ impl AgentSwarmRunner {
     }
 }
 
-/// 子代理审批：自动放行（与 TaskTool 一致，避免嵌套交互死锁）。
+/// 子代理审批：自动放行（与 `TaskTool` 一致，避免嵌套交互死锁）。
 struct AlwaysAllow;
 #[async_trait::async_trait]
 impl ApprovalPolicy for AlwaysAllow {
@@ -157,10 +157,10 @@ impl ApprovalPolicy for DelegatedApproval {
 #[must_use]
 pub fn build_role_prompt(agent: &SwarmAgent) -> String {
     let mut parts = vec![format!("You are a {}.", agent.role)];
-    if let Some(extra) = &agent.extra_context {
-        if !extra.is_empty() {
-            parts.push(extra.clone());
-        }
+    if let Some(extra) = &agent.extra_context
+        && !extra.is_empty()
+    {
+        parts.push(extra.clone());
     }
     parts.join("\n\n")
 }
@@ -219,7 +219,7 @@ impl SwarmAgentRunner for AgentSwarmRunner {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     cancel_handle.cancel();
                     error = Some("swarm agent cancelled".to_string());
                     break;
@@ -233,7 +233,7 @@ impl SwarmAgentRunner for AgentSwarmRunner {
             }
         }
 
-        let exit_code = if error.is_some() { 1 } else { 0 };
+        let exit_code = i32::from(error.is_some());
         SwarmAgentResult {
             exit_code,
             output,

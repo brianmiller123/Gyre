@@ -5,7 +5,6 @@
 //! - [`glob_match`] 基于 `globset`，按 glob 模式发现文件。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,6 +126,7 @@ pub fn glob_match(root: &Path, pattern: &str, max: usize) -> Result<Vec<PathBuf>
 /// 列出 `root` 下的条目（尊重 `.gitignore`）。
 /// - `recursive = false`：仅直接子项（文件与目录，按名排序）。
 /// - `recursive = true`：递归所有文件（跳过隐藏/gitignore）。
+#[must_use]
 pub fn list_files(root: &Path, recursive: bool, max: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !recursive {

@@ -1,4 +1,4 @@
-//! list_files 工具：列目录条目（尊重 .gitignore）。
+//! `list_files` 工具：列目录条目（尊重 .gitignore）。
 
 use std::path::Path;
 
@@ -13,10 +13,10 @@ pub struct ListFilesTool;
 
 #[async_trait]
 impl Tool for ListFilesTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "list_files"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "列出目录条目。recursive=false（默认）仅直接子项；true 递归所有文件（尊重 .gitignore）。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -44,7 +44,7 @@ impl Tool for ListFilesTool {
             .to_string();
         let recursive = input
             .get("recursive")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let root = ctx.workspace.resolve(Path::new(&rel));
         let items =

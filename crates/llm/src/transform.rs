@@ -1,6 +1,6 @@
 //! 统一上下文转换与缓存策略层（A2）。
 //!
-//! 抽出各 adapter 内联的格式处理，供 OpenAI / Anthropic 适配器复用：
+//! 抽出各 adapter 内联的格式处理，供 `OpenAI` / Anthropic 适配器复用：
 //! - [`normalize_tool_schema`]：剥离 provider 冗余字段（`$schema`/`title`），输出干净 JSON Schema。
 //! - [`CacheStrategy`] + [`inject_ephemeral_cache`] / [`anthropic_apply_cache`]：
 //!   Anthropic 多点 `cache_control` breakpoint 注入（system + tools 末尾 + 稳定前缀边界消息），
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 /// 前缀缓存注入策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheStrategy {
-    /// 不注入 cache_control。
+    /// 不注入 `cache_control`。
     None,
     /// 单点：仅 system 段（保持早期行为）。
     #[default]
@@ -51,7 +51,7 @@ pub fn normalize_tool_schema(schema: &Value) -> Value {
     v
 }
 
-/// 构造 Anthropic system 块数组（按策略注入 cache_control）。
+/// 构造 Anthropic system 块数组（按策略注入 `cache_control`）。
 #[must_use]
 pub fn anthropic_system_blocks(system: &[String], strategy: CacheStrategy) -> Value {
     let text = system.join("\n\n");
@@ -65,9 +65,9 @@ pub fn anthropic_system_blocks(system: &[String], strategy: CacheStrategy) -> Va
 /// 对已构造好的 Anthropic 请求体应用多点缓存策略（原地修改）。
 ///
 /// 注入点（受 [`CacheStrategy`] 控制）：
-/// 1. `system` 数组首块（Ephemeral / MultiPoint）
-/// 2. `tools` 数组末个工具（仅 MultiPoint）
-/// 3. `messages` 中**稳定前缀边界**消息的最后 content 块（仅 MultiPoint）：
+/// 1. `system` 数组首块（Ephemeral / `MultiPoint`）
+/// 2. `tools` 数组末个工具（仅 `MultiPoint`）
+/// 3. `messages` 中**稳定前缀边界**消息的最后 content 块（仅 `MultiPoint`）：
 ///    目标索引 = `stable_prefix_len - 1`（稳定前缀最后一条），但 clamp 到不超过倒数第二条
 ///    （最后一条为本轮新输入，永不缓存）。`stable_prefix_len == 0`（首次/压缩/分支切换后）
 ///    时**跳过消息注入**——全量重发，放 breakpoint 也命中不了，避免浪费配额。
@@ -124,7 +124,7 @@ fn inject_into_stable_prefix_message(body: &mut Value, stable_prefix_len: usize)
     }
 }
 
-/// 统计 body 内 cache_control 标记数量（可观测/测试用）。
+/// 统计 body 内 `cache_control` 标记数量（可观测/测试用）。
 #[must_use]
 pub fn count_cache_breakpoints(body: &Value) -> usize {
     let ser = serde_json::to_string(body).unwrap_or_default();

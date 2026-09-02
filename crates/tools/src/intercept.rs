@@ -17,7 +17,7 @@ use regex::Regex;
 ///
 /// 匹配器用 `Arc<dyn Fn>`（而非直接存 `Regex`）并派生 `Clone`，是为了让「echo 重定向」这类
 /// 无法用单个 RE2 正则表达的判定也能以同一套规则结构参与匹配，且装配层可在父/子 Agent 间
-/// 共享同一份已编译规则（server 的 builtin_tools 与 builtin_tools_with_pool 各需一份）。
+/// 共享同一份已编译规则（server 的 `builtin_tools` 与 `builtin_tools_with_pool` 各需一份）。
 #[derive(Clone)]
 pub struct CompiledRule {
     /// 重定向目标工具名（如 `read_file` / `write_file`）。
@@ -188,8 +188,7 @@ fn is_write_redirect(cmd: &str) -> bool {
                 let end = bytes[k..]
                     .iter()
                     .position(|&b| matches!(b, b' ' | b'\t' | b';' | b'|' | b'&' | b'\n'))
-                    .map(|p| k + p)
-                    .unwrap_or(bytes.len());
+                    .map_or(bytes.len(), |p| k + p);
                 if is_real_file_target(&cmd[k..end]) {
                     return true;
                 }
@@ -209,10 +208,7 @@ fn is_real_file_target(target: &str) -> bool {
     if t.is_empty() || t.starts_with('&') {
         return false;
     }
-    !matches!(
-        t,
-        "/dev/null" | "/dev/tty" | "/dev/stdout" | "/dev/stderr"
-    )
+    !matches!(t, "/dev/null" | "/dev/tty" | "/dev/stdout" | "/dev/stderr")
 }
 
 #[cfg(test)]
@@ -292,7 +288,10 @@ mod tests {
     #[test]
     fn keeps_scanning_past_dev_sink_to_later_real_redirect() {
         let rules = default_compiled();
-        assert_eq!(hit("echo data > /dev/null > out.txt", &rules), Some("write_file"));
+        assert_eq!(
+            hit("echo data > /dev/null > out.txt", &rules),
+            Some("write_file")
+        );
         assert_eq!(
             hit("printf x > /dev/stdout >> real.txt", &rules),
             Some("write_file")
@@ -304,20 +303,32 @@ mod tests {
         let rules = default_compiled();
         assert_eq!(hit("cd src && cat main.rs", &rules), Some("read_file"));
         assert_eq!(hit("cd src; grep foo .", &rules), Some("grep"));
-        assert_eq!(hit("cd src && echo hi > out.txt", &rules), Some("write_file"));
+        assert_eq!(
+            hit("cd src && echo hi > out.txt", &rules),
+            Some("write_file")
+        );
     }
 
     #[test]
     fn intercepts_sed_n_read_ranges_to_read_file() {
         let rules = default_compiled();
         // 实测高频：模型用 sed -n 'A,Bp' 读文件区间。
-        assert_eq!(hit("sed -n '3425,3440p' Cargo.lock", &rules), Some("read_file"));
-        assert_eq!(hit("sed -n '55,75p' crates/config/src/config.rs", &rules), Some("read_file"));
+        assert_eq!(
+            hit("sed -n '3425,3440p' Cargo.lock", &rules),
+            Some("read_file")
+        );
+        assert_eq!(
+            hit("sed -n '55,75p' crates/config/src/config.rs", &rules),
+            Some("read_file")
+        );
         assert_eq!(hit("sed -n 1,15p file", &rules), Some("read_file"));
         assert_eq!(hit("sed -n '574p' main.rs", &rules), Some("read_file"));
         assert_eq!(hit("sed -n '/foo/,/bar/p' x.rs", &rules), Some("read_file"));
         // cd 前缀不能绕过。
-        assert_eq!(hit("cd src && sed -n '1,5p' main.rs", &rules), Some("read_file"));
+        assert_eq!(
+            hit("cd src && sed -n '1,5p' main.rs", &rules),
+            Some("read_file")
+        );
     }
 
     #[test]
@@ -325,7 +336,10 @@ mod tests {
         let rules = default_compiled();
         // 实测高频：模型用 sed -i 做原地编辑。
         assert_eq!(hit("sed -i 's/x/y/' file.txt", &rules), Some("write_file"));
-        assert_eq!(hit("sed -i '63,117d' src/lib.rs", &rules), Some("write_file"));
+        assert_eq!(
+            hit("sed -i '63,117d' src/lib.rs", &rules),
+            Some("write_file")
+        );
         assert_eq!(hit("sed -i.bak 's/a/b/' f", &rules), Some("write_file"));
         // 不带 -n/-i 的 sed（过滤管道，输出到 stdout）不拦截。
         assert_eq!(hit("sed 's/x/y/' | sort", &rules), None);
@@ -348,6 +362,9 @@ mod tests {
         assert_eq!(hit("git status", &rules), None);
         assert_eq!(hit("echo hello world", &rules), None);
         assert_eq!(hit("wc -l Cargo.lock", &rules), None);
-        assert_eq!(hit("python3 -c 'import os; print(os.listdir())'", &rules), None);
+        assert_eq!(
+            hit("python3 -c 'import os; print(os.listdir())'", &rules),
+            None
+        );
     }
 }

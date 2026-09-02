@@ -209,6 +209,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         };
         let p = dir.join("a.txt");
         let report = write_with_effects(&p, "hi\n", &ctx).await.unwrap();
@@ -242,6 +243,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         };
         let p = dir.join("b.txt");
         let report = write_with_effects(&p, "ok\n", &ctx).await.unwrap();
@@ -276,6 +278,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         };
         let p = dir.join("c.txt");
         let report = write_with_effects(&p, "raw\n", &ctx).await.unwrap();
@@ -311,6 +314,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         };
         let p = dir.join("d.txt");
         let report = write_with_effects(&p, "stable\n", &ctx).await.unwrap();

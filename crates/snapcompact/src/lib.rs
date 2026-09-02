@@ -12,16 +12,14 @@
 //! - [`shape`]：帧形状、帧数预算与 provider 图像预算（移植 snapcompact.ts 常量）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
-#![warn(clippy::nursery)]
 
 pub mod render;
 pub mod serialize;
 pub mod shape;
 
-pub use render::{render_frame, Frame};
-pub use serialize::{normalize, paginate, SerializeOptions};
+pub use render::{Frame, render_frame};
+pub use serialize::{SerializeOptions, normalize, paginate};
 pub use shape::{
-    estimate_frame_tokens, max_frames_for_data_budget, provider_image_budget, Shape,
-    DEFAULT_MAX_FRAMES, DEFAULT_SHAPE, FRAME_DATA_BYTES_BUDGET, FRAME_TOKEN_ESTIMATE,
+    DEFAULT_MAX_FRAMES, DEFAULT_SHAPE, FRAME_DATA_BYTES_BUDGET, FRAME_TOKEN_ESTIMATE, Shape,
+    estimate_frame_tokens, max_frames_for_data_budget, provider_image_budget,
 };

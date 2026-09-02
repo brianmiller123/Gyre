@@ -90,13 +90,19 @@ impl Workspace {
     /// 根目录路径（clone 出的 PathBuf，避免持有 Mutex guard 跨 await）。
     #[must_use]
     pub fn root(&self) -> PathBuf {
-        self.root.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// 是否启用隔离。
     #[must_use]
     pub fn is_isolated(&self) -> bool {
-        self.iso.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.iso
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// 解析路径为**工作区内**绝对路径（沙箱化）。
@@ -106,7 +112,11 @@ impl Workspace {
     /// 故指向根之外的绝对路径会被映射到根下（读得到 not-found，写被限制在根内）。
     #[must_use]
     pub fn resolve(&self, relative: &Path) -> PathBuf {
-        let root = self.root.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let root = self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         sandbox_within(&root, relative)
     }
 
@@ -118,7 +128,10 @@ impl Workspace {
     /// diff 执行失败时返回错误。
     pub async fn diff(&self) -> Option<Result<agent_iso::Diff, agent_iso::IsoError>> {
         let handle = {
-            let guard = self.iso.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self
+                .iso
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard
                 .as_ref()
                 .map(|h| (h.lower.clone(), h.merged.clone(), h.kind))
@@ -134,7 +147,10 @@ impl Workspace {
     /// 由于内部使用 [`Mutex`]，此方法接受 `&self` 而非 `&mut self`。
     pub fn close_isolation(&self) -> Result<(), agent_iso::IsoError> {
         let handle = {
-            let mut guard = self.iso.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .iso
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.take()
         };
         let Some(handle) = handle else {
@@ -142,7 +158,10 @@ impl Workspace {
         };
         let backend = agent_iso::backend(handle.kind);
         backend.stop(&handle.merged)?;
-        *self.root.lock().unwrap_or_else(|e| e.into_inner()) = handle.lower;
+        *self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.lower;
         Ok(())
     }
 }
@@ -233,7 +252,7 @@ fn resolve_symlinks_within(base: &Path, candidate: &Path) -> PathBuf {
         // fail-safe 钳制到根，杜绝写入跟随符号链接逃逸。
         if out
             .symlink_metadata()
-            .map_or(false, |m| m.file_type().is_symlink())
+            .is_ok_and(|m| m.file_type().is_symlink())
         {
             return base.to_path_buf();
         }

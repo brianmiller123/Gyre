@@ -8,6 +8,7 @@ description = "Tool trait, ToolRegistry, and built-in fs/shell tools"
 
 [dependencies]
 agent-core   = { workspace = true }
+agent-shell  = { workspace = true }
 agent-search = { workspace = true }
 agent-lsp    = { workspace = true }
 reqwest      = { workspace = true }
@@ -23,7 +24,10 @@ url          = { workspace = true }
 base64       = { workspace = true }
 regex        = { workspace = true }
 encoding_rs  = { workspace = true }
-
+zip          = { workspace = true }
+tar          = { workspace = true }
+flate2       = { workspace = true }
+rusqlite     = { workspace = true }
 [dev-dependencies]
 # 基准门：grep/glob 吞吐基准（benches/search.rs）
 criterion = { workspace = true }

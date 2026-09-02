@@ -16,7 +16,8 @@ fn path_dirs(path_env: &str) -> impl Iterator<Item = PathBuf> {
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file()
-        && p.metadata().is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        && p.metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]

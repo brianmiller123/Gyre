@@ -107,7 +107,7 @@ pub fn detect_servers(root: &Path) -> Vec<LspServerInfo> {
 
     // ── C#: .csproj / .sln ──────────────────────────────────────────
     if let Ok(entries) = std::fs::read_dir(root) {
-        let has_dotnet = entries.filter_map(|e| e.ok()).any(|e| {
+        let has_dotnet = entries.filter_map(std::result::Result::ok).any(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
             name.ends_with(".csproj") || name.ends_with(".sln")
@@ -159,22 +159,22 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
         Some("js") => Some("javascript"),
         Some("jsx") => Some("javascriptreact"),
         Some("go") => Some("go"),
-        Some("py") | Some("pyi") => Some("python"),
+        Some("py" | "pyi") => Some("python"),
         Some("cs") => Some("csharp"),
         Some("java") => Some("java"),
         Some("zig") => Some("zig"),
-        Some("c") | Some("h") => Some("c"),
-        Some("cpp") | Some("cc") | Some("cxx") | Some("c++") => Some("cpp"),
-        Some("hpp") | Some("hh") | Some("hxx") => Some("cpp"),
+        Some("c" | "h") => Some("c"),
+        Some("cpp" | "cc" | "cxx" | "c++") => Some("cpp"),
+        Some("hpp" | "hh" | "hxx") => Some("cpp"),
         Some("toml") => Some("toml"),
         Some("json") => Some("json"),
-        Some("yaml") | Some("yml") => Some("yaml"),
-        Some("md") | Some("mdx") => Some("markdown"),
+        Some("yaml" | "yml") => Some("yaml"),
+        Some("md" | "mdx") => Some("markdown"),
         Some("css") => Some("css"),
-        Some("scss") | Some("sass") => Some("scss"),
-        Some("html") | Some("htm") => Some("html"),
+        Some("scss" | "sass") => Some("scss"),
+        Some("html" | "htm") => Some("html"),
         Some("sql") => Some("sql"),
-        Some("sh") | Some("bash") | Some("zsh") => Some("shellscript"),
+        Some("sh" | "bash" | "zsh") => Some("shellscript"),
         Some("dockerfile") => Some("dockerfile"),
         Some("vue") => Some("vue"),
         Some("svelte") => Some("svelte"),

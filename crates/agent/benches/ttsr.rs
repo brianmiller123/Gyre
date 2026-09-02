@@ -5,7 +5,7 @@
 //! - `TtsrManager::check_delta(stream, delta)`：matcher.rs:83
 //!   （流式增量正则匹配——每收到一个文本/思考增量块调用一次，缓冲累积后逐规则门控匹配）
 //! - `TtsrManager::check_tool_call(tool, path, digest)`：matcher.rs:99
-//!   （工具载荷 digest 线性匹配——工具执行后的 MessageEnd 快照匹配）
+//!   （工具载荷 digest 线性匹配——工具执行后的 `MessageEnd` 快照匹配）
 //!
 //! 规则集经 `parse_rule`（crates/ttsr/src/rule.rs:206）确定性构造，仿 `.gyre/rules/*.md`
 //! 典型形态（text / tool:NAME 作用域 + 正则条件，Rust regex 线性时间匹配）。
@@ -13,8 +13,8 @@
 
 use std::hint::black_box;
 
-use agent_ttsr::{parse_rule, Rule, TtsrManager};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use agent_ttsr::{Rule, TtsrManager, parse_rule};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 /// 典型 TTSR 规则集：8 条（text / tool 作用域混布，模拟真实装配）。
 fn typical_rules() -> Vec<Rule> {
@@ -68,7 +68,7 @@ fn typical_rules() -> Vec<Rule> {
         .collect()
 }
 
-/// check_delta：模拟流式输出 80 个增量块（每块 ~120 字符，含 1 次命中）。
+/// `check_delta：模拟流式输出` 80 个增量块（每块 ~120 字符，含 1 次命中）。
 fn bench_check_delta(c: &mut Criterion) {
     let rules = typical_rules();
     let chunks: Vec<String> = (0..80)
@@ -96,7 +96,7 @@ fn bench_check_delta(c: &mut Criterion) {
     });
 }
 
-/// check_tool_call：模拟典型工具调用快照匹配（写 / 读 / 命令三类载荷）。
+/// `check_tool_call：模拟典型工具调用快照匹配（写` / 读 / 命令三类载荷）。
 fn bench_check_tool_call(c: &mut Criterion) {
     let rules = typical_rules();
     let calls: Vec<(String, Option<String>, String)> = vec![

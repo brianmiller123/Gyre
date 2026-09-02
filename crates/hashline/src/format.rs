@@ -85,7 +85,7 @@ pub fn format_numbered_lines(text: &str, start_line: Anchor) -> String {
 pub fn compute_file_hash(text: &str) -> String {
     let normalized: String = normalize_for_hash(text);
     let h = fnv1a_32(normalized.as_bytes());
-    let low16 = (h & 0xFFFF) as u32;
+    let low16 = h & 0xFFFF;
     format!("{low16:0HASH_LEN$X}")
 }
 

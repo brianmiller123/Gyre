@@ -112,7 +112,7 @@ fn discover_agents_md(cwd: &Path) -> Vec<DiscoveredSection> {
             if let Ok(content) = std::fs::read_to_string(&p) {
                 out.push(DiscoveredSection {
                     source: Source::AgentsMd,
-                    path: p.clone(),
+                    path: p,
                     name: "AGENTS.md".into(),
                     globs: vec!["**".into()],
                     content,
@@ -376,10 +376,8 @@ mod tests {
         std::fs::write(dir.join(".clinerules.md"), "单文件规则\n").unwrap();
 
         let found = discover(&dir);
-        let cline: Vec<&DiscoveredSection> = found
-            .iter()
-            .filter(|s| s.source == Source::Cline)
-            .collect();
+        let cline: Vec<&DiscoveredSection> =
+            found.iter().filter(|s| s.source == Source::Cline).collect();
         assert_eq!(cline.len(), 2, "{cline:?}");
         assert!(cline.iter().any(|s| s.name == "always"));
         assert!(cline.iter().any(|s| s.name == "clinerules"));
@@ -410,7 +408,10 @@ mod tests {
             content: "body".into(),
         };
         let text = render_section(&s);
-        assert!(text.contains("外来配置[cursor]") && text.contains("适用于 **/*.rs"), "{text}");
+        assert!(
+            text.contains("外来配置[cursor]") && text.contains("适用于 **/*.rs"),
+            "{text}"
+        );
         assert!(text.contains("body"));
     }
 }

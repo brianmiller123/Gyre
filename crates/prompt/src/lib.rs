@@ -4,7 +4,6 @@
 //! 不在代码里拼接。`{{var}}` 轻量渲染。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 pub mod enhance;
 pub mod mentions;

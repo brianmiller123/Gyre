@@ -147,8 +147,7 @@ impl DebugTool {
         }
         // 部分适配器（debugpy/dlv）要求 arguments.request；缺省补上，用户显式值优先
         if let Value::Object(map) = &mut launch_args {
-            map.entry("request")
-                .or_insert(Value::String(action.into()));
+            map.entry("request").or_insert(Value::String(action.into()));
         }
         let spawn = DapSession::spawn(&spec, launch_args);
         let session = tokio::select! {
@@ -212,7 +211,11 @@ impl DebugTool {
     }
 
     /// scopes：需 `frame_id`（来自 `stack_trace`），返回结构化 JSON。
-    async fn scopes_action(&self, input: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+    async fn scopes_action(
+        &self,
+        input: &Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let session = self.session().await?;
         let frame_id = input.get("frame_id").cloned().ok_or_else(|| {
             ToolError::InvalidArgs("scopes 需要 'frame_id'（来自 stack_trace 的 frame id）".into())
@@ -254,7 +257,9 @@ impl DebugTool {
         let expression = input
             .get("expression")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("evaluate 需要 'expression'（要求值的表达式）".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArgs("evaluate 需要 'expression'（要求值的表达式）".into())
+            })?
             .to_string();
         let args = dap_args(input, &[("expression", Value::String(expression))]);
         let resp = dap_request(&session, ctx, "evaluate", args).await?;
@@ -262,17 +267,22 @@ impl DebugTool {
     }
 
     /// `set_breakpoint`：登记（`source`+`line` → id）并整源下发（DAP 整源替换语义）。
-    async fn set_breakpoint(&self, input: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+    async fn set_breakpoint(
+        &self,
+        input: &Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let session = self.session().await?; // 先确认有会话
         let source = input
             .get("source")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("set_breakpoint 需要 'source'（源文件路径）".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArgs("set_breakpoint 需要 'source'（源文件路径）".into())
+            })?
             .to_string();
-        let line = input
-            .get("line")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| ToolError::InvalidArgs("set_breakpoint 需要 'line'（1-based 行号）".into()))?;
+        let line = input.get("line").and_then(Value::as_u64).ok_or_else(|| {
+            ToolError::InvalidArgs("set_breakpoint 需要 'line'（1-based 行号）".into())
+        })?;
         {
             let mut bps = self.breakpoints.lock().await;
             bps.add(&source, line);
@@ -337,12 +347,19 @@ impl DebugTool {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.breakpoints.lock().await.apply_response(source, &dap_bps);
+        self.breakpoints
+            .lock()
+            .await
+            .apply_response(source, &dap_bps);
         Ok(())
     }
 
     /// 线程 id：显式 `thread_id` 优先，否则取 `threads` 首个线程的 id。
-    async fn require_thread_id(&self, input: &Value, ctx: &ToolContext<'_>) -> Result<Value, ToolError> {
+    async fn require_thread_id(
+        &self,
+        input: &Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<Value, ToolError> {
         if let Some(v) = input.get("thread_id") {
             return Ok(v.clone());
         }
@@ -444,11 +461,7 @@ impl Tool for DebugTool {
         true
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let action = input
             .get("action")
             .and_then(Value::as_str)
@@ -461,7 +474,10 @@ impl Tool for DebugTool {
         }
         match action {
             "launch" | "attach" => self.launch_or_attach(action, &input, ctx).await,
-            "continue" => self.simple_request("continue", "continue", &input, ctx).await,
+            "continue" => {
+                self.simple_request("continue", "continue", &input, ctx)
+                    .await
+            }
             "pause" => self.thread_action("pause", "pause", &input, ctx).await,
             "next" => self.thread_action("next", "next", &input, ctx).await,
             "step_in" => self.thread_action("step_in", "stepIn", &input, ctx).await,
@@ -575,10 +591,7 @@ impl Breakpoints {
             for bp in dap_bps {
                 let line = bp.get("line").and_then(Value::as_u64);
                 if line.is_some_and(|l| l == record.line) {
-                    record.verified = bp
-                        .get("verified")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
+                    record.verified = bp.get("verified").and_then(Value::as_bool).unwrap_or(false);
                     record.dap_id = bp.get("id").and_then(Value::as_i64);
                 }
             }

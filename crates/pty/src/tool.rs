@@ -17,10 +17,10 @@ pub struct RunPtyTool;
 
 #[async_trait]
 impl Tool for RunPtyTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "run_pty_command"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "在伪终端（PTY）中执行 shell 命令，返回合并 stdout/stderr 与退出码。\
          适用于需要 TTY 的命令（top/vim/交互式 REPL 等）。属执行类操作，默认需审批。"
     }
@@ -70,7 +70,7 @@ impl Tool for RunPtyTool {
 
         let opts = PtyOptions {
             command: command.to_string(),
-            cwd: Some(ctx.workspace.root().to_path_buf()),
+            cwd: Some(ctx.workspace.root()),
             env: HashMap::new(),
             timeout_ms,
             rows,
@@ -82,7 +82,7 @@ impl Tool for RunPtyTool {
         tokio::pin!(run_fut);
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 return Err(ToolError::Execution("PTY 命令被取消".into()));
             }
             res = &mut run_fut => res.map_err(ToolError::Io)?,

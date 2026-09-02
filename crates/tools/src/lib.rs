@@ -5,24 +5,28 @@
 //! 由执行循环（`crates/agent`）集中做 say/ask 审批门禁。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
+mod ask;
 mod ast_tool;
+mod checkpoint;
 pub mod conflict;
-pub mod intercept;
-pub mod minimizer;
 mod fs;
 mod fuzzy_match;
 mod github;
+mod hub_tool;
 mod image;
+pub mod intercept;
 mod list_tool;
 mod lsp_apply;
 mod lsp_tool;
 mod lsp_write_effect;
 mod memory_tool;
+pub mod minimizer;
 mod search;
+mod security_scan;
 mod shell;
 mod ssh;
+mod todo;
 mod web_search;
 mod write;
 
@@ -30,25 +34,34 @@ use agent_core::{
     ApprovalPolicy, ApprovalRequest, CapabilityTier, ToolResult, ToolSpec, Workspace, WriteEffect,
 };
 
-pub use conflict::{ConflictBlock, ConflictHistory, ConflictTarget};
+pub use ask::AskUserTool;
 pub use ast_tool::{AstRewriteTool, AstSearchTool, PendingRewrite, ReplaceBlockTool};
+pub use checkpoint::{Checkpoint, CheckpointState, CheckpointTool, RewindTool};
+pub use conflict::{ConflictBlock, ConflictHistory, ConflictTarget};
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use fuzzy_match::{
     FuzzyOpts, MatchError, MatchMethod, MatchOutcome, find_unique_match, set_fuzzy_opts,
 };
 pub use github::{GithubTool, PROMPT_SECTION};
+pub use hub_tool::{HubIdentity, HubTool};
 pub use image::{ImageGenTool, ReadImageTool};
+pub use intercept::{CompiledRule, default_compiled};
 pub use list_tool::ListFilesTool;
-pub use minimizer::{Minimizer, Minimized, OutputFilter, default_filters, disabled};
 pub use lsp_apply::LspApplyTool;
 pub use lsp_tool::{LspPool, LspTool};
 pub use lsp_write_effect::LspWriteEffect;
+pub use memory_tool::{MemoryEditTool, MemoryLearnTool};
 pub use memory_tool::{MemoryRecallTool, MemoryReflectTool, MemoryRetainTool};
+pub use minimizer::{Minimized, Minimizer, OutputFilter, default_filters, disabled};
 pub use search::{GlobTool, GrepTool};
+pub use security_scan::{SECURITY_SCAN_PROMPT_SECTION, SecurityScanState, SecurityScanTool};
 pub use shell::RunCommandTool;
 pub use ssh::{SSH_PROMPT_SECTION, SshTool};
-pub use intercept::{CompiledRule, default_compiled};
-pub use web_search::{DuckDuckGoHtml, Searxng, SitePage, WebResult, WebSearchChain, WebSearchProvider, WebSearchTool, extract_site};
+pub use todo::{TodoPhase, TodoState, TodoTool};
+pub use web_search::{
+    DuckDuckGoHtml, Searxng, SitePage, WebResult, WebSearchChain, WebSearchProvider, WebSearchTool,
+    extract_site,
+};
 pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
 
 /// 工具流式 partial 更新（工具 execute 内经 [`ToolContext::update_tx`] 推送，agent 循环端
@@ -72,11 +85,11 @@ pub struct ToolContext<'a> {
     pub approval: &'a dyn ApprovalPolicy,
     /// 取消令牌（中断长时工具）。
     pub cancel: &'a tokio_util::sync::CancellationToken,
-    /// Skill 解析器（可选；read_file 遇 `skill://` URL 时使用）。
+    /// Skill `解析器（可选；read_file` 遇 `skill://` URL 时使用）。
     pub skills: Option<&'a dyn agent_core::SkillResolver>,
-    /// 跨会话记忆（可选；read_file 遇 `memory://` URL 时使用）。
+    /// `跨会话记忆（可选；read_file` 遇 `memory://` URL 时使用）。
     pub memory: Option<&'a dyn agent_core::MemoryStore>,
-    /// 外部资源解析器（可选；read_file 遇 `mcp://` URL 时使用）。
+    /// `外部资源解析器（可选；read_file` 遇 `mcp://` URL 时使用）。
     pub resources: Option<&'a dyn agent_core::ResourceResolver>,
     /// 写入效果（可选；写工具经 `write_with_effects` 在写盘后触发 LSP format/diagnostics）。
     pub write_effect: Option<&'a dyn WriteEffect>,
@@ -90,15 +103,18 @@ pub struct ToolContext<'a> {
     /// 会话级 ast-rewrite 暂存队列（`ast_rewrite preview:true` 暂存，`write_file xd://resolve`
     /// 应用 / `xd://reject` 丢弃）。`None` 时 preview 模式报「暂存队列未启用」。
     pub pending_rewrites: Option<&'a std::sync::Arc<std::sync::Mutex<Vec<PendingRewrite>>>>,
+    /// 会话上下文管理器（可选；checkpoint/rewind 等会话状态工具经此读活跃叶子/回卷分支）。
+    /// `None` 时相关工具报「会话上下文不可用」。
+    pub context: Option<&'a dyn agent_core::ContextManager>,
 }
 
 /// 工具并发模式（决定同一轮多工具调用的调度）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Concurrency {
-    /// 可与其它 `Shared` 工具并发执行（典型：只读 I/O，如 read_file / grep）。
+    /// 可与其它 `Shared` 工具并发执行（典型：只读 I/O，如 `read_file` / grep）。
     Shared,
     /// 串行执行，且作为屏障——其前的工具须全部完成，其后的工具须等它完成（典型：写/执行类，
-    /// 如 write_file / run_command，避免彼此或与读工具竞态）。
+    /// 如 `write_file` / `run_command，避免彼此或与读工具竞态`）。
     Exclusive,
 }
 
@@ -207,7 +223,7 @@ impl ToolRegistry for DefaultToolRegistry {
 }
 
 /// 核心工具集（始终启用，不受 `[tools]` 开关控制）：
-/// read_file / write_file / list_files / run_command / grep / glob。
+/// `read_file` / `write_file` / `list_files` / `run_command` / grep / glob。
 /// 编辑经可选的 `apply_hashline`（主推）完成；`write_file` 负责整文件创建/覆写。
 ///
 /// `intercept` 为 `run_command` 的命令拦截规则（把 cat/grep/find/echo-redirect 重定向到
@@ -247,7 +263,8 @@ pub fn image_tools(reg: DefaultToolRegistry) -> DefaultToolRegistry {
 pub fn lsp_tool(reg: DefaultToolRegistry) -> DefaultToolRegistry {
     let tool = LspTool::new();
     let pool = tool.pool();
-    reg.with(Box::new(tool)).with(Box::new(LspApplyTool::new(pool)))
+    reg.with(Box::new(tool))
+        .with(Box::new(LspApplyTool::new(pool)))
 }
 
 /// 全部内置工具（core + ast + image + lsp），向后兼容入口。
@@ -294,7 +311,7 @@ pub struct OptionalToolPrompt {
     pub prompt: &'static str,
 }
 
-/// AST 组使用指引（覆盖 replace_block / ast_search / ast_rewrite）。
+/// AST 组使用指引（覆盖 `replace_block` / `ast_search` / `ast_rewrite`）。
 const AST_PROMPT: &str = "<ast>\n\
 AST 结构化工具已启用：基于 tree-sitter 的句法感知编辑与检索。\n\
 - replace_block：按行号定位，整体替换一个句法块（函数/结构体/方法），自动确定块边界，比纯文本替换更稳。\n\
@@ -311,7 +328,7 @@ action ∈ {diagnostics, goto_definition, find_references, hover, document_symbo
 rename 做跨文件语义重命名。uri 用 file:/// 绝对路径；语言服务器须已在工作区可被发现。\n\
 </lsp>";
 
-/// 图像组使用指引（覆盖 read_image / image_gen）。
+/// 图像组使用指引（覆盖 `read_image` / `image_gen`）。
 const IMAGE_PROMPT: &str = "<image>\n\
 图像工具已启用：read_image（读取本地图片给模型查看，png/jpeg/gif/webp）与 image_gen（OpenAI 兼容图像生成）。\n\
 image_gen 需环境变量 IMAGE_API_KEY 或 OPENAI_API_KEY。\n\
@@ -366,7 +383,7 @@ mod tests {
         assert!(specs.iter().any(|s| s.name == "read_file"));
         assert!(reg.get("write_file").is_some());
         // github 默认禁用：由装配层在 config [github] enabled 时条件注册。
-        assert!(!reg.get("github").is_some());
+        assert!(reg.get("github").is_none());
         assert!(reg.get("nope").is_none());
     }
 

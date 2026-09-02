@@ -5,7 +5,6 @@
 //! 经驱动任务转为 [`ServerFrame`] 广播给 WebSocket 订阅者；审批经 [`ClientFrame::Respond`] 回执。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,8 +14,8 @@ use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest,
     AskMessage, AskResponse, AssistantMessage, CompactionStrategy, ContentBlock, ContextManager,
-    LlmProvider, Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult,
-    ToolResultMessage, Usage, UserContent, UserMessage, Workspace,
+    LlmProvider, Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage,
+    Usage, UserContent, UserMessage, Workspace,
 };
 use agent_supervisor::{SubAgentStatus, Supervisor};
 use agent_tools::Tool;
@@ -42,7 +41,7 @@ const MAX_SESSIONS: usize = 64;
 /// tungstenite 拒收（`Capacity::MessageTooBig`）→ 连接关闭、任务永不到达驱动、
 /// 前端表现为「上传图片后无任何内容响应」。提升到 16 MiB 以容纳常见截图/照片。
 const WS_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-/// 单张上传图片解码后字节上限（与 CLI `read_image` 的 MAX_IMAGE_BYTES 对齐）。
+/// 单张上传图片解码后字节上限（与 CLI `read_image` 的 `MAX_IMAGE_BYTES` 对齐）。
 const MAX_UPLOAD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -140,7 +139,7 @@ pub enum ServerFrame {
     ThinkingDelta { delta: String },
     /// 信息性输出。
     Say { text: String },
-    /// 需审批/回答（对应 ClientFrame::Respond）。
+    /// 需审批/回答（对应 `ClientFrame::Respond`）。
     Ask { ask: AskMessage },
     /// 工具执行进度。
     ToolExec { name: String, output: String },
@@ -309,7 +308,7 @@ pub struct WebApprovalPolicy {
 
 impl WebApprovalPolicy {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         rules: RulesEngine,
         tx: broadcast::Sender<ServerFrame>,
         pending: PendingMap,
@@ -330,17 +329,16 @@ impl ApprovalPolicy for WebApprovalPolicy {
         self.pending.lock().await.insert(id.clone(), resp_tx);
         let _ = self.tx.send(ServerFrame::Ask { ask: ask.clone() });
 
-        match tokio::time::timeout(
+        if let Ok(Ok(response)) = tokio::time::timeout(
             std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
             resp_rx,
         )
         .await
         {
-            Ok(Ok(response)) => Ok(response),
-            _ => {
-                self.pending.lock().await.remove(&id);
-                Err(ToolError::Execution("审批超时或被丢弃".into()))
-            }
+            Ok(response)
+        } else {
+            self.pending.lock().await.remove(&id);
+            Err(ToolError::Execution("审批超时或被丢弃".into()))
         }
     }
 }
@@ -406,8 +404,8 @@ pub struct SessionManager {
     inner: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     config: Arc<Config>,
     http: reqwest::Client,
-    cwd: Arc<std::path::PathBuf>,
-    /// 协同中继（端到端加密）：按不透明 room_id 广播密封字节，永不接触明文/密钥。
+    cwd: Arc<std::path::Path>,
+    /// 协同中继（端到端加密）：按不透明 `room_id` 广播密封字节，永不接触明文/密钥。
     relay: agent_collab::Relay,
     /// host 侧房间机密（`room_id` → 房间密钥 + 规范 write token）。
     ///
@@ -437,7 +435,7 @@ impl SessionManager {
     pub fn new(
         config: Arc<Config>,
         http: reqwest::Client,
-        cwd: Arc<std::path::PathBuf>,
+        cwd: Arc<std::path::Path>,
         socks5: Option<Arc<agent_proxy::Socks5Controller>>,
     ) -> Self {
         // 审批模式持久化路径：`<cwd>/.gyre/approval-mode.state`（与 SOCKS5 开关同目录）。
@@ -460,19 +458,19 @@ impl SessionManager {
 
     /// 审批模式控制器句柄（`/api/approval-mode` 路由驱动；会话创建时取其生效值）。
     #[must_use]
-    pub fn approval(&self) -> &Arc<agent_config::ApprovalModeController> {
+    pub const fn approval(&self) -> &Arc<agent_config::ApprovalModeController> {
         &self.approval
     }
 
     /// SOCKS5 代理控制器句柄（`/api/socks5` 路由驱动其开关；`None` = 未配置）。
     #[must_use]
-    pub fn socks5(&self) -> &Option<Arc<agent_proxy::Socks5Controller>> {
+    pub const fn socks5(&self) -> &Option<Arc<agent_proxy::Socks5Controller>> {
         &self.socks5
     }
 
     /// 协同中继句柄（供路由直接 join/publish）。
     #[must_use]
-    pub fn relay(&self) -> &agent_collab::Relay {
+    pub const fn relay(&self) -> &agent_collab::Relay {
         &self.relay
     }
 
@@ -485,12 +483,12 @@ impl SessionManager {
     /// 工作区根目录（agent 打开的目录）。
     #[must_use]
     pub fn cwd(&self) -> &std::path::Path {
-        self.cwd.as_path()
+        &self.cwd
     }
 
     /// 进程级暂停门句柄（`/api/pause` `/api/resume` 路由驱动其 `pause()` / `resume()`）。
     #[must_use]
-    pub fn pause_gate(&self) -> &Arc<PauseGate> {
+    pub const fn pause_gate(&self) -> &Arc<PauseGate> {
         &self.pause_gate
     }
 
@@ -519,7 +517,7 @@ impl SessionManager {
         let resolved_cwd: std::path::PathBuf = match cwd {
             Some(c) if c.is_absolute() => c.canonicalize().unwrap_or_else(|_| c.to_path_buf()),
             Some(c) => self.cwd.join(c),
-            None => self.cwd.as_path().to_path_buf(),
+            None => self.cwd.to_path_buf(),
         };
         let effective_cwd: &std::path::Path = &resolved_cwd;
         // 解析会话 id：resume（复用）> fork（复制为新 id）> 新建。
@@ -661,6 +659,7 @@ impl SessionManager {
     }
 
     /// 模型 profile 列表（前端选择）。
+    #[must_use]
     pub fn models(&self) -> Vec<ModelProfileView> {
         let mut out = vec![profile_view("default", &self.config.default_model)];
         for m in &self.config.models {
@@ -669,8 +668,9 @@ impl SessionManager {
         out
     }
 
-    /// 期望的鉴权 token（从 config.server.auth_token，已 ${ENV} 展开）。
+    /// 期望的鉴权 token（从 `config.server.auth_token，已` ${ENV} 展开）。
     /// 返回 None 表示无需鉴权。
+    #[must_use]
     pub fn expected_token(&self) -> Option<String> {
         self.config
             .server
@@ -708,7 +708,7 @@ struct DriverDeps {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// 当前运行任务的取消句柄（None 表示无任务运行）。
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
-    /// 上下文管理器（手动压缩 `/compact` + 任务后 ContextUsage 下发）。
+    /// 上下文管理器（手动压缩 `/compact` + 任务后 `ContextUsage` 下发）。
     context: Arc<dyn ContextManager>,
     /// 多模态图片上传句柄表（`POST /upload` 写、`new_task` 的 `ImageRef` 读，消费即清）。
     uploads: Arc<Mutex<HashMap<String, (String, String)>>>,
@@ -803,11 +803,12 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
                             // 缺失句柄跳过并告警。解析后清空，避免无界增长。
                             let uploads_snapshot = d.uploads.lock().await.clone();
                             for b in &blocks {
-                                match b.to_user_content(&uploads_snapshot) {
-                                    Some(uc) => contents.push(uc),
-                                    None => tracing::warn!(
+                                if let Some(uc) = b.to_user_content(&uploads_snapshot) {
+                                    contents.push(uc)
+                                } else {
+                                    tracing::warn!(
                                         "多模态内容块解析为空（upload_id 可能已过期/未知），已跳过"
-                                    ),
+                                    );
                                 }
                             }
                             d.uploads.lock().await.clear();
@@ -821,7 +822,7 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
                     loop {
                         tokio::select! {
                             biased;
-                            _ = select_cancel.cancelled() => {
+                            () = select_cancel.cancelled() => {
                                 if let Err(e) = d.tx.send(ServerFrame::Say {
                                     text: "任务已取消".into(),
                                 }) {
@@ -875,12 +876,10 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
                     }) {
                         tracing::warn!(?e, "广播取消确认失败");
                     }
-                } else {
-                    if let Err(e) = deps.tx.send(ServerFrame::Say {
-                        text: "无运行中任务".into(),
-                    }) {
-                        tracing::warn!(?e, "广播无任务提示失败");
-                    }
+                } else if let Err(e) = deps.tx.send(ServerFrame::Say {
+                    text: "无运行中任务".into(),
+                }) {
+                    tracing::warn!(?e, "广播无任务提示失败");
                 }
             }
             ClientFrame::Compact => {
@@ -933,9 +932,9 @@ async fn driver(deps: DriverDeps, mut inbound: mpsc::UnboundedReceiver<ClientFra
     }
 }
 
-/// 从配置装配 Agent（与 CLI 一致，审批替换为 WebApprovalPolicy）。
+/// 从配置装配 Agent（与 CLI 一致，审批替换为 `WebApprovalPolicy`）。
 ///
-/// 返回装配好的 Agent 与其上下文管理器（后者供驱动任务做 `/compact` 与 ContextUsage 下发）。
+/// 返回装配好的 Agent 与其上下文管理器（后者供驱动任务做 `/compact` 与 `ContextUsage` 下发）。
 #[allow(clippy::too_many_arguments)]
 async fn build_agent(
     config: &Config,
@@ -978,24 +977,20 @@ async fn build_agent(
     let fallback_models: Vec<agent_core::Model> = chain
         .iter()
         .skip(1)
-        .map(|p| {
-            agent_core::Model {
-                id: p.id.clone(),
-                provider: "openai-compatible".into(),
-                api: p.api,
-                max_input_tokens: p.effective_max_input_tokens(),
-                max_output_tokens: p.max_output_tokens.unwrap_or(4096),
-                supports_tools: true,
-                supports_streaming: true,
-                supports_thinking: config.agent.enable_thinking,
-                extra_body: p.extra_body.clone(),
-            }
+        .map(|p| agent_core::Model {
+            id: p.id.clone(),
+            provider: "openai-compatible".into(),
+            api: p.api,
+            max_input_tokens: p.effective_max_input_tokens(),
+            max_output_tokens: p.max_output_tokens.unwrap_or(4096),
+            supports_tools: true,
+            supports_streaming: true,
+            supports_thinking: config.agent.enable_thinking,
+            extra_body: p.extra_body.clone(),
         })
         .collect();
-    let key_rings: std::collections::HashMap<String, Vec<String>> = chain
-        .iter()
-        .map(|p| (p.id.clone(), p.key_ring()))
-        .collect();
+    let key_rings: std::collections::HashMap<String, Vec<String>> =
+        chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
 
     let mut registry = agent_llm::ProviderRegistry::new();
     for p in agent_llm::collect_providers(http) {
@@ -1017,15 +1012,15 @@ async fn build_agent(
         ctx: provider_ctx.clone(),
         model: model.clone(),
     };
-    let mode = mode_override
-        .map(|m| match m.trim().to_ascii_lowercase().as_str() {
+    let mode = mode_override.map_or(config.agent.mode, |m| {
+        match m.trim().to_ascii_lowercase().as_str() {
             "architect" => Mode::Architect,
             "ask" => Mode::Ask,
             "debug" => Mode::Debug,
             "plan" => Mode::Plan,
             _ => Mode::Code,
-        })
-        .unwrap_or(config.agent.mode);
+        }
+    });
     let prompts = Arc::new(agent_prompt::PromptCatalog::new());
     // 持久化上下文（与 CLI 共享 <cwd>/.agent/sessions/<id>.jsonl）：resume 时自动加载历史。
     let session_path = agent_context::SessionStore::for_cwd(cwd).path_for(session_id);
@@ -1033,15 +1028,33 @@ async fn build_agent(
         agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
             .await
             .map_err(|e| e.to_string())?;
-    ctx.set_summarizer(Box::new(
-        agent_context::compaction::LlmSummaryProvider::new(
-            Arc::clone(&provider),
-            model.clone(),
-            provider_ctx.clone(),
-            config.compaction.remote_endpoint.clone(),
-        ),
-    ))
-    .await;
+    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换；server 简化装配，无心智模型配置）。
+    // 提前到 summarizer 之前：压缩前召回（preCompactionContext）需把记忆挂到摘要提供器。
+    let memory: Option<Arc<dyn agent_core::MemoryStore>> = if config.memory.enabled {
+        match config.memory.backend {
+            agent_config::MemoryBackend::Local => {
+                Some(Arc::new(agent_memory::LocalMemoryStore::new(cwd)))
+            }
+            agent_config::MemoryBackend::Structured => Some(Arc::new(
+                agent_memory::StructuredMemoryStore::new(cwd)
+                    .with_embedder(agent_memory::default_embedder()),
+            )),
+        }
+    } else {
+        None
+    };
+    let mut summarizer = agent_context::compaction::LlmSummaryProvider::new(
+        Arc::clone(&provider),
+        model.clone(),
+        provider_ctx.clone(),
+        config.compaction.remote_endpoint.clone(),
+        config.user_agent.clone(),
+    );
+    if let Some(m) = &memory {
+        // P2-5：压缩前召回（对齐 mnemopi `preCompactionContext`）——挂记忆到摘要提供器。
+        summarizer = summarizer.with_memory(Arc::clone(m));
+    }
+    ctx.set_summarizer(Box::new(summarizer)).await;
     // Shake 归档落盘到 <cwd>/.gyre/artifacts，使被压缩的大块可经 read_file artifact:// 回读。
     ctx.set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
         cwd.join(".gyre").join("artifacts"),
@@ -1059,7 +1072,7 @@ async fn build_agent(
     // Web 开关的运行时切换对已建会话实时生效（无需重建 Agent / 会话）。
     agent_cfg.approval_mode = approval.effective(agent_cfg.approval_mode);
     let rules = RulesEngine::new(Arc::new(agent_cfg))
-        .with_workspace_root(Some(workspace.root().to_path_buf()))
+        .with_workspace_root(Some(workspace.root()))
         .with_approval_override(approval.shared());
     let approval: Arc<dyn ApprovalPolicy> = Arc::new(WebApprovalPolicy::new(
         rules,
@@ -1073,7 +1086,7 @@ async fn build_agent(
         Vec::new()
     };
     // 输出最小化器（[agent.commands.minimizer] enabled/max_lines）。
-    let minimizer = compiled_minimizer(&config);
+    let minimizer = compiled_minimizer(config);
     // 子 Agent 工具集（builtin + MCP，不含 task 以防递归）
     let mut sub_reg = agent_tools::builtin_tools(intercept.clone(), minimizer);
     if config.github.enabled {
@@ -1105,15 +1118,35 @@ async fn build_agent(
     };
     // 父 Agent 工具集 = builtin + MCP + task（task 受开关控制）
     let (mut tool_registry, lsp_pool) =
-        agent_tools::builtin_tools_with_pool(intercept, compiled_minimizer(&config));
+        agent_tools::builtin_tools_with_pool(intercept, compiled_minimizer(config));
     if config.github.enabled {
         tool_registry = tool_registry.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,
         )));
     }
-    for t in mcp.tools() {
-        tool_registry = tool_registry.with(Box::new(t.clone()));
-    }
+    // P0/P1：todo / ask 恒开 + checkpoint / rewind 会话回卷（每会话独立检查点）。
+    tool_registry = tool_registry
+        .with(Box::new(agent_tools::TodoTool::new(
+            agent_tools::TodoState::load(cwd.join(".gyre").join("todo.json")).shared(),
+        )))
+        .with(Box::new(agent_tools::AskUserTool::new()));
+    let checkpoint_state = agent_tools::CheckpointState::new().shared();
+    tool_registry = tool_registry
+        .with(Box::new(agent_tools::CheckpointTool::new(Arc::clone(
+            &checkpoint_state,
+        ))))
+        .with(Box::new(agent_tools::RewindTool::new(Arc::clone(
+            &checkpoint_state,
+        ))));
+    // Phase 0：security_scan 接线（v1 工具早已实现但两端装配层均未注册——运行时不可达）。
+    tool_registry = tool_registry.with(Box::new(agent_tools::SecurityScanTool::new(
+        agent_tools::SecurityScanState::new().shared(),
+    )));
+    // P1：hub 消息总线（每会话以 "main" 入册）。
+    tool_registry = tool_registry.with(Box::new(agent_tools::HubTool::register(
+        agent_core::hub::Hub::new().shared(),
+        "main",
+    )));
     if config.subagent.enabled {
         let task_tool = agent::TaskTool::new(
             Arc::clone(&provider),
@@ -1138,22 +1171,8 @@ async fn build_agent(
         .with_approval(Arc::clone(&approval));
         tool_registry = tool_registry.with(Box::new(task_tool));
     }
-    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换；server 简化装配，无心智模型配置）。
-    let memory: Option<Arc<dyn agent_core::MemoryStore>> = if config.memory.enabled {
-        match config.memory.backend {
-            agent_config::MemoryBackend::Local => {
-                Some(Arc::new(agent_memory::LocalMemoryStore::new(cwd)))
-            }
-            agent_config::MemoryBackend::Structured => Some(Arc::new(
-                agent_memory::StructuredMemoryStore::new(cwd)
-                    .with_embedder(agent_memory::default_embedder()),
-            )),
-        }
-    } else {
-        None
-    };
-    // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect（仅父 Agent；子 Agent 工具集不含）。
-    // 放在 memory 装配之后，仅启用记忆时注册（零上下文成本）。
+    // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect + memory_edit / learn
+    // （仅父 Agent；子 Agent 工具集不含）。仅启用记忆时注册（零上下文成本）。
     if let Some(m) = &memory {
         tool_registry = tool_registry
             .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
@@ -1163,7 +1182,9 @@ async fn build_agent(
                 Arc::clone(&provider),
                 model.clone(),
                 provider_ctx.clone(),
-            )));
+            )))
+            .with(Box::new(agent_tools::MemoryEditTool::new(Arc::clone(m))))
+            .with(Box::new(agent_tools::MemoryLearnTool::new(Arc::clone(m))));
     }
     let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
 
@@ -1171,6 +1192,8 @@ async fn build_agent(
     if config.github.enabled {
         context_files.push(agent_tools::PROMPT_SECTION.to_string());
     }
+    // Phase 0：security_scan 恒开注册 → 使用指引恒注入（与工具注册面一致）。
+    context_files.push(agent_tools::SECURITY_SCAN_PROMPT_SECTION.to_string());
 
     // 模型的输出 token 预算（来自 profile.max_output_tokens，回退 4096）须下发给
     // Agent 作为每轮请求的 max_tokens；否则 assemble 未设置会回落到硬编码 4096，
@@ -1219,7 +1242,7 @@ fn assemble(
     memory: Option<Arc<dyn agent_core::MemoryStore>>,
     pause_gate: Arc<PauseGate>,
 ) -> Agent {
-    let workspace_root = workspace.root().to_path_buf();
+    let workspace_root = workspace.root();
     // fuzzy 配置 → 全局覆盖（首次装配 set，OnceLock 幂等；与 CLI 一致）。
     {
         let mut opts = agent_tools::FuzzyOpts::from_env();
@@ -1291,7 +1314,10 @@ fn compiled_minimizer(config: &agent_config::Config) -> agent_tools::Minimizer {
 }
 
 /// 缺省有规则即启用；`[ttsr] enabled = false` 或 `disabled_rules` 可关闭/过滤。
-fn ttsr_for(config: &agent_config::Config, workspace_root: &std::path::Path) -> Option<std::sync::Arc<agent_ttsr::TtsrCoordinator>> {
+fn ttsr_for(
+    config: &agent_config::Config,
+    workspace_root: &std::path::Path,
+) -> Option<std::sync::Arc<agent_ttsr::TtsrCoordinator>> {
     if !config.ttsr.enabled.unwrap_or(true) {
         return None;
     }
@@ -1514,18 +1540,19 @@ async fn approval_mode_set(
     .into_response()
 }
 
-/// ApprovalMode → JSON 字符串（`"always-ask"` 等，与 serde kebab-case 一致）。
+/// `ApprovalMode` → JSON 字符串（`"always-ask"` 等，与 serde kebab-case 一致）。
 fn mode_json(mode: ApprovalMode) -> serde_json::Value {
-    serde_json::Value::String(match mode {
-        ApprovalMode::AlwaysAsk => "always-ask",
-        ApprovalMode::Write => "write",
-        ApprovalMode::Yolo => "yolo",
-    }
-    .to_string())
+    serde_json::Value::String(
+        match mode {
+            ApprovalMode::AlwaysAsk => "always-ask",
+            ApprovalMode::Write => "write",
+            ApprovalMode::Yolo => "yolo",
+        }
+        .to_string(),
+    )
 }
 
 /// 构建 axum Router（静态前端内嵌于二进制，运行时无需 `web/` 目录）。
-#[must_use]
 pub fn app(state: SessionManager) -> Router {
     Router::new()
         .route("/api/sessions", get(create_session))
@@ -1657,9 +1684,9 @@ struct SessionsSummary {
 struct ToolStat {
     /// 工具名。
     name: String,
-    /// 调用次数（assistant 消息中的 ToolCall 块计数）。
+    /// 调用次数（assistant 消息中的 `ToolCall` 块计数）。
     calls: u64,
-    /// 错误次数（对应 tool_call_id 的 ToolResult::Error 计数）。
+    /// 错误次数（对应 `tool_call_id` 的 `ToolResult::Error` 计数）。
     errors: u64,
 }
 
@@ -1764,8 +1791,8 @@ impl StatsAccumulator {
         });
         top_models.truncate(STATS_MAX_MODELS);
 
-        let daily = match window {
-            Some(dates) => dates
+        let daily = if let Some(dates) = window {
+            dates
                 .iter()
                 .map(|date| {
                     let d = self.daily.get(date);
@@ -1775,20 +1802,19 @@ impl StatsAccumulator {
                         cost: d.map_or(0.0, |x| x.cost),
                     }
                 })
-                .collect(),
-            None => {
-                let mut v: Vec<DailyStat> = self
-                    .daily
-                    .into_iter()
-                    .map(|(date, d)| DailyStat {
-                        date,
-                        tokens: d.tokens,
-                        cost: d.cost,
-                    })
-                    .collect();
-                v.sort_by(|a, b| a.date.cmp(&b.date));
-                v
-            }
+                .collect()
+        } else {
+            let mut v: Vec<DailyStat> = self
+                .daily
+                .into_iter()
+                .map(|(date, d)| DailyStat {
+                    date,
+                    tokens: d.tokens,
+                    cost: d.cost,
+                })
+                .collect();
+            v.sort_by(|a, b| a.date.cmp(&b.date));
+            v
         };
 
         StatsAgg {
@@ -1831,6 +1857,8 @@ fn collect_stats(store: &agent_context::SessionStore, window: Option<&[String]>)
 }
 
 /// 读取会话 JSONL 的全部非空行（文件缺失 → 空）。
+// 尽力而为读取：刻意跳过 Err 行继续；lint 建议的 map_while 会在首个 Err 截断后续行，语义不同。
+#[allow(clippy::lines_filter_map_ok)]
 fn read_jsonl_lines(path: &std::path::Path) -> Vec<String> {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
@@ -1838,7 +1866,7 @@ fn read_jsonl_lines(path: &std::path::Path) -> Vec<String> {
     };
     std::io::BufReader::new(file)
         .lines()
-        .flatten()
+        .filter_map(Result::ok)
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
@@ -1848,7 +1876,7 @@ fn read_jsonl_lines(path: &std::path::Path) -> Vec<String> {
 ///
 /// 与 [`read_history`] 同源解析（[`parse_history_line`]：新会话树 / 旧线性两种格式
 /// 都兼容）；无法解析的行跳过、不计入消息数。`tool_call_id → 工具名` 映射按文件
-/// 独立维护——不同会话/分支可能复用同一 tool_call_id。
+/// 独立维护——不同会话/分支可能复用同一 `tool_call_id`。
 fn aggregate_file_lines(acc: &mut StatsAccumulator, lines: &[String], date: &str) {
     acc.sessions += 1;
     let mut call_names: HashMap<String, String> = HashMap::new();
@@ -1895,13 +1923,12 @@ fn aggregate_file_lines(acc: &mut StatsAccumulator, lines: &[String], date: &str
 fn mtime_utc_date(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     unix_to_utc_date(secs)
 }
 
 /// UNIX 纪元秒 → UTC 日期 `YYYY-MM-DD`（自实现，避免为本地可观测端点引入
-/// chrono 依赖）。采用 Howard Hinnant 的 civil_from_days 算法。
+/// chrono 依赖）。采用 Howard Hinnant 的 `civil_from_days` 算法。
 fn unix_to_utc_date(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
@@ -1911,7 +1938,7 @@ fn unix_to_utc_date(secs: i64) -> String {
 /// 自 1970-01-01 起的天数 → (年, 月, 日)。
 ///
 /// 算法来源：<https://howardhinnant.github.io/date_algorithms.html#civil_from_days>。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+const fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -1928,8 +1955,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn recent_dates(days: u64) -> Vec<String> {
     let today = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
         .div_euclid(86_400);
     (0..days)
         .rev()
@@ -2189,7 +2215,7 @@ async fn workspace_info(
     let cwd = state.cwd();
     Json(serde_json::json!({
         "root": cwd.display().to_string(),
-        "name": cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| ".".into()),
+        "name": cwd.file_name().map_or_else(|| ".".into(), |n| n.to_string_lossy().to_string()),
     }))
     .into_response()
 }
@@ -2258,7 +2284,7 @@ async fn read_file(
         }
     };
     // 二进制探测：含 NUL 视为非文本
-    if bytes.iter().any(|&b| b == 0) {
+    if bytes.contains(&0) {
         return Json(serde_json::json!({
             "path": path_str,
             "binary": true,
@@ -2334,7 +2360,7 @@ fn collect_entries(dir: &std::path::Path) -> Result<Vec<serde_json::Value>, Stri
             Ok(t) => t,
             Err(_) => continue,
         };
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = entry.metadata().map_or(0, |m| m.len());
         let item = serde_json::json!({
             "name": name,
             "kind": if ft.is_dir() { "dir" } else { "file" },
@@ -2484,7 +2510,9 @@ fn render_session_transcript(path: &std::path::Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     let mut parts: Vec<String> = Vec::new();
-    for line in std::io::BufReader::new(file).lines().flatten() {
+    // 尽力而为读取：刻意跳过 Err 行继续；lint 建议的 map_while 会在首个 Err 截断后续行，语义不同。
+    #[allow(clippy::lines_filter_map_ok)]
+    for line in std::io::BufReader::new(file).lines().filter_map(Result::ok) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -2525,7 +2553,9 @@ fn render_session_transcript(path: &std::path::Path) -> Option<String> {
 fn read_first_user(path: &std::path::Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(file).lines().flatten() {
+    // 尽力而为读取：刻意跳过 Err 行继续；lint 建议的 map_while 会在首个 Err 截断后续行，语义不同。
+    #[allow(clippy::lines_filter_map_ok)]
+    for line in std::io::BufReader::new(file).lines().filter_map(Result::ok) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -2664,8 +2694,7 @@ async fn list_sessions(
             let mtime_ms = s
                 .mtime
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis() as u64);
             serde_json::json!({
                 "id": s.id,
                 "preview": preview,
@@ -2695,7 +2724,7 @@ async fn session_history(
     Json(serde_json::json!({ "items": items })).into_response()
 }
 
-/// `GET /api/sessions/{id}/branches` → 会话分支树（节点 id / parent_id / 角色 / 预览 +
+/// `GET /api/sessions/{id}/branches` → 会话分支树（节点 id / `parent_id` / 角色 / 预览 +
 /// 活跃叶子 + 叶子列表）。前端渲染分支视图、做分支切换用。
 ///
 /// 直接读 JSONL 文件（活跃与非活跃会话皆可用），兼容旧线性日志（迁移为单链树）。
@@ -2743,52 +2772,49 @@ async fn switch_branch(
         return (StatusCode::BAD_REQUEST, "非法会话 id 或 leaf_id").into_response();
     }
     let leaf_id = body.leaf_id.trim().to_string();
-    match state.get(&id).await {
-        Some(session) => {
-            if session.running.load(std::sync::atomic::Ordering::SeqCst) {
-                return (StatusCode::CONFLICT, "任务运行中，无法切换分支").into_response();
-            }
-            let ok = if body.handoff {
-                match session.context.switch_branch_with_handoff(&leaf_id).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("切换失败: {e}"))
-                            .into_response();
-                    }
+    if let Some(session) = state.get(&id).await {
+        if session.running.load(std::sync::atomic::Ordering::SeqCst) {
+            return (StatusCode::CONFLICT, "任务运行中，无法切换分支").into_response();
+        }
+        let ok = if body.handoff {
+            match session.context.switch_branch_with_handoff(&leaf_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("切换失败: {e}"))
+                        .into_response();
                 }
-            } else {
-                session.context.set_active_leaf(&leaf_id).await
-            };
-            if ok {
-                Json(serde_json::json!({ "ok": true, "active_leaf": leaf_id })).into_response()
-            } else {
-                (StatusCode::NOT_FOUND, "目标叶子不存在").into_response()
             }
-        }
-        None => {
-            // 非活跃会话：校验 leaf_id 存在并写 sidecar。
-            let store = agent_context::SessionStore::for_cwd(state.cwd());
-            let path = store.path_for(&id);
-            if !path.exists() {
-                return (StatusCode::NOT_FOUND, "会话不存在").into_response();
-            }
-            let tree = read_branch_tree(&path);
-            let exists = tree["nodes"].as_array().map_or(false, |a| {
-                a.iter().any(|n| n["id"].as_str() == Some(leaf_id.as_str()))
-            });
-            if !exists {
-                return (StatusCode::NOT_FOUND, "目标叶子不存在").into_response();
-            }
-            let sidecar = path.with_extension("leaf");
-            if let Err(e) = std::fs::write(&sidecar, leaf_id.as_bytes()) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("写入活跃叶子失败: {e}"),
-                )
-                    .into_response();
-            }
+        } else {
+            session.context.set_active_leaf(&leaf_id).await
+        };
+        if ok {
             Json(serde_json::json!({ "ok": true, "active_leaf": leaf_id })).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "目标叶子不存在").into_response()
         }
+    } else {
+        // 非活跃会话：校验 leaf_id 存在并写 sidecar。
+        let store = agent_context::SessionStore::for_cwd(state.cwd());
+        let path = store.path_for(&id);
+        if !path.exists() {
+            return (StatusCode::NOT_FOUND, "会话不存在").into_response();
+        }
+        let tree = read_branch_tree(&path);
+        let exists = tree["nodes"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|n| n["id"].as_str() == Some(leaf_id.as_str())));
+        if !exists {
+            return (StatusCode::NOT_FOUND, "目标叶子不存在").into_response();
+        }
+        let sidecar = path.with_extension("leaf");
+        if let Err(e) = std::fs::write(&sidecar, leaf_id.as_bytes()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("写入活跃叶子失败: {e}"),
+            )
+                .into_response();
+        }
+        Json(serde_json::json!({ "ok": true, "active_leaf": leaf_id })).into_response()
     }
 }
 
@@ -2800,7 +2826,9 @@ fn read_branch_tree(path: &std::path::Path) -> serde_json::Value {
     let mut nodes: Vec<agent_core::SessionNode> = Vec::new();
     let mut legacy: Vec<agent_core::AgentMessage> = Vec::new();
     if let Ok(file) = std::fs::File::open(path) {
-        for line in std::io::BufReader::new(file).lines().flatten() {
+        // 尽力而为读取：刻意跳过 Err 行继续；lint 建议的 map_while 会在首个 Err 截断后续行，语义不同。
+        #[allow(clippy::lines_filter_map_ok)]
+        for line in std::io::BufReader::new(file).lines().filter_map(Result::ok) {
             let t = line.trim();
             if t.is_empty() {
                 continue;
@@ -3041,7 +3069,9 @@ async fn upload_image(
     Json(serde_json::json!({ "upload_id": upload_id })).into_response()
 }
 
-/// 校验 token：配置了 auth_token 则必须匹配。
+/// 校验 token：配置了 `auth_token` 则必须匹配。
+// Err 载荷为完整 axum Response（超 clippy 大小阈值）；装箱需改动全部 20 个调用点签名，保守豁免。
+#[allow(clippy::result_large_err)]
 fn check_auth(state: &SessionManager, token: &Option<String>) -> Result<(), Response> {
     let Some(expected) = state.expected_token() else {
         return Ok(());
@@ -3049,8 +3079,7 @@ fn check_auth(state: &SessionManager, token: &Option<String>) -> Result<(), Resp
     // 常量时间比较（避免按字节提前返回的时序侧信道）。长度差异可接受地泄露。
     let ok = token
         .as_deref()
-        .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()));
     if ok {
         Ok(())
     } else {
@@ -3168,7 +3197,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, session: Arc<Sessio
 /// host 侧房间机密：房间密钥 + 规范 write token（[`new_collab_room`] 创建时登记）。
 ///
 /// 本服务即 host 进程：密钥由服务本地生成、从不外发，仅用于向 guest 单播
-/// host 裁决帧（Welcome read_only）。中继保持密钥盲视——host 只密封自己的帧，
+/// host 裁决帧（Welcome `read_only）。中继保持密钥盲视——host` 只密封自己的帧，
 /// 永不解封他人帧。
 #[derive(Clone)]
 struct HostSecret {
@@ -3181,7 +3210,7 @@ struct HostSecret {
 /// `GET /api/collab/room` → 生成房间密钥，返回派生 `room_id` 与 base64url 密钥片段。
 ///
 /// 本服务作为 host 进程在内存保留密钥与规范 write token（[`SessionManager::collab_hosts`]），
-/// 供 WS 桥向 guest 单播 read_only 裁决；密钥本地生成、从不外发，中继仍只路由密封字节。
+/// 供 WS 桥向 guest 单播 `read_only` 裁决；密钥本地生成、从不外发，中继仍只路由密封字节。
 async fn new_collab_room(
     State(state): State<SessionManager>,
     axum::extract::Query(auth): axum::extract::Query<SessionParams>,
@@ -3192,21 +3221,20 @@ async fn new_collab_room(
     let key = agent_collab::generate_room_key();
     let room_id = agent_collab::room_id(&key);
     let write_token = agent_collab::generate_write_token();
-    state.relay().set_write_token(&room_id, write_token.clone()).await;
+    state
+        .relay()
+        .set_write_token(&room_id, write_token.clone())
+        .await;
     // 可选会话绑定：guest 连接时由 host 下发会话历史快照块。
     let session_id = auth.sid.filter(|s| is_safe_session_id(s));
-    state
-        .collab_hosts
-        .lock()
-        .await
-        .insert(
-            room_id.clone(),
-            HostSecret {
-                key,
-                write_token: write_token.clone(),
-                session_id,
-            },
-        );
+    state.collab_hosts.lock().await.insert(
+        room_id.clone(),
+        HostSecret {
+            key,
+            write_token: write_token.clone(),
+            session_id,
+        },
+    );
     Json(serde_json::json!({
         "room_id": room_id,
         "key": agent_collab::encode_room_key(&key),
@@ -3234,10 +3262,7 @@ async fn collab_ws_handler(
     let Some(ws) = ws.0 else {
         return (
             axum::http::StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/html; charset=utf-8",
-            )],
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
             COLLAB_GUEST_PAGE,
         )
             .into_response();
@@ -3245,12 +3270,11 @@ async fn collab_ws_handler(
     let wt = auth.wt.clone();
     let host = state.collab_host(&room_id).await;
     let cwd = state.cwd().to_path_buf();
-    ws.max_message_size(256 * 1024)
-        .on_upgrade(move |socket| {
-            // `wt` = write token（房间创建时随可写链接分发的 32 hex 字符）；
-            // 缺省 = 只读 view 链接，publish 将被中继拒绝。
-            collab_relay(socket, room_id, state.relay.clone(), wt, host, cwd)
-        })
+    ws.max_message_size(256 * 1024).on_upgrade(move |socket| {
+        // `wt` = write token（房间创建时随可写链接分发的 32 hex 字符）；
+        // 缺省 = 只读 view 链接，publish 将被中继拒绝。
+        collab_relay(socket, room_id, state.relay.clone(), wt, host, cwd)
+    })
 }
 
 /// 可选 WebSocket 升级 extractor：非 WS 请求返回 `None`（浏览器 GET → guest 页面）。
@@ -3270,13 +3294,9 @@ where
         parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let is_ws = axum::http::header::HeaderMap::get(
-            &parts.headers,
-            axum::http::header::UPGRADE,
-        )
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
+        let is_ws = axum::http::header::HeaderMap::get(&parts.headers, axum::http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
         if !is_ws {
             return Ok(Self(None));
         }
@@ -3452,7 +3472,7 @@ mod tests {
         }
     }
 
-    /// `StateChanged` 为 struct variant，序列化后 `state` 字段直接承载 AgentState 字符串值，
+    /// `StateChanged` 为 struct variant，序列化后 `state` 字段直接承载 `AgentState` 字符串值，
     /// 而非被 serde 展平为 `{"running": null}` 之类（newtype 包装 fieldless enum 的陷阱）。
     #[test]
     fn serialize_state_changed_emits_state_field() {
@@ -3469,7 +3489,7 @@ mod tests {
     }
 
     /// `read_history` 应从 assistant 消息中分别提取 thinking 与 text，
-    /// 且 thinking 排在正文之前（与实时流 ThinkingDelta → TextDelta 顺序一致）。
+    /// 且 thinking 排在正文之前（与实时流 `ThinkingDelta` → `TextDelta` 顺序一致）。
     #[test]
     fn read_history_includes_thinking() {
         use agent_core::{AssistantMessage, ContentBlock, Usage};
@@ -3510,7 +3530,7 @@ mod tests {
         assert_eq!(items[1]["text"].as_str().unwrap(), "最终回答");
     }
 
-    /// transcript 渲染：全部 role 前缀正确、SoftRequirement 跳过、tool_call 摘要截断。
+    /// transcript 渲染：全部 role 前缀正确、SoftRequirement `跳过、tool_call` 摘要截断。
     #[test]
     fn render_session_transcript_renders_all_roles() {
         use agent_core::{
@@ -3531,7 +3551,9 @@ mod tests {
             let mut f = std::fs::File::create(&path).unwrap();
             let lines = [
                 serde_json::to_string(&AgentMessage::User(UserMessage {
-                    content: vec![UserContent::Text { text: "你好".into() }],
+                    content: vec![UserContent::Text {
+                        text: "你好".into(),
+                    }],
                 }))
                 .unwrap(),
                 serde_json::to_string(&AgentMessage::Assistant(AssistantMessage {
@@ -3634,7 +3656,7 @@ mod tests {
         let _ = std::fs::remove_file(&empty);
     }
 
-    /// host welcome 携带 entry_count（快照块总数，guest 端加载进度）。
+    /// host welcome 携带 `entry_count（快照块总数，guest` 端加载进度）。
     #[test]
     fn host_welcome_carries_entry_count() {
         let host = HostSecret {
@@ -3652,7 +3674,7 @@ mod tests {
         }
     }
 
-    /// 会话树格式（SessionNode JSONL）的会话：read_history 与 read_branch_tree
+    /// 会话树格式（SessionNode `JSONL）的会话：read_history` 与 `read_branch_tree`
     /// 都应正确解析，且分支结构（两叶子）可见。
     #[test]
     fn read_history_and_branches_parse_session_nodes() {
@@ -3716,7 +3738,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Sprint 4-1：`/api/pause` `/api/resume` 处理器驱动 SessionManager 共享的进程级暂停门。
+    /// Sprint 4-1：`/api/pause` `/api/resume` 处理器驱动 `SessionManager` 共享的进程级暂停门。
     /// 证明「HTTP 路由 → 共享单例 PauseGate」接线端到端正确；park/resume 机制本身由
     /// agent crate 的 `pause_gate_parks_run_and_resumes` 覆盖。
     #[tokio::test]
@@ -3726,7 +3748,7 @@ mod tests {
         let mgr = SessionManager::new(
             Arc::new(cfg),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             None,
         );
         assert!(!mgr.pause_gate().paused(), "初始应为运行态");
@@ -3747,7 +3769,7 @@ mod tests {
         let mgr = SessionManager::new(
             Arc::new(cfg),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             None,
         );
         let router = app(mgr);
@@ -3775,7 +3797,12 @@ mod tests {
             .expect("读 body");
         let html = String::from_utf8_lossy(&body);
         // 关键元素：WebCrypto AES-GCM 解封 + 帧处理 + 断线重连。
-        for marker in ["AES-GCM", "snapshot_chunk", "重连中", "crypto.subtle.importKey"] {
+        for marker in [
+            "AES-GCM",
+            "snapshot_chunk",
+            "重连中",
+            "crypto.subtle.importKey",
+        ] {
             assert!(html.contains(marker), "guest 页应含 {marker}");
         }
     }
@@ -3800,7 +3827,8 @@ mod tests {
             session_id: None,
         };
         // 正确 wt → read_only: false（可写）。
-        let sealed = seal_host_welcome(&host, Some("tok-canonical-0123456789abcdef"), 1, 0).unwrap();
+        let sealed =
+            seal_host_welcome(&host, Some("tok-canonical-0123456789abcdef"), 1, 0).unwrap();
         let frame = agent_collab::open(&host.key, &sealed).expect("裁决帧应可解封");
         match frame {
             agent_collab::WireFrame::Welcome {
@@ -3840,7 +3868,7 @@ mod tests {
     }
 
     /// 统计聚合纯函数：给定 JSONL 行集合（新旧两种持久化格式混合 + 无法解析的行）
-    /// → 正确的 sessions / usage / tools / top_models / daily 聚合。
+    /// → 正确的 sessions / usage / tools / `top_models` / daily 聚合。
     #[test]
     fn stats_aggregate_from_jsonl_lines() {
         use agent_core::{
@@ -3849,7 +3877,10 @@ mod tests {
         };
 
         // 会话树格式（SessionNode 包裹）下的用户消息（新格式）。
-        let user = SessionNode::root("n1".into(), AgentMessage::User(UserMessage::from_text("hi")));
+        let user = SessionNode::root(
+            "n1".into(),
+            AgentMessage::User(UserMessage::from_text("hi")),
+        );
         let mut lines = vec![serde_json::to_string(&user).unwrap()];
 
         // 旧线性格式（裸 AgentMessage）的 assistant：两次工具调用 + usage。
@@ -3876,7 +3907,7 @@ mod tests {
                     text: "done".into(),
                 },
             ],
-            usage: usage.clone(),
+            usage,
             model: "claude-sonnet".into(),
             stop_reason: None,
             stop_details: None,
@@ -3929,7 +3960,11 @@ mod tests {
         let mut acc = StatsAccumulator::default();
         aggregate_file_lines(&mut acc, &lines, "2026-08-01");
         // 再聚合一个空内容文件（同日期）：会话数 +1，消息/用量不变。
-        aggregate_file_lines(&mut acc, &[serde_json::to_string(&user).unwrap()], "2026-08-01");
+        aggregate_file_lines(
+            &mut acc,
+            &[serde_json::to_string(&user).unwrap()],
+            "2026-08-01",
+        );
 
         let agg = acc.finish(None);
         assert_eq!(agg.sessions.total, 2);
@@ -3967,7 +4002,7 @@ mod tests {
     /// 趋势窗口：daily 按窗口逐日补齐（缺数据的日期补零、升序且与窗口等长）。
     #[test]
     fn stats_trend_window_fills_missing_days() {
-        use agent_core::{AgentMessage, AssistantMessage, ContentBlock, Usage};
+        use agent_core::{AgentMessage, AssistantMessage, Usage};
         let asst = AgentMessage::Assistant(AssistantMessage {
             content: vec![],
             usage: Usage {
@@ -3998,7 +4033,7 @@ mod tests {
         assert_eq!(agg.daily[2].tokens, 0);
     }
 
-    /// 日期换算：civil_from_days 基准值 + 趋势窗口今天收尾。
+    /// `日期换算：civil_from_days` 基准值 + 趋势窗口今天收尾。
     #[test]
     fn unix_date_conversion() {
         assert_eq!(unix_to_utc_date(0), "1970-01-01");
@@ -4036,7 +4071,7 @@ mod tests {
         let mgr = SessionManager::new(
             Arc::new(cfg),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             Some(ctrl),
         );
         let router = app(mgr);
@@ -4066,7 +4101,9 @@ mod tests {
             "响应体不得含明文密码"
         );
         assert!(
-            v["redacted"].as_str().is_some_and(|r| r.contains("user:***@")),
+            v["redacted"]
+                .as_str()
+                .is_some_and(|r| r.contains("user:***@")),
             "redacted 应脱敏: {v}"
         );
 
@@ -4081,7 +4118,7 @@ mod tests {
                     .expect("示例配置应可解析为 Config")
             }),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             None,
         );
         let router2 = app(mgr2);
@@ -4114,7 +4151,7 @@ mod tests {
         let mgr = SessionManager::new(
             Arc::new(cfg),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             Some(Arc::clone(&ctrl)),
         );
         let router = app(mgr);
@@ -4138,7 +4175,7 @@ mod tests {
         let mgr2 = SessionManager::new(
             Arc::new(toml::from_str(include_str!("../../../config.example.toml")).unwrap()),
             reqwest::Client::new(),
-            Arc::new(std::path::PathBuf::from(".")),
+            Arc::from(std::path::PathBuf::from(".")),
             None,
         );
         let router2 = app(mgr2);
@@ -4158,7 +4195,10 @@ mod tests {
 
     /// 测试用临时 cwd（避免在仓库根写 `.gyre/approval-mode.state`）。
     fn tmp_cwd(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("gyre-server-approval-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gyre-server-approval-{}-{name}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         dir
     }
@@ -4172,7 +4212,7 @@ mod tests {
         let mgr = SessionManager::new(
             Arc::new(cfg),
             reqwest::Client::new(),
-            Arc::new(tmp_cwd("status")),
+            Arc::from(tmp_cwd("status")),
             None,
         );
         let router = app(mgr);
@@ -4204,12 +4244,7 @@ mod tests {
             .expect("示例配置应可解析为 Config");
         let cwd = tmp_cwd("set");
         let sidecar = cwd.join(".gyre").join("approval-mode.state");
-        let mgr = SessionManager::new(
-            Arc::new(cfg),
-            reqwest::Client::new(),
-            Arc::new(cwd),
-            None,
-        );
+        let mgr = SessionManager::new(Arc::new(cfg), reqwest::Client::new(), Arc::from(cwd), None);
         let approval = mgr.approval().clone();
         let router = app(mgr);
 

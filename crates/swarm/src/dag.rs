@@ -4,7 +4,7 @@
 //!
 //! 依赖来源：
 //! 1. 显式 `waits_for`
-//! 2. `reports_to` 的隐含反向（A reports_to B ⇒ B 依赖 A）
+//! 2. `reports_to` 的隐含反向（A `reports_to` B ⇒ B 依赖 A）
 //! 3. pipeline/sequential 且无显式依赖时：按 YAML 声明顺序串成链
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -166,7 +166,7 @@ mod tests {
                     task: "t".into(),
                     extra_context: None,
                     reports_to: vec![],
-                    waits_for: waits.iter().map(|s| s.to_string()).collect(),
+                    waits_for: waits.iter().map(std::string::ToString::to_string).collect(),
                     model: None,
                 },
             );

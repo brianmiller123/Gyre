@@ -1,0 +1,7 @@
+# 测试执法基线（借鉴 oh-my-pi `.config/nextest.toml` 的工程取向）
+# flaky 是 bug，不是遮羞布：禁止自动重试，失败必须修到根因。
+[profile.default]
+retries = 0
+fail-fast = false
+# 单测超 60s 视为慢测试；再拖 4 个周期（共 ~4 分钟）强制终止整个测试进程组
+slow-timeout = { period = "60s", terminate-after = 4 }

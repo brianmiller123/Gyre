@@ -167,6 +167,7 @@ pub async fn run_review(staged: bool, explicit: Option<usize>, env: &ReviewEnv<'
         update_tx: None,
         conflicts: None,
         pending_rewrites: None,
+        context: None,
     };
     let all_text = match task_tool
         .execute(json!({ "tasks": tasks }), &tool_ctx)
@@ -702,6 +703,9 @@ diff --git a/b.rs b/b.rs
         let empty = render_report(1, &data, &[]);
         assert!(!empty.contains("[P"), "空发现不输出分级条目");
         assert!(!empty.contains("建议:"), "空发现不输出建议");
-        assert!(!empty.trim().is_empty(), "空发现报告非空（含 review.empty）");
+        assert!(
+            !empty.trim().is_empty(),
+            "空发现报告非空（含 review.empty）"
+        );
     }
 }

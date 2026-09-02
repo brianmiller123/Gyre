@@ -79,7 +79,7 @@ impl LspManager {
     async fn client_for_uri(&mut self, uri: &Url) -> Result<&mut LspClient, LspError> {
         let path = uri
             .to_file_path()
-            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+            .map_err(|()| LspError::InvalidUri(uri.to_string()))?;
         let lang_id = language_id_from_path(&path)
             .unwrap_or("plaintext")
             .to_string();
@@ -102,7 +102,7 @@ impl LspManager {
     pub async fn open_document(&mut self, uri: &Url, text: &str) -> Result<(), LspError> {
         let path = uri
             .to_file_path()
-            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+            .map_err(|()| LspError::InvalidUri(uri.to_string()))?;
         let lang_id = language_id_from_path(&path).unwrap_or("plaintext");
         let client = self.ensure_client(lang_id).await?;
         client.open_document(uri, text, lang_id).await
@@ -232,7 +232,7 @@ impl LspManager {
     pub async fn format(&mut self, uri: &Url) -> Result<Option<String>, LspError> {
         let path = uri
             .to_file_path()
-            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+            .map_err(|()| LspError::InvalidUri(uri.to_string()))?;
         let text = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| LspError::Unsupported(format!("读取文件失败: {e}")))?;
@@ -250,7 +250,7 @@ impl LspManager {
     pub async fn ensure_document_open(&mut self, uri: &Url, text: &str) -> Result<(), LspError> {
         let path = uri
             .to_file_path()
-            .map_err(|_| LspError::InvalidUri(uri.to_string()))?;
+            .map_err(|()| LspError::InvalidUri(uri.to_string()))?;
         let lang_id = language_id_from_path(&path).unwrap_or("plaintext");
         self.client_for_uri(uri)
             .await?

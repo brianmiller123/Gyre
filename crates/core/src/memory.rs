@@ -32,6 +32,22 @@ pub struct MemoryHit {
     pub importance: u8,
 }
 
+impl MemoryHit {
+    /// 渲染为 `- [score] content` 行（system 注入 / 压缩上下文用，与 omp 注入格式一致）。
+    #[must_use]
+    pub fn render_list(hits: &[Self]) -> String {
+        let mut out = String::new();
+        for h in hits {
+            out.push_str(&format!(
+                "- [{:.2}] {}\n",
+                h.score,
+                h.content.replace('\n', " ")
+            ));
+        }
+        out
+    }
+}
+
 /// 记忆存储端口（按项目作用域）。
 ///
 /// 实现负责按 cwd（或其哈希）划分独立记忆库，跨会话持久化。
@@ -92,6 +108,22 @@ pub trait MemoryStore: Send + Sync {
             source: source.to_string(),
         })
         .await
+    }
+
+    /// 按记录 id 遗忘（删除）一条记忆（`memory_edit` forget 用）：返回是否删除成功。
+    /// 默认 `Ok(false)`——后端不支持逐条删除（如 local 后端按内容追加、经 LLM
+    /// 合并成文档，记录无稳定 id，按内容匹配不可靠，故不支持）。
+    ///
+    /// # Errors
+    /// 删除失败时返回 IO 错误。
+    async fn forget(&self, _id: &str) -> Result<bool, std::io::Error> {
+        Ok(false)
+    }
+
+    /// 列出记忆库 bank 名（`memory_edit` banks 用）；默认空
+    /// （单库后端 / 无 bank 概念的实现）。
+    async fn banks(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// 追加一条心智模型（`reflect` 工具 / LLM 提炼用）：写入项目 `mental_models.md`，

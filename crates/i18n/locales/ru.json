@@ -64,7 +64,7 @@
   "tools.enabled": "[tools] {key} включён (инструмент и промпт внедрены)",
   "tools.disabled": "[tools] {key} отключён (инструмент и промпт скрыты)",
   "tools.title": "╭─ Необязательные инструменты ─────────────────────────────",
-  "tools.core_line": "│ Базовые инструменты (read_file/write_file/str_replace/apply_diff/list_files/run_command/grep/glob) всегда включены",
+  "tools.core_line": "│ Базовые инструменты (read_file/write_file/list_files/run_command/grep/glob/web_search) + сессионные инструменты (todo/ask/checkpoint/rewind/security_scan) всегда включены",
   "tools.entry": "│ [{state}] {key:<9} {label}",
   "tools.hint_toggle": "│ Подсказка : /tools <key> on|off переключение (внедряется только при включении)",
   "tools.hint_config": "│           : или задайте [tools].enabled.<key> = true для включения при старте",

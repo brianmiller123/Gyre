@@ -49,21 +49,21 @@ pub fn recover(previous: &str, current: &str, section: &FileSection) -> Option<R
     }
 
     // 主路径：3-way 合并（处理行数变化 / 外部写）
-    if let Some(merged) = apply_three_way(previous, &applied_text, current) {
-        if merged != current {
-            let first_changed =
-                find_first_changed_line(current, &merged).or(applied.first_changed_line);
-            let mut warnings = Vec::with_capacity(applied.warnings.len() + 1);
-            if first_changed.is_some() {
-                warnings.push(RECOVERY_EXTERNAL_WARNING.to_string());
-            }
-            warnings.extend(applied.warnings);
-            return Some(RecoveryResult {
-                text: merged,
-                first_changed_line: first_changed,
-                warnings,
-            });
+    if let Some(merged) = apply_three_way(previous, &applied_text, current)
+        && merged != current
+    {
+        let first_changed =
+            find_first_changed_line(current, &merged).or(applied.first_changed_line);
+        let mut warnings = Vec::with_capacity(applied.warnings.len() + 1);
+        if first_changed.is_some() {
+            warnings.push(RECOVERY_EXTERNAL_WARNING.to_string());
         }
+        warnings.extend(applied.warnings);
+        return Some(RecoveryResult {
+            text: merged,
+            first_changed_line: first_changed,
+            warnings,
+        });
     }
 
     // 回退：会话链回放（行数相等 + 锚行内容一致）
@@ -71,21 +71,21 @@ pub fn recover(previous: &str, current: &str, section: &FileSection) -> Option<R
         let anchor_lines = anchor_lines_of(section);
         if anchor_lines.is_empty() || verify_anchor_content(previous, current, &anchor_lines) {
             let replay = apply_section(current, section);
-            if let Some(new_text) = replay.text {
-                if new_text != current {
-                    let first_changed =
-                        find_first_changed_line(current, &new_text).or(replay.first_changed_line);
-                    let mut warnings = Vec::with_capacity(replay.warnings.len() + 1);
-                    if first_changed.is_some() {
-                        warnings.push(RECOVERY_SESSION_REPLAY_WARNING.to_string());
-                    }
-                    warnings.extend(replay.warnings);
-                    return Some(RecoveryResult {
-                        text: new_text,
-                        first_changed_line: first_changed,
-                        warnings,
-                    });
+            if let Some(new_text) = replay.text
+                && new_text != current
+            {
+                let first_changed =
+                    find_first_changed_line(current, &new_text).or(replay.first_changed_line);
+                let mut warnings = Vec::with_capacity(replay.warnings.len() + 1);
+                if first_changed.is_some() {
+                    warnings.push(RECOVERY_SESSION_REPLAY_WARNING.to_string());
                 }
+                warnings.extend(replay.warnings);
+                return Some(RecoveryResult {
+                    text: new_text,
+                    first_changed_line: first_changed,
+                    warnings,
+                });
             }
         }
     }
@@ -121,19 +121,17 @@ fn apply_three_way(previous: &str, applied: &str, current: &str) -> Option<Strin
         match op.tag() {
             similar::DiffTag::Equal => {
                 // 在 current 剩余部分中定位等价行序列，重新对齐
-                match find_subseq(&cur[pos..], old) {
-                    Some(rel) => {
-                        // 保留 current[pos..pos+rel]（外部可能在等价区前插入了行）
-                        for l in &cur[pos..pos + rel] {
-                            out.push((*l).to_string());
-                        }
-                        // 输出等价内容（与 current[pos+rel..] 一致）
-                        for l in old {
-                            out.push((*l).to_string());
-                        }
-                        pos += rel + old.len();
+                {
+                    let rel = find_subseq(&cur[pos..], old)?;
+                    // 保留 current[pos..pos+rel]（外部可能在等价区前插入了行）
+                    for l in &cur[pos..pos + rel] {
+                        out.push((*l).to_string());
                     }
-                    None => return None,
+                    // 输出等价内容（与 current[pos+rel..] 一致）
+                    for l in old {
+                        out.push((*l).to_string());
+                    }
+                    pos += rel + old.len();
                 }
             }
             similar::DiffTag::Delete | similar::DiffTag::Replace => {

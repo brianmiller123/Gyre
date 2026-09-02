@@ -17,19 +17,20 @@ Gyre 是一个**生产级 AI 编程智能体框架**，提供完整的「感知�
 ### 🤖 智能体引擎
 - **五态状态机**（NoTask → Running → Streaming → WaitingForInput → Idle）：移植 Zoo-Code 成熟的状态模型，精确控制智能体生命周期。
 - **消息驱动架构**：`say`（信息性）/ `ask`（交互阻塞）消息模型，支持审批网关与用户回执。
-- **多模式**：`code`（编码）/ `architect`（架构）/ `ask`（问答）/ `debug`（调试），模式决定 system prompt 与工具子集。
+- **多模式**：`code`（编码）/ `architect`（架构）/ `ask`（问答）/ `debug`（调试）/ `plan`（规划），模式决定 system prompt 与工具子集。
 - **Steering 机制**：运行时中途注入消息，动态干预智能体推理方向。
 - **软工具需求**：先提醒后强制，保护 Provider 前缀缓存。
 
 ### 🛠️ 工具链
-- **核心工具**：`read_file` / `write_file` / `str_replace` / `apply_diff` / `list_files` / `run_command` / `grep` / `glob`
+- **核心工具**：`read_file` / `write_file` / `list_files` / `run_command` / `grep` / `glob` / `web_search`（编辑经可选的 AST / Hashline 工具组完成）
+- **会话工具**：`todo` / `ask` / `checkpoint` / `rewind`（会话回卷）/ `security_scan`（本地密钥泄漏与危险模式扫描）
 - **AST 代码操控**（可选）：`replace_block`（tree-sitter 句法块替换）/ `ast_search` / `ast_rewrite`（ast-grep 结构化搜索重写）
 - **LSP 集成**（可选）：诊断 / 跳转到定义 / 查找引用 / 重命名符号
 - **Hashline DSL**（可选）：行锚定批量编辑，多文件多区间一次性应用
 - **PTY 伪终端**（可选）：`run_pty_command`，支持交互式终端应用（top / vim / REPL）
 - **图像处理**（可选）：`read_image` / `image_gen`（DALL·E 或兼容 API）
 - **GitHub 集成**（可选）：PR / Issue / Actions 查询与操作，GraphQL 查询
-- **MCP 协议**：兼容 Model Context Protocol，可挂载任意 MCP server 工具
+- **MCP 协议**：实现 Model Context Protocol（stdio 传输，initialize / tools/list / tools/call），可挂载 stdio MCP server 的工具
 
 ### 🧠 上下文管理
 - **AppendOnlyLog**：消息只追加，唯一变异路径是压缩时合法 `replaceTail`
@@ -69,7 +70,7 @@ Gyre 是一个**生产级 AI 编程智能体框架**，提供完整的「感知�
 
 ### 📐 架构设计
 - **Ports & Adapters（六边形架构）**：所有核心依赖以 `Arc<dyn Trait>` 注入，循环对传输/Provider/Tool 完全透明
-- **零侵入扩展**：`inventory` 编译期插件自荐注册，新增 Provider/Tool 无需修改中央注册清单
+- **零侵入扩展**：Provider 经 `inventory` 编译期插件自荐注册；Tool 在 CLI/server 组装根显式装配（`DefaultToolRegistry`），互不侵入
 - **单向依赖**：`core` 零业务依赖，`agent` 仅依赖 Trait 而非具体实现，依赖链单向无环
 - **事件驱动**：循环产出 `Stream<Item = AgentEvent>`，前端/CLI 统一订阅
 
@@ -86,7 +87,7 @@ Gyre 是一个**生产级 AI 编程智能体框架**，提供完整的「感知�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/Gyre/Gyre.git
+git clone https://github.com/brianmiller123/Gyre.git
 cd Gyre
 
 # 复制配置并填入 API key
@@ -171,31 +172,43 @@ Gyre/
 ├── crates/
 │   ├── core/                   # 契约层：类型 + Trait + 错误（零业务依赖）
 │   ├── config/                 # TOML 分层配置 + 模型 profile + 审批规则引擎
-│   ├── llm/                    # LLM Provider 适配器（OpenAI/Anthropic/DeepSeek）
+│   ├── llm/                    # LLM Provider 适配器（OpenAI/Anthropic/DeepSeek/GLM/Gemini）
 │   ├── context/                # 上下文管理（AppendOnlyLog + StablePrefix + 压缩）
 │   ├── prompt/                 # System prompt 模板引擎
-│   ├── tools/                  # 工具集（文件系统/AST/LSP/搜索/Shell/GitHub/图像）
+│   ├── tools/                  # 工具集（文件系统/AST/LSP/搜索/Shell/GitHub/图像/todo/ask 等）
+│   ├── shell/                  # 进程内 shell 执行（brush 解析器 + 50+ coreutils 内建，零 fork）
 │   ├── agent/                  # 执行循环状态机（智能体核心）
 │   ├── server/                 # HTTP/WebSocket 服务（axum）
-│   ├── cli/                    # CLI 二进制入口（REPL + 命令调度）
+│   ├── acp/                    # Agent Client Protocol 适配器（编辑器集成）
+│   ├── cli/                    # CLI 二进制入口（REPL + 命令调度 + RPC）
 │   ├── ast/                    # AST 操控（tree-sitter + ast-grep）
 │   ├── search/                 # 代码搜索（grep/glob/fd/highlight/tokens）
-│   ├── mcp/                    # MCP 协议客户端
+│   ├── ttsr/                   # 时间旅行流规则（不占 system prompt 的流式护栏）
+│   ├── mcp/                    # MCP 协议客户端（stdio）
+│   ├── lsp/                    # LSP 语言服务器客户端
+│   ├── dap/                    # DAP 调试适配器客户端（`debug` 工具）
+│   ├── browser/                # headless 浏览器自动化（最小 CDP 客户端）
 │   ├── memory/                 # 跨会话长期记忆
 │   ├── skills/                 # Skill 系统（file-backed 技能）
 │   ├── swarm/                  # 多 Agent 编排（DAG 管道）
 │   ├── collab/                 # 协同中继（端到端加密）
 │   ├── hashline/               # Hashline DSL 批量编辑
 │   ├── pty/                    # PTY 伪终端工具
-│   ├── lsp/                    # LSP 语言服务器客户端
 │   ├── iso/                    # 文件系统隔离（沙箱 diff）
 │   ├── supervisor/             # 子 Agent 监控总线
+│   ├── proxy/                  # SOCKS5 出站代理控制器（进程级单例）
+│   ├── discovery/              # 外来 Agent 工具配置发现（AGENTS.md / CLAUDE.md / Cursor / Cline）
+│   ├── advisor/                # 独立只读评审 agent（nit / concern / blocker）
+│   ├── eval/                   # Python/JS 持久 eval 内核 + 环回桥
+│   ├── snapcompact/            # 快照压缩：被丢弃历史 → PNG 帧，视觉模型读图回放
 │   ├── i18n/                   # 多语种消息目录（编译期内嵌 + 系统语言探测）
 │   └── telemetry/              # OpenTelemetry 可观测性
 ├── web/                        # Web UI 前端（React + Vite）
 │   └── c5-ui/                  # 前端源码
+├── vendor/                     # 随仓库分发的 fork（pi-shell / pi-builtins / pi-walker / brush-core）
 ├── prompts/                    # System prompt 模板（.md）
-├── plans/                      # 架构设计文档
+├── docs/                       # 设计文档与对标分析
+├── tests/                      # 黄金回归样本
 └── config.example.toml         # 配置示例
 ```
 
@@ -468,7 +481,7 @@ oh-my-pi 贡献了**底层代码操控精确性与执行循环工程化**的成�
 | --- | --- | --- | --- |
 | **语言统一** | TypeScript 运行时 + Rust N-API 原生插件（混合架构） | **纯 Rust 单 workspace**（edition 2024） | 消除 N-API FFI 开销与跨语言序列化损耗，编译期类型安全，零运行时解释成本 |
 | **架构模式** | 类单体编排 + 部分 trait 抽象 | **完整 Ports & Adapters（六边形架构）** | 所有依赖以 `Arc<dyn Trait>` 注入，循环对传输/Provider/Tool 完全透明，单测可全局替身化 |
-| **扩展机制** | 手动注册中央清单 | **编译期零侵入发现**（`inventory` macro） | 新增 Provider/Tool 无需修改任何中央注册代码，`impl Trait + submit!` 即可 |
+| **扩展机制** | 手动注册中央清单 | **Provider 自荐注册**（`inventory` macro）+ Tool 显式装配 | 新增 Provider 无需中央注册代码（`impl Trait + submit!` 即可）；Tool 在组装根显式接线 |
 | **并发模型** | Node.js 事件循环 + N-API 线程池 | **async/await + Tokio 全异步** | 原生 `Send + Sync`，无 GIL 锁竞争，`spawn_blocking` 隔离 CPU 密集任务 |
 | **工具可插拔** | 固定工具集 + 环境变量开关 | **配置驱动动态工具组**（`[tools.enabled]`） | 运行时 `/tools <key> on|off` 动态切换，未启用工具零 Token 开销 |
 | **上下文压缩** | 单级压缩策略 | **三级渐进压缩**（Shake → Summarize → Prune） | 先轻度抖动去冗余，再 LLM 摘要折叠历史，最后窗口裁剪兜底，平衡质量与 Token 消耗 |

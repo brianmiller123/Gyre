@@ -1,14 +1,14 @@
 //! # agent-llm
 //!
 //! LLM Provider 适配器层：[`ProviderRegistry`] 单一分发入口（移植 oh-my-pi `streamSimple`）
-//! + 各线协议适配器。当前实现 OpenAI Chat Completions（覆盖最广，含兼容网关/本地 vLLM）。
+//! + 各线协议适配器。当前实现 `OpenAI` Chat Completions（覆盖最广，含兼容网关/本地 vLLM）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod anthropic;
 mod deepseek;
 pub mod dialect;
+mod gemini;
 mod glm;
 pub mod inband;
 mod openai;
@@ -20,6 +20,7 @@ pub mod transform;
 pub use anthropic::AnthropicMessagesAdapter;
 pub use deepseek::DeepSeekProvider;
 pub use dialect::Dialect;
+pub use gemini::GeminiProvider;
 pub use glm::GlmProvider;
 pub use inband::{InbandProvider, wrap_inband_if};
 pub use openai::OpenAiCompletionsAdapter;
@@ -36,19 +37,38 @@ pub(crate) async fn read_error_body(resp: reqwest::Response) -> String {
     const MAX_ERR_BYTES: usize = 4 * 1024;
     let mut resp = resp;
     let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() >= MAX_ERR_BYTES {
-                    buf.truncate(MAX_ERR_BYTES);
-                    break;
-                }
-            }
-            _ => break,
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        buf.extend_from_slice(&chunk);
+        if buf.len() >= MAX_ERR_BYTES {
+            buf.truncate(MAX_ERR_BYTES);
+            break;
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 非成功 HTTP 响应 → [`agent_core::LlmError`]：
+/// - **429** → [`LlmError::RateLimit`]，解析 `Retry-After` 头（数字秒；HTTP-date 或缺失
+///   回退 5s）——供执行循环按 `retry_after` 退避重试（此前 429 落为 `Http`，
+///   `retry_after` 信息丢失、直接走 fallback 链）。
+/// - 其余 → [`LlmError::Http`]（读体，限 4 KiB）。
+pub(crate) async fn http_error(resp: reqwest::Response) -> agent_core::LlmError {
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        let retry_after_ms = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(5000, |secs| secs * 1000);
+        tracing::warn!(retry_after_ms, "上游 429 速率限制");
+        return agent_core::LlmError::RateLimit { retry_after_ms };
+    }
+    let text = crate::read_error_body(resp).await;
+    agent_core::LlmError::Http {
+        status: status.as_u16(),
+        body: text,
+    }
 }
 
 /// 从原始字节缓冲中切出下一行（连同尾随 `\n` 一并移除），返回该行的字节。
@@ -67,7 +87,7 @@ pub(crate) const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 
 /// 判断行缓冲是否超过单行上限。供各 Provider 在 `drain_line` 抽干完整行后，对剩余的
 /// 未完结尾段做检查——若尾段超限说明上游发了一条无换行的巨型行。
-pub(crate) fn line_buffer_too_long(buf: &[u8]) -> bool {
+pub(crate) const fn line_buffer_too_long(buf: &[u8]) -> bool {
     buf.len() > MAX_SSE_LINE_BYTES
 }
 
@@ -99,7 +119,7 @@ pub(crate) fn merge_extra_body(body: &mut serde_json::Value, extra: Option<&serd
 }
 
 /// 把已构建的 assistant 消息标记为「瞬时流错误」（移植 oh-my-pi
-/// [`recoverTransientErrorToolTurn`]：保留已完成的 tool_call 而非整轮废弃）。
+/// [`recoverTransientErrorToolTurn`]：保留已完成的 `tool_call` 而非整轮废弃）。
 ///
 /// 设置 `stop_reason=Error` + `stop_details=stream_interrupted`（瞬时白名单类，见
 /// [`agent_core::StopDetails::is_transient_stream_error`]），使上游 agent 循环的瞬时恢复

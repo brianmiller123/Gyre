@@ -25,7 +25,7 @@ pub struct ThinkingConfig {
 impl ThinkingConfig {
     /// 构造思考配置。
     #[must_use]
-    pub fn new(budget_tokens: usize) -> Self {
+    pub const fn new(budget_tokens: usize) -> Self {
         Self { budget_tokens }
     }
 }
@@ -55,7 +55,7 @@ impl Effort {
     /// 反向对齐 [`crate::LlmProvider`] openai 适配器的 budget→effort 阈值
     ///（`>=32_000 → high`、`>=12_000 → medium`、否则 `low`），使 effort↔budget 往返一致。
     #[must_use]
-    pub fn default_budget(self) -> usize {
+    pub const fn default_budget(self) -> usize {
         match self {
             Self::Minimal => 1_000,
             Self::Low => 4_000,
@@ -114,9 +114,9 @@ pub enum ThinkingPolicy {
         classifier: std::sync::Arc<dyn ThinkingClassifier>,
         /// 分类失败时的兜底配置。
         fallback: ThinkingConfig,
-        /// budget 钳位下限（默认 1_000）。
+        /// budget 钳位下限（默认 `1_000`）。
         min_budget: usize,
-        /// budget 钳位上限（默认 64_000）。
+        /// budget 钳位上限（默认 `64_000`）。
         max_budget: usize,
     },
 }
@@ -176,7 +176,7 @@ impl ThinkingPolicy {
     }
 }
 
-/// 截断分类器输入：超长文本取 head 4000 + tail 2000（移植 oh-my-pi HEAD_CHARS/TAIL_CHARS）。
+/// 截断分类器输入：超长文本取 head 4000 + tail 2000（移植 oh-my-pi `HEAD_CHARS/TAIL_CHARS`）。
 #[must_use]
 fn truncate_classifier_input(s: &str) -> String {
     const MAX: usize = 6_000;
@@ -288,7 +288,7 @@ pub enum AssistantEvent {
 pub struct CompletionRequest {
     /// 目标模型。
     pub model: Model,
-    /// 稳定前缀（已被 StablePrefix 冻结的 system prompts）。
+    /// 稳定前缀（已被 `StablePrefix` 冻结的 system prompts）。
     pub system: Vec<String>,
     /// 已转换的 Provider 线消息。
     pub messages: Vec<ProviderMessage>,

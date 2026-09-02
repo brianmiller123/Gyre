@@ -1,0 +1,29 @@
+# Vendored from oh-my-pi (third/oh-my-pi/crates/pi-walker); workspace
+# references literalized for standalone consumption outside that workspace.
+[package]
+name = "pi-walker"
+version = "18.0.0"
+edition = "2024"
+license = "MIT"
+authors = ["Stencil Labs, Inc."]
+repository = "https://github.com/can1357/oh-my-pi"
+rust-version = "1.88.0"
+
+[dependencies]
+dashmap = "6.1"
+globset = "0.4"
+ignore = "0.4"
+parking_lot = "0.12.5"
+rayon = "1.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+	"Wdk_Storage_FileSystem",
+	"Win32_Foundation",
+	"Win32_Security",
+	"Win32_Storage_FileSystem",
+	"Win32_System_IO",
+] }

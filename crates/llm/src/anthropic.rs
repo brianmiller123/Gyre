@@ -1,7 +1,7 @@
 //! Anthropic Messages API 适配器（Claude）。
 //!
-//! 流式 SSE：按 data 帧 `type` 字段分发（message_start / content_block_start /
-//! content_block_delta / message_delta / message_stop），累积文本与工具调用。
+//! 流式 SSE：按 data 帧 `type` `字段分发（message_start` / `content_block_start` /
+//! `content_block_delta` / `message_delta` / `message_stop），累积文本与工具调用`。
 
 use std::pin::Pin;
 
@@ -26,7 +26,7 @@ pub struct AnthropicMessagesAdapter {
 impl AnthropicMessagesAdapter {
     /// 构造。
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
+    pub const fn new(client: reqwest::Client) -> Self {
         Self { client }
     }
 }
@@ -67,13 +67,9 @@ impl LlmProvider for AnthropicMessagesAdapter {
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = crate::read_error_body(resp).await;
-            return Err(LlmError::Http {
-                status: status.as_u16(),
-                body: text,
-            });
+        if !resp.status().is_success() {
+            // 429 → RateLimit（含 Retry-After），供执行循环退避重试（Phase 0）。
+            return Err(crate::http_error(resp).await);
         }
         Ok(parse_stream(resp, model_id))
     }
@@ -93,10 +89,10 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
             ProviderMessage::User { content } => {
                 let blocks: Vec<serde_json::Value> = content
                     .iter()
-                    .filter_map(|c| match c {
-                        UserContent::Text { text } => Some(serde_json::json!({"type":"text","text":text})),
+                    .map(|c| match c {
+                        UserContent::Text { text } => serde_json::json!({"type":"text","text":text}),
                         UserContent::Image { mime, data } => {
-                            Some(serde_json::json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}}))
+                            serde_json::json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}})
                         }
                     })
                     .collect();
@@ -193,8 +189,7 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
 fn anthropic_tool_choice(d: &ToolChoiceDirective) -> Option<serde_json::Value> {
     match d {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => Some(serde_json::json!({"type":"auto"})),
-        ToolChoiceDirective::Hard(ToolChoice::Any)
-        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any | ToolChoice::Required) => {
             Some(serde_json::json!({"type":"any"}))
         }
         ToolChoiceDirective::Hard(ToolChoice::None) => None,
@@ -307,8 +302,7 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
                 }
             };
             buf.extend_from_slice(chunk.as_ref());
-            loop {
-                let Some(line_bytes) = crate::drain_line(&mut buf) else { break };
+            while let Some(line_bytes) = crate::drain_line(&mut buf) {
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() { continue; }
                 let Some(data) = line.strip_prefix("data:") else { continue };

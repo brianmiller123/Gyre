@@ -72,7 +72,7 @@ impl SkillRegistry {
             skills.push(s);
         }
         // 稳定排序：name 大小写不敏感
-        skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        skills.sort_by_key(|a| a.name.to_lowercase());
         Ok(SkillCatalog { skills, warnings })
     }
 }
@@ -130,7 +130,7 @@ pub fn resolve_skill_url(url: &str, skills: &[Skill]) -> Result<PathBuf, SkillEr
     // 同时认 `/` 与 `\`：skill 名规范（^[a-z0-9]+(-[a-z0-9]+)*$）禁止二者，
     // 故首个 `/` 或 `\` 必为 name/rel 分隔符。Windows 环境下 LLM 易用 `\` 构造 URL，
     // 仅按 `/` 分割会把整个 `name\sub\file.md` 当作 skill 名 → Unknown。
-    let (name, path_part) = match rest.find(|c| c == '/' || c == '\\') {
+    let (name, path_part) = match rest.find(['/', '\\']) {
         Some(idx) => (&rest[..idx], Some(&rest[idx + 1..])),
         None => (rest, None),
     };
@@ -194,7 +194,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn from_hex(b: u8) -> Option<u8> {
+const fn from_hex(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),

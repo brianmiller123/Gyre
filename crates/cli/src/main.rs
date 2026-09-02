@@ -14,16 +14,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_core::{
-    AgentEvent, AskResponse, CompactionStrategy, Hook, HookEvent, MemoryStore, Model, StatusKind,
-    Usage,
+    AgentEvent, AskResponse, CompactionStrategy, Hook, HookEvent, Model, StatusKind, Usage,
 };
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use futures::StreamExt;
-use tokio::io::AsyncBufReadExt;
 use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 use secrecy::ExposeSecret;
+use tokio::io::AsyncBufReadExt;
 
 /// i18n 取词宏（编译期内嵌 locale 目录，运行期按系统/配置语言激活）。
 use agent_i18n::t;
@@ -129,7 +128,10 @@ fn localize_cli_help(mut cmd: clap::Command) -> clap::Command {
     }
     cmd = cmd.about(agent_i18n::t!("cli.help.about"));
     // 收集 id 后逐个 mut_arg 替换（避免在不可变迭代期间修改命令）。
-    let ids: Vec<String> = cmd.get_arguments().map(|a| a.get_id().to_string()).collect();
+    let ids: Vec<String> = cmd
+        .get_arguments()
+        .map(|a| a.get_id().to_string())
+        .collect();
     for id in ids {
         if let Some((_, key)) = CLI_HELP_KEYS.iter().find(|(i, _)| *i == id) {
             cmd = cmd.mut_arg(&id, |arg| arg.help(agent_i18n::tr(key, &[])));
@@ -229,12 +231,12 @@ async fn run_server(
     // 专供流式 LLM 调用——总超时会切断仍在正常输出的慢速长流（收不到 `data: [DONE]`
     // 终止帧而误判「未收到结束标记」）；真正的「上游挂起」由各 SSE 适配器的按 chunk
     // 空闲读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
-    let http = agent_proxy::build_http_client(socks5.clone(), |b| {
+    let http = agent_proxy::build_http_client(socks5.clone(), cfg.user_agent.as_deref(), |b| {
         b.tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
     })
     .context(t!("error.build_http"))?;
-    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd), socks5);
+    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::from(cwd), socks5);
     // ACP 路由在组装层合并（agent-acp 依赖 agent-server，故不能在 server crate 内 merge，
     // 否则循环依赖）。
     let app = if acp_enabled {
@@ -268,12 +270,12 @@ async fn run_acp_stdio(
     print_approval_status(&cfg);
     // 流式 LLM 客户端：不设整条请求总超时（会误杀慢速长流），上游静默由按 chunk 空闲
     // 读超时（agent_llm::STREAM_IDLE_TIMEOUT）兜底，连接阶段挂起由 connect_timeout 兜底。
-    let http = agent_proxy::build_http_client(socks5.clone(), |b| {
+    let http = agent_proxy::build_http_client(socks5.clone(), cfg.user_agent.as_deref(), |b| {
         b.tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
     })
     .context(t!("error.build_http"))?;
-    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::new(cwd), socks5);
+    let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::from(cwd), socks5);
     agent_acp::run_stdio(state)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -328,8 +330,8 @@ async fn main() -> Result<()> {
     // 持久化开关的读取逻辑——CLI 显式给出时 CLI 优先，未给时 sidecar 生效）。
     let socks_cli_override = cli.socks.as_ref().map(|_| true); // 给出 --socks 即视为显式启用
     if let Some(spec) = &cli.socks {
-        let (host, port) =
-            parse_socks_spec(spec).map_err(|e| anyhow::anyhow!("--socks 格式无效: {spec:?} — {e}"))?;
+        let (host, port) = parse_socks_spec(spec)
+            .map_err(|e| anyhow::anyhow!("--socks 格式无效: {spec:?} — {e}"))?;
         cfg.socks5.host = host;
         cfg.socks5.port = Some(port);
     }
@@ -410,6 +412,15 @@ async fn main() -> Result<()> {
     // 内核池按新 session_key 隔离，避免跨会话共享命名空间）。
     let session_label = Arc::new(std::sync::RwLock::new(session_id.clone()));
 
+    // P1：checkpoint/rewind 共享状态（单活跃检查点，跨 Agent 重建存活）。
+    let checkpoint_state = agent_tools::CheckpointState::new().shared();
+    // Phase 0：security_scan 共享状态（v1 仅记录最近一次扫描摘要；跨 Agent 重建存活）。
+    let security_scan_state = agent_tools::SecurityScanState::new().shared();
+    // P0：todo 清单共享状态（todo 工具与 /todo 命令共用；.gyre/todo.json 持久化，跨 Agent 重建存活）。
+    let todo_state = agent_tools::TodoState::load(cwd.join(".gyre").join("todo.json")).shared();
+    // P1：进程内消息总线（hub 工具以 "main" 入册；跨 Agent 重建存活）。
+    let hub = agent_core::hub::Hub::new().shared();
+
     // 2. 解析模型 profile（P2：含 fallback 链——主模型失败且错误可重试时依序换备用模型）
     let chain = cfg
         .resolve_chain(cli.model.as_deref())
@@ -420,10 +431,8 @@ async fn main() -> Result<()> {
     let fallback_models: Vec<agent_core::Model> =
         chain.iter().skip(1).map(|p| p.to_model()).collect();
     // P2：API key 轮换环（`api_keys` 多 key 列表；空 = 单 key 不轮换）。
-    let key_rings: std::collections::HashMap<String, Vec<String>> = chain
-        .iter()
-        .map(|p| (p.id.clone(), p.key_ring()))
-        .collect();
+    let key_rings: std::collections::HashMap<String, Vec<String>> =
+        chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
 
     // 3. 装配 Provider（registry + OpenAI Chat Completions 适配器）
     // SOCKS5 代理控制器（仅影响后端出站请求；开关经 --socks / 配置 / sidecar）。
@@ -433,7 +442,7 @@ async fn main() -> Result<()> {
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
     // LLM 调用，总超时会切断仍在正常输出的慢速长流（收不到终止帧而误判「未收到结束标记」）；
     // 真正的「上游挂起」由各 SSE 适配器的按 chunk 空闲读超时（STREAM_IDLE_TIMEOUT）兜底。
-    let client = agent_proxy::build_http_client(socks5, |b| {
+    let client = agent_proxy::build_http_client(socks5, cfg.user_agent.as_deref(), |b| {
         b.tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
     })
@@ -463,15 +472,51 @@ async fn main() -> Result<()> {
         agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
             .await
             .context(t!("error.open_persistence"))?;
-    pctx.set_summarizer(Box::new(
-        agent_context::compaction::LlmSummaryProvider::new(
-            Arc::clone(&provider),
-            model.clone(),
-            provider_ctx.clone(),
-            cfg.compaction.remote_endpoint.clone(),
-        ),
-    ))
-    .await;
+    // 4d. 装配长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
+    // local：markdown 管道 + LLM 合并（P1 既有）；structured：records.jsonl + 向量融合检索。
+    // 两者都带心智模型注入（P1-6，seeds + 项目 mental_models.md）。
+    // 提前到 summarizer 之前：压缩前召回（preCompactionContext）需把记忆挂到摘要提供器。
+    let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
+    let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
+    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
+    if cfg.memory.enabled {
+        match cfg.memory.backend {
+            agent_config::MemoryBackend::Local => {
+                let store = Arc::new(
+                    agent_memory::LocalMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default()),
+                );
+                local_memory = Some(Arc::clone(&store));
+                memory = Some(store);
+            }
+            agent_config::MemoryBackend::Structured => {
+                // 向量记忆：L2 fastembed 语义嵌入（vec-embed feature 编译时）或 L1 投影（离线），
+                // 懒加载 + 失败降级，永不 panic。
+                let store = Arc::new(
+                    agent_memory::StructuredMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default())
+                        .with_embedder(agent_memory::default_embedder()),
+                );
+                structured_memory = Some(Arc::clone(&store));
+                memory = Some(store);
+            }
+        }
+        if let Ok(Some(_)) = memory.as_ref().unwrap().summary().await {
+            eprintln!("{}", t!("memory.injected"));
+        }
+    }
+    let mut summarizer = agent_context::compaction::LlmSummaryProvider::new(
+        Arc::clone(&provider),
+        model.clone(),
+        provider_ctx.clone(),
+        cfg.compaction.remote_endpoint.clone(),
+        cfg.user_agent.clone(),
+    );
+    if let Some(m) = &memory {
+        // P2-5：压缩前召回（对齐 mnemopi `preCompactionContext`）——挂记忆到摘要提供器。
+        summarizer = summarizer.with_memory(Arc::clone(m));
+    }
+    pctx.set_summarizer(Box::new(summarizer)).await;
     // Shake 归档落盘到 <cwd>/.gyre/artifacts，使被压缩的大块可经 read_file artifact:// 回读。
     pctx.set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
         cwd.join(".gyre").join("artifacts"),
@@ -528,50 +573,17 @@ async fn main() -> Result<()> {
     if !foreign_sections.is_empty() {
         eprintln!(
             "{}",
-            t!(
-                "context.foreign_loaded",
-                count = foreign_sections.len()
-            )
+            t!("context.foreign_loaded", count = foreign_sections.len())
         );
     }
     // 外来配置追加进上下文约定（与 AGENTS.md 同通道注入 system）。
     let mut base_context_files = agent_config::discover_context_files(&cwd);
     base_context_files.extend(foreign_sections);
+    // Phase 0：security_scan 恒开注册 → 使用指引恒注入（与工具注册面一致）。
+    base_context_files.push(agent_tools::SECURITY_SCAN_PROMPT_SECTION.to_string());
     let commands = agent_config::discover_commands(&cwd);
     if !commands.is_empty() {
         eprintln!("{}", t!("commands.loaded", count = commands.len()));
-    }
-    // 4d. 装配长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
-    // local：markdown 管道 + LLM 合并（P1 既有）；structured：records.jsonl + 向量融合检索。
-    // 两者都带心智模型注入（P1-6，seeds + 项目 mental_models.md）。
-    let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
-    let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
-    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
-    if cfg.memory.enabled {
-        match cfg.memory.backend {
-            agent_config::MemoryBackend::Local => {
-                let store = Arc::new(
-                    agent_memory::LocalMemoryStore::new(&cwd)
-                        .with_mental_models_config(agent_memory::MentalModelsConfig::default()),
-                );
-                local_memory = Some(Arc::clone(&store));
-                memory = Some(store);
-            }
-            agent_config::MemoryBackend::Structured => {
-                // 向量记忆：L2 fastembed 语义嵌入（vec-embed feature 编译时）或 L1 投影（离线），
-                // 懒加载 + 失败降级，永不 panic。
-                let store = Arc::new(
-                    agent_memory::StructuredMemoryStore::new(&cwd)
-                        .with_mental_models_config(agent_memory::MentalModelsConfig::default())
-                        .with_embedder(agent_memory::default_embedder()),
-                );
-                structured_memory = Some(Arc::clone(&store));
-                memory = Some(store);
-            }
-        }
-        if let Ok(Some(_)) = memory.as_ref().unwrap().summary().await {
-            eprintln!("{}", t!("memory.injected"));
-        }
     }
     // 5. 装配 Approval（规则引擎 + stdin 交互回调）
     let prompt_resolver: agent_config::PromptResolver = Arc::new(|ask: agent_core::AskMessage| {
@@ -644,20 +656,19 @@ async fn main() -> Result<()> {
     // P0-1：eval 内核管理器（`[eval] enabled` 或 env `GYRE_EVAL=1` 启用）。
     // 内核池跨 Agent 重建存活（/model、/mode 切换不丢命名空间）；环回桥由 EvalTool
     // 首次 execute 时按当前审批懒加载 spawn。
-    let eval_mgr: Option<Arc<agent_eval::EvalManager>> = if cfg.eval.enabled
-        || std::env::var("GYRE_EVAL").is_ok_and(|v| v == "1")
-    {
-        let mgr = Arc::new(agent_eval::EvalManager::new(
-            agent_eval::EvalSettings::from_parts(
-                cfg.eval.python.clone(),
-                cfg.eval.idle_timeout_secs,
-            ),
-        ));
-        mgr.ensure_sweeper();
-        Some(mgr)
-    } else {
-        None
-    };
+    let eval_mgr: Option<Arc<agent_eval::EvalManager>> =
+        if cfg.eval.enabled || std::env::var("GYRE_EVAL").is_ok_and(|v| v == "1") {
+            let mgr = Arc::new(agent_eval::EvalManager::new(
+                agent_eval::EvalSettings::from_parts(
+                    cfg.eval.python.clone(),
+                    cfg.eval.idle_timeout_secs,
+                ),
+            ));
+            mgr.ensure_sweeper();
+            Some(mgr)
+        } else {
+            None
+        };
 
     #[allow(clippy::too_many_arguments)]
     let build_agent = |mode: agent_core::Mode,
@@ -703,9 +714,33 @@ async fn main() -> Result<()> {
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
         }
-        // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect 经 ToolContext.memory
-        // 访问同一存储；未启用记忆时不注册（零上下文成本）。子 Agent 工具集（sub_reg）
-        // 不含记忆工具。
+        // P1：hub 消息总线（以 "main" 入册；子 Agent 不含——其消费面留待 task 集成）。
+        tool_registry = tool_registry.with(Box::new(agent_tools::HubTool::register(
+            Arc::clone(&hub),
+            "main",
+        )));
+        // Phase 0：todo / ask / checkpoint / rewind 接线（修复 CLI 前端工具面缺失——
+        // 此前仅 server 装配，双前端工具面不一致；状态取闭包外共享句柄，跨 Agent
+        // 重建存活）。ask 经 ApprovalPolicy::prompt 通道走 CLI 的 stdin resolver
+        //（见上方 prompt_resolver），宿主零新增接线。
+        tool_registry = tool_registry
+            .with(Box::new(agent_tools::TodoTool::new(Arc::clone(
+                &todo_state,
+            ))))
+            .with(Box::new(agent_tools::AskUserTool::new()))
+            .with(Box::new(agent_tools::CheckpointTool::new(Arc::clone(
+                &checkpoint_state,
+            ))))
+            .with(Box::new(agent_tools::RewindTool::new(Arc::clone(
+                &checkpoint_state,
+            ))));
+        // Phase 0：security_scan 接线（两端装配修复：此前工具已实现但无任何前端注册）。
+        tool_registry = tool_registry.with(Box::new(agent_tools::SecurityScanTool::new(
+            Arc::clone(&security_scan_state),
+        )));
+        // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect + memory_edit / learn
+        // 经 ToolContext.memory 访问同一存储；未启用记忆时不注册（零上下文成本）。
+        // 子 Agent 工具集（sub_reg）不含记忆工具。
         if let Some(m) = &memory {
             tool_registry = tool_registry
                 .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
@@ -715,7 +750,9 @@ async fn main() -> Result<()> {
                     Arc::clone(&provider),
                     model.clone(),
                     provider_ctx.clone(),
-                )));
+                )))
+                .with(Box::new(agent_tools::MemoryEditTool::new(Arc::clone(m))))
+                .with(Box::new(agent_tools::MemoryLearnTool::new(Arc::clone(m))));
         }
         if subagent_enabled {
             let task_tool = agent::TaskTool::new(
@@ -859,12 +896,12 @@ async fn main() -> Result<()> {
             builder
         };
         // 编辑后 LSP writethrough：lsp 启用（lsp_pool 为 Some）且 edit 开启时，共享 LspTool 的 pool 注入。
-        let builder = if lsp_pool.is_some()
-            && (cfg.agent.tools.edit.format_on_write || cfg.agent.tools.edit.diagnostics_on_write)
-        {
+        let builder = if let Some(pool) = lsp_pool.as_ref().filter(|_| {
+            cfg.agent.tools.edit.format_on_write || cfg.agent.tools.edit.diagnostics_on_write
+        }) {
             builder.write_effect(std::sync::Arc::new(agent_tools::LspWriteEffect::new(
                 workspace.root().to_path_buf(),
-                std::sync::Arc::clone(lsp_pool.as_ref().expect("lsp_pool 已检查 Some")),
+                std::sync::Arc::clone(pool),
                 cfg.agent.tools.edit.format_on_write,
                 cfg.agent.tools.edit.diagnostics_on_write,
                 cfg.agent.tools.edit.diagnostics_deduplicate,
@@ -894,6 +931,10 @@ async fn main() -> Result<()> {
         if let Some(m) = &structured_memory {
             hooks.push(Arc::new(StructuredSleepHook {
                 store: Arc::clone(m),
+                auto_consolidate: cfg.memory.auto_consolidate,
+                provider: Some(Arc::clone(&provider)),
+                model: Some(model.clone()),
+                provider_ctx: Some(provider_ctx.clone()),
             }));
         }
         if let Some(m) = &memory {
@@ -968,7 +1009,7 @@ async fn main() -> Result<()> {
     // 在 stderr 给出明确提示，避免反复调试仍误判为「启动失败」。
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!(
-            "提示：stdin 非终端（检测到管道/子进程输入）。若作为 ACP/LSP 服务端被编辑器\
+            "提示：stdin 非终端（检测到管道/子进程输入）。若作为 ACP 服务端被编辑器\
              （如 Zed）调用，须加 --acp 参数；否则此处进入交互 REPL。"
         );
     }
@@ -1021,6 +1062,7 @@ async fn main() -> Result<()> {
                     github_allow_write,
                     optional: &optional,
                     goal: goal_state.clone(),
+                    todo: Arc::clone(&todo_state),
                 };
                 handle_command(line, &ctx)
             };
@@ -1082,14 +1124,20 @@ async fn main() -> Result<()> {
                         {
                             Ok(new_pctx) => {
                                 new_pctx
-                                    .set_summarizer(Box::new(
-                                        agent_context::compaction::LlmSummaryProvider::new(
-                                            Arc::clone(&provider),
-                                            current_model.clone(),
-                                            current_provider_ctx.clone(),
-                                            cfg.compaction.remote_endpoint.clone(),
-                                        ),
-                                    ))
+                                    .set_summarizer(Box::new({
+                                        let mut s =
+                                            agent_context::compaction::LlmSummaryProvider::new(
+                                                Arc::clone(&provider),
+                                                current_model.clone(),
+                                                current_provider_ctx.clone(),
+                                                cfg.compaction.remote_endpoint.clone(),
+                                                cfg.user_agent.clone(),
+                                            );
+                                        if let Some(m) = &memory {
+                                            s = s.with_memory(Arc::clone(m));
+                                        }
+                                        s
+                                    }))
                                     .await;
                                 new_pctx
                                     .set_shake_sink(Arc::new(
@@ -1138,21 +1186,24 @@ async fn main() -> Result<()> {
                     {
                         Ok(new_pctx) => {
                             new_pctx
-                                .set_summarizer(Box::new(
-                                    agent_context::compaction::LlmSummaryProvider::new(
+                                .set_summarizer(Box::new({
+                                    let mut s = agent_context::compaction::LlmSummaryProvider::new(
                                         Arc::clone(&provider),
                                         current_model.clone(),
                                         current_provider_ctx.clone(),
                                         cfg.compaction.remote_endpoint.clone(),
-                                    ),
-                                ))
+                                        cfg.user_agent.clone(),
+                                    );
+                                    if let Some(m) = &memory {
+                                        s = s.with_memory(Arc::clone(m));
+                                    }
+                                    s
+                                }))
                                 .await;
                             new_pctx
-                                .set_shake_sink(Arc::new(
-                                    agent_context::compaction::DirSink::new(
-                                        cwd.join(".gyre").join("artifacts"),
-                                    ),
-                                ))
+                                .set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
+                                    cwd.join(".gyre").join("artifacts"),
+                                )))
                                 .await;
                             context = Arc::new(new_pctx);
                             session_id = fresh_id.clone();
@@ -1405,16 +1456,12 @@ async fn main() -> Result<()> {
             let mentions = agent_prompt::mentions::parse_mentions(&text);
             if !mentions.is_empty() {
                 let mut blocks: Vec<String> = Vec::new();
-                for m in &mentions {
-                    if let agent_prompt::mentions::Mention::File(p) = m {
-                        match std::fs::read_to_string(cwd.join(p)) {
-                            Ok(content) => {
-                                blocks.push(agent_prompt::mentions::format_file_block(
-                                    p, &content,
-                                ));
-                            }
-                            Err(e) => eprintln!("@file {p} 读取失败，已跳过：{e}"),
+                for agent_prompt::mentions::Mention::File(p) in &mentions {
+                    match std::fs::read_to_string(cwd.join(p)) {
+                        Ok(content) => {
+                            blocks.push(agent_prompt::mentions::format_file_block(p, &content));
                         }
+                        Err(e) => eprintln!("@file {p} 读取失败，已跳过：{e}"),
                     }
                 }
                 if !blocks.is_empty() {
@@ -1574,7 +1621,6 @@ mod with_eval_tests {
     }
 }
 
-
 /// 确保未启用工具既不出现在 LLM 工具列表，也不占 system prompt Token。
 #[must_use]
 fn assemble_builtin_tools(
@@ -1645,7 +1691,9 @@ fn compiled_minimizer(cfg: &agent_config::Config) -> agent_tools::Minimizer {
 }
 
 /// 可选工具组 key 白名单（不含 `github`；github 由独立字段管理）。
-const OPTIONAL_TOOL_KEYS: &[&str] = &["ast", "lsp", "image", "hashline", "pty", "debug", "ssh", "browser"];
+const OPTIONAL_TOOL_KEYS: &[&str] = &[
+    "ast", "lsp", "image", "hashline", "pty", "debug", "ssh", "browser",
+];
 
 /// 判断 key 是否为已知可选工具组（不含 github）。
 #[must_use]
@@ -1908,11 +1956,7 @@ impl Hook for AutoRetainHook {
         }
         for (id, name, args) in ctx.message.tool_calls() {
             let _ = id;
-            let arg_preview: String = args
-                .to_string()
-                .chars()
-                .take(120)
-                .collect();
+            let arg_preview: String = args.to_string().chars().take(120).collect();
             parts.push(format!("- tool {name}({arg_preview})"));
         }
         if parts.is_empty() {
@@ -1930,16 +1974,40 @@ impl Hook for AutoRetainHook {
     }
 }
 
-/// 结构化记忆会话末维护 Hook（P0-4）：任务成功结束时清理过期记录 + 内容去重 + 模型变更重嵌。
-/// 对齐 mnemopi `sleep` 的轻量版（无 LLM 合并）。
+/// 结构化记忆会话末维护 Hook（P0-4/P0-5）：任务成功结束时 LLM 沉淀未沉淀记录
+/// （working → episodic，`auto_consolidate` 开启且 provider 可用时），再清理过期记录
+/// + 内容去重 + 模型变更重嵌。对齐 mnemopi `sleep` 的完整语义（consolidate + cleanup）。
 struct StructuredSleepHook {
     store: Arc<agent_memory::StructuredMemoryStore>,
+    auto_consolidate: bool,
+    provider: Option<Arc<dyn agent_core::LlmProvider>>,
+    model: Option<Model>,
+    provider_ctx: Option<agent_core::ProviderCallContext>,
 }
 
 #[async_trait::async_trait]
 impl Hook for StructuredSleepHook {
     async fn on_event(&self, event: &HookEvent) {
         if matches!(event, HookEvent::Stop { success: true }) {
+            if self.auto_consolidate {
+                if let (Some(p), Some(m), Some(ctx)) =
+                    (&self.provider, &self.model, &self.provider_ctx)
+                {
+                    match self.store.consolidate(p, m, ctx).await {
+                        Ok(report) => {
+                            if report.distilled > 0 {
+                                tracing::info!(
+                                    absorbed = report.absorbed,
+                                    distilled = report.distilled,
+                                    banks = report.banks,
+                                    "记忆 LLM 沉淀完成"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "记忆 LLM 沉淀失败"),
+                    }
+                }
+            }
             match self.store.sleep() {
                 Ok(report) => {
                     tracing::info!(
@@ -2251,7 +2319,8 @@ mod tests {
     #[test]
     fn assemble_defaults_to_core_only() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
+        let (reg, _) =
+            assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
@@ -2274,7 +2343,8 @@ mod tests {
     fn assemble_enables_ast_group() {
         let mut optional = std::collections::HashMap::new();
         optional.insert("ast".to_string(), true);
-        let (reg, _) = assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
+        let (reg, _) =
+            assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));
@@ -2287,7 +2357,8 @@ mod tests {
     #[test]
     fn assemble_github_independent_of_optional_map() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) = assemble_builtin_tools(&optional, true, true, false, agent_tools::disabled());
+        let (reg, _) =
+            assemble_builtin_tools(&optional, true, true, false, agent_tools::disabled());
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(
@@ -2331,18 +2402,33 @@ mod tests {
 
     #[test]
     fn parse_socks_spec_ok() {
-        assert_eq!(parse_socks_spec("127.0.0.1:1080"), Ok(("127.0.0.1".into(), 1080)));
-        assert_eq!(parse_socks_spec(" proxy.example.com:8080 "), Ok(("proxy.example.com".into(), 8080)));
+        assert_eq!(
+            parse_socks_spec("127.0.0.1:1080"),
+            Ok(("127.0.0.1".into(), 1080))
+        );
+        assert_eq!(
+            parse_socks_spec(" proxy.example.com:8080 "),
+            Ok(("proxy.example.com".into(), 8080))
+        );
         assert_eq!(parse_socks_spec("[::1]:1080"), Ok(("::1".into(), 1080)));
-        assert_eq!(parse_socks_spec("1.2.3.4:65535"), Ok(("1.2.3.4".into(), 65535)));
+        assert_eq!(
+            parse_socks_spec("1.2.3.4:65535"),
+            Ok(("1.2.3.4".into(), 65535))
+        );
     }
 
     #[test]
     fn parse_socks_spec_rejects_bad_input() {
         assert!(parse_socks_spec("127.0.0.1").is_err(), "缺端口应拒绝");
         assert!(parse_socks_spec("127.0.0.1:0").is_err(), "端口 0 应拒绝");
-        assert!(parse_socks_spec("127.0.0.1:abc").is_err(), "非数字端口应拒绝");
-        assert!(parse_socks_spec("127.0.0.1:70000").is_err(), "端口超范围应拒绝");
+        assert!(
+            parse_socks_spec("127.0.0.1:abc").is_err(),
+            "非数字端口应拒绝"
+        );
+        assert!(
+            parse_socks_spec("127.0.0.1:70000").is_err(),
+            "端口超范围应拒绝"
+        );
         assert!(parse_socks_spec(":1080").is_err(), "空 host 应拒绝");
         assert!(parse_socks_spec("host:").is_err(), "空端口应拒绝");
     }
@@ -2359,7 +2445,10 @@ mod tests {
             .get_help()
             .expect("help 应存在")
             .to_string();
-        assert!(socks_help.contains("SOCKS5 代理"), "zh help 应为中文: {socks_help}");
+        assert!(
+            socks_help.contains("SOCKS5 代理"),
+            "zh help 应为中文: {socks_help}"
+        );
         let about = cmd.get_about().expect("about").to_string();
         assert!(about.contains("智能体"), "zh about 应为中文: {about}");
 
@@ -2373,7 +2462,10 @@ mod tests {
             .get_help()
             .expect("help 应存在")
             .to_string();
-        assert!(socks_help.contains("SOCKS5 proxy"), "en help 应为英文: {socks_help}");
+        assert!(
+            socks_help.contains("SOCKS5 proxy"),
+            "en help 应为英文: {socks_help}"
+        );
 
         // ru：词表替换，且与 en 不同。
         agent_i18n::init(Some("ru"));
@@ -2385,7 +2477,10 @@ mod tests {
             .get_help()
             .expect("help 应存在")
             .to_string();
-        assert!(socks_help.contains("SOCKS5-прокси"), "ru help 应来自词表: {socks_help}");
+        assert!(
+            socks_help.contains("SOCKS5-прокси"),
+            "ru help 应来自词表: {socks_help}"
+        );
 
         // 恢复系统探测，避免影响其它测试。
         agent_i18n::init(None);
@@ -2395,7 +2490,7 @@ mod tests {
 
     /// 记录 append_note 的 mock 存储。
     struct MockStore {
-        notes: Arc<std::sync::Mutex<Vec<String>>>,
+        notes: Arc<parking_lot::Mutex<Vec<String>>>,
         root: PathBuf,
     }
 
@@ -2408,7 +2503,7 @@ mod tests {
             Ok(None)
         }
         async fn append_note(&self, note: &agent_core::MemoryNote) -> Result<(), std::io::Error> {
-            self.notes.lock().unwrap().push(note.content.clone());
+            self.notes.lock().push(note.content.clone());
             Ok(())
         }
         async fn clear(&self) -> Result<(), std::io::Error> {
@@ -2465,7 +2560,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_retain_counts_final_rounds_only() {
-        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let store = Arc::new(MockStore {
             notes: Arc::clone(&notes),
             root: PathBuf::from("/tmp/mock"),
@@ -2483,7 +2578,7 @@ mod tests {
             let msg = assistant_with_text(&format!("答复 {i}"));
             hook.on_turn_end(&turn_ctx(&msg, false)).await;
         }
-        assert!(notes.lock().unwrap().is_empty(), "前 3 个停止轮不应沉淀");
+        assert!(notes.lock().is_empty(), "前 3 个停止轮不应沉淀");
         // 停止轮 4：触发沉淀（内容 = assistant 文本 + 工具摘要）。
         let mut msg = assistant_with_text("决定用 structured 后端");
         msg.content.push(agent_core::ContentBlock::ToolCall {
@@ -2492,21 +2587,20 @@ mod tests {
             arguments: serde_json::json!({ "path": "Cargo.toml" }),
         });
         hook.on_turn_end(&turn_ctx(&msg, false)).await;
-        let got = notes.lock().unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(got[0].contains("决定用 structured 后端"));
-        assert!(got[0].contains("- tool write_file("), "应含工具摘要");
-        assert!(got[0].chars().count() <= 4000, "防爆库截断");
-        // 停止轮 5..=7 不触发，8 再触发。
-        drop(got);
+        {
+            let got = notes.lock();
+            assert_eq!(got.len(), 1);
+            assert!(got[0].contains("决定用 structured 后端"));
+            assert!(got[0].contains("- tool write_file("), "应含工具摘要");
+            assert!(got[0].chars().count() <= 4000, "防爆库截断");
+        }
         for i in 5..=7 {
             let m = assistant_with_text(&format!("答复 {i}"));
             hook.on_turn_end(&turn_ctx(&m, false)).await;
         }
-        assert_eq!(notes.lock().unwrap().len(), 1);
+        assert_eq!(notes.lock().len(), 1);
         let m8 = assistant_with_text("收尾总结");
         hook.on_turn_end(&turn_ctx(&m8, false)).await;
-        assert_eq!(notes.lock().unwrap().len(), 2);
+        assert_eq!(notes.lock().len(), 2);
     }
 }
-

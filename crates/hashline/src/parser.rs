@@ -101,10 +101,10 @@ fn is_hex_tag(s: &str) -> bool {
 }
 
 fn close_hunk(current: &mut Option<FileSection>, open: &mut Option<Hunk>) {
-    if let Some(h) = open.take() {
-        if let Some(section) = current.as_mut() {
-            section.hunks.push(h);
-        }
+    if let Some(h) = open.take()
+        && let Some(section) = current.as_mut()
+    {
+        section.hunks.push(h);
     }
 }
 

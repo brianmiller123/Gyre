@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions 适配器（覆盖最广，含兼容网关 / 本地 vLLM）。
+//! `OpenAI` Chat Completions 适配器（覆盖最广，含兼容网关 / 本地 vLLM）。
 //!
 //! 流程：构造 `/chat/completions` 请求体（`stream:true` + `include_usage`）→
 //! `reqwest` 流式响应 → 逐行解析 SSE `data:` 帧 → 增量映射为 [`AssistantEvent`]。
@@ -14,7 +14,7 @@ use async_stream::stream;
 use futures::StreamExt;
 use serde::Deserialize;
 
-/// OpenAI Chat Completions 适配器。
+/// `OpenAI` Chat Completions 适配器。
 pub struct OpenAiCompletionsAdapter {
     client: reqwest::Client,
 }
@@ -22,7 +22,7 @@ pub struct OpenAiCompletionsAdapter {
 impl OpenAiCompletionsAdapter {
     /// 构造（复用外部 `reqwest::Client` 以共享连接池）。
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
+    pub const fn new(client: reqwest::Client) -> Self {
         Self { client }
     }
 }
@@ -66,13 +66,9 @@ impl LlmProvider for OpenAiCompletionsAdapter {
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = crate::read_error_body(resp).await;
-            return Err(LlmError::Http {
-                status: status.as_u16(),
-                body: text,
-            });
+        if !resp.status().is_success() {
+            // 429 → RateLimit（含 Retry-After），供执行循环退避重试（Phase 0）。
+            return Err(crate::http_error(resp).await);
         }
         Ok(parse_sse_stream(resp, model_id))
     }
@@ -222,9 +218,9 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
 fn join_user_text(content: &[UserContent]) -> String {
     content
         .iter()
-        .filter_map(|c| match c {
-            UserContent::Text { text } => Some(text.as_str()),
-            UserContent::Image { .. } => Some("[image]"),
+        .map(|c| match c {
+            UserContent::Text { text } => text.as_str(),
+            UserContent::Image { .. } => "[image]",
         })
         .collect::<Vec<_>>()
         .join("")
@@ -234,8 +230,7 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any)
-        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any | ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -307,7 +302,7 @@ struct UsageChunk {
     prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
-/// OpenAI 流式 `usage.prompt_tokens_details`（缓存计量）。
+/// `OpenAI` 流式 `usage.prompt_tokens_details`（缓存计量）。
 #[derive(Deserialize, Default)]
 struct PromptTokensDetails {
     /// 缓存命中读取 token（`cached_tokens`）。
@@ -380,8 +375,7 @@ fn parse_sse_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
             };
             buf.extend_from_slice(chunk.as_ref());
             // 处理完整行
-            loop {
-                let Some(line_bytes) = crate::drain_line(&mut buf) else { break };
+            while let Some(line_bytes) = crate::drain_line(&mut buf) {
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -509,7 +503,7 @@ fn build_message(
     // replay 时 build_provider_context 据此过滤，避免 refusal 文本反复喂回模型。
     let (stop_reason, stop_details) = match finish.as_deref() {
         Some("length") => (Some(StopReason::Length), None),
-        Some("tool_calls") | Some("function_call") => (Some(StopReason::ToolUse), None),
+        Some("tool_calls" | "function_call") => (Some(StopReason::ToolUse), None),
         Some("content_filter") => (
             Some(StopReason::Error),
             Some(agent_core::StopDetails::new("sensitive")),
@@ -617,10 +611,12 @@ mod tests {
 
     #[test]
     fn build_message_parses_tool_call_args() {
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
         let msg = build_message(
             "m",
             "",
@@ -644,29 +640,39 @@ mod tests {
     fn finalize_stream_interrupt_retains_completed_toolcall() {
         // P0-自愈激活：finish 未收 + 已完成工具调用（参数合法 JSON）→ 标记瞬时错误，
         // 供 agent 瞬时恢复保留并执行已完成工具（而非整轮废弃）。
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
         let msg = finalize_stream_interrupt("m", "", &[tc], &None, &Usage::default())
             .expect("已完成工具调用应可恢复");
         assert_eq!(msg.stop_reason, Some(StopReason::Error));
-        assert!(msg
-            .stop_details
-            .as_ref()
-            .is_some_and(agent_core::StopDetails::is_transient_stream_error));
+        assert!(
+            msg.stop_details
+                .as_ref()
+                .is_some_and(agent_core::StopDetails::is_transient_stream_error)
+        );
     }
 
     #[test]
     fn finalize_stream_interrupt_finish_received_keeps_stop_reason() {
         // finish 已收（响应实际完成）→ 不标记瞬时错误，保留 finish 推导的 stop_reason。
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
-        let msg =
-            finalize_stream_interrupt("m", "", &[tc], &Some("tool_calls".into()), &Usage::default())
-                .expect("finish 已收应返回消息");
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
+        let msg = finalize_stream_interrupt(
+            "m",
+            "",
+            &[tc],
+            &Some("tool_calls".into()),
+            &Usage::default(),
+        )
+        .expect("finish 已收应返回消息");
         assert_eq!(msg.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(msg.stop_details, None);
     }
@@ -674,10 +680,12 @@ mod tests {
     #[test]
     fn finalize_stream_interrupt_partial_args_not_recoverable() {
         // 参数不合法 JSON（流中断于工具参数中途）→ 不可恢复，返回 None。
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"#.into(); // 残缺 JSON
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"#.into(), // 残缺 JSON
+            ..Default::default()
+        };
         assert!(finalize_stream_interrupt("m", "", &[tc], &None, &Usage::default()).is_none());
     }
 

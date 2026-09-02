@@ -28,7 +28,8 @@ use crate::Agent;
 const SUB_TEXT_MAX: usize = 64 * 1024;
 /// task 工具在途（并发 + 递归）委派数硬上限：拦截「子 Agent 再委派 task」的指数级爆炸。
 const MAX_INFLIGHT_TASKS: usize = 16;
-
+/// `output_schema` 校验失败后的重试上限（移植 omp schema permissive 重试语义）。
+const MAX_SCHEMA_RETRIES: usize = 2;
 /// 子 Agent 上下文工厂：每次委派创建一个全新上下文（不继承父对话）。
 pub type ContextFactory = Arc<dyn Fn() -> Arc<dyn ContextManager> + Send + Sync>;
 
@@ -155,18 +156,104 @@ impl TaskTool {
         builder.build()
     }
 
-    /// 运行单个子 Agent 任务，返回其（任务, 文本, 错误）。
+    /// 运行单个子 Agent 任务（无 schema 约束，行为与历史版本一致）。
+    async fn run_one(&self, task: String, cancel: CancellationToken) -> SubOutcome {
+        self.run_with_schema(task, cancel, None).await
+    }
+
+    /// 运行单个子 Agent 任务，可选 `output_schema` typed 输出约束。
+    ///
+    /// typed 路径（移植 omp task `schema` 语义）：任务包装 `<output_contract>` 要求
+    /// 只输出一个 JSON 值；输出经 [`extract_json`] 提取 + [`validate_json_schema`]
+    /// 校验，失败时在同一子 Agent 上下文注入纠错反馈重试（上限 [`MAX_SCHEMA_RETRIES`]），
+    /// 仍失败则返回可恢复错误（附最终校验错误）。重试复用同一子 Agent——纠错对话
+    /// 留在其上下文中，模型能看到自己上一次的输出。
     ///
     /// 若注入了 [`agent_supervisor::Supervisor`]，则把子 Agent 事件流观测为
     /// 子 Agent 生命周期（阶段 / 轮次 / 工具 / 用量 / 日志）；否则行为与改动前完全一致。
-    async fn run_one(&self, task: String, cancel: CancellationToken) -> SubOutcome {
+    async fn run_with_schema(
+        &self,
+        task: String,
+        cancel: CancellationToken,
+        schema: Option<&serde_json::Value>,
+    ) -> SubOutcome {
         let sub_agent = self.build_sub_agent(cancel);
         let sid: Option<String> = match self.supervisor.as_ref() {
             Some(s) => Some(s.spawn(None, label_for(&task), task.clone()).await),
             None => None,
         };
 
-        let events = sub_agent.run(&task);
+        let first_prompt = match schema {
+            Some(s) => typed_task_prompt(&task, s),
+            None => task.clone(),
+        };
+        let (mut text, mut errored) = self.run_turn(&sub_agent, &first_prompt, &sid).await;
+
+        let mut json = None;
+        if let Some(s) = schema {
+            let mut last_err = String::new();
+            let mut attempts = 0;
+            loop {
+                if errored.is_none() {
+                    match crate::extract_json(&text) {
+                        Some(v) => match crate::validate_json_schema(&v, s) {
+                            Ok(()) => {
+                                json = Some(v);
+                                break;
+                            }
+                            Err(e) => last_err = e,
+                        },
+                        None => last_err = "输出中未找到 JSON 值".to_string(),
+                    }
+                } else {
+                    last_err = errored.clone().unwrap_or_default();
+                }
+                if attempts >= MAX_SCHEMA_RETRIES {
+                    break;
+                }
+                attempts += 1;
+                let (t2, e2) = self
+                    .run_turn(&sub_agent, &retry_feedback(&last_err, &text), &sid)
+                    .await;
+                text = t2;
+                errored = e2;
+            }
+            if json.is_none() {
+                return SubOutcome {
+                    task,
+                    text,
+                    error: Some(format!(
+                        "typed 输出未通过 schema 校验（重试 {MAX_SCHEMA_RETRIES} 次后仍失败）：{last_err}"
+                    )),
+                    json: None,
+                };
+            }
+        }
+
+        let success = errored.is_none() && (json.is_some() || schema.is_none());
+        if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+            s.finish(id, success, errored.clone()).await;
+        }
+
+        SubOutcome {
+            task,
+            text,
+            error: errored,
+            json,
+        }
+    }
+
+    /// 消费一个子 Agent 轮次的事件流，返回（文本累积, 致命错误）。
+    ///
+    /// typed 重试轮复用同一子 Agent 实例（上下文保留纠错对话）；supervisor 观测
+    /// 按轮次进行（streaming 相位在每轮内首次 `TextDelta` 时置位）。
+    async fn run_turn(
+        &self,
+        sub_agent: &Agent,
+        prompt: &str,
+        sid: &Option<String>,
+    ) -> (String, Option<String>) {
+        let events = sub_agent.run(prompt);
         tokio::pin!(events);
         let mut text = String::new();
         let mut errored: Option<String> = None;
@@ -187,7 +274,7 @@ impl TaskTool {
                             text.push_str("\n...(子 Agent 输出过长，已截断)");
                         }
                     }
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         if !streaming {
                             streaming = true;
                             s.set_phase(id, agent_supervisor::SubAgentPhase::Streaming)
@@ -196,7 +283,7 @@ impl TaskTool {
                     }
                 }
                 AgentEvent::ToolExec { name, output } => {
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         s.record_tool_call(id, &name).await;
                         s.log(
                             id,
@@ -207,12 +294,12 @@ impl TaskTool {
                     }
                 }
                 AgentEvent::Usage(u) => {
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         s.record_usage(id, &u).await;
                     }
                 }
                 AgentEvent::StateChanged(st) => {
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         if let Some(phase) = match st {
                             AgentState::Running => Some(agent_supervisor::SubAgentPhase::Running),
                             AgentState::Streaming => {
@@ -228,7 +315,7 @@ impl TaskTool {
                     }
                 }
                 AgentEvent::Say(msg) => {
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         let lvl = match msg.kind {
                             StatusKind::Error => agent_supervisor::LogLevel::Error,
                             StatusKind::Warning => agent_supervisor::LogLevel::Warn,
@@ -239,7 +326,7 @@ impl TaskTool {
                     }
                 }
                 AgentEvent::Done(summary) => {
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         for _ in 0..summary.turns {
                             s.record_turn(id).await;
                         }
@@ -247,7 +334,7 @@ impl TaskTool {
                 }
                 AgentEvent::Error(e) => {
                     errored = Some(e.clone());
-                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
+                    if let (Some(s), Some(id)) = (self.supervisor.as_ref(), sid) {
                         s.log(id, agent_supervisor::LogLevel::Error, &e).await;
                     }
                 }
@@ -263,17 +350,7 @@ impl TaskTool {
                 | AgentEvent::ToolExecutionEnd { .. } => {}
             }
         }
-
-        let success = errored.is_none();
-        if let (Some(s), Some(id)) = (self.supervisor.as_ref(), &sid) {
-            s.finish(id, success, errored.clone()).await;
-        }
-
-        SubOutcome {
-            task,
-            text,
-            error: errored,
-        }
+        (text, errored)
     }
 }
 
@@ -282,6 +359,8 @@ struct SubOutcome {
     task: String,
     text: String,
     error: Option<String>,
+    /// typed 输出（`output_schema` 校验通过后的 JSON 值；普通任务为 None）。
+    json: Option<serde_json::Value>,
 }
 
 /// 子 Agent 审批：自动放行（未注入父级策略时的回退；避免嵌套交互死锁）。
@@ -321,11 +400,11 @@ impl ApprovalPolicy for DelegatedApproval {
 
 #[async_trait]
 impl Tool for TaskTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "task"
     }
-    fn description(&self) -> &str {
-        "委派子任务给独立子 Agent（独立上下文，不继承当前对话），返回其最终结果。支持单任务（task）或并行多任务（tasks，按并发护栏并行）。适合并行处理或分片复杂任务。"
+    fn description(&self) -> &'static str {
+        "委派子任务给独立子 Agent（独立上下文，不继承当前对话），返回其最终结果。支持单任务（task）或并行多任务（tasks，按并发护栏并行）。单任务可给 output_schema（JSON Schema）要求结构化 JSON 输出——校验失败自动带纠错反馈重试，成功返回紧凑 JSON。适合并行处理或分片复杂任务。"
     }
     fn schema(&self) -> serde_json::Value {
         json!({
@@ -336,6 +415,10 @@ impl Tool for TaskTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "多个可并行的子任务描述（与 task 二选一；按并发护栏并行执行后聚合结果）"
+                },
+                "output_schema": {
+                    "type": "object",
+                    "description": "typed 输出契约（仅与 task 单任务联用）：JSON Schema（type/properties/required/items/enum/界限等子集）。给出时子 Agent 须只输出一个符合 schema 的 JSON 值，校验通过后父级收到紧凑 JSON"
                 }
             }
         })
@@ -366,6 +449,20 @@ impl Tool for TaskTool {
         if tasks.is_empty() {
             return Err(ToolError::InvalidArgs("`tasks` 为空".into()));
         }
+        // typed 输出契约：仅支持单任务（多任务聚合无法对齐单一 schema）。
+        let output_schema = input.get("output_schema").cloned();
+        if let Some(s) = &output_schema {
+            if !s.is_object() {
+                return Err(ToolError::InvalidArgs(
+                    "`output_schema` 必须是 JSON Schema 对象".into(),
+                ));
+            }
+            if tasks.len() > 1 {
+                return Err(ToolError::InvalidArgs(
+                    "`output_schema` 仅支持单任务（task），不与 tasks 数组联用".into(),
+                ));
+            }
+        }
 
         // 在途委派护栏：经共享 `depth` 计数器追踪整棵递归树，拦截指数级递归委派。
         // 计数器在函数返回时（含所有早退路径）由 guard 自动递减。
@@ -382,9 +479,10 @@ impl Tool for TaskTool {
         // 单任务：直接同步执行。子 Agent 取父级 cancel 的 child，级联取消。
         if tasks.len() == 1 {
             let out = self
-                .run_one(
+                .run_with_schema(
                     tasks.into_iter().next().expect("non-empty"),
                     _ctx.cancel.child_token(),
+                    output_schema.as_ref(),
                 )
                 .await;
             return finish_single(out);
@@ -418,6 +516,7 @@ impl Tool for TaskTool {
                     task: String::new(),
                     text: String::new(),
                     error: Some(format!("子任务 panic: {je}")),
+                    json: None,
                 }),
             }
         }
@@ -464,6 +563,12 @@ impl Drop for InflightGuard {
 
 /// 单任务结果归一化（与原行为一致）。
 fn finish_single(out: SubOutcome) -> Result<ToolResult, ToolError> {
+    // typed 输出优先：返回紧凑 JSON（父 Agent 直接消费结构化数据）。
+    if let Some(v) = out.json {
+        let compact = serde_json::to_string(&v)
+            .map_err(|e| ToolError::Execution(format!("typed 输出序列化失败: {e}")))?;
+        return Ok(ToolResult::text(compact));
+    }
     if out.text.trim().is_empty() {
         if let Some(e) = out.error {
             return Err(ToolError::Execution(format!("子 Agent 失败: {e}")));
@@ -471,6 +576,25 @@ fn finish_single(out: SubOutcome) -> Result<ToolResult, ToolError> {
         return Ok(ToolResult::text("（子 Agent 无文本输出）"));
     }
     Ok(ToolResult::text(out.text))
+}
+
+/// `output_schema` 的任务包装：明确要求「只输出一个符合 schema 的 JSON 值」。
+fn typed_task_prompt(task: &str, schema: &serde_json::Value) -> String {
+    let schema_str = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
+    format!(
+        "{task}\n\n<output_contract>\n最终输出必须**只是一个 JSON 值**，符合以下 JSON Schema \
+(支持关键字：type/properties/required/items/enum/const/长度与数值界限/allOf/anyOf/oneOf)：\n\
+{schema_str}\n不要输出 markdown 围栏、注释或任何 JSON 之外的文本。\n</output_contract>"
+    )
+}
+
+/// schema 校验失败的纠错反馈（同上下文重试轮注入）。
+fn retry_feedback(errors: &str, previous: &str) -> String {
+    format!(
+        "你上一次输出未通过 JSON Schema 校验：{errors}\n上一次输出（截断）：{}\n\
+请重新给出**只含一个 JSON 值**的输出，严格符合上述 schema。",
+        truncate(previous, 2000)
+    )
 }
 
 /// 监控卡片标签：任务首部截断到 40 字符（换行折叠为空格）。

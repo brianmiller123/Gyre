@@ -23,15 +23,15 @@ pub enum LaunchError {
     /// spawn 失败。
     #[error("spawn 失败: {0}")]
     Spawn(String),
-    /// 等待 DevTools 端点超时。
+    /// 等待 `DevTools` 端点超时。
     #[error("等待 DevTools 端点超时（{0:?}）")]
     Timeout(Duration),
-    /// 进程提前退出，未输出 DevTools 端点。
+    /// 进程提前退出，未输出 `DevTools` 端点。
     #[error("chromium 进程提前退出: {0}")]
     Exited(String),
 }
 
-/// 解析出的 DevTools 端点。
+/// 解析出的 `DevTools` 端点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevToolsEndpoint {
     /// 浏览器级 WebSocket 端点（`ws://127.0.0.1:<port>/devtools/browser/<id>`）。
@@ -41,24 +41,14 @@ pub struct DevToolsEndpoint {
 }
 
 /// 启动选项。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     /// 显式可执行文件路径；`None` 时依次尝试 `BROWSER_PATH` 环境变量与 PATH 探测。
     pub binary: Option<PathBuf>,
     /// 是否追加 `--no-sandbox`；`None` 时读取 `BROWSER_NO_SANDBOX` 环境变量。
     pub no_sandbox: Option<bool>,
-    /// 等待 DevTools 端点的超时；默认 15s。
+    /// 等待 `DevTools` 端点的超时；默认 15s。
     pub timeout: Option<Duration>,
-}
-
-impl Default for LaunchOptions {
-    fn default() -> Self {
-        Self {
-            binary: None,
-            no_sandbox: None,
-            timeout: None,
-        }
-    }
 }
 
 impl LaunchOptions {
@@ -110,8 +100,7 @@ fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file()
         && p.metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+            .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -175,7 +164,7 @@ pub struct BrowserProcess {
 }
 
 impl BrowserProcess {
-    /// 启动 headless chromium 并等待 DevTools 端点就绪。
+    /// 启动 headless chromium 并等待 `DevTools` 端点就绪。
     ///
     /// # Errors
     /// 二进制未找到 / spawn 失败 / 等待端点超时 / 进程提前退出时返回 [`LaunchError`]。
@@ -214,7 +203,7 @@ impl BrowserProcess {
         })
     }
 
-    /// 浏览器级 DevTools WebSocket 端点。
+    /// 浏览器级 `DevTools` WebSocket 端点。
     #[must_use]
     pub fn ws_url(&self) -> &str {
         &self.endpoint.ws_url
@@ -222,7 +211,7 @@ impl BrowserProcess {
 
     /// 调试端口。
     #[must_use]
-    pub fn port(&self) -> Option<u16> {
+    pub const fn port(&self) -> Option<u16> {
         self.endpoint.port
     }
 
@@ -249,7 +238,7 @@ impl BrowserProcess {
                 tokio::pin!(grace);
                 tokio::select! {
                     _ = child.wait() => return Ok(()),
-                    _ = &mut grace => {
+                    () = &mut grace => {
                         let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
                         let _ = child.wait().await;
                         return Ok(());
@@ -283,7 +272,7 @@ impl Drop for BrowserProcess {
     }
 }
 
-/// 逐行读 stderr，等待 DevTools 端点（带超时）。
+/// 逐行读 stderr，等待 `DevTools` 端点（带超时）。
 async fn read_devtools_endpoint(
     mut stderr: tokio::process::ChildStderr,
     timeout: Duration,
@@ -295,7 +284,7 @@ async fn read_devtools_endpoint(
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => return Err(LaunchError::Timeout(timeout)),
+            () = &mut deadline => return Err(LaunchError::Timeout(timeout)),
             line = lines.next_line() => {
                 let line = line.map_err(|e| LaunchError::Spawn(format!("读取 stderr 失败: {e}")))?;
                 match line {
@@ -383,7 +372,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 伪 chromium：打印 DevTools 行后长驻，并记录自身与孙进程 pid 供整树击杀断言。
+    /// 伪 chromium：打印 `DevTools` 行后长驻，并记录自身与孙进程 pid 供整树击杀断言。
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_chromium_launch_parse_and_tree_kill() {

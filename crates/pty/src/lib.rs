@@ -1,6 +1,6 @@
 //! # agent-pty
 //!
-//! PTY 交互式 Shell：跨平台伪终端（`portable-pty`：Unix posix openpty / Windows ConPTY），
+//! PTY 交互式 Shell：跨平台伪终端（`portable-pty`：Unix posix openpty / Windows `ConPTY`），
 //! 让 `top`/`vim`/交互式 REPL 等**要求 TTY** 的命令可在 agent 工具中运行。
 //!
 //! 移植自 [`oh-my-pi pi-shell`](../../../third/oh-my-pi/crates/pi-shell)（运行模型）。
@@ -10,7 +10,6 @@
 //! - [`RunPtyTool`]：`run_pty_command` 工具（与 `run_command` 互补）
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 pub mod session;
 pub mod tool;

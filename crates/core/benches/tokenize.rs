@@ -3,7 +3,7 @@
 //! 真实热路径函数：`agent_context::token::TokenCounter`（crates/context/src/token.rs）：
 //! - `TokenCounter::count_text`：token.rs:56（默认 cl100k 编码）
 //! - `TokenCounter::count_text_for`：token.rs:51（按 model 族选 BPE，run-loop 用量统计
-//!   与压缩估算走此路径：gpt-4o 系列 → o200k_base）
+//!   与压缩估算走此路径：gpt-4o 系列 → `o200k_base`）
 //! - `TokenCounter::count_context_for`：token.rs:68（完整上下文 system + messages 计数）
 //!
 //! 位置说明：grep 证实 crates/core 内无 tiktoken 封装（`Usage` 仅做加法记账），计数实现在
@@ -15,9 +15,9 @@
 
 use std::hint::black_box;
 
-use agent_core::{ProviderMessage, UserContent};
 use agent_context::token::TokenCounter;
-use criterion::{criterion_group, criterion_main, Criterion};
+use agent_core::{ProviderMessage, UserContent};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 /// 基准文本：拼接至 ≥ 8 KiB 的 Rust 风格代码（确定性内容）。
 fn build_8kb_code() -> String {

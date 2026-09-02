@@ -1,5 +1,5 @@
 //! In-band 工具调用方言：把工具规格渲染进 system prompt（**不**发原生 `tools`），
-//! 并从模型的文本输出解析工具调用——供 function-calling 不稳的模型（GLM / DeepSeek 等
+//! 并从模型的文本输出解析工具调用——供 function-calling 不稳的模型（GLM / `DeepSeek` 等
 //! 兼容网关、本地 vLLM）用「提示词 + 文本协议」方式稳定调用工具。
 //!
 //! 移植 oh-my-pi owned-dialect 思路（renderInbandToolPrompt / 解析 in-band tool call），
@@ -72,13 +72,12 @@ pub(crate) fn finalize_tool_calls(
 ) -> (Vec<ContentBlock>, String) {
     let mut calls = Vec::new();
     for (i, inner) in completed.iter().enumerate() {
-        match parse_tool_call_json(inner, i) {
-            Some(c) => calls.push(c),
-            None => {
-                cleaned.push_str(OPEN);
-                cleaned.push_str(inner);
-                cleaned.push_str(CLOSE);
-            }
+        if let Some(c) = parse_tool_call_json(inner, i) {
+            calls.push(c)
+        } else {
+            cleaned.push_str(OPEN);
+            cleaned.push_str(inner);
+            cleaned.push_str(CLOSE);
         }
     }
     (calls, cleaned)
@@ -117,7 +116,7 @@ pub(crate) struct XmlToolStreamParser {
 
 impl XmlToolStreamParser {
     /// 构造。
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             in_tool: false,
             buf: String::new(),
@@ -131,34 +130,30 @@ impl XmlToolStreamParser {
         let mut completed: Vec<String> = Vec::new();
         loop {
             if !self.in_tool {
-                match self.buf.find(OPEN) {
-                    Some(p) => {
-                        text_out.push_str(&self.buf[..p]);
-                        self.buf = self.buf[p + OPEN.len()..].to_string();
-                        self.in_tool = true;
-                        continue;
+                if let Some(p) = self.buf.find(OPEN) {
+                    text_out.push_str(&self.buf[..p]);
+                    self.buf = self.buf[p + OPEN.len()..].to_string();
+                    self.in_tool = true;
+                    continue;
+                } else {
+                    // 保留可能是 OPEN 前缀的尾巴；冲刷其余（在字符边界切，避免拆多字节）。
+                    let mut cut = self.buf.len().saturating_sub(OPEN.len() - 1);
+                    while cut > 0 && !self.buf.is_char_boundary(cut) {
+                        cut -= 1;
                     }
-                    None => {
-                        // 保留可能是 OPEN 前缀的尾巴；冲刷其余（在字符边界切，避免拆多字节）。
-                        let mut cut = self.buf.len().saturating_sub(OPEN.len() - 1);
-                        while cut > 0 && !self.buf.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        text_out.push_str(&self.buf[..cut]);
-                        self.buf = self.buf[cut..].to_string();
-                        break;
-                    }
+                    text_out.push_str(&self.buf[..cut]);
+                    self.buf = self.buf[cut..].to_string();
+                    break;
                 }
-            } else {
-                match self.buf.find(CLOSE) {
-                    Some(p) => {
-                        completed.push(self.buf[..p].to_string());
-                        self.buf = self.buf[p + CLOSE.len()..].to_string();
-                        self.in_tool = false;
-                        continue;
-                    }
-                    None => break, // 工具内部未闭合：全部保留，不下发。
+            }
+            match self.buf.find(CLOSE) {
+                Some(p) => {
+                    completed.push(self.buf[..p].to_string());
+                    self.buf = self.buf[p + CLOSE.len()..].to_string();
+                    self.in_tool = false;
+                    continue;
                 }
+                None => break, // 工具内部未闭合：全部保留，不下发。
             }
         }
         (text_out, completed)

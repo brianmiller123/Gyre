@@ -64,7 +64,7 @@
   "tools.enabled": "[tools] {key} enabled (tool & prompt injected)",
   "tools.disabled": "[tools] {key} disabled (tool & prompt masked)",
   "tools.title": "╭─ Optional tools ──────────────────────────────────────────",
-  "tools.core_line": "│ Core tools (read_file/write_file/str_replace/apply_diff/list_files/run_command/grep/glob) always enabled",
+  "tools.core_line": "│ Core tools (read_file/write_file/list_files/run_command/grep/glob/web_search) + session tools (todo/ask/checkpoint/rewind/security_scan) always enabled",
   "tools.entry": "│ [{state}] {key:<9} {label}",
   "tools.hint_toggle": "│ Tip       : /tools <key> on|off toggle (inject only when enabled)",
   "tools.hint_config": "│           : or set [tools].enabled.<key> = true to enable on startup",

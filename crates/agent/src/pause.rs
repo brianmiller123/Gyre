@@ -95,8 +95,8 @@ impl PauseGate {
         // biased：cancel 优先于 resume（取消语义优先）。
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {}
-            _ = wait_until_false(&mut rx) => {}
+            () = cancel.cancelled() => {}
+            () = wait_until_false(&mut rx) => {}
         }
     }
 }

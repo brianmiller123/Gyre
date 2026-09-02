@@ -175,10 +175,7 @@ interruptMode: always
 "#;
         let (fields, body) = parse_frontmatter(content);
         assert_eq!(fields["name"], vec!["box-leak"]);
-        assert_eq!(
-            fields["condition"],
-            vec!["(?i)Box::leak", "Box::from_raw"]
-        );
+        assert_eq!(fields["condition"], vec!["(?i)Box::leak", "Box::from_raw"]);
         assert_eq!(fields["interruptMode"], vec!["always"]);
         assert!(body.contains("规则正文"));
     }

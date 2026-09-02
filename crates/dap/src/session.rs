@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -194,7 +194,10 @@ impl DapSession {
         // 尽力断开（短超时；失败静默，直接杀进程）
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            self.request("disconnect", json!({ "restart": false, "terminateDebuggee": true })),
+            self.request(
+                "disconnect",
+                json!({ "restart": false, "terminateDebuggee": true }),
+            ),
         )
         .await;
         if let Some(tx) = take_write_tx(&self.inner) {
@@ -256,7 +259,8 @@ impl DapSession {
             .map_err(|_| DapError::Closed("写通道锁损坏".into()))?
             .clone()
             .ok_or_else(|| DapError::Closed("写通道已关闭".into()))?;
-        tx.send(frame).map_err(|_| DapError::Closed("写通道已关闭".into()))
+        tx.send(frame)
+            .map_err(|_| DapError::Closed("写通道已关闭".into()))
     }
 }
 
@@ -484,8 +488,7 @@ mod tests {
         body: Value,
     ) {
         *seq += 1;
-        let msg =
-            json!({ "seq": *seq, "type": "response", "request_seq": request_seq, "success": true, "body": body });
+        let msg = json!({ "seq": *seq, "type": "response", "request_seq": request_seq, "success": true, "body": body });
         writer
             .write_all(&encode_frame(&msg).expect("编码"))
             .await
@@ -566,7 +569,10 @@ mod tests {
             if recorded.iter().any(|c| c == "continue") {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "适配器未收到 continue");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "适配器未收到 continue"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // 会话仍可用
@@ -592,10 +598,9 @@ mod tests {
     /// 无 lldb-dap 环境时显式跳过。
     #[tokio::test]
     async fn lldb_dap_launch_smoke() {
-        let Some(lldb) = crate::probe::probe_executable(
-            "lldb-dap",
-            &std::env::var("PATH").unwrap_or_default(),
-        ) else {
+        let Some(lldb) =
+            crate::probe::probe_executable("lldb-dap", &std::env::var("PATH").unwrap_or_default())
+        else {
             eprintln!("跳过：未找到 lldb-dap");
             return;
         };
@@ -609,19 +614,19 @@ mod tests {
             args: vec![],
         };
         let launch = json!({ "request": "launch", "program": "/bin/true", "stopOnEntry": false });
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(30),
-            async {
-                let session = DapSession::spawn(&spec, launch).await?;
-                let threads = session.request("threads", json!({})).await?;
-                session.close().await;
-                Ok::<_, DapError>(threads)
-            },
-        )
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let session = DapSession::spawn(&spec, launch).await?;
+            let threads = session.request("threads", json!({})).await?;
+            session.close().await;
+            Ok::<_, DapError>(threads)
+        })
         .await;
         let threads = outcome
             .expect("lldb-dap 冒烟超时（30s）——环境异常")
             .expect("lldb-dap launch 冒烟应成功");
-        assert!(threads.get("threads").is_some(), "threads 响应应含 threads 数组");
+        assert!(
+            threads.get("threads").is_some(),
+            "threads 响应应含 threads 数组"
+        );
     }
 }

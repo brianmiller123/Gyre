@@ -1,4 +1,4 @@
-//! 图片工具：read_image（读取本地图片为多模态结果）+ image_gen（调用 OpenAI 兼容图像生成）。
+//! `图片工具：read_image（读取本地图片为多模态结果`）+ `image_gen（调用` `OpenAI` 兼容图像生成）。
 //!
 //! 多模态链路：工具返回 [`ToolResult::Image`]，由 `convert_to_llm` 编码为 base64
 //! [`ToolImage`](agent_core::ToolImage)，支持多模态的 provider（Anthropic）可作为 image block
@@ -24,7 +24,7 @@ fn mime_from_ext(path: &Path) -> Option<String> {
         .as_deref()
     {
         Some("png") => Some("image/png".into()),
-        Some("jpg") | Some("jpeg") => Some("image/jpeg".into()),
+        Some("jpg" | "jpeg") => Some("image/jpeg".into()),
         Some("gif") => Some("image/gif".into()),
         Some("webp") => Some("image/webp".into()),
         _ => None,
@@ -36,10 +36,10 @@ pub struct ReadImageTool;
 
 #[async_trait]
 impl Tool for ReadImageTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "read_image"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "读取本地图片文件（png/jpeg/gif/webp），作为图像供模型查看分析。仅限只读。"
     }
     fn schema(&self) -> Value {
@@ -76,7 +76,7 @@ impl Tool for ReadImageTool {
     }
 }
 
-/// 调用 OpenAI 兼容图像生成 API（`/images/generations`）。
+/// 调用 `OpenAI` 兼容图像生成 API（`/images/generations`）。
 ///
 /// 凭据从环境变量读取（`IMAGE_API_KEY` / `OPENAI_API_KEY`）；`base_url` 可由参数覆盖，
 /// 兼容网关/本地模型。生成图片以 base64 取回后解码为图像结果。
@@ -84,10 +84,10 @@ pub struct ImageGenTool;
 
 #[async_trait]
 impl Tool for ImageGenTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "image_gen"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "调用图像生成 API（OpenAI 兼容 /images/generations）按 prompt 生成图片。\
          需配置环境变量 IMAGE_API_KEY 或 OPENAI_API_KEY。"
     }
@@ -190,7 +190,7 @@ mod tests {
     use super::*;
     use agent_core::{ApprovalDecision, ApprovalRequest, Workspace};
 
-    fn dummy_ctx<'a>(ws: &'a Workspace) -> ToolContext<'a> {
+    fn dummy_ctx(ws: &Workspace) -> ToolContext<'_> {
         struct AutoApprove;
         #[async_trait::async_trait]
         impl agent_core::ApprovalPolicy for AutoApprove {
@@ -218,6 +218,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         }
     }
 

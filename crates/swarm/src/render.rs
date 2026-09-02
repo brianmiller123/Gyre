@@ -35,7 +35,7 @@ pub fn render_swarm_progress(state: &SwarmState) -> Vec<String> {
     let now = unix_now_ms();
     for agent in &agents {
         let icon = status_label_for(agent.status);
-        let duration = format_agent_duration(*agent, now);
+        let duration = format_agent_duration(agent, now);
         let error_suffix = agent
             .error
             .as_ref()
@@ -91,18 +91,17 @@ fn status_label_for(status: AgentStatus) -> &'static str {
     STATUS_LABELS
         .iter()
         .find(|(s, _)| *s == status)
-        .map(|(_, label)| *label)
-        .unwrap_or("[????]")
+        .map_or("[????]", |(_, label)| *label)
 }
 
 fn format_agent_duration(agent: &crate::state::AgentState, now: u64) -> String {
     if let (Some(start), Some(end)) = (agent.started_at, agent.completed_at) {
         return format!(" ({})", format_duration(end.saturating_sub(start)));
     }
-    if let Some(start) = agent.started_at {
-        if matches!(agent.status, AgentStatus::Running | AgentStatus::Waiting) {
-            return format!(" ({})...", format_duration(now.saturating_sub(start)));
-        }
+    if let Some(start) = agent.started_at
+        && matches!(agent.status, AgentStatus::Running | AgentStatus::Waiting)
+    {
+        return format!(" ({})...", format_duration(now.saturating_sub(start)));
     }
     String::new()
 }
@@ -133,8 +132,7 @@ fn format_duration(ms: u64) -> String {
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]

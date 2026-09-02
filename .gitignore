@@ -5,7 +5,8 @@ Cargo.lock.bak
 
 # 本地智能体配置与运行时数据（不应入库）
 /.agent/
-/.config/
+/.config/*
+!/.config/nextest.toml
 *.log
 
 # IDE
@@ -18,8 +19,11 @@ Cargo.lock.bak
 third/
 third/Zoo-Code
 plans/
-docs/
-vendor/
+vendor/*
+!vendor/pi-shell/
+!vendor/pi-builtins/
+!vendor/pi-walker/
+!vendor/brush-core/
 
 problem.txt
 # 运行时 sidecar 状态（SOCKS5 开关 / 审批模式），不入库

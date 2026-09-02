@@ -64,6 +64,7 @@ pub trait DeferredDiagnosticsHandle: Send + Sync {
 }
 
 /// [`WriteEffect::after_write`] 的返回值。
+#[derive(Default)]
 pub struct WriteOutcome {
     /// 格式化后的完整文件内容。
     ///
@@ -80,16 +81,6 @@ impl WriteOutcome {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
-    }
-}
-
-impl Default for WriteOutcome {
-    fn default() -> Self {
-        Self {
-            formatted_text: None,
-            diagnostics: Vec::new(),
-            deferred: None,
-        }
     }
 }
 

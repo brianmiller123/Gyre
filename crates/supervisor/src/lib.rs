@@ -13,7 +13,6 @@
 //! 三者共享同一份 `Arc` 状态（`Supervisor` 廉价克隆），无需额外接线。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod model;
 mod registry;

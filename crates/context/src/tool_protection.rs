@@ -90,11 +90,10 @@ pub(crate) fn sanitize_agent_messages(msgs: Vec<AgentMessage>) -> Vec<AgentMessa
     for m in msgs {
         match m {
             AgentMessage::Assistant(mut a) => {
-                a.content
-                    .retain(|b| match b {
-                        ContentBlock::ToolCall { id, .. } => ids_with_result.contains(id),
-                        _ => true,
-                    });
+                a.content.retain(|b| match b {
+                    ContentBlock::ToolCall { id, .. } => ids_with_result.contains(id),
+                    _ => true,
+                });
                 if a.content.is_empty() {
                     // 纯 tool-call 助手消息且其调用全部悬空：丢弃，避免空助手消息。
                     continue;
@@ -216,10 +215,11 @@ mod tests {
         let AgentMessage::Assistant(a) = &out[0] else {
             panic!("助手应保留");
         };
-        assert!(a
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { text } if text == "hi")));
+        assert!(
+            a.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "hi"))
+        );
     }
 
     #[test]
@@ -240,7 +240,11 @@ mod tests {
             AgentMessage::user_text("u"),
         ];
         let out = sanitize_agent_messages(log);
-        assert_eq!(call_ids(&out), vec!["c2".to_string()], "仅 c2（有结果）应保留");
+        assert_eq!(
+            call_ids(&out),
+            vec!["c2".to_string()],
+            "仅 c2（有结果）应保留"
+        );
         assert!(
             out.iter()
                 .any(|m| matches!(m, AgentMessage::ToolResult(t) if t.tool_call_id == "c2")),
@@ -254,8 +258,7 @@ mod tests {
         let log = vec![res("c1", "x"), AgentMessage::user_text("u")];
         let out = sanitize_agent_messages(log);
         assert!(
-            !out.iter()
-                .any(|m| matches!(m, AgentMessage::ToolResult(_))),
+            !out.iter().any(|m| matches!(m, AgentMessage::ToolResult(_))),
             "无发起助手的孤立 ToolResult 应丢弃"
         );
     }

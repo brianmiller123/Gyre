@@ -1,16 +1,16 @@
-//! DeepSeek 独立 Provider 路由模块。
+//! `DeepSeek` 独立 Provider 路由模块。
 //!
-//! DeepSeek 的 API 基于但区别于标准 OpenAI Completions，本模块忠实移植 Zoo-Code
+//! `DeepSeek` 的 API 基于但区别于标准 `OpenAI` Completions，本模块忠实移植 Zoo-Code
 //! [`deepseek.ts`](../../third/Zoo-Code/src/api/providers/deepseek.ts) 的特化处理：
 //!
-//! 1. **reasoning_content 字段**：流式 delta 含 `reasoning_content`（非 OpenAI 标准），
+//! 1. **`reasoning_content` 字段**：流式 delta 含 `reasoning_content`（非 `OpenAI` 标准），
 //!    提取为 thinking 事件（[`extract_reasoning_from_delta`]）。
 //! 2. **R1 消息格式**：DeepSeek-R1 不支持连续同角色消息，需合并（[`convert_to_r1_format`]）。
 //! 3. **thinking 模式参数**：`thinking: {type:"enabled"}` + `reasoning_effort: "high"|"max"`
-//!    （非标准 reasoning_effort 取值；[`normalize_reasoning_effort`]）。
+//!    （非标准 `reasoning_effort` 取值；[`normalize_reasoning_effort`]）。
 //! 4. **温度限制**：thinking 模式下**不发送 temperature**（DeepSeek-R1 不支持）。
-//! 5. **缓存用量**：`prompt_tokens_details.cached_tokens` / `cache_miss_tokens`（DeepSeek 特有）。
-//! 6. **max_completion_tokens**：用 `max_completion_tokens` 而非 `max_tokens`。
+//! 5. **缓存用量**：`prompt_tokens_details.cached_tokens` / `cache_miss_tokens`（`DeepSeek` 特有）。
+//! 6. **`max_completion_tokens`**：用 `max_completion_tokens` 而非 `max_tokens`。
 
 use std::pin::Pin;
 
@@ -23,21 +23,21 @@ use async_stream::stream;
 use futures::StreamExt;
 use serde::Deserialize;
 
-/// DeepSeek 默认 base URL。
+/// `DeepSeek` 默认 base URL。
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 
 /// 支持 thinking toggle 的 V4 模型集合。
 const V4_THINKING_MODELS: &[&str] = &["deepseek-v4-flash", "deepseek-v4-pro"];
 
-/// DeepSeek Provider。
+/// `DeepSeek` Provider。
 pub struct DeepSeekProvider {
     client: reqwest::Client,
 }
 
 impl DeepSeekProvider {
-    /// 构造（复用外部 reqwest::Client）。
+    /// 构造（复用外部 `reqwest::Client`）。
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
+    pub const fn new(client: reqwest::Client) -> Self {
         Self { client }
     }
 }
@@ -91,10 +91,10 @@ impl LlmProvider for DeepSeekProvider {
 // 判定逻辑（移植 deepseek.ts）
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 是否为 DeepSeek thinking 模型。
+/// 是否为 `DeepSeek` thinking 模型。
 ///
-/// `deepseek-reasoner` 永远启用思考（官方 reasoner 内建思考，自动输出 reasoning_content）；
-/// V4 系列需 `thinking:{type:"enabled"}` toggle（由 ThinkingConfig 触发）。
+/// `deepseek-reasoner` 永远启用思考（官方 reasoner 内建思考，自动输出 `reasoning_content`）；
+/// V4 系列需 `thinking:{type:"enabled"}` toggle（由 `ThinkingConfig` 触发）。
 fn is_thinking_model(model_id: &str, thinking: Option<&ThinkingConfig>) -> bool {
     if model_id == "deepseek-reasoner" {
         return true;
@@ -103,11 +103,11 @@ fn is_thinking_model(model_id: &str, thinking: Option<&ThinkingConfig>) -> bool 
     V4_THINKING_MODELS.contains(&model_id) && thinking.is_some()
 }
 
-/// 归一化 reasoning_effort 为 DeepSeek 取值（"high" | "max"）。
+/// 归一化 `reasoning_effort` 为 `DeepSeek` 取值（"high" | "max"）。
 ///
-/// DeepSeek 将 low/medium 映射为 high，xhigh 映射为 max。
+/// `DeepSeek` 将 low/medium 映射为 high，xhigh 映射为 max。
 #[must_use]
-pub fn normalize_reasoning_effort(budget_tokens: usize) -> &'static str {
+pub const fn normalize_reasoning_effort(budget_tokens: usize) -> &'static str {
     // 按 budget 分档映射到 DeepSeek 的 high/max
     if budget_tokens >= 32_000 {
         "max"
@@ -174,8 +174,7 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any)
-        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any | ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -189,10 +188,10 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
 // R1 消息格式（合并连续同角色）
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 将 system + messages 转为 DeepSeek R1 格式：合并连续同角色消息。
+/// 将 system + messages 转为 `DeepSeek` R1 格式：合并连续同角色消息。
 ///
 /// DeepSeek-R1 不支持连续同角色消息。对于 thinking 模型，`merge_tool_result_text`
-/// 将 tool_result 后的文本合并到最后一条 tool 消息（避免创建 user 消息导致 reasoning 丢失）。
+/// 将 `tool_result` 后的文本合并到最后一条 tool 消息（避免创建 user 消息导致 reasoning 丢失）。
 pub fn convert_to_r1_format(
     system: &[String],
     messages: &[ProviderMessage],
@@ -217,9 +216,9 @@ pub fn convert_to_r1_format(
             ProviderMessage::User { content } => {
                 let text: String = content
                     .iter()
-                    .filter_map(|c| match c {
-                        agent_core::UserContent::Text { text } => Some(text.as_str()),
-                        agent_core::UserContent::Image { .. } => Some("[image]"),
+                    .map(|c| match c {
+                        agent_core::UserContent::Text { text } => text.as_str(),
+                        agent_core::UserContent::Image { .. } => "[image]",
                     })
                     .collect::<Vec<_>>()
                     .join("");
@@ -296,7 +295,7 @@ fn push_or_merge(
 
 /// 从流式 delta 提取 reasoning 文本。
 ///
-/// 优先 `reasoning_content`（DeepSeek-R1 / QwQ 风格），回退 `reasoning`（OpenRouter 风格）。
+/// 优先 `reasoning_content`（DeepSeek-R1 / `QwQ` 风格），回退 `reasoning`（`OpenRouter` 风格）。
 #[must_use]
 pub fn extract_reasoning_from_delta(delta: &serde_json::Value) -> Option<String> {
     if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
@@ -340,7 +339,7 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// DeepSeek delta：含标准 content/tool_calls + reasoning_content。
+/// `DeepSeek` delta：含标准 `content/tool_calls` + `reasoning_content`。
 #[derive(Deserialize, Default)]
 struct DeepSeekDelta {
     #[serde(default)]
@@ -368,7 +367,7 @@ struct DeepSeekFn {
     arguments: Option<String>,
 }
 
-/// DeepSeek 用量：含 prompt_tokens_details（缓存计量）。
+/// `DeepSeek` 用量：含 `prompt_tokens_details（缓存计量`）。
 #[derive(Deserialize, Default)]
 struct DeepSeekUsage {
     #[serde(default)]
@@ -379,7 +378,7 @@ struct DeepSeekUsage {
     prompt_tokens_details: Option<DeepSeekPromptDetails>,
 }
 
-/// DeepSeek 缓存详情。
+/// `DeepSeek` 缓存详情。
 #[derive(Deserialize, Default)]
 struct DeepSeekPromptDetails {
     #[serde(default)]
@@ -450,8 +449,7 @@ fn parse_deepseek_stream(resp: reqwest::Response, model_id: String) -> Assistant
                 }
             };
             buf.extend_from_slice(chunk.as_ref());
-            loop {
-                let Some(line_bytes) = crate::drain_line(&mut buf) else { break };
+            while let Some(line_bytes) = crate::drain_line(&mut buf) {
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() { continue; }
                 let Some(data) = line.strip_prefix("data:") else { continue };
@@ -583,7 +581,7 @@ fn build_deepseek_message(
     // P2-P：content_filter → Error + sensitive（DeepSeek OpenAI 兼容，含 content_filter）。
     let (stop_reason, stop_details) = match finish.as_deref() {
         Some("length") => (Some(StopReason::Length), None),
-        Some("tool_calls") | Some("function_call") => (Some(StopReason::ToolUse), None),
+        Some("tool_calls" | "function_call") => (Some(StopReason::ToolUse), None),
         Some("content_filter") => (
             Some(StopReason::Error),
             Some(agent_core::StopDetails::new("sensitive")),
@@ -644,7 +642,7 @@ fn map_transport_error(e: reqwest::Error, provider: &str) -> LlmError {
     }
 }
 
-/// DeepSeek HTTP 错误映射。
+/// `DeepSeek` HTTP 错误映射。
 fn map_deepseek_error(status: u16, body: &str) -> LlmError {
     match status {
         401 | 403 => LlmError::Auth(format!("DeepSeek 鉴权失败（{status}）: {body}")),
@@ -880,16 +878,19 @@ mod tests {
     fn finalize_stream_interrupt_retains_completed_toolcall() {
         // P0-自愈激活：finish 未收 + 已完成工具调用（参数合法 JSON）→ 标记瞬时错误，
         // 供 agent 瞬时恢复保留并执行已完成工具（而非整轮废弃）。
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
         let msg = finalize_stream_interrupt("m", "", &[tc], &None, &Usage::default())
             .expect("已完成工具调用应可恢复");
         assert_eq!(msg.stop_reason, Some(StopReason::Error));
-        assert!(msg
-            .stop_details
-            .as_ref()
-            .is_some_and(agent_core::StopDetails::is_transient_stream_error));
+        assert!(
+            msg.stop_details
+                .as_ref()
+                .is_some_and(agent_core::StopDetails::is_transient_stream_error)
+        );
     }
 }

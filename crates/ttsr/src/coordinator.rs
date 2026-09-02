@@ -14,7 +14,7 @@ use std::sync::{Mutex, PoisonError};
 
 use agent_core::AgentMessage;
 
-use crate::matcher::{digest_for, path_of, tool_calls_of, TtsrManager};
+use crate::matcher::{TtsrManager, digest_for, path_of, tool_calls_of};
 use crate::rule::{InterruptMode, Rule};
 
 /// 注入消息的持久化标记前缀（`[ttsr-injection:name1,name2]`）。
@@ -146,7 +146,10 @@ impl TtsrCoordinator {
         // 尽早释放 manager 锁，再写提醒表（避免跨锁保持）。
         drop(manager);
         if !pending.is_empty() {
-            let mut reminders = self.reminders.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut reminders = self
+                .reminders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for (id, reminder) in pending {
                 reminders
                     .entry(id)
@@ -208,11 +211,7 @@ pub fn parse_marker(text: &str) -> Option<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 #[cfg(test)]
@@ -221,7 +220,11 @@ mod tests {
     use crate::rule::parse_rule;
 
     fn text_rule(name: &str, condition: &str) -> Rule {
-        parse_rule(name, &format!("---\ncondition: [{condition:?}]\n---\nbody {name}")).unwrap()
+        parse_rule(
+            name,
+            &format!("---\ncondition: [{condition:?}]\n---\nbody {name}"),
+        )
+        .unwrap()
     }
 
     fn coordinator(rules: Vec<Rule>) -> TtsrCoordinator {
@@ -287,7 +290,10 @@ mod tests {
             stop_reason: Some(agent_core::StopReason::ToolUse),
             stop_details: None,
         };
-        assert_eq!(c.check_tool_calls(&hard), ToolOutcome::Abort(vec!["hard".into()]));
+        assert_eq!(
+            c.check_tool_calls(&hard),
+            ToolOutcome::Abort(vec!["hard".into()])
+        );
 
         let soft = agent_core::AssistantMessage {
             content: vec![agent_core::ContentBlock::ToolCall {
@@ -308,11 +314,13 @@ mod tests {
 
     #[test]
     fn tool_abort_marks_injected_once() {
-        let c = coordinator(vec![parse_rule(
-            "hard",
-            "---\nscope: tool:write_file\ncondition: [secret]\n---\nbody",
-        )
-        .unwrap()]);
+        let c = coordinator(vec![
+            parse_rule(
+                "hard",
+                "---\nscope: tool:write_file\ncondition: [secret]\n---\nbody",
+            )
+            .unwrap(),
+        ]);
         c.on_turn_start();
         let msg = |content: &str| agent_core::AssistantMessage {
             content: vec![agent_core::ContentBlock::ToolCall {
@@ -325,7 +333,10 @@ mod tests {
             stop_reason: Some(agent_core::StopReason::ToolUse),
             stop_details: None,
         };
-        assert_eq!(c.check_tool_calls(&msg("secret")), ToolOutcome::Abort(vec!["hard".into()]));
+        assert_eq!(
+            c.check_tool_calls(&msg("secret")),
+            ToolOutcome::Abort(vec!["hard".into()])
+        );
         // 注入（mark）后：同轮内不再触发（once 抑制）。
         let _ = c.render_injection(&["hard".into()]);
         assert_eq!(c.check_tool_calls(&msg("secret")), ToolOutcome::None);

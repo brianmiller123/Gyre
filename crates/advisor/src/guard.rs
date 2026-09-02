@@ -25,7 +25,7 @@ impl EmissionGuard {
     #[must_use]
     pub fn normalize(note: &str) -> String {
         let mut out = String::with_capacity(note.len());
-        for ch in note.chars().flat_map(|c| c.to_lowercase()) {
+        for ch in note.chars().flat_map(char::to_lowercase) {
             if ch.is_alphanumeric() {
                 out.push(ch);
             }
@@ -115,6 +115,9 @@ mod tests {
     fn short_noise_rejected() {
         let g = EmissionGuard::new();
         assert!(!g.emit(Severity::Nit, "hmm"));
-        assert!(g.emit(Severity::Blocker, "User acceptance criteria no longer match the fix."));
+        assert!(g.emit(
+            Severity::Blocker,
+            "User acceptance criteria no longer match the fix."
+        ));
     }
 }

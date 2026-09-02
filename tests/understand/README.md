@@ -3,7 +3,7 @@
 阶段 0（Understand-Anything 数据管道桥）产出的**确定性基线样本**，供阶段 1+
 （Rust 原生重构 `understand-scan` / `understand-parse`）做行为一致性回归对比。
 
-> 架构背景：[`plans/understand-anything-integration-architecture.md`](../../plans/understand-anything-integration-architecture.md) §6.3 / §8 阶段 1–7。
+> 架构背景：Understand-Anything 集成架构 §6.3 / §8 阶段 1–7（内部设计文档，未随仓库分发）。
 
 ---
 

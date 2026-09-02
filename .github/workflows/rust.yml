@@ -11,9 +11,58 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-A warnings"
+  # 注意：不再设置 RUSTFLAGS=-A warnings —— 警告必须被看见并在 lint 门清零
 
 jobs:
+  # ─── 执法门 1：格式 + 静态检查（clippy 全量 -D warnings）────────────────────────
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (deny all warnings)
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+  # ─── 执法门 2：测试（nextest；retries=0 见 .config/nextest.toml）────────────────
+  test:
+    name: Test (nextest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace
+
+      # nextest 不执行 doctests，单独补跑
+      - name: Run doctests
+        run: cargo test --workspace --doc
+
+  # ─── 构建 + 发布（matrix 双平台；release 步骤仅在 tag 触发时执行）───────────────
   build:
     # ✨ Matrix：同时构建 Linux 与 Windows 二进制
     # 两个平台并行跑，fail-fast=false 保证一个失败不影响另一个继续跑完，便于排查
@@ -73,6 +122,12 @@ jobs:
     - name: Build Rust Backend
       run: cargo build -r --verbose  # 默认在根目录执行，无需 cd ../../
 
+    # ✨ 发布冒烟：产物必须能打印版本号并正常退出（防"编译过但起不来"的坏 release）
+    - name: Smoke test (--version)
+      if: startsWith(github.ref, 'refs/tags/')
+      shell: bash
+      run: "./target/release/${{ matrix.binary }} --version"
+
     # ✨ 核心增补：整理二进制文件 —— 不打包，直接重命名为带平台后缀的裸二进制上传
     # 用户下载后即可直接运行（Linux: ./agent-linux-amd64，Windows: agent-windows-amd64.exe）
     # 二进制名 agent 来自 crates/cli 的 [[bin]] name = "agent"
@@ -91,21 +146,35 @@ jobs:
         cp "$SRC" "dist/${{ matrix.artifact }}"
         echo "✅ 产物已生成："; ls -lh dist/
 
-    # ✨ 自动创建 Release 并上传裸二进制文件（非压缩包）
+    # ✨ 校验和：为每个平台产物生成 SHA256 sidecar，下载方可自行核验完整性
+    # windows-latest 的 shell: bash = Git Bash，自带 sha256sum，双平台同一实现
+    - name: Generate SHA256 checksum
+      if: startsWith(github.ref, 'refs/tags/')
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd dist
+        sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+        cat "${{ matrix.artifact }}.sha256"
+
+    # ✨ 自动创建 Release 并上传裸二进制 + 校验和 sidecar（非压缩包）
     # softprops/action-gh-release@v2 对并发上传是幂等的：两个 matrix job 同时跑时，
     # 后到的会复用已存在的 release 并追加自己的文件，无需额外协调
     - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/${{ matrix.artifact }}
+        files: |
+          dist/${{ matrix.artifact }}
+          dist/${{ matrix.artifact }}.sha256
         # 关键：files 没匹配到任何文件时让 Action 直接失败，而不是静默建一个只有源码的 release
         fail_on_unmatched_files: true
         body: |
           Automated Release by GitHub Actions.
           - Commit: ${{ github.sha }}
           - Binaries (download & run directly):
-              - Linux x86_64:   `agent-linux-amd64`
-              - Windows x86_64: `agent-windows-amd64.exe`
+              - Linux x86_64:   `agent-linux-amd64`      (+ `.sha256` checksum)
+              - Windows x86_64: `agent-windows-amd64.exe` (+ `.sha256` checksum)
+          Verify integrity: `sha256sum -c agent-<platform>.sha256`
         draft: false
         prerelease: false

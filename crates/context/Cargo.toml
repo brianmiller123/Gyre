@@ -22,6 +22,7 @@ base64   = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
+parking_lot = "0.12"
 # 基准门：run-loop 压缩耗时基准（benches/compaction.rs）
 criterion = { workspace = true }
 

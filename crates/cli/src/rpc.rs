@@ -385,7 +385,7 @@ pub async fn run_rpc(
     let socks5 = super::build_socks5_controller(&cfg, &cwd, socks_override);
     super::print_socks5_status(&socks5);
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时（专供流式 LLM 调用）。
-    let client = agent_proxy::build_http_client(socks5, |b| {
+    let client = agent_proxy::build_http_client(socks5, cfg.user_agent.as_deref(), |b| {
         b.tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
     })
@@ -415,15 +415,44 @@ pub async fn run_rpc(
         agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
             .await
             .context("打开持久化上下文失败")?;
-    pctx.set_summarizer(Box::new(
-        agent_context::compaction::LlmSummaryProvider::new(
-            Arc::clone(&provider),
-            model.clone(),
-            provider_ctx.clone(),
-            cfg.compaction.remote_endpoint.clone(),
-        ),
-    ))
-    .await;
+    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
+    // 提前到 summarizer 之前：压缩前召回（preCompactionContext）需把记忆挂到摘要提供器。
+    let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
+    let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
+    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
+    if cfg.memory.enabled {
+        match cfg.memory.backend {
+            agent_config::MemoryBackend::Local => {
+                let store = Arc::new(
+                    agent_memory::LocalMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default()),
+                );
+                local_memory = Some(Arc::clone(&store));
+                memory = Some(store);
+            }
+            agent_config::MemoryBackend::Structured => {
+                let store = Arc::new(
+                    agent_memory::StructuredMemoryStore::new(&cwd)
+                        .with_mental_models_config(agent_memory::MentalModelsConfig::default())
+                        .with_embedder(agent_memory::default_embedder()),
+                );
+                structured_memory = Some(Arc::clone(&store));
+                memory = Some(store);
+            }
+        }
+    }
+    let mut summarizer = agent_context::compaction::LlmSummaryProvider::new(
+        Arc::clone(&provider),
+        model.clone(),
+        provider_ctx.clone(),
+        cfg.compaction.remote_endpoint.clone(),
+        cfg.user_agent.clone(),
+    );
+    if let Some(m) = &memory {
+        // P2-5：压缩前召回（对齐 mnemopi `preCompactionContext`）——挂记忆到摘要提供器。
+        summarizer = summarizer.with_memory(Arc::clone(m));
+    }
+    pctx.set_summarizer(Box::new(summarizer)).await;
     // Shake 归档落盘到 <cwd>/.gyre/artifacts（与 CLI 单次任务一致）。
     pctx.set_shake_sink(Arc::new(agent_context::compaction::DirSink::new(
         cwd.join(".gyre").join("artifacts"),
@@ -470,32 +499,6 @@ pub async fn run_rpc(
     let mut base_context_files = agent_config::discover_context_files(&cwd);
     base_context_files.extend(foreign_sections);
 
-    // 长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
-    let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
-    let mut local_memory: Option<Arc<agent_memory::LocalMemoryStore>> = None;
-    let mut structured_memory: Option<Arc<agent_memory::StructuredMemoryStore>> = None;
-    if cfg.memory.enabled {
-        match cfg.memory.backend {
-            agent_config::MemoryBackend::Local => {
-                let store = Arc::new(
-                    agent_memory::LocalMemoryStore::new(&cwd)
-                        .with_mental_models_config(agent_memory::MentalModelsConfig::default()),
-                );
-                local_memory = Some(Arc::clone(&store));
-                memory = Some(store);
-            }
-            agent_config::MemoryBackend::Structured => {
-                let store = Arc::new(
-                    agent_memory::StructuredMemoryStore::new(&cwd)
-                        .with_mental_models_config(agent_memory::MentalModelsConfig::default())
-                        .with_embedder(agent_memory::default_embedder()),
-                );
-                structured_memory = Some(Arc::clone(&store));
-                memory = Some(store);
-            }
-        }
-    }
-
     // 审批：RPC 模式下 stdin 是协议通道，无法交互审批——一律拒绝（写工具会失败并反映在
     // tool_result 中）；需要全自动写权限时以 `--approval-mode yolo` 启动。
     let prompt_resolver: agent_config::PromptResolver = Arc::new(|ask: agent_core::AskMessage| {
@@ -518,8 +521,8 @@ pub async fn run_rpc(
     let subagent_inherit = cfg.subagent.inherit_parent;
     let subagent_max_output_override = cfg.subagent.max_output_tokens;
     let profile_temperature = profile.temperature;
-    let mut github_enabled = cfg.github.enabled;
-    let mut github_allow_write = cfg.github.allow_write;
+    let github_enabled = cfg.github.enabled;
+    let github_allow_write = cfg.github.allow_write;
     let supervisor = agent_supervisor::Supervisor::new();
 
     // P0-3：goals 目标预算共享状态（跨 Agent 重建保持；与 main() 单次任务路径一致）。
@@ -537,7 +540,7 @@ pub async fn run_rpc(
             None
         };
 
-    let mut current_mode = mode;
+    let current_mode = mode;
     let mut current_model = model;
     let mut current_api_key = api_key;
     let mut current_base_url = profile.base_url.clone();
@@ -741,6 +744,10 @@ pub async fn run_rpc(
         if let Some(m) = &structured_memory {
             hooks.push(Arc::new(StructuredSleepHook {
                 store: Arc::clone(m),
+                auto_consolidate: cfg.memory.auto_consolidate,
+                provider: Some(Arc::clone(&provider)),
+                model: Some(model.clone()),
+                provider_ctx: Some(provider_ctx.clone()),
             }));
         }
         if let Some(m) = &memory {

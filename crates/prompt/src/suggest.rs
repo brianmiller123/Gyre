@@ -18,7 +18,6 @@ pub struct FileSuggestion {
     pub reason: String,
 }
 
-
 /// 语言 token → 相关扩展名映射（query 里出现 "rust" 倾向 .rs/.toml 等）。
 fn lang_exts(token: &str) -> Option<&'static [&'static str]> {
     match token {
@@ -87,9 +86,7 @@ pub fn score_files(query: &str, files: &[String], limit: usize) -> Vec<FileSugge
 
         for tok in &tokens {
             let basename_hit = stem.to_lowercase().contains(tok);
-            let seg_hit = segments
-                .iter()
-                .any(|s| s.to_lowercase().contains(tok));
+            let seg_hit = segments.iter().any(|s| s.to_lowercase().contains(tok));
             let path_hit = norm.to_lowercase().contains(tok);
 
             if let Some(exts) = lang_exts(tok) {
@@ -139,7 +136,6 @@ fn dedup_reasons(rs: &[&str]) -> String {
     seen.join(" + ")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,9 +156,15 @@ mod tests {
     fn ranks_by_basename_then_path() {
         let r = score_files("auth login", &files(), 5);
         // basename 含两个 token 的文件应排最高。
-        assert_eq!(r.first().map(|s| s.path.as_str()), Some("src/auth_login.rs"));
+        assert_eq!(
+            r.first().map(|s| s.path.as_str()),
+            Some("src/auth_login.rs")
+        );
         // README / Cargo.toml 无命中，不出现。
-        assert!(r.iter().all(|s| s.path != "README.md" && s.path != "Cargo.toml"));
+        assert!(
+            r.iter()
+                .all(|s| s.path != "README.md" && s.path != "Cargo.toml")
+        );
     }
 
     #[test]
@@ -172,13 +174,11 @@ mod tests {
         let rs_score = r
             .iter()
             .find(|s| s.path == "src/auth.rs")
-            .map(|s| s.score)
-            .unwrap_or(0.0);
+            .map_or(0.0, |s| s.score);
         let tsx_score = r
             .iter()
             .find(|s| s.path == "web/src/Auth.tsx")
-            .map(|s| s.score)
-            .unwrap_or(0.0);
+            .map_or(0.0, |s| s.score);
         assert!(rs_score > tsx_score);
     }
 

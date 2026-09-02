@@ -5,7 +5,7 @@
 //!
 //! 设计：
 //! - [`run_pty_command`]：一次性执行 `<command>; printf MARKER_%d`，读到 EOF，解析退出码。
-//!   跨平台：Unix posix openpty，Windows ConPTY。
+//!   跨平台：Unix posix openpty，Windows `ConPTY`。
 //! - [`PtyShell`]：持久 shell（`stty -echo` + 唯一 marker 协议），跨命令保持 cwd/环境。
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ const MARKER_PREFIX: &str = "__AGENT_PTY_EXIT_";
 /// PTY 输出累积上限（超出即停止读取，防 OOM）。
 const PTY_MAX_OUTPUT: usize = 8 * 1024 * 1024; // 8 MiB
 /// 持久 shell 单命令墙钟超时（超时即杀 shell，fail-closed）。
-const PTY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
+const PTY_RUN_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// 把 portable-pty 的 anyhow 风格错误转为 [`io::Error`]。
 fn pty_err<E: std::fmt::Display>(e: E) -> io::Error {
@@ -125,7 +125,7 @@ pub async fn run_pty_command(opts: &PtyOptions) -> Result<PtyResult, io::Error> 
                 timed_out = false;
                 res.map_err(|e| io::Error::other(format!("pty 读取失败: {e}")))?
             }
-            _ = tokio::time::sleep(dur) => {
+            () = tokio::time::sleep(dur) => {
                 // 超时：杀子进程 → reader 收 EOF → 阻塞读取线程解除
                 {
                     let mut c = killer.lock().await;
@@ -147,7 +147,7 @@ pub async fn run_pty_command(opts: &PtyOptions) -> Result<PtyResult, io::Error> 
         let c = Arc::clone(&child);
         tokio::task::spawn_blocking(move || {
             let mut guard = c.blocking_lock();
-            guard.wait().map_or(false, |s| s.success())
+            guard.wait().is_ok_and(|s| s.success())
         })
         .await
         .unwrap_or(false)
@@ -160,7 +160,7 @@ pub async fn run_pty_command(opts: &PtyOptions) -> Result<PtyResult, io::Error> 
     let exit_code = if timed_out {
         None
     } else {
-        parsed_exit.or_else(|| Some(if success { 0 } else { 1 }))
+        parsed_exit.or_else(|| Some(i32::from(!success)))
     };
 
     Ok(PtyResult {
@@ -254,22 +254,22 @@ impl PtyShell {
         }
         // 墙钟超时：防止交互式命令（vim/top/挂起）永久阻塞读线程。
         // 超时即杀掉持久 shell（fail-closed），会话随后不可复用，需新建 PtyShell。
-        let (cleaned, exit) =
-            match tokio::time::timeout(PTY_RUN_TIMEOUT, self.read_until_marker(&marker)).await {
-                Ok(res) => res?,
-                Err(_) => {
-                    if let Ok(mut child) = self._child.lock() {
-                        let _ = child.kill();
-                    }
-                    // 标记失效：防止后续 run 在 reader 锁上死锁。
-                    self.poisoned.store(true, Ordering::SeqCst);
-                    return Ok(PtyResult {
-                        output: String::new(),
-                        exit_code: None,
-                        timed_out: true,
-                    });
-                }
-            };
+        let (cleaned, exit) = if let Ok(res) =
+            tokio::time::timeout(PTY_RUN_TIMEOUT, self.read_until_marker(&marker)).await
+        {
+            res?
+        } else {
+            if let Ok(mut child) = self._child.lock() {
+                let _ = child.kill();
+            }
+            // 标记失效：防止后续 run 在 reader 锁上死锁。
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Ok(PtyResult {
+                output: String::new(),
+                exit_code: None,
+                timed_out: true,
+            });
+        };
         Ok(PtyResult {
             output: normalize_output(&cleaned),
             exit_code: exit,

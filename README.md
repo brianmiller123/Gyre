@@ -17,19 +17,20 @@ Gyre is a **production-grade AI coding agent framework** that provides a complet
 ### 🤖 Agent Engine
 - **Five-state state machine** (NoTask → Running → Streaming → WaitingForInput → Idle): ported from Zoo-Code's mature state model for precise control of the agent lifecycle.
 - **Message-driven architecture**: `say` (informational) / `ask` (interactive-blocking) message models, with an approval gateway and user receipts.
-- **Multiple modes**: `code` (coding) / `architect` (architecture) / `ask` (Q&A) / `debug` (debugging). The mode determines the system prompt and the tool subset.
+- **Multiple modes**: `code` (coding) / `architect` (architecture) / `ask` (Q&A) / `debug` (debugging) / `plan` (planning). The mode determines the system prompt and the tool subset.
 - **Steering mechanism**: inject messages mid-run to dynamically intervene in the agent's reasoning direction.
 - **Soft tool requirements**: warn first, then enforce, protecting the provider prefix cache.
 
 ### 🛠️ Toolchain
-- **Core tools**: `read_file` / `write_file` / `str_replace` / `apply_diff` / `list_files` / `run_command` / `grep` / `glob`
+- **Core tools**: `read_file` / `write_file` / `list_files` / `run_command` / `grep` / `glob` / `web_search` (editing goes through the optional AST / Hashline groups)
+- **Session tools**: `todo` / `ask` / `checkpoint` / `rewind` (session rollback) / `security_scan` (local secret-leak & dangerous-pattern scan)
 - **AST code manipulation** (optional): `replace_block` (tree-sitter syntactic block replacement) / `ast_search` / `ast_rewrite` (ast-grep structural search & rewrite)
 - **LSP integration** (optional): diagnostics / go-to-definition / find references / rename symbol
 - **Hashline DSL** (optional): line-anchored batch editing, applying multiple files and ranges in one pass
 - **PTY pseudo-terminal** (optional): `run_pty_command`, supports interactive terminal apps (top / vim / REPL)
 - **Image processing** (optional): `read_image` / `image_gen` (DALL·E or a compatible API)
 - **GitHub integration** (optional): query and operate on PRs / Issues / Actions, plus GraphQL queries
-- **MCP protocol**: compatible with the Model Context Protocol; any MCP server's tools can be mounted
+- **MCP protocol**: implements the Model Context Protocol over stdio (initialize / tools/list / tools/call); mount tools from any stdio MCP server
 
 ### 🧠 Context Management
 - **AppendOnlyLog**: messages are append-only; the only legal mutation path is `replaceTail` during compaction
@@ -69,7 +70,7 @@ Gyre is a **production-grade AI coding agent framework** that provides a complet
 
 ### 📐 Architecture Design
 - **Ports & Adapters (Hexagonal Architecture)**: all core dependencies are injected as `Arc<dyn Trait>`; the loop is completely transparent to transport / provider / tool
-- **Non-invasive extension**: `inventory` compile-time plugin self-registration; adding a provider/tool requires no changes to any central registry
+- **Non-invasive extension**: providers self-register via the `inventory` compile-time plugin; tools are assembled explicitly at the CLI/server composition root (`DefaultToolRegistry`)
 - **Unidirectional dependencies**: `core` has zero business dependencies; `agent` depends only on Traits, not concrete implementations; the dependency graph is unidirectional and acyclic
 - **Event-driven**: the loop yields `Stream<Item = AgentEvent>`; both front-ends subscribe uniformly
 
@@ -86,7 +87,7 @@ Gyre is a **production-grade AI coding agent framework** that provides a complet
 
 ```bash
 # Clone the repository
-git clone https://github.com/Gyre/Gyre.git
+git clone https://github.com/brianmiller123/Gyre.git
 cd Gyre
 
 # Copy the config and fill in your API key
@@ -171,31 +172,43 @@ Gyre/
 ├── crates/
 │   ├── core/                   # contracts: types + traits + errors (zero business deps)
 │   ├── config/                 # layered TOML config + model profiles + approval rule engine
-│   ├── llm/                    # LLM provider adapters (OpenAI/Anthropic/DeepSeek)
+│   ├── llm/                    # LLM provider adapters (OpenAI/Anthropic/DeepSeek/GLM/Gemini)
 │   ├── context/                # context management (AppendOnlyLog + StablePrefix + compaction)
 │   ├── prompt/                 # system prompt template engine
-│   ├── tools/                  # toolset (filesystem/AST/LSP/search/shell/GitHub/image)
+│   ├── tools/                  # toolset (filesystem/AST/LSP/search/shell/GitHub/image/todo/ask/...)
+│   ├── shell/                  # in-process shell exec (brush parser + 50+ coreutils builtins, zero fork)
 │   ├── agent/                  # execution-loop state machine (the agent core)
 │   ├── server/                 # HTTP/WebSocket service (axum)
-│   ├── cli/                    # CLI binary entry (REPL + command dispatch)
+│   ├── acp/                    # Agent Client Protocol adapter (editor integration)
+│   ├── cli/                    # CLI binary entry (REPL + command dispatch + RPC)
 │   ├── ast/                    # AST manipulation (tree-sitter + ast-grep)
 │   ├── search/                 # code search (grep/glob/fd/highlight/tokens)
-│   ├── mcp/                    # MCP protocol client
+│   ├── ttsr/                   # time-traveling stream rules (prompt-free streaming guardrails)
+│   ├── mcp/                    # MCP protocol client (stdio)
+│   ├── lsp/                    # LSP language-server client
+│   ├── dap/                    # DAP debug-adapter client (`debug` tool)
+│   ├── browser/                # headless browser automation (minimal CDP client)
 │   ├── memory/                 # cross-session long-term memory
 │   ├── skills/                 # skill system (file-backed skills)
 │   ├── swarm/                  # multi-agent orchestration (DAG pipelines)
 │   ├── collab/                 # collaboration relay (end-to-end encryption)
 │   ├── hashline/               # Hashline DSL batch editing
 │   ├── pty/                    # PTY pseudo-terminal tool
-│   ├── lsp/                    # LSP language-server client
 │   ├── iso/                    # filesystem isolation (sandbox diff)
 │   ├── supervisor/             # sub-agent monitoring bus
+│   ├── proxy/                  # SOCKS5 egress proxy controller (process-wide singleton)
+│   ├── discovery/              # foreign agent-tool config discovery (AGENTS.md / CLAUDE.md / Cursor / Cline)
+│   ├── advisor/                # independent read-only review agent (nit / concern / blocker)
+│   ├── eval/                   # persistent Python/JS eval kernels + loopback bridge
+│   ├── snapcompact/            # snapshot compaction: dropped history → PNG frames for vision-model replay
 │   ├── i18n/                   # multilingual message catalog (compile-time embedded + system-language detection)
 │   └── telemetry/              # OpenTelemetry observability
 ├── web/                        # Web UI front-end (React + Vite)
 │   └── c5-ui/                  # front-end source
+├── vendor/                     # in-tree forks (pi-shell / pi-builtins / pi-walker / brush-core)
 ├── prompts/                    # system prompt templates (.md)
-├── plans/                      # architecture design docs
+├── docs/                       # design docs & benchmark analyses
+├── tests/                      # golden regression fixtures
 └── config.example.toml         # config example
 ```
 
@@ -468,7 +481,7 @@ Compared with the reference projects above, this project achieves **significant 
 | --- | --- | --- | --- |
 | **Language unity** | TypeScript runtime + Rust N-API native plugins (hybrid) | **Pure Rust single workspace** (edition 2024) | Eliminates N-API FFI overhead and cross-language serialization loss; compile-time type safety; zero runtime interpretation cost |
 | **Architecture pattern** | Quasi-monolithic orchestration + partial trait abstraction | **Full Ports & Adapters (Hexagonal Architecture)** | All dependencies injected as `Arc<dyn Trait>`; the loop is fully transparent to transport/provider/tool; unit tests can stub globally |
-| **Extension mechanism** | Manual central registry | **Compile-time non-invasive discovery** (`inventory` macro) | Adding a provider/tool requires no changes to any central registration code; `impl Trait + submit!` suffices |
+| **Extension mechanism** | Manual central registry | **Provider self-registration** (`inventory` macro) + explicit tool assembly | Adding a provider needs no central registration code (`impl Trait + submit!`); tools are wired explicitly at the composition root |
 | **Concurrency model** | Node.js event loop + N-API thread pool | **async/await + Tokio, fully async** | Native `Send + Sync`, no GIL-lock contention; `spawn_blocking` isolates CPU-heavy tasks |
 | **Tool pluggability** | Fixed toolset + environment-variable switches | **Config-driven dynamic tool groups** (`[tools.enabled]`) | Toggle at runtime via `/tools <key> on\|off`; disabled tools cost zero tokens |
 | **Context compaction** | Single-tier compaction strategy | **Three-tier progressive compaction** (Shake → Summarize → Prune) | Light jitter-based dedup first, then LLM summarization to fold history, then window-pruning fallback — balancing quality and token cost |

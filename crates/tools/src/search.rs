@@ -13,10 +13,10 @@ pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "grep"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "在工作区正则搜索文件内容（尊重 .gitignore）。返回命中文件、行号与行文本。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -46,7 +46,7 @@ impl Tool for GrepTool {
             .to_string();
         let highlight = input
             .get("highlight")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         // pattern 会被 move 进 spawn_blocking 闭包；另留一份用于命中高亮。
         let pattern_for_hl = pattern.clone();
@@ -80,10 +80,10 @@ pub struct GlobTool;
 
 #[async_trait]
 impl Tool for GlobTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "glob"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "按 glob 模式（如 **/*.rs）发现工作区内文件路径。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -109,7 +109,7 @@ impl Tool for GlobTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `pattern`".into()))?
             .to_string();
-        let root = ctx.workspace.root().to_path_buf();
+        let root = ctx.workspace.root();
         let files =
             tokio::task::spawn_blocking(move || agent_search::glob_match(&root, &pattern, 100))
                 .await

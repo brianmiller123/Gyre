@@ -36,25 +36,67 @@ pub struct TemporalInfo {
 const MS_PER_DAY: i64 = 86_400_000;
 
 const DAY_MAP: &[(&str, i64)] = &[
-    ("monday", 0), ("tuesday", 1), ("wednesday", 2), ("thursday", 3),
-    ("friday", 4), ("saturday", 5), ("sunday", 6),
-    ("mon", 0), ("tue", 1), ("wed", 2), ("thu", 3), ("fri", 4), ("sat", 5), ("sun", 6),
+    ("monday", 0),
+    ("tuesday", 1),
+    ("wednesday", 2),
+    ("thursday", 3),
+    ("friday", 4),
+    ("saturday", 5),
+    ("sunday", 6),
+    ("mon", 0),
+    ("tue", 1),
+    ("wed", 2),
+    ("thu", 3),
+    ("fri", 4),
+    ("sat", 5),
+    ("sun", 6),
 ];
 
 const MONTH_MAP: &[(&str, i64)] = &[
-    ("january", 1), ("february", 2), ("march", 3), ("april", 4), ("may", 5),
-    ("june", 6), ("july", 7), ("august", 8), ("september", 9), ("october", 10),
-    ("november", 11), ("december", 12),
-    ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("jun", 6), ("jul", 7),
-    ("aug", 8), ("sep", 9), ("oct", 10), ("nov", 11), ("dec", 12),
+    ("january", 1),
+    ("february", 2),
+    ("march", 3),
+    ("april", 4),
+    ("may", 5),
+    ("june", 6),
+    ("july", 7),
+    ("august", 8),
+    ("september", 9),
+    ("october", 10),
+    ("november", 11),
+    ("december", 12),
+    ("jan", 1),
+    ("feb", 2),
+    ("mar", 3),
+    ("apr", 4),
+    ("jun", 6),
+    ("jul", 7),
+    ("aug", 8),
+    ("sep", 9),
+    ("oct", 10),
+    ("nov", 11),
+    ("dec", 12),
 ];
 
 const DAY_NAMES: &[&str] = &[
-    "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
 ];
 
 const NAMED_TIME_KEYS: &[&str] = &[
-    "morning", "afternoon", "evening", "night", "midnight", "noon", "dawn", "dusk",
+    "morning",
+    "afternoon",
+    "evening",
+    "night",
+    "midnight",
+    "noon",
+    "dawn",
+    "dusk",
 ];
 
 /// 日期（y,m,d）→ 自 1970-01-01 的天数（Howard Hinnant `days_from_civil`）。
@@ -187,8 +229,7 @@ fn re(text: &str) -> &'static Regex {
     if let Some(r) = cache.get(text) {
         return r;
     }
-    let compiled: &'static Regex =
-        Box::leak(Box::new(Regex::new(text).expect("静态正则合法")));
+    let compiled: &'static Regex = Box::leak(Box::new(Regex::new(text).expect("静态正则合法")));
     cache.insert(text.to_string(), compiled);
     compiled
 }
@@ -266,7 +307,11 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
         let m = caps[2].parse::<i64>().ok()?;
         let d = caps[3].parse::<i64>().ok()?;
         if let Some(ms) = date_utc(y, m, d) {
-            return Some(ParsedDate { epoch_ms: ms as u64, precision: "day", tags: tags_for_day(ms) });
+            return Some(ParsedDate {
+                epoch_ms: ms as u64,
+                precision: "day",
+                tags: tags_for_day(ms),
+            });
         }
     }
 
@@ -278,9 +323,17 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
         if y < 100 {
             y += 2000;
         }
-        let ms = if a > 12 { date_utc(y, b, a) } else { date_utc(y, a, b) };
+        let ms = if a > 12 {
+            date_utc(y, b, a)
+        } else {
+            date_utc(y, a, b)
+        };
         if let Some(ms) = ms {
-            return Some(ParsedDate { epoch_ms: ms as u64, precision: "day", tags: tags_for_day(ms) });
+            return Some(ParsedDate {
+                epoch_ms: ms as u64,
+                precision: "day",
+                tags: tags_for_day(ms),
+            });
         }
     }
 
@@ -312,7 +365,11 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
         return Some(ParsedDate {
             epoch_ms: d as u64,
             precision: "day",
-            tags: vec![iso_date(d), day_name(d).to_string(), "yesterday".to_string()],
+            tags: vec![
+                iso_date(d),
+                day_name(d).to_string(),
+                "yesterday".to_string(),
+            ],
         });
     }
 
@@ -327,7 +384,11 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
 
     if re(r"\bday\s+before\s+yesterday\b").is_match(&text_lower) {
         let d = add_days(date_only(reference as i64), -2);
-        return Some(ParsedDate { epoch_ms: d as u64, precision: "day", tags: vec![iso_date(d)] });
+        return Some(ParsedDate {
+            epoch_ms: d as u64,
+            precision: "day",
+            tags: vec![iso_date(d)],
+        });
     }
 
     // `last|this|next monday`
@@ -350,8 +411,9 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
     }
 
     // `(on )?monday`
-    if let Some(caps) = re(r"\b(on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b")
-        .captures(&text_lower)
+    if let Some(caps) =
+        re(r"\b(on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b")
+            .captures(&text_lower)
     {
         let d = resolve_relative_day(reference as i64, &caps[2], "this");
         return Some(ParsedDate {
@@ -377,7 +439,11 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
                         epoch_ms: ref_date as u64,
                         precision: "week",
                         tags: vec![
-                            format!("week-{}-{}", iso_week(ref_date), civil_from_days(ref_date / MS_PER_DAY).0),
+                            format!(
+                                "week-{}-{}",
+                                iso_week(ref_date),
+                                civil_from_days(ref_date / MS_PER_DAY).0
+                            ),
                             "this-week".to_string(),
                         ],
                     });
@@ -467,13 +533,18 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
     }
 
     // `3 days ago` / `5 weeks back`
-    if let Some(caps) = re(r"\b(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+(ago|before|earlier|back)\b")
-        .captures(&text_lower)
+    if let Some(caps) =
+        re(r"\b(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+(ago|before|earlier|back)\b")
+            .captures(&text_lower)
     {
         let num = caps[1].parse::<i64>().ok()?;
         let unit = &caps[2];
         let d = delta_date(reference as i64, num, unit, -1)?;
-        let precision = if unit == "day" || unit == "hour" { "day" } else { "week" };
+        let precision = if unit == "day" || unit == "hour" {
+            "day"
+        } else {
+            "week"
+        };
         return Some(ParsedDate {
             epoch_ms: d as u64,
             precision,
@@ -482,13 +553,17 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
     }
 
     // `in 5 weeks`
-    if let Some(caps) = re(r"\bin\s+(\d+)\s+(second|minute|hour|day|week|month|year)s?\b")
-        .captures(&text_lower)
+    if let Some(caps) =
+        re(r"\bin\s+(\d+)\s+(second|minute|hour|day|week|month|year)s?\b").captures(&text_lower)
     {
         let num = caps[1].parse::<i64>().ok()?;
         let unit = &caps[2];
         let d = delta_date(reference as i64, num, unit, 1)?;
-        let precision = if unit == "day" || unit == "hour" { "day" } else { "week" };
+        let precision = if unit == "day" || unit == "hour" {
+            "day"
+        } else {
+            "week"
+        };
         return Some(ParsedDate {
             epoch_ms: d as u64,
             precision,
@@ -517,8 +592,10 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
     // ── 中文时间表达（Gyre 增强；omp 无此支持）──
 
     // `N天前` / `三天前` / `两小时前` / `3个月前`（阿拉伯数字或中文数字，1–99）
-    if let Some(caps) = re(r"([0-9一二两三四五六七八九十零]+)\s*(秒|分钟|小时|天|日|周|星期|个月|月|年)(前|以前|之前)")
-        .captures(text)
+    if let Some(caps) = re(
+        r"([0-9一二两三四五六七八九十零]+)\s*(秒|分钟|小时|天|日|周|星期|个月|月|年)(前|以前|之前)",
+    )
+    .captures(text)
     {
         let num = parse_chinese_num(&caps[1])?;
         let unit = match &caps[2] {
@@ -531,7 +608,11 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
             _ => "year",
         };
         let d = delta_date(reference as i64, num, unit, -1)?;
-        let precision = if unit == "day" || unit == "hour" { "day" } else { "week" };
+        let precision = if unit == "day" || unit == "hour" {
+            "day"
+        } else {
+            "week"
+        };
         return Some(ParsedDate {
             epoch_ms: d as u64,
             precision,
@@ -558,7 +639,8 @@ pub fn parse_nl_date(text: &str, reference: Option<u64>) -> Option<ParsedDate> {
 
     // `上周一` / `本周三` / `下周日` / `上周` / `下周`（中文周名 → 英文全名复用
     // resolve_relative_day 的 last/this/next 语义；中文一周从周一起）
-    if let Some(caps) = re(r"(上|本|这|下)(周|星期|礼拜)([一二三四五六日天])?").captures(text) {
+    if let Some(caps) = re(r"(上|本|这|下)(周|星期|礼拜)([一二三四五六日天])?").captures(text)
+    {
         let qualifier = match &caps[1] {
             "上" => "last",
             "下" => "next",
@@ -693,7 +775,8 @@ pub fn temporal_boost(ts_ms: u64, query_time_ms: u64, halflife_hours: f64) -> f6
 }
 
 fn now_ms() -> u64 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // u128→u64 截断在毫秒量级可接受
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // u128→u64 截断在毫秒量级可接受
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -733,9 +816,18 @@ mod tests {
 
     #[test]
     fn yesterday_today_tomorrow() {
-        assert_eq!(parse_nl_date("yesterday", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 4));
-        assert_eq!(parse_nl_date("today", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 5));
-        assert_eq!(parse_nl_date("tomorrow", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 6));
+        assert_eq!(
+            parse_nl_date("yesterday", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 4)
+        );
+        assert_eq!(
+            parse_nl_date("today", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 5)
+        );
+        assert_eq!(
+            parse_nl_date("tomorrow", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 6)
+        );
     }
 
     #[test]
@@ -813,31 +905,93 @@ mod tests {
     #[test]
     fn chinese_relative_days() {
         // 相对时刻保留时分（与英文 deltaDate 一致）
-        assert_eq!(parse_nl_date("三天前", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 2) + 12 * 3_600_000);
-        assert_eq!(parse_nl_date("3天前", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 2) + 12 * 3_600_000);
-        assert_eq!(parse_nl_date("二十五天前", Some(ref_ms())).unwrap().epoch_ms, day(2025, 2, 8) + 12 * 3_600_000);
-        assert_eq!(parse_nl_date("两小时前", Some(ref_ms())).unwrap().epoch_ms, ref_ms() - 2 * 3_600_000);
-        assert_eq!(parse_nl_date("两周前", Some(ref_ms())).unwrap().epoch_ms, day(2025, 2, 19) + 12 * 3_600_000);
-        assert_eq!(parse_nl_date("3个月前", Some(ref_ms())).unwrap().epoch_ms, day(2024, 12, 5) + 12 * 3_600_000);
-        assert_eq!(parse_nl_date("一年前", Some(ref_ms())).unwrap().epoch_ms, day(2024, 3, 5) + 12 * 3_600_000);
+        assert_eq!(
+            parse_nl_date("三天前", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 2) + 12 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("3天前", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 2) + 12 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("二十五天前", Some(ref_ms()))
+                .unwrap()
+                .epoch_ms,
+            day(2025, 2, 8) + 12 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("两小时前", Some(ref_ms())).unwrap().epoch_ms,
+            ref_ms() - 2 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("两周前", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 2, 19) + 12 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("3个月前", Some(ref_ms())).unwrap().epoch_ms,
+            day(2024, 12, 5) + 12 * 3_600_000
+        );
+        assert_eq!(
+            parse_nl_date("一年前", Some(ref_ms())).unwrap().epoch_ms,
+            day(2024, 3, 5) + 12 * 3_600_000
+        );
     }
 
     #[test]
     fn chinese_weekday_and_units() {
         // 2025-03-05 是周三；上周一 = 本周一(3/3) − 7 = 2/24
-        assert_eq!(parse_nl_date("上周一", Some(ref_ms())).unwrap().epoch_ms, day(2025, 2, 24));
-        assert_eq!(parse_nl_date("本周三", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 5));
-        assert_eq!(parse_nl_date("下周日", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 9));
-        assert_eq!(parse_nl_date("上周", Some(ref_ms())).unwrap().epoch_ms, day(2025, 2, 26));
-        assert_eq!(parse_nl_date("下周", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 12));
-        assert_eq!(parse_nl_date("下个月", Some(ref_ms())).unwrap().epoch_ms, day(2025, 4, 1));
-        assert_eq!(parse_nl_date("上个月", Some(ref_ms())).unwrap().epoch_ms, day(2025, 2, 1));
-        assert_eq!(parse_nl_date("去年", Some(ref_ms())).unwrap().epoch_ms, day(2024, 1, 1));
-        assert_eq!(parse_nl_date("前年", Some(ref_ms())).unwrap().epoch_ms, day(2023, 1, 1));
-        assert_eq!(parse_nl_date("昨天", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 4));
-        assert_eq!(parse_nl_date("前天", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 3));
-        assert_eq!(parse_nl_date("后天", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 7));
-        assert_eq!(parse_nl_date("最近", Some(ref_ms())).unwrap().epoch_ms, day(2025, 3, 5));
+        assert_eq!(
+            parse_nl_date("上周一", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 2, 24)
+        );
+        assert_eq!(
+            parse_nl_date("本周三", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 5)
+        );
+        assert_eq!(
+            parse_nl_date("下周日", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 9)
+        );
+        assert_eq!(
+            parse_nl_date("上周", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 2, 26)
+        );
+        assert_eq!(
+            parse_nl_date("下周", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 12)
+        );
+        assert_eq!(
+            parse_nl_date("下个月", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 4, 1)
+        );
+        assert_eq!(
+            parse_nl_date("上个月", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 2, 1)
+        );
+        assert_eq!(
+            parse_nl_date("去年", Some(ref_ms())).unwrap().epoch_ms,
+            day(2024, 1, 1)
+        );
+        assert_eq!(
+            parse_nl_date("前年", Some(ref_ms())).unwrap().epoch_ms,
+            day(2023, 1, 1)
+        );
+        assert_eq!(
+            parse_nl_date("昨天", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 4)
+        );
+        assert_eq!(
+            parse_nl_date("前天", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 3)
+        );
+        assert_eq!(
+            parse_nl_date("后天", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 7)
+        );
+        assert_eq!(
+            parse_nl_date("最近", Some(ref_ms())).unwrap().epoch_ms,
+            day(2025, 3, 5)
+        );
     }
 
     #[test]

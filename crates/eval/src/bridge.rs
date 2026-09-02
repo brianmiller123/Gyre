@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::EvalError;
@@ -52,7 +52,7 @@ impl Drop for RunGuard {
         self.state
             .runs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.token);
     }
 }
@@ -70,6 +70,7 @@ struct CallRequest {
 }
 
 /// 构造环回桥 URL（内核侧 `tool.*` 回调目标）。
+#[cfg(test)]
 fn bridge_url(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
@@ -109,20 +110,16 @@ impl BridgeServer {
 
     /// 监听地址（127.0.0.1 + 随机端口）。
     #[must_use]
-    pub fn addr(&self) -> SocketAddr {
+    pub const fn addr(&self) -> SocketAddr {
         self.addr
     }
 
     /// 注册一个 run token；返回的 [`RunGuard`] drop 时注销。
-    pub async fn register_run(
-        &self,
-        token: String,
-        cancel: CancellationToken,
-    ) -> RunGuard {
+    pub async fn register_run(&self, token: String, cancel: CancellationToken) -> RunGuard {
         self.state
             .runs
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(token.clone(), RunEntry { cancel });
         RunGuard {
             state: Arc::clone(&self.state),
@@ -139,7 +136,7 @@ async fn call_handler(
     let run = state
         .runs
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&req.token)
         .cloned();
     let Some(run) = run else {
@@ -151,7 +148,9 @@ async fn call_handler(
     let Some(tool) = state.registry.get(&req.tool) else {
         return (
             StatusCode::OK,
-            Json(json!({"ok": false, "error": json!({"message": format!("未知工具：{}", req.tool)})})),
+            Json(
+                json!({"ok": false, "error": json!({"message": format!("未知工具：{}", req.tool)})}),
+            ),
         );
     };
     let child = run.cancel.child_token();
@@ -166,11 +165,10 @@ async fn call_handler(
         update_tx: None,
         conflicts: None,
         pending_rewrites: None,
+        context: None,
     };
     match tool.execute(req.args, &ctx).await {
-        Ok(ToolResult::Text(text)) => {
-            (StatusCode::OK, Json(json!({"ok": true, "output": text})))
-        }
+        Ok(ToolResult::Text(text)) => (StatusCode::OK, Json(json!({"ok": true, "output": text}))),
         Ok(ToolResult::Image { mime, .. }) => (
             StatusCode::OK,
             Json(json!({"ok": true, "output": format!("[image/{mime}]")})),
@@ -180,17 +178,22 @@ async fn call_handler(
             recoverable,
         }) => (
             StatusCode::OK,
-            Json(json!({"ok": false, "error": json!({"message": message, "recoverable": recoverable})})),
+            Json(
+                json!({"ok": false, "error": json!({"message": message, "recoverable": recoverable})}),
+            ),
         ),
-        Err(e) => (StatusCode::OK, Json(json!({"ok": false, "error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({"ok": false, "error": e.to_string()})),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_tools::DefaultToolRegistry;
     use crate::test_support::NoopApproval;
+    use agent_tools::DefaultToolRegistry;
 
     /// 环回桥 URL 拼接。
     #[test]
@@ -199,7 +202,7 @@ mod tests {
         assert_eq!(bridge_url(addr), "http://127.0.0.1:45678");
     }
 
-    /// RunGuard drop 注销 token；期间 token 有效。
+    /// `RunGuard` drop 注销 token；期间 token 有效。
     #[tokio::test]
     async fn run_guard_registers_and_deregisters_token() {
         let bridge = BridgeServer::spawn(
@@ -210,13 +213,15 @@ mod tests {
         .await
         .expect("桥启动失败");
         let token = "unit-token".to_string();
-        let guard = bridge.register_run(token.clone(), CancellationToken::new()).await;
+        let guard = bridge
+            .register_run(token.clone(), CancellationToken::new())
+            .await;
         assert!(
             bridge
                 .state
                 .runs
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&token)
         );
         drop(guard);
@@ -225,7 +230,7 @@ mod tests {
                 .state
                 .runs
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&token)
         );
     }

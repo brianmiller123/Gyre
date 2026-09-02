@@ -27,6 +27,6 @@ pub mod frontmatter;
 pub mod matcher;
 pub mod rule;
 
-pub use coordinator::{parse_marker, ToolOutcome, TtsrConfig, TtsrCoordinator, INJECTION_MARKER};
-pub use matcher::{digest_for, path_of, tool_calls_of, TtsrManager};
-pub use rule::{discover_rules, parse_rule, InterruptMode, Repeat, Rule, RuleScope};
+pub use coordinator::{INJECTION_MARKER, ToolOutcome, TtsrConfig, TtsrCoordinator, parse_marker};
+pub use matcher::{TtsrManager, digest_for, path_of, tool_calls_of};
+pub use rule::{InterruptMode, Repeat, Rule, RuleScope, discover_rules, parse_rule};

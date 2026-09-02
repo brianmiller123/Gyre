@@ -86,9 +86,9 @@ pub struct HarmonyDetection {
     pub surface: HarmonySurface,
     /// 命中的 content 块索引（供恢复/审计定位）。
     pub content_index: Option<usize>,
-    /// 工具名（仅 tool_arg）。
+    /// 工具名（仅 `tool_arg`）。
     pub tool_name: Option<String>,
-    /// 工具调用 id（仅 tool_arg）。
+    /// 工具调用 id（仅 `tool_arg`）。
     pub tool_call_id: Option<String>,
     /// 命中信号列表（按位置排序）。
     pub signals: Vec<HarmonySignal>,
@@ -120,7 +120,7 @@ pub struct HarmonyAuditEvent {
     pub model: String,
     /// provider。
     pub provider: String,
-    /// 工具名（仅 tool_arg）。
+    /// 工具名（仅 `tool_arg`）。
     pub tool_name: Option<String>,
     /// 移除文本长度。
     pub removed_len: usize,
@@ -141,7 +141,7 @@ pub struct HarmonyRecoveredToolCall {
 
 /// 是否对该模型的回复运行泄漏检测。
 ///
-/// Gyre 判据：[`Api::OpenAiResponses`]（Harmony 是 OpenAI Responses API 的内部协议；
+/// Gyre 判据：[`Api::OpenAiResponses`]（Harmony 是 `OpenAI` Responses API 的内部协议；
 /// Chat Completions / Anthropic / GLM 等均无 Harmony）。默认对整个协议族开启而非枚举
 /// 模型 id，避免未来的 gpt-5.6 静默绕过——检测本身廉价，漏检代价不廉价。
 #[must_use]
@@ -157,7 +157,7 @@ pub fn signal_list_label(signals: &[HarmonySignal]) -> String {
         let label = s
             .classes
             .iter()
-            .map(|c| c.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join("+");
         if !seen.contains(&label) {
@@ -178,8 +178,8 @@ pub fn signal_list_label(signals: &[HarmonySignal]) -> String {
 ///
 /// `tool_arg` surface 更严格：工具参数是任意文件/数据内容，可 legitimately 携带 marker、
 /// channel word、harmony token 或非拉丁文字（编辑这些 fixture 就是如此）。唯一可靠的
-/// 泄漏信号是「结构合法解析之后的尾随内容」，故 tool_arg 检测**额外要求** `T` 共生信号。
-/// 无 `parsed_end` 边界时 `T` 永不置位，tool_arg 扫描保持惰性——绝不硬中止合法工具调用。
+/// 泄漏信号是「结构合法解析之后的尾随内容」，故 `tool_arg` 检测**额外要求** `T` 共生信号。
+/// 无 `parsed_end` 边界时 `T` `永不置位，tool_arg` 扫描保持惰性——绝不硬中止合法工具调用。
 #[must_use]
 pub fn detect_harmony_leak(
     text: &str,
@@ -263,8 +263,8 @@ pub fn detect_harmony_leak(
 
 /// 扫描 assistant 消息的所有 content 块，返回首个检测。
 ///
-/// 不接受 `parsed_end` 回调：流式后处理无法可靠解析工具 DSL 边界，故 tool_arg surface
-/// 保持惰性（安全默认）。assistant_text / assistant_thinking 仍按基础规则检测。
+/// 不接受 `parsed_end` 回调：流式后处理无法可靠解析工具 DSL 边界，故 `tool_arg` surface
+/// `保持惰性（安全默认）。assistant_text` / `assistant_thinking` 仍按基础规则检测。
 #[must_use]
 pub fn detect_in_message(message: &AssistantMessage) -> Option<HarmonyDetection> {
     for (i, block) in message.content.iter().enumerate() {
@@ -409,8 +409,8 @@ pub fn create_audit_event(
     }
 }
 
-/// 记录审计事件到 tracing（全字段，完整可观测 + 消除 dead_code）。供 run_loop 双计数器
-/// 各分支调用；未来可替换为 on_harmony_leak hook 把事件交给 host。
+/// 记录审计事件到 tracing（全字段，完整可观测 + 消除 `dead_code）。供` `run_loop` 双计数器
+/// 各分支调用；未来可替换为 `on_harmony_leak` hook 把事件交给 host。
 pub fn log_audit(tag: &str, ev: &HarmonyAuditEvent) {
     tracing::warn!(
         action = ?ev.action,
@@ -430,7 +430,7 @@ pub fn log_audit(tag: &str, ev: &HarmonyAuditEvent) {
 /// 检测选项。
 #[derive(Debug, Clone, Default)]
 pub struct DetectOpts {
-    /// 结构合法解析的结束字节偏移（仅 tool_arg；其后 marker 置 `T`）。
+    /// 结构合法解析的结束字节偏移（仅 `tool_arg；其后` marker 置 `T`）。
     pub parsed_end: Option<usize>,
     /// content 块索引。
     pub content_index: Option<usize>,
@@ -755,7 +755,6 @@ mod tests {
                 content_index: Some(0),
                 tool_name: Some("edit"),
                 tool_call_id: Some("call_1"),
-                ..DetectOpts::default()
             },
         )
         .expect("应检测到 tool_arg 泄漏");

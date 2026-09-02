@@ -156,10 +156,7 @@ mod tests {
 
     #[test]
     fn trims_line_trailing_space() {
-        assert_eq!(
-            normalize("a  \nb  ", &SerializeOptions::default()),
-            "a\nb"
-        );
+        assert_eq!(normalize("a  \nb  ", &SerializeOptions::default()), "a\nb");
     }
 
     #[test]

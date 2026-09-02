@@ -114,7 +114,10 @@ impl DuckDuckGoHtml {
         let mut out = Vec::new();
         for block in html.split("result__a") {
             // 每个结果块：`<a ... href="URL">TITLE</a>` 后跟 snippet 区。
-            let Some(href) = block.split("href=\"").nth(1).and_then(|s| s.split('"').next())
+            let Some(href) = block
+                .split("href=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
             else {
                 continue;
             };
@@ -151,7 +154,7 @@ impl DuckDuckGoHtml {
 
 #[async_trait]
 impl WebSearchProvider for DuckDuckGoHtml {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "duckduckgo-html"
     }
 
@@ -169,7 +172,7 @@ impl WebSearchProvider for DuckDuckGoHtml {
 
 #[async_trait]
 impl WebSearchProvider for Searxng {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "searxng"
     }
 
@@ -188,8 +191,14 @@ impl WebSearchProvider for Searxng {
         let mut out = Vec::new();
         if let Some(results) = v.get("results").and_then(serde_json::Value::as_array) {
             for r in results {
-                let title = r.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
-                let url = r.get("url").and_then(serde_json::Value::as_str).unwrap_or("");
+                let title = r
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let url = r
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
                 let snippet = r
                     .get("content")
                     .and_then(serde_json::Value::as_str)
@@ -257,12 +266,21 @@ async fn extract_arxiv(id: &str) -> Result<Option<SitePage>, ToolError> {
         .unwrap_or_default();
     let mut md = String::new();
     if !authors.is_empty() {
-        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("**作者**：{}\n\n", authors.join(", ")));
+        let _ = std::fmt::Write::write_fmt(
+            &mut md,
+            format_args!("**作者**：{}\n\n", authors.join(", ")),
+        );
     }
     if !abstract_text.is_empty() {
-        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("**摘要**：{}\n\n", truncate(&abstract_text, 2000)));
+        let _ = std::fmt::Write::write_fmt(
+            &mut md,
+            format_args!("**摘要**：{}\n\n", truncate(&abstract_text, 2000)),
+        );
     }
-    let _ = std::fmt::Write::write_fmt(&mut md, format_args!("来源：<https://arxiv.org/abs/{id}>\n"));
+    let _ = std::fmt::Write::write_fmt(
+        &mut md,
+        format_args!("来源：<https://arxiv.org/abs/{id}>\n"),
+    );
     Ok(Some(SitePage {
         title,
         markdown: md,
@@ -273,8 +291,8 @@ async fn extract_arxiv(id: &str) -> Result<Option<SitePage>, ToolError> {
 /// crates.io API → 最新版本/描述/依赖数。
 async fn extract_crates(name: &str) -> Result<Option<SitePage>, ToolError> {
     let body = crate::fs::fetch_http(&format!("https://crates.io/api/v1/crates/{name}")).await?;
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| ToolError::Execution(format!("crates.io JSON: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ToolError::Execution(format!("crates.io JSON: {e}")))?;
     let desc = v
         .pointer("/crate/description")
         .and_then(serde_json::Value::as_str)
@@ -289,11 +307,16 @@ async fn extract_crates(name: &str) -> Result<Option<SitePage>, ToolError> {
         .unwrap_or(0);
     let mut md = String::new();
     if !desc.is_empty() {
-        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("**描述**：{}\n\n", truncate(desc, 500)));
+        let _ = std::fmt::Write::write_fmt(
+            &mut md,
+            format_args!("**描述**：{}\n\n", truncate(desc, 500)),
+        );
     }
     let _ = std::fmt::Write::write_fmt(
         &mut md,
-        format_args!("**最新版本**：{latest}　**总下载量**：{downloads}\n\n来源：<https://crates.io/crates/{name}>\n"),
+        format_args!(
+            "**最新版本**：{latest}　**总下载量**：{downloads}\n\n来源：<https://crates.io/crates/{name}>\n"
+        ),
     );
     Ok(Some(SitePage {
         title: format!("crates.io: {name}"),
@@ -304,8 +327,7 @@ async fn extract_crates(name: &str) -> Result<Option<SitePage>, ToolError> {
 
 /// npm registry → 最新版本/描述。
 async fn extract_npm(name: &str) -> Result<Option<SitePage>, ToolError> {
-    let body =
-        crate::fs::fetch_http(&format!("https://registry.npmjs.org/{name}/latest")).await?;
+    let body = crate::fs::fetch_http(&format!("https://registry.npmjs.org/{name}/latest")).await?;
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| ToolError::Execution(format!("npm JSON: {e}")))?;
     let desc = v
@@ -318,9 +340,15 @@ async fn extract_npm(name: &str) -> Result<Option<SitePage>, ToolError> {
         .unwrap_or("?");
     let mut md = String::new();
     if !desc.is_empty() {
-        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("**描述**：{}\n\n", truncate(desc, 500)));
+        let _ = std::fmt::Write::write_fmt(
+            &mut md,
+            format_args!("**描述**：{}\n\n", truncate(desc, 500)),
+        );
     }
-    let _ = std::fmt::Write::write_fmt(&mut md, format_args!("**最新版本**：{version}\n\n来源：<https://www.npmjs.com/package/{name}>\n"));
+    let _ = std::fmt::Write::write_fmt(
+        &mut md,
+        format_args!("**最新版本**：{version}\n\n来源：<https://www.npmjs.com/package/{name}>\n"),
+    );
     Ok(Some(SitePage {
         title: format!("npm: {name}"),
         markdown: md,
@@ -360,7 +388,10 @@ fn html_meta_list(html: &str, name: &str) -> Vec<String> {
     let needle = format!("name=\"{name}\"");
     while let Some(pos) = rest.find(&needle) {
         let after = &rest[pos + needle.len()..];
-        if let Some(content) = after.split("content=\"").nth(1).and_then(|s| s.split('"').next())
+        if let Some(content) = after
+            .split("content=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
         {
             out.push(html_unescape(content));
         }
@@ -412,8 +443,8 @@ fn urlencode(s: &str) -> String {
             }
             b' ' => out.push('+'),
             _ => {
-                    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
-                }
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
+            }
         }
     }
     out
@@ -448,10 +479,10 @@ impl Default for WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "web_search"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "联网搜索（免 key：DuckDuckGo；可选 searxng 实例经 GYRE_SEARXNG_URL）。\
 query 支持 `site:example.com` 过滤；命中 arxiv/crates.io/npm/github 时返回结构 markdown。"
     }
@@ -484,8 +515,7 @@ query 支持 `site:example.com` 过滤；命中 arxiv/crates.io/npm/github 时�
         let max_results = input
             .get("max_results")
             .and_then(serde_json::Value::as_u64)
-            .map(|n| n.min(10).max(1) as usize)
-            .unwrap_or(5);
+            .map_or(5, |n| n.clamp(1, 10) as usize);
 
         let results = self.chain.search(query).await?;
         let results = results.into_iter().take(max_results).collect::<Vec<_>>();
@@ -494,7 +524,10 @@ query 支持 `site:example.com` 过滤；命中 arxiv/crates.io/npm/github 时�
         }
 
         let mut out = String::new();
-        out.push_str(&format!("「{query}」搜索结果（{} 条）：\n\n", results.len()));
+        out.push_str(&format!(
+            "「{query}」搜索结果（{} 条）：\n\n",
+            results.len()
+        ));
         for (i, r) in results.iter().enumerate() {
             out.push_str(&format!("{}. **{}**\n   {}\n", i + 1, r.title, r.url));
             if !r.snippet.is_empty() {
@@ -544,7 +577,7 @@ mod tests {
         struct Fail;
         #[async_trait]
         impl WebSearchProvider for Fail {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "fail"
             }
             async fn search(&self, _q: &str) -> Result<Vec<WebResult>, String> {
@@ -554,7 +587,7 @@ mod tests {
         struct Empty;
         #[async_trait]
         impl WebSearchProvider for Empty {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "empty"
             }
             async fn search(&self, _q: &str) -> Result<Vec<WebResult>, String> {
@@ -564,7 +597,7 @@ mod tests {
         struct OkP;
         #[async_trait]
         impl WebSearchProvider for OkP {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ok"
             }
             async fn search(&self, _q: &str) -> Result<Vec<WebResult>, String> {
@@ -576,11 +609,7 @@ mod tests {
             }
         }
         // 失败 → 空 → 成功：成功者胜出。
-        let chain = WebSearchChain::new(vec![
-            Arc::new(Fail),
-            Arc::new(Empty),
-            Arc::new(OkP),
-        ]);
+        let chain = WebSearchChain::new(vec![Arc::new(Fail), Arc::new(Empty), Arc::new(OkP)]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let results = rt.block_on(chain.search("q")).unwrap();
         assert_eq!(results.len(), 1);
@@ -598,10 +627,7 @@ mod tests {
         assert!(r.is_ok());
         assert!(r.unwrap().is_none());
         // 已知站点前缀命中 matcher（抓取本身依赖网络，此处仅验证路由）。
-        assert!(matches!(
-            extract_site("https://crates.io/crates/serde"),
-            _
-        ));
+        assert!(matches!(extract_site("https://crates.io/crates/serde"), _));
     }
 
     #[test]

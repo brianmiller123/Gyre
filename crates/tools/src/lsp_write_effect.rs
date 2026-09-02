@@ -27,7 +27,7 @@ use url::Url;
 ///
 /// 与 [`crate::LspTool`] 共享同一 `pool`，复用已启动的语言服务器。
 pub struct LspWriteEffect {
-    /// 工作区根（用于 detect_servers 与 manager 池 key）。
+    /// 工作区根（用于 `detect_servers` 与 manager 池 key）。
     workspace_root: PathBuf,
     /// 共享 LSP 管理器池（通常取自 [`crate::LspTool::pool`]）。
     pool: Arc<Mutex<HashMap<PathBuf, LspManager>>>,
@@ -90,7 +90,7 @@ impl WriteEffect for LspWriteEffect {
     async fn after_write(&self, path: &Path, new_text: &str) -> Result<WriteOutcome, String> {
         let uri = match Url::from_file_path(path) {
             Ok(u) => u,
-            Err(_) => return Ok(WriteOutcome::empty()),
+            Err(()) => return Ok(WriteOutcome::empty()),
         };
 
         let mut managers = self.pool.lock().await;

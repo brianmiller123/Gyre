@@ -3,11 +3,10 @@
 //! 智能体执行循环：[`Agent`] 持有 trait 注入的 Provider/Tools/Context/Prompt/Approval，
 //! [`Agent::run`] 产出 [`AgentEvent`] 流，驱动「流式推理 → 工具调用 → 审批 → 回填 → 继续」闭环。
 //!
-//! 状态机（移植 Zoo-Code 五态）：Running → Streaming → (WaitingForInput) → Idle。
+//! 状态机（移植 Zoo-Code 五态）：Running → Streaming → (`WaitingForInput`) → Idle。
 //! 解耦：本 crate 仅依赖 Trait，不依赖任何具体 Provider/Tool 实现。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use std::sync::Arc;
 
@@ -33,8 +32,10 @@ use tracing::Instrument;
 mod harmony;
 pub mod keywords;
 mod pause;
+mod schema_check;
 mod task_tool;
 pub use pause::PauseGate;
+pub use schema_check::{extract_json, validate_json_schema};
 pub use task_tool::{ContextFactory, TaskTool};
 
 /// P1-L：advisor 评审触发周期（每 N 轮一次；评审本身是独立 LLM 调用，太频繁会拖慢主循环）。
@@ -43,7 +44,7 @@ const ADVISOR_EVERY_N_TURNS: usize = 4;
 /// P0-3：goals 目标预算配置（cli 从 `[goals]` 映射）。
 #[derive(Debug, Clone)]
 pub struct GoalBudget {
-    /// token 累计上限（记账口径 input + cache_write + output；`0` = 不限）。
+    /// token 累计上限（记账口径 input + `cache_write` + output；`0` = 不限）。
     pub token_budget: u64,
     /// 墙钟上限（`Duration::ZERO` = 不限）。
     pub time_budget: std::time::Duration,
@@ -54,7 +55,7 @@ pub struct GoalBudget {
 impl GoalBudget {
     /// 空预算（不限）。
     #[must_use]
-    pub fn unlimited() -> Self {
+    pub const fn unlimited() -> Self {
         Self {
             token_budget: 0,
             time_budget: std::time::Duration::ZERO,
@@ -88,9 +89,9 @@ impl GoalState {
         }
     }
 
-    /// 记账口径：input + cache_write + output（cache_read 为折扣价不计，同 oh-my-pi GoalRuntime）。
+    /// 记账口径：input + `cache_write` + `output（cache_read` 为折扣价不计，同 oh-my-pi `GoalRuntime`）。
     #[must_use]
-    pub fn billed(&self) -> u64 {
+    pub const fn billed(&self) -> u64 {
         self.usage.input_tokens + self.usage.cache_write_tokens + self.usage.output_tokens
     }
 
@@ -100,12 +101,11 @@ impl GoalState {
         if self.budget.token_budget > 0 && self.billed() >= self.budget.token_budget {
             return true;
         }
-        if !self.budget.time_budget.is_zero() {
-            if let Some(start) = self.start
-                && start.elapsed() >= self.budget.time_budget
-            {
-                return true;
-            }
+        if !self.budget.time_budget.is_zero()
+            && let Some(start) = self.start
+            && start.elapsed() >= self.budget.time_budget
+        {
+            return true;
         }
         false
     }
@@ -173,7 +173,10 @@ mod goal_tests {
             ..GoalBudget::unlimited()
         });
         assert!(!s.note_usage(&usage(60, 0, 0, 0)), "未超限不触发");
-        assert!(s.note_usage(&usage(50, 0, 0, 0)), "累计 110 ≥ 100 首次超限触发");
+        assert!(
+            s.note_usage(&usage(50, 0, 0, 0)),
+            "累计 110 ≥ 100 首次超限触发"
+        );
         assert!(
             !s.note_usage(&usage(50, 0, 0, 0)),
             "已提醒过不再重复触发（防无限续跑循环）"
@@ -197,7 +200,6 @@ mod goal_tests {
         assert!(s.budget.hard_stop, "硬停标记供停止边界分支消费");
     }
 }
-
 
 /// 把 TTSR 提醒文本前置到工具结果（Text 前置文本；Error 前置到 message；Image 跳过）。
 fn prepend_reminder(result: &ToolResult, reminder: &str) -> ToolResult {
@@ -240,7 +242,7 @@ pub trait RuntimeOverrides: Send + Sync {
     }
     /// 强制关闭本轮思考（移植 oh-my-pi `getDisableReasoning`）。
     ///
-    /// 返回 `Some(true)` 时，即便 [`Self::thinking`] 或 ThinkingPolicy 给出了思考配置，
+    /// 返回 `Some(true)` 时，即便 [`Self::thinking`] 或 `ThinkingPolicy` 给出了思考配置，
     /// 本轮也置空 thinking（不发 reasoning 参数）——用于 mid-run 按场景关闭思考（如简单
     /// follow-up 轮省 token）。返回 `None` 或 `Some(false)` 沿用思考解析结果。
     fn disable_thinking(&self) -> Option<bool> {
@@ -273,7 +275,7 @@ pub struct KeyRing {
 impl KeyRing {
     /// 构造轮换环（`keys` 为空时 [`Self::next`] 恒返回 `None`，等同不轮换）。
     #[must_use]
-    pub fn new(keys: Vec<String>) -> Self {
+    pub const fn new(keys: Vec<String>) -> Self {
         Self {
             keys,
             index: std::sync::atomic::AtomicUsize::new(0),
@@ -285,10 +287,15 @@ impl KeyRing {
         if self.keys.is_empty() {
             return None;
         }
-        let idx = self.index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let idx = self
+            .index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(self.keys[idx % self.keys.len()].clone())
     }
 }
+
+/// assistant 消息改写钩子（同步闭包；每轮最终化后、入 context / UI / 工具分发前原地改写）。
+pub type AssistantTransform = dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync;
 
 /// 智能体（Ports & Adapters：所有依赖以 trait 注入）。
 pub struct Agent {
@@ -321,7 +328,7 @@ pub struct Agent {
     hooks: Vec<Arc<dyn Hook>>,
     /// 跨会话长期记忆（启动注入 summary 段）。
     memory: Option<Arc<dyn MemoryStore>>,
-    /// 外部资源解析器（`mcp://` 路由用；装配层注入 McpRegistry）。
+    /// 外部资源解析器（`mcp://` 路由用；装配层注入 `McpRegistry`）。
     resources: Option<Arc<dyn ResourceResolver>>,
     /// 软工具需求（运行期共享，便于外部更新）。
     soft_requirement: Arc<std::sync::Mutex<Option<SoftToolRequirement>>>,
@@ -344,9 +351,9 @@ pub struct Agent {
     /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新，移植 oh-my-pi
     /// `getReasoning` 等动态解析器）。
     runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
-    /// assistant 消息改写钩子（最终化后、入 context / MessageEnd / 工具分发前原地改写，
+    /// assistant 消息改写钩子（最终化后、入 context / `MessageEnd` / 工具分发前原地改写，
     /// 移植 oh-my-pi `transformAssistantMessage`）。单一真相源：所有下游看改写后。
-    transform_assistant: Option<Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>>,
+    transform_assistant: Option<Arc<AssistantTransform>>,
     /// 写入效果（编辑后 LSP format/diagnostics 钩子；装配层注入 `LspWriteEffect`）。
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// 工具执行期的 steering 中断策略（默认 [`InterruptMode::Immediate`]）。
@@ -366,7 +373,7 @@ pub struct Agent {
     compaction_backend: agent_core::CompactionBackend,
     /// P2：snapcompact 帧数预算。
     compaction_max_frames: usize,
-    /// 预算超限待注入标记（run_loop 用量记账置位，停止边界消费）。
+    /// `预算超限待注入标记（run_loop` 用量记账置位，停止边界消费）。
     goal_pending: Arc<std::sync::atomic::AtomicBool>,
     /// 会话级合并冲突注册表（read 注册 / write 解决，`conflict://` 协议）。
     conflicts: Arc<std::sync::Mutex<agent_tools::ConflictHistory>>,
@@ -380,7 +387,6 @@ pub struct Agent {
 
 impl Agent {
     /// 构建器。
-    #[must_use]
     pub fn builder(model: agent_core::Model) -> AgentBuilder {
         AgentBuilder {
             model,
@@ -432,7 +438,10 @@ impl Agent {
     /// 随时输入、模型立即收到」。未启用 steering（构建时未调 `.steering()`）时为空操作，
     /// 返回 `false`。移植 oh-my-pi `Agent.steer()`。
     pub fn steer(&self, message: agent_core::AgentMessage) -> bool {
-        self.steer_tx.as_ref().and_then(|tx| tx.send(message).ok()).is_some()
+        self.steer_tx
+            .as_ref()
+            .and_then(|tx| tx.send(message).ok())
+            .is_some()
     }
 
     /// 取消句柄（外部中止）。
@@ -449,13 +458,13 @@ impl Agent {
 
     /// 压缩后端（summarize / snapcompact 图像化压缩；装配期由配置解析注入）。
     #[must_use]
-    pub fn compaction_backend(&self) -> agent_core::CompactionBackend {
+    pub const fn compaction_backend(&self) -> agent_core::CompactionBackend {
         self.compaction_backend
     }
 
     /// snapcompact 帧数预算。
     #[must_use]
-    pub fn compaction_max_frames(&self) -> usize {
+    pub const fn compaction_max_frames(&self) -> usize {
         self.compaction_max_frames
     }
 
@@ -550,7 +559,7 @@ pub struct AgentBuilder {
     /// 运行时配置覆盖（每轮解析 thinking / temperature；mid-run 热更新）。
     runtime_overrides: Option<Arc<dyn RuntimeOverrides>>,
     /// assistant 消息改写钩子（最终化后、入 context/UI/tools 前）。
-    transform_assistant: Option<Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>>,
+    transform_assistant: Option<Arc<AssistantTransform>>,
     /// 写入效果（编辑后 LSP format/diagnostics）。
     write_effect: Option<Arc<dyn WriteEffect>>,
     /// P2：模型 fallback 链（主模型失败且错误可重试时依序尝试；跨线协议族亦可）。
@@ -595,7 +604,6 @@ impl AgentBuilder {
     /// 启用 steering：内部创建无界信道，rx 注入 agent 循环，tx 镜像进 Agent 供
     /// [`Agent::steer`] 使用。供需要「运行中接受用户输入并立即投递」的宿主（CLI/Web）调用。
     /// 与 `.steer_rx(rx)` 互斥：后者由调用方自带接收端（测试用），本方法自洽创建一对。
-    #[must_use]
     pub fn steering(mut self) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
         self.steer_tx = Some(tx);
@@ -642,17 +650,14 @@ impl AgentBuilder {
     /// 脱敏、归一化。改写对 **context 持久化、MessageEnd 事件、工具参数分发** 三者一致生效
     /// （单一真相源——在所有下游消费前 apply）。同步闭包：宏展开等本地计算用；若需异步
     /// 改写（调外部服务解析宏），后续可升级为 trait + async 方法。
-    pub fn transform_assistant(
-        mut self,
-        tf: Arc<dyn Fn(&mut agent_core::AssistantMessage) + Send + Sync>,
-    ) -> Self {
+    pub fn transform_assistant(mut self, tf: Arc<AssistantTransform>) -> Self {
         self.transform_assistant = Some(tf);
         self
     }
 
     /// 工具执行期的 steering 中断策略（默认 [`InterruptMode::Immediate`]：batch 含
     /// [`agent_tools::Tool::interruptible`] 工具时，steering 中途打断在途工具）。
-    pub fn interrupt_mode(mut self, mode: InterruptMode) -> Self {
+    pub const fn interrupt_mode(mut self, mode: InterruptMode) -> Self {
         self.interrupt_mode = mode;
         self
     }
@@ -679,14 +684,13 @@ impl AgentBuilder {
     }
 
     /// advisor 评审触发周期（轮；默认 4）。
-    #[must_use]
     pub fn advisor_every_n_turns(mut self, n: usize) -> Self {
         self.advisor_every_n_turns = n.max(1);
         self
     }
 
     /// P2：模型 fallback 链——主模型调用失败且错误可重试（网络/5xx/429/鉴权）时，
-    /// 依序尝试这些备用模型（跨线协议族亦可，如 Anthropic 主 → OpenAI 备）。
+    /// 依序尝试这些备用模型（跨线协议族亦可，如 Anthropic 主 → `OpenAI` 备）。
     /// 链上模型的 `thinking`/工具规格沿用主模型请求（备用模型宜同族同能力）。
     pub fn fallbacks(mut self, models: Vec<agent_core::Model>) -> Self {
         self.fallbacks = models;
@@ -750,64 +754,62 @@ impl AgentBuilder {
         self
     }
 
-    /// 注入外部资源解析器（启用 read_file 的 `mcp://` 协议路由）。
+    /// 注入外部资源解析器（启用 `read_file` 的 `mcp://` 协议路由）。
     pub fn resources(mut self, resources: Arc<dyn ResourceResolver>) -> Self {
         self.resources = Some(resources);
         self
     }
-    /// 设置 Provider 调用上下文（api_key / base_url）。
+    /// 设置 Provider `调用上下文（api_key` / `base_url`）。
     pub fn provider_ctx(mut self, c: ProviderCallContext) -> Self {
         self.provider_ctx = c;
         self
     }
     /// 设置模式。
-    pub fn mode(mut self, m: Mode) -> Self {
+    pub const fn mode(mut self, m: Mode) -> Self {
         self.mode = m;
         self
     }
     /// 设置最大连续错误次数。
-    pub fn max_mistakes(mut self, n: usize) -> Self {
+    pub const fn max_mistakes(mut self, n: usize) -> Self {
         self.max_mistakes = n;
         self
     }
 
     /// 设置单任务最大轮次（硬上限；默认 1000，0 表示不限制）。防止模型陷入「调用工具→失败→重试」的无限循环。
-    pub fn max_turns(mut self, n: usize) -> Self {
+    pub const fn max_turns(mut self, n: usize) -> Self {
         self.max_turns = n;
         self
     }
     /// 设置运行时限（wall-clock）。超时后在下一轮顶部优雅停止（已完成轮次保留，
     /// `summary.success = false`）。不设置则不限时。
-    #[must_use]
-    pub fn deadline(mut self, d: std::time::Duration) -> Self {
+    pub const fn deadline(mut self, d: std::time::Duration) -> Self {
         self.deadline = Some(d);
         self
     }
     /// 设置上下文窗口占用阈值。
-    pub fn context_guard(mut self, g: f32) -> Self {
+    pub const fn context_guard(mut self, g: f32) -> Self {
         self.context_guard = g;
         self
     }
     /// 设置最大输出 token。
-    pub fn max_output_tokens(mut self, n: usize) -> Self {
+    pub const fn max_output_tokens(mut self, n: usize) -> Self {
         self.max_output_tokens = n;
         self
     }
     /// 设置温度。
-    pub fn temperature(mut self, t: f32) -> Self {
+    pub const fn temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
         self
     }
 
     /// 设置思考模式（reasoning/thinking）。由支持思考的模型消费。
-    pub fn thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
     /// P1-K：设置自适应思考策略（每轮按用户 prompt 难度经 [`ThinkingClassifier`] 解析 budget，
     /// 钳到模型范围；移植 oh-my-pi `auto-thinking`）。设置后覆盖 `.thinking()` 静态配置。
-    #[must_use]
     pub fn thinking_policy(mut self, policy: ThinkingPolicy) -> Self {
         self.thinking_policy = Some(policy);
         self
@@ -815,7 +817,7 @@ impl AgentBuilder {
 
     /// 设置取消令牌（默认新建一个）。用于把外部/父级取消信号接入本 Agent——
     /// 子 Agent 委派时应传入 `parent_cancel.child_token()` 以级联取消，否则子 Agent
-    /// 将无法被父任务取消（详见 task_tool 的递归委派）。
+    /// 将无法被父任务取消（详见 `task_tool` 的递归委派）。
     pub fn cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = cancel;
         self
@@ -831,14 +833,12 @@ impl AgentBuilder {
     }
 
     /// 压缩后端（P2：`summarize` 默认 / `snapcompact` 图像化压缩——要求视觉模型）。
-    #[must_use]
-    pub fn compaction_backend(mut self, backend: agent_core::CompactionBackend) -> Self {
+    pub const fn compaction_backend(mut self, backend: agent_core::CompactionBackend) -> Self {
         self.compaction_backend = backend;
         self
     }
 
     /// snapcompact 帧数预算（默认 80）。
-    #[must_use]
     pub fn compaction_max_frames(mut self, max_frames: usize) -> Self {
         self.compaction_max_frames = max_frames.max(1);
         self
@@ -848,6 +848,7 @@ impl AgentBuilder {
     ///
     /// # Panics
     /// 缺少必填依赖时 panic。
+    #[must_use]
     pub fn build(self) -> Agent {
         Agent {
             model: self.model,
@@ -940,7 +941,7 @@ const MAX_PAUSED_CONTINUATIONS: usize = 8;
 /// 避免无限强制循环。移植 oh-my-pi `MAX_SOFT_TOOL_ESCALATIONS`。
 const MAX_SOFT_TOOL_ESCALATIONS: usize = 3;
 /// Harmony 泄漏「截断恢复」连续上限（移植 oh-my-pi `harmonyTruncateResumeCount`）。
-/// tool_arg 可恢复时，截断污染输入 + sentinel 续跑；连续超限则升级为错误。
+/// `tool_arg` 可恢复时，截断污染输入 + sentinel 续跑；连续超限则升级为错误。
 const MAX_HARMONY_TRUNCATE_RESUME: usize = 2;
 /// Harmony 泄漏「丢弃重试」连续上限（移植 oh-my-pi `harmonyRetryAttempt`）。
 /// text/thinking 泄漏无法恢复，丢弃本轮重采样；连续超限则升级为错误。
@@ -948,7 +949,7 @@ const MAX_HARMONY_ABORT_RETRY: usize = 2;
 
 /// 发射 `on_turn_end` 钩子（per-turn 程序化副作用）。与 `AgentEvent::TurnEnd` 事件配对，
 /// 但面向**不经事件流**的程序化 hook（审计 / 指标 / memory 更新 / telemetry span 等）。
-/// 事件消费者（如 server 的 `to_server_frame`）已能从 TurnEnd 事件观测；本钩子供 agent
+/// 事件消费者（如 server 的 `to_server_frame`）已能从 `TurnEnd` 事件观测；本钩子供 agent
 /// 内部 / 装配层注入的程序化副作用使用。移植 oh-my-pi `onTurnEnd`。
 async fn fire_on_turn_end(
     hooks: &[Arc<dyn Hook>],
@@ -967,13 +968,11 @@ async fn fire_on_turn_end(
 }
 
 mod engine;
-pub(crate) use engine::{
-    persist_interrupted, poll_and_run, record_run_end, run_batch, run_loop, run_pending_task,
-    schedule_and_run, PendingTask,
-};
+pub(crate) use engine::run_loop;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{PendingTask, persist_interrupted, run_pending_task, schedule_and_run};
     use agent_context::InMemoryContext;
     use agent_core::ContextManager;
     use agent_core::{
@@ -982,8 +981,8 @@ mod tests {
     };
     use agent_tools::{Concurrency, DefaultToolRegistry, Tool, ToolContext, ToolRegistry};
     use async_trait::async_trait;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1084,6 +1083,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         }
     }
 
@@ -1676,7 +1676,9 @@ mod tests {
             while let Some(ev) = stream.next().await {
                 match ev {
                     AgentEvent::Done(_) => done = true,
-                    AgentEvent::Say(s) if s.text.contains("停止边界 steering") => injected = true,
+                    AgentEvent::Say(s) if s.text.contains("停止边界 steering") => {
+                        injected = true
+                    }
                     _ => {}
                 }
             }
@@ -1697,7 +1699,11 @@ mod tests {
             injected,
             "公共 API steer 应在停止边界被 drain 并发出注入提示"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "应续跑（provider 调用 2 次）");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "应续跑（provider 调用 2 次）"
+        );
     }
 
     /// cancel 时不 drain steering（防搁浅）：第一轮注入 steering 并取消 → 停止边界
@@ -2018,7 +2024,9 @@ mod tests {
             } else {
                 // 第 2 轮：自然结束。
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "transient".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -2109,6 +2117,164 @@ mod tests {
         );
     }
 
+    /// 桩 Provider：前 2 次 `stream()` 返回 429 RateLimit（retry_after=1ms，测试友好），
+    /// 第 3 次返回纯文本（自然结束）。验证 Phase 0 的 429 退避重试。
+    struct RateLimitThenDoneProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for RateLimitThenDoneProvider {
+        fn id(&self) -> &'static str {
+            "rate-limit"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                return Err(agent_core::LlmError::RateLimit { retry_after_ms: 1 });
+            }
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                usage: Usage::default(),
+                model: "rate-limit".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// Phase 0：429 RateLimit 按 `retry_after` 同模型退避重试（≤3 次尝试）——
+    /// 前 2 次失败后第 3 次成功，任务正常完成（此前行为：无重试直接上抛/fallback）。
+    #[tokio::test]
+    async fn rate_limit_retries_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx = Arc::new(InMemoryContext::new(vec![]));
+
+        let mut model = agent_core::Model::with_defaults(
+            "rate-limit",
+            "rate-limit",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(RateLimitThenDoneProvider {
+                calls: calls.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .max_turns(5)
+            .build();
+
+        let mut done_success: Option<bool> = None;
+        let mut saw_429_status = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Done(sum) => done_success = Some(sum.success),
+                AgentEvent::Say(sm) if sm.text.contains("429") => saw_429_status = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "2 次 429 各退避重试 1 次 + 第 3 次成功，provider 共调用 3 次"
+        );
+        assert_eq!(done_success, Some(true), "退避重试后应自然完成");
+        assert!(saw_429_status, "退避等待前应发出 429 状态消息");
+    }
+
+    /// 桩 Provider：恒返回 429 RateLimit。验证重试超限后的停机路径。
+    struct AlwaysRateLimitProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for AlwaysRateLimitProvider {
+        fn id(&self) -> &'static str {
+            "always-rl"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(agent_core::LlmError::RateLimit { retry_after_ms: 1 })
+        }
+    }
+
+    /// Phase 0：429 重试达上限（3 次尝试）后按既有错误路径停机——
+    /// max_mistakes=1 时单轮即停，provider 恰好调用 3 次（不再无限退避）。
+    #[tokio::test]
+    async fn rate_limit_exhaustion_stops_after_attempt_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx = Arc::new(InMemoryContext::new(vec![]));
+
+        let mut model = agent_core::Model::with_defaults(
+            "always-rl",
+            "always-rl",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(AlwaysRateLimitProvider {
+                calls: calls.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .max_mistakes(1)
+            .max_turns(5)
+            .build();
+
+        let mut saw_stop_cap = false;
+        let mut saw_llm_error = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Error(e) if e.contains("连续错误达到上限") => {
+                    saw_stop_cap = true
+                }
+                AgentEvent::Error(e) if e.contains("LLM 调用失败") => saw_llm_error = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "同模型退避重试恰为 3 次尝试（RATE_LIMIT_MAX_ATTEMPTS），超限不再重试"
+        );
+        assert!(saw_llm_error, "超限应走既有 LLM 错误路径");
+        assert!(
+            saw_stop_cap,
+            "max_mistakes=1 应触发上限停机（该路径无 Done 事件）"
+        );
+    }
     // ── P1-C（软工具升级护栏：detour 跳过 + 升级上限）─────────────────────
 
     /// 桩 Provider：每轮返回一个 detour 工具调用（name="other"），永不调用所需工具。
@@ -2582,8 +2748,10 @@ mod tests {
 
     #[test]
     fn run_summary_records_tool_counters_and_coverage() {
-        let mut s = AgentRunSummary::default();
-        s.tools_available = vec!["a".into(), "b".into(), "c".into()];
+        let mut s = AgentRunSummary {
+            tools_available: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
         s.record_tool("a", &ToolResult::text("ok"));
         s.record_tool(
             "a",
@@ -3057,11 +3225,14 @@ mod tests {
 
     // ── RuntimeOverrides（P3-A：mid-run 配置热更新）─────────────────────────
 
+    /// 每轮 provider 观测值（thinking 是否存在, temperature）。
+    type SeenTurnParams = Arc<std::sync::Mutex<Vec<(bool, Option<f32>)>>>;
+
     /// 记录每轮 provider 收到的 `(thinking 是否存在, temperature)`，并按轮次返回不同消息
     ///（第 1 轮 tool_call、第 2 轮纯文本），使循环正好 2 轮。
     struct RecordingProvider {
         calls: Arc<AtomicUsize>,
-        seen: Arc<std::sync::Mutex<Vec<(bool, Option<f32>)>>>,
+        seen: SeenTurnParams,
     }
     #[async_trait]
     impl agent_core::LlmProvider for RecordingProvider {
@@ -3131,8 +3302,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_overrides_apply_per_turn() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let seen: Arc<std::sync::Mutex<Vec<(bool, Option<f32>)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = SeenTurnParams::default();
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let mut reg = DefaultToolRegistry::new();
         reg.register(Box::new(ProbeTool {
@@ -3187,10 +3357,13 @@ mod tests {
         );
     }
 
+    /// 每轮 provider 观测值（thinking budget, ctx api_key）。
+    type SeenBudgetKey = Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>>;
+
     /// 桩 Provider：记录每轮收到的 thinking budget 与 ctx.api_key，供 P1 mid-run override
     ///（disable_thinking / api_key）测试观测。返回纯文本一轮即结束。
     struct CtxRecordingProvider {
-        seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>>,
+        seen: SeenBudgetKey,
     }
     #[async_trait]
     impl agent_core::LlmProvider for CtxRecordingProvider {
@@ -3211,7 +3384,9 @@ mod tests {
                 .unwrap()
                 .push((budget, ctx.api_key.clone()));
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: "done".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 usage: Usage::default(),
                 model: "ctx-rec".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -3233,8 +3408,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_override_disables_thinking() {
-        let seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = SeenBudgetKey::default();
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
         let mut model = agent_core::Model::with_defaults(
@@ -3265,8 +3439,7 @@ mod tests {
         let guard = seen.lock().unwrap();
         assert_eq!(guard.len(), 1, "应正好 1 轮 provider 调用");
         assert_eq!(
-            guard[0].0,
-            None,
+            guard[0].0, None,
             "disable_thinking==Some(true) 应置空 thinking（覆盖启动期静态 2000）"
         );
     }
@@ -3281,8 +3454,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_override_api_key_overrides_ctx() {
-        let seen: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<String>)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = SeenBudgetKey::default();
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
         let mut model = agent_core::Model::with_defaults(
@@ -3292,8 +3464,10 @@ mod tests {
         );
         model.max_input_tokens = 200_000;
 
-        let mut startup_ctx = agent_core::ProviderCallContext::default();
-        startup_ctx.api_key = Some("startup-key".into());
+        let startup_ctx = agent_core::ProviderCallContext {
+            api_key: Some("startup-key".into()),
+            ..agent_core::ProviderCallContext::default()
+        };
 
         let agent = Agent::builder(model)
             .provider(Arc::new(CtxRecordingProvider { seen: seen.clone() }))
@@ -3341,7 +3515,9 @@ mod tests {
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let msg = AssistantMessage {
-                content: vec![ContentBlock::Text { text: "done".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 usage: Usage::default(),
                 model: "done-count".into(),
                 stop_reason: Some(StopReason::Stop),
@@ -3372,7 +3548,9 @@ mod tests {
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
-            .provider(Arc::new(DoneCountingProvider { calls: calls.clone() }))
+            .provider(Arc::new(DoneCountingProvider {
+                calls: calls.clone(),
+            }))
             .tools(tools)
             .context(ctx)
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -3447,8 +3625,7 @@ mod tests {
     #[tokio::test]
     async fn followup_at_stop_boundary_continues_run() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (followup_tx, followup_rx) =
-            tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
+        let (followup_tx, followup_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
         let mut model = agent_core::Model::with_defaults(
@@ -3472,7 +3649,9 @@ mod tests {
 
         // run 前注入一条 followUp 延续消息。
         followup_tx
-            .send(agent_core::AgentMessage::user_text("继续完成子任务".to_string()))
+            .send(agent_core::AgentMessage::user_text(
+                "继续完成子任务".to_string(),
+            ))
             .ok();
 
         let stream = agent.run("go");
@@ -3523,7 +3702,9 @@ mod tests {
                 }
             } else {
                 AssistantMessage {
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     usage: Usage::default(),
                     model: "harmony-temp".into(),
                     stop_reason: Some(StopReason::Stop),
@@ -3547,11 +3728,8 @@ mod tests {
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let tools: Arc<dyn ToolRegistry> = Arc::new(DefaultToolRegistry::new());
         // harmony 检测仅对 OpenAiResponses 模型生效（is_harmony_leak_target）。
-        let mut model = agent_core::Model::with_defaults(
-            "gpt-5",
-            "openai",
-            agent_core::Api::OpenAiResponses,
-        );
+        let mut model =
+            agent_core::Model::with_defaults("gpt-5", "openai", agent_core::Api::OpenAiResponses);
         model.max_input_tokens = 200_000;
 
         let agent = Agent::builder(model)
@@ -3576,7 +3754,11 @@ mod tests {
         }
         let guard = seen.lock().unwrap();
         assert_eq!(guard.len(), 2, "应正好 2 轮（泄漏 abort-retry + done）");
-        assert_eq!(guard[0], Some(0.7), "首轮无 harmony retry，temperature 不变");
+        assert_eq!(
+            guard[0],
+            Some(0.7),
+            "首轮无 harmony retry，temperature 不变"
+        );
         // 浮点：0.7 + 0.05 在 f32 下非精确 0.75，用近似比较。
         let bumped = guard[1].expect("第二轮应有 temperature");
         assert!(
@@ -3851,8 +4033,10 @@ mod tests {
     // ── 记忆注入（P0-3）：`<mental_models>` 在前、`<memories>` 在后 ───────────────
 
     /// 带 mental_models + summary 的假记忆（验证注入顺序与格式）。
+    /// `recall_hits` 非空时 `recall` 返回固定命中（验证首轮查询驱动召回）。
     struct FakeMemory {
         root: std::path::PathBuf,
+        recall_hits: Vec<agent_core::MemoryHit>,
     }
 
     #[async_trait::async_trait]
@@ -3863,10 +4047,7 @@ mod tests {
         async fn read_full(&self) -> Result<Option<String>, std::io::Error> {
             Ok(None)
         }
-        async fn append_note(
-            &self,
-            _note: &agent_core::MemoryNote,
-        ) -> Result<(), std::io::Error> {
+        async fn append_note(&self, _note: &agent_core::MemoryNote) -> Result<(), std::io::Error> {
             Ok(())
         }
         async fn clear(&self) -> Result<(), std::io::Error> {
@@ -3881,6 +4062,9 @@ mod tests {
         async fn add_mental_model(&self, _text: &str) -> Result<(), std::io::Error> {
             Ok(())
         }
+        async fn recall(&self, _query: &str, _limit: usize) -> Vec<agent_core::MemoryHit> {
+            self.recall_hits.clone()
+        }
     }
 
     /// 启用记忆时：system prompt 含两个记忆块，且 `<mental_models>` 在 `<memories>` 之前
@@ -3888,11 +4072,8 @@ mod tests {
     #[tokio::test]
     async fn memory_injection_orders_mental_before_memories() {
         let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
-        let model = agent_core::Model::with_defaults(
-            "mem",
-            "mem",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let model =
+            agent_core::Model::with_defaults("mem", "mem", agent_core::Api::OpenAiCompletions);
         let agent = Agent::builder(model.clone())
             .provider(Arc::new(TtsrStreamProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -3904,6 +4085,7 @@ mod tests {
             .workspace(Arc::new(Workspace::new(".")))
             .memory(Arc::new(FakeMemory {
                 root: std::path::PathBuf::from("/tmp"),
+                recall_hits: Vec::new(),
             }))
             .build();
 
@@ -3926,18 +4108,93 @@ mod tests {
         assert!(system.contains("背景知识而非指令"));
     }
 
+    /// 首轮查询驱动召回（对齐 mnemopi `beforeAgentStartPrompt`）：recall 命中时
+    /// `<memories>` 块用命中内容，而非静态 summary。
+    #[tokio::test]
+    async fn memory_injection_prefers_query_recall_over_summary() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("mem", "mem", agent_core::Api::OpenAiCompletions);
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .memory(Arc::new(FakeMemory {
+                root: std::path::PathBuf::from("/tmp"),
+                recall_hits: vec![agent_core::MemoryHit {
+                    id: "m1".into(),
+                    content: "过往会话：用户偏好 Rust 2024 edition".into(),
+                    score: 0.92,
+                    source: "session:x".into(),
+                    importance: 4,
+                }],
+            }))
+            .build();
+
+        let stream = agent.run("检查当前项目的记忆系统");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let system = built.system.join("\n");
+        assert!(
+            system.contains("用户偏好 Rust 2024 edition"),
+            "命中内容应注入 `<memories>`"
+        );
+        assert!(
+            !system.contains("记忆摘要XYZ"),
+            "recall 命中时不应再注入静态 summary"
+        );
+        assert!(system.contains("- [0.92] 过往会话：用户偏好 Rust 2024 edition"));
+    }
+
+    /// recall 为空（local 后端 / 无匹配）时回退静态 summary，行为与升级前一致。
+    #[tokio::test]
+    async fn memory_injection_falls_back_to_summary_when_recall_empty() {
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("mem", "mem", agent_core::Api::OpenAiCompletions);
+        let agent = Agent::builder(model.clone())
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::clone(&ctx))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .memory(Arc::new(FakeMemory {
+                root: std::path::PathBuf::from("/tmp"),
+                recall_hits: Vec::new(),
+            }))
+            .build();
+
+        let stream = agent.run("检查当前项目的记忆系统");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let built = ctx
+            .build_provider_context(&model, &[])
+            .await
+            .expect("上下文可构建");
+        let system = built.system.join("\n");
+        assert!(system.contains("记忆摘要XYZ"), "recall 为空应回退 summary");
+    }
+
     // ── Magic keywords（ultrathink / orchestrate）集成 ────────────────────────
 
     /// prompt 含 `orchestrate` → 隐藏通知先于用户消息注入 context；不含 → 无注入。
     #[tokio::test]
     async fn magic_keyword_orchestrate_injects_notice() {
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
-        let model = agent_core::Model::with_defaults(
-            "kw",
-            "kw",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("kw", "kw", agent_core::Api::OpenAiCompletions);
         let agent = Agent::builder(model.clone())
             .provider(Arc::new(TtsrStreamProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -3960,17 +4217,19 @@ mod tests {
             .messages
             .iter()
             .filter_map(|m| match m {
-                agent_core::ProviderMessage::User { content } => content.iter().find_map(
-                    |c| match c {
+                agent_core::ProviderMessage::User { content } => {
+                    content.iter().find_map(|c| match c {
                         agent_core::UserContent::Text { text } => Some(text.as_str()),
                         _ => None,
-                    },
-                ),
+                    })
+                }
                 _ => None,
             })
             .collect();
         assert!(
-            texts.iter().any(|t| t.contains("[magic-keyword:orchestrate]")),
+            texts
+                .iter()
+                .any(|t| t.contains("[magic-keyword:orchestrate]")),
             "orchestrate 命中应注入隐藏通知"
         );
     }
@@ -3978,13 +4237,9 @@ mod tests {
     /// `orchestrates`（复数）不命中：无通知注入。
     #[tokio::test]
     async fn magic_keyword_plural_does_not_inject() {
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
-        let model = agent_core::Model::with_defaults(
-            "kw",
-            "kw",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("kw", "kw", agent_core::Api::OpenAiCompletions);
         let agent = Agent::builder(model.clone())
             .provider(Arc::new(TtsrStreamProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -4049,13 +4304,9 @@ mod tests {
     /// advisor 评审命中 → `[advisor:blocker]` 标记消息注入 context；filler 建议被 guard 拦截。
     #[tokio::test]
     async fn advisor_injects_blocker_advice() {
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
-        let model = agent_core::Model::with_defaults(
-            "adv",
-            "adv",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("adv", "adv", agent_core::Api::OpenAiCompletions);
         let advisor = agent_advisor::Advisor::new(
             Arc::new(AdvisorProvider {
                 advice: "[blocker] The fix no longer matches acceptance criteria.",
@@ -4094,15 +4345,13 @@ mod tests {
     /// filler（"Stop."）不注入；评审失败（provider 报错）不阻断主循环。
     #[tokio::test]
     async fn advisor_filters_filler_and_tolerates_failure() {
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
-        let model = agent_core::Model::with_defaults(
-            "adv",
-            "adv",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let model =
+            agent_core::Model::with_defaults("adv", "adv", agent_core::Api::OpenAiCompletions);
         let advisor = agent_advisor::Advisor::new(
-            Arc::new(AdvisorProvider { advice: "[nit] Stop." }),
+            Arc::new(AdvisorProvider {
+                advice: "[nit] Stop.",
+            }),
             model.clone(),
         );
         let agent = Agent::builder(model.clone())
@@ -4139,11 +4388,13 @@ mod tests {
     fn ttsr_leak_coordinator() -> std::sync::Arc<agent_ttsr::TtsrCoordinator> {
         std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
             agent_ttsr::TtsrConfig::default(),
-            vec![agent_ttsr::parse_rule(
-                "leak",
-                "---\ncondition: [Box::leak]\n---\n禁止在生产代码路径使用 Box::leak。",
-            )
-            .unwrap()],
+            vec![
+                agent_ttsr::parse_rule(
+                    "leak",
+                    "---\ncondition: [Box::leak]\n---\n禁止在生产代码路径使用 Box::leak。",
+                )
+                .unwrap(),
+            ],
         ))
     }
 
@@ -4157,11 +4408,7 @@ mod tests {
         violating_calls: usize,
     }
     impl SingleToolCallProvider {
-        fn new(
-            tool: &'static str,
-            args: serde_json::Value,
-            calls: Arc<AtomicUsize>,
-        ) -> Self {
+        fn new(tool: &'static str, args: serde_json::Value, calls: Arc<AtomicUsize>) -> Self {
             Self {
                 tool,
                 args,
@@ -4220,7 +4467,8 @@ mod tests {
     /// 流式 Provider：按序发射文本增量 + 无工具 MessageEnd；记录调用次数。
     struct TtsrStreamProvider {
         calls: Arc<AtomicUsize>,
-    }    #[async_trait]
+    }
+    #[async_trait]
     impl agent_core::LlmProvider for TtsrStreamProvider {
         fn id(&self) -> &'static str {
             "ttsr-stream"
@@ -4257,15 +4505,16 @@ mod tests {
     #[tokio::test]
     async fn ttsr_mid_stream_abort_injects_and_retries() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let model = agent_core::Model::with_defaults(
             "ttsr-stream",
             "ttsr-stream",
             agent_core::Api::OpenAiCompletions,
         );
         let agent = Agent::builder(model.clone())
-            .provider(Arc::new(TtsrStreamProvider { calls: calls.clone() }))
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: calls.clone(),
+            }))
             .tools(Arc::new(DefaultToolRegistry::new()))
             .context(Arc::clone(&ctx))
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -4324,7 +4573,9 @@ mod tests {
             agent_core::Api::OpenAiCompletions,
         );
         let agent = Agent::builder(model)
-            .provider(Arc::new(TtsrStreamProvider { calls: calls.clone() }))
+            .provider(Arc::new(TtsrStreamProvider {
+                calls: calls.clone(),
+            }))
             .tools(Arc::new(DefaultToolRegistry::new()))
             .context(Arc::clone(&ctx))
             .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
@@ -4351,8 +4602,7 @@ mod tests {
     #[tokio::test]
     async fn ttsr_tool_never_rule_folds_reminder_into_result() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let ttsr = std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
             agent_ttsr::TtsrConfig::default(),
             vec![agent_ttsr::parse_rule(
@@ -4402,7 +4652,10 @@ mod tests {
             })
             .collect();
         assert!(
-            tool_msgs.iter().any(|c| c.contains("<system-reminder reason=\"rule_violation\" rule=\"no-secret\">")),
+            tool_msgs
+                .iter()
+                .any(|c| c
+                    .contains("<system-reminder reason=\"rule_violation\" rule=\"no-secret\">")),
             "工具结果应折叠 system-reminder 提醒"
         );
         assert_eq!(
@@ -4417,15 +4670,16 @@ mod tests {
     #[tokio::test]
     async fn ttsr_tool_always_rule_discards_and_retries() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let ctx: Arc<dyn agent_core::ContextManager> =
-            Arc::new(InMemoryContext::new(vec![]));
+        let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(InMemoryContext::new(vec![]));
         let ttsr = std::sync::Arc::new(agent_ttsr::TtsrCoordinator::new(
             agent_ttsr::TtsrConfig::default(),
-            vec![agent_ttsr::parse_rule(
-                "no-secret",
-                "---\nscope: tool:echo\ncondition: [secret]\n---\n不要输出 secret。",
-            )
-            .unwrap()],
+            vec![
+                agent_ttsr::parse_rule(
+                    "no-secret",
+                    "---\nscope: tool:echo\ncondition: [secret]\n---\n不要输出 secret。",
+                )
+                .unwrap(),
+            ],
         ));
         let mut reg = DefaultToolRegistry::new();
         reg.register(Box::new(EchoTool));
@@ -4481,9 +4735,12 @@ mod tests {
 
     // ── P2：模型 fallback 链 + API key 轮换 ────────────────────────────────
 
+    /// 桩调用记录（model id, ctx api_key）。
+    type ProbeCalls = Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>;
+
     /// 按模型 id 分派 + 记录调用（model.id, ctx.api_key）的桩 Provider。
     struct FallbackProbe {
-        calls: Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>,
+        calls: ProbeCalls,
         /// 对这些 id 返回可重试错误（其余返回 done）。
         fail_ids: &'static [&'static str],
         /// 对该 id 返回**不可重试**错误（换模型无意义，应立即上抛）。
@@ -4503,7 +4760,9 @@ mod tests {
             req: agent_core::CompletionRequest,
             ctx: &agent_core::ProviderCallContext,
         ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
-            self.calls.lock().push((req.model.id.clone(), ctx.api_key.clone()));
+            self.calls
+                .lock()
+                .push((req.model.id.clone(), ctx.api_key.clone()));
             if self.hard_fail_id == Some(req.model.id.as_str()) {
                 return Err(agent_core::LlmError::Decode("不可重试".into()));
             }
@@ -4551,16 +4810,10 @@ mod tests {
             fail_ids: &["primary"],
             hard_fail_id: None,
         });
-        let primary = agent_core::Model::with_defaults(
-            "primary",
-            "p",
-            agent_core::Api::AnthropicMessages,
-        );
-        let backup = agent_core::Model::with_defaults(
-            "backup",
-            "p",
-            agent_core::Api::OpenAiCompletions,
-        );
+        let primary =
+            agent_core::Model::with_defaults("primary", "p", agent_core::Api::AnthropicMessages);
+        let backup =
+            agent_core::Model::with_defaults("backup", "p", agent_core::Api::OpenAiCompletions);
         let agent = probe_agent(probe, primary, vec![backup], Default::default()).build();
         let mut said = String::new();
         let mut errs = 0;
@@ -4596,11 +4849,8 @@ mod tests {
             fail_ids: &["primary", "backup"],
             hard_fail_id: None,
         });
-        let primary = agent_core::Model::with_defaults(
-            "primary",
-            "p",
-            agent_core::Api::AnthropicMessages,
-        );
+        let primary =
+            agent_core::Model::with_defaults("primary", "p", agent_core::Api::AnthropicMessages);
         let backup = agent_core::Model::with_defaults("backup", "p", agent_core::Api::Zai);
         let agent = probe_agent(probe, primary, vec![backup], Default::default())
             .max_mistakes(1)
@@ -4623,7 +4873,10 @@ mod tests {
             }
         }
         assert!(saw_boom, "应透传底层错误");
-        assert_eq!(errs, 2, "boom 错误 + 停止提示各一次（全链失败只算 1 个 mistake）");
+        assert_eq!(
+            errs, 2,
+            "boom 错误 + 停止提示各一次（全链失败只算 1 个 mistake）"
+        );
         assert!(stopped, "达到 max_mistakes 应停止");
         let calls = calls.lock();
         assert_eq!(calls.len(), 2, "本轮应尝试链上全部模型");
@@ -4638,11 +4891,8 @@ mod tests {
             fail_ids: &[],
             hard_fail_id: Some("primary"),
         });
-        let primary = agent_core::Model::with_defaults(
-            "primary",
-            "p",
-            agent_core::Api::AnthropicMessages,
-        );
+        let primary =
+            agent_core::Model::with_defaults("primary", "p", agent_core::Api::AnthropicMessages);
         let backup = agent_core::Model::with_defaults("backup", "p", agent_core::Api::Zai);
         let agent = probe_agent(probe, primary, vec![backup], Default::default())
             .max_mistakes(1)
@@ -4674,22 +4924,21 @@ mod tests {
             fail_ids: &[],
             hard_fail_id: None,
         });
-        let model = agent_core::Model::with_defaults(
-            "primary",
-            "p",
-            agent_core::Api::AnthropicMessages,
-        );
-        let rings =
-            std::collections::HashMap::from([("primary".to_string(), vec!["k1".to_string(), "k2".to_string()])]);
+        let model =
+            agent_core::Model::with_defaults("primary", "p", agent_core::Api::AnthropicMessages);
+        let rings = std::collections::HashMap::from([(
+            "primary".to_string(),
+            vec!["k1".to_string(), "k2".to_string()],
+        )]);
         let agent = probe_agent(Arc::clone(&probe), model.clone(), Vec::new(), rings).build();
-        let mut stream = agent.run("go");
+        let stream = agent.run("go");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
             if let AgentEvent::Done(_) = ev {
                 break;
             }
         }
-        let mut stream = agent.run("go2");
+        let stream = agent.run("go2");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
             if let AgentEvent::Done(_) = ev {
@@ -4706,7 +4955,7 @@ mod tests {
         let agent2 = probe_agent(Arc::clone(&probe), model, Vec::new(), Default::default())
             .runtime_overrides(Arc::new(KeyOverride))
             .build();
-        let mut stream = agent2.run("go3");
+        let stream = agent2.run("go3");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
             if let AgentEvent::Done(_) = ev {
@@ -4812,7 +5061,12 @@ mod tests {
             time_budget: std::time::Duration::ZERO,
             hard_stop: false,
         })));
-        let agent = budget_agent(Arc::new(BudgetProvider { calls: calls.clone() }), goal);
+        let agent = budget_agent(
+            Arc::new(BudgetProvider {
+                calls: calls.clone(),
+            }),
+            goal,
+        );
         let mut injected = false;
         let mut done = false;
         let stream = agent.run("go");
@@ -4846,7 +5100,12 @@ mod tests {
             time_budget: std::time::Duration::ZERO,
             hard_stop: true,
         })));
-        let agent = budget_agent(Arc::new(BudgetProvider { calls: calls.clone() }), goal);
+        let agent = budget_agent(
+            Arc::new(BudgetProvider {
+                calls: calls.clone(),
+            }),
+            goal,
+        );
         let mut injected = false;
         let mut done = false;
         let stream = agent.run("go");
@@ -4863,10 +5122,6 @@ mod tests {
         }
         assert!(!injected, "硬模式不注入提醒");
         assert!(done, "硬模式正常结束");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "硬模式不续跑（3 次调用）"
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "硬模式不续跑（3 次调用）");
     }
 }

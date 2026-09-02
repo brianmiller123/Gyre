@@ -54,11 +54,11 @@ impl Default for LspTool {
 
 #[async_trait::async_trait]
 impl Tool for LspTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lsp"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Language Server Protocol client: get diagnostics, go to definition, find references, \
          hover for type info, list document symbols, search workspace symbols, rename symbols, \
          and get code actions/quick fixes."
@@ -120,7 +120,7 @@ impl Tool for LspTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| agent_core::ToolError::InvalidArgs("缺少 'action' 参数".into()))?;
 
-        let workspace_root = ctx.workspace.root().to_path_buf();
+        let workspace_root = ctx.workspace.root().clone();
         let mut managers = self.managers.lock().await;
 
         if !managers.contains_key(&workspace_root) {
@@ -396,12 +396,12 @@ fn parse_uri(input: &serde_json::Value) -> Result<url::Url, agent_core::ToolErro
 fn parse_position(input: &serde_json::Value) -> Result<(u32, u32), agent_core::ToolError> {
     let line = input
         .get("line")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| agent_core::ToolError::InvalidArgs("缺少 'line' 参数".into()))?
         as u32;
     let character = input
         .get("character")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| agent_core::ToolError::InvalidArgs("缺少 'character' 参数".into()))?
         as u32;
     Ok((line, character))

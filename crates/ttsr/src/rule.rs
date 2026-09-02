@@ -244,13 +244,17 @@ pub fn parse_rule(name: &str, content: &str) -> Result<Rule, String> {
     let mut conditions = Vec::new();
     if let Some(items) = fields.get("condition") {
         for c in items {
-            let re = regex::Regex::new(c)
-                .map_err(|e| format!("规则 {name} 正则编译失败 `{c}`: {e}"))?;
+            let re =
+                regex::Regex::new(c).map_err(|e| format!("规则 {name} 正则编译失败 `{c}`: {e}"))?;
             conditions.push(re);
         }
     }
     let ast_condition = first(&fields, "astCondition").map(str::to_string);
-    if ast_condition.is_some() && scopes.iter().all(|s| matches!(s, RuleScope::Text | RuleScope::Thinking)) {
+    if ast_condition.is_some()
+        && scopes
+            .iter()
+            .all(|s| matches!(s, RuleScope::Text | RuleScope::Thinking))
+    {
         return Err(format!(
             "规则 {name}: astCondition 仅支持工具作用域（scope: tool / tool:NAME）"
         ));
@@ -268,7 +272,10 @@ pub fn parse_rule(name: &str, content: &str) -> Result<Rule, String> {
         ast_condition,
     };
     if !rule.is_matchable() {
-        return Err(format!("规则 {}: 无 condition / astCondition，无法作为 TTSR 规则", rule.name));
+        return Err(format!(
+            "规则 {}: 无 condition / astCondition，无法作为 TTSR 规则",
+            rule.name
+        ));
     }
     Ok(rule)
 }
@@ -281,11 +288,10 @@ fn first<'a>(fields: &'a BTreeMap<String, Vec<String>>, key: &str) -> Option<&'a
 fn glob_matches(patterns: &[String], path: &str) -> bool {
     let base = std::path::Path::new(path).file_name();
     patterns.iter().any(|p| {
-        Glob::new(p)
-            .is_ok_and(|g| {
-                let m = g.compile_matcher();
-                m.is_match(path) || base.is_some_and(|b| m.is_match(b))
-            })
+        Glob::new(p).is_ok_and(|g| {
+            let m = g.compile_matcher();
+            m.is_match(path) || base.is_some_and(|b| m.is_match(b))
+        })
     })
 }
 
@@ -328,9 +334,7 @@ mod tests {
 
     #[test]
     fn parses_basic_rule_with_defaults() {
-        let r = rule(
-            "---\ncondition: ['(?i)Box::leak']\n---\n禁止 Box::leak，改用 Arc<str>。",
-        );
+        let r = rule("---\ncondition: ['(?i)Box::leak']\n---\n禁止 Box::leak，改用 Arc<str>。");
         assert_eq!(r.name, "test-rule");
         assert_eq!(r.scopes, vec![RuleScope::Text]);
         assert_eq!(r.interrupt_mode, InterruptMode::Always);
@@ -384,9 +388,7 @@ mod tests {
 
     #[test]
     fn never_interrupt_mode_parsed() {
-        let r = rule(
-            "---\ninterruptMode: never\ncondition: [x]\n---\nbody",
-        );
+        let r = rule("---\ninterruptMode: never\ncondition: [x]\n---\nbody");
         assert_eq!(r.interrupt_mode, InterruptMode::Never);
     }
 
@@ -420,18 +422,20 @@ mod tests {
     #[test]
     fn bad_regex_rejected() {
         assert!(parse_rule("t", "---\ncondition: ['(']\n---\nbody").is_err());
-        assert!(parse_rule("t", "---\nscope: [tool:write_file(]\ncondition: [x]\n---\nbody").is_err());
+        assert!(
+            parse_rule(
+                "t",
+                "---\nscope: [tool:write_file(]\ncondition: [x]\n---\nbody"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn discover_loads_md_files_only() {
         let dir = std::env::temp_dir().join(format!("ttsr-discover-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("a.md"),
-            "---\ncondition: [x]\n---\nbody a",
-        )
-        .unwrap();
+        std::fs::write(dir.join("a.md"), "---\ncondition: [x]\n---\nbody a").unwrap();
         std::fs::write(dir.join("b.txt"), "not a rule").unwrap();
         let rules = discover_rules(&dir);
         assert_eq!(rules.len(), 1);

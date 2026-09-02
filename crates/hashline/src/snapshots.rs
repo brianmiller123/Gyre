@@ -101,7 +101,7 @@ impl InMemorySnapshotStore {
             .find(|s| s.hash.eq_ignore_ascii_case(hash))
     }
 
-    /// 是否记录过该路径下指纹等于 `hash` 的版本（recovery 据此判定 hash_recognized）。
+    /// 是否记录过该路径下指纹等于 `hash` 的版本（recovery 据此判定 `hash_recognized`）。
     #[must_use]
     pub fn recognizes(&self, path: &str, hash: &str) -> bool {
         self.by_hash(path, hash).is_some()

@@ -1,7 +1,7 @@
 //! AES-256-GCM 密封编解码器：房间密钥仅存于链接片段，中继只见不透明字节。
 //!
 //! 移植自 [`oh-my-pi collab-web/codec.ts`](../../../third/oh-my-pi/packages/collab-web/src/lib/codec.ts)
-//! （浏览器侧 WebCrypto 的 Rust 对偶）。
+//! （浏览器侧 `WebCrypto` 的 Rust 对偶）。
 //!
 //! 密封布局：`[12B nonce][ciphertext+tag]`。房间密钥为 32 字节。
 

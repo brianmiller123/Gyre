@@ -144,7 +144,7 @@ pub fn rewrite(
         .into_iter()
         .map(|e| (e.position, e.deleted_length, e.inserted_text))
         .collect();
-    sorted.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    sorted.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
     let mut result = src.as_bytes().to_vec();
     for (position, deleted_length, inserted) in sorted {
         let inserted_str =

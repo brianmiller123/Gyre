@@ -7,10 +7,16 @@
 //! - `session/cancel`（通知）— 取消当前 turn
 //! - `session/load`（请求）— 恢复历史会话
 //! - `session/close`（请求）— 关闭会话
+//! - `session/request_permission`（服务端→客户端请求）— turn 中的审批/追问经此发给
+//!   ACP 客户端，客户端以同 id 的 JSON-RPC 响应回答（构造/登记/回执解析见下方模块）
 //!
 //! `session/prompt` 需在 turn 期间持续推送 `session/update` 通知，因此由各传输层
 //! 自行调用 [`start_prompt`] + 消费 broadcast 实现（HTTP 经 SSE，stdio 经主循环 select）。
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use agent_core::{AskKind, AskMessage, AskResponse};
 use agent_server::{ClientFrame, ServerFrame, SessionManager};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -24,6 +30,7 @@ pub const ACP_PROTOCOL_VERSION: u16 = 1;
 
 // JSON-RPC 标准错误码。
 const PARSE_ERROR: i32 = -32700;
+const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32603;
@@ -49,6 +56,12 @@ pub async fn dispatch_rpc(
         "session/prompt" => Err(rpc_error(
             INTERNAL_ERROR,
             "session/prompt 须由传输层处理（stdio 主循环 / HTTP SSE）",
+        )),
+        // session/request_permission 为服务端→客户端方向请求：客户端主动调用属协议误用，
+        // 返回 Invalid Request（方法本身有效，只是方向错误）。
+        "session/request_permission" => Err(rpc_error(
+            INVALID_REQUEST,
+            "session/request_permission 是服务端发起的请求，客户端不应调用",
         )),
         // ── 向后兼容：旧自定义方法名映射 ──
         "newTask" => handle_session_new(state, req).await,
@@ -320,6 +333,229 @@ pub fn stop_reason(frame: &ServerFrame) -> &'static str {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// session/request_permission（服务端 → 客户端方向）
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// 权限请求等待上限（秒）：超时按拒绝处理（fail closed）。
+pub const PERMISSION_TIMEOUT_SECS: u64 = 600;
+
+/// 服务端发起请求的 id 前缀（与客户端请求 id 空间隔离）。
+const PERMISSION_ID_PREFIX: &str = "gyre-perm-";
+
+/// 服务端发起请求的 id 计数器。
+static PERMISSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 生成一个新的权限请求 id。
+#[must_use]
+pub fn next_permission_id() -> String {
+    format!(
+        "{PERMISSION_ID_PREFIX}{}",
+        PERMISSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// 按 [`AskKind`] 选择 `session/request_permission` 的 options。
+///
+/// 工具/命令审批提供 ACP v1 四种许可选项；追问（`Followup`）与完成结果
+/// （`CompletionResult`）只需自由文本回答（`{kind:"text"}`）。
+#[must_use]
+pub fn permission_options(kind: &AskKind) -> Vec<Value> {
+    match kind {
+        AskKind::Tool { .. } | AskKind::Command { .. } => vec![
+            json!({ "kind": "allow_once" }),
+            json!({ "kind": "allow_always" }),
+            json!({ "kind": "reject_once" }),
+            json!({ "kind": "reject_always" }),
+        ],
+        AskKind::Followup | AskKind::CompletionResult => vec![json!({ "kind": "text" })],
+    }
+}
+
+/// 构造 `session/request_permission` JSON-RPC 请求（服务端 → 客户端方向）。
+///
+/// params 按 ACP v1：`sessionId` + `prompt`（文本内容块）+ `options`。
+#[must_use]
+pub fn permission_request(
+    id: String,
+    session_id: &str,
+    ask: &AskMessage,
+) -> crate::types::JsonRpcRequest {
+    crate::types::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(crate::types::JsonRpcId::Str(id)),
+        method: "session/request_permission".into(),
+        params: Some(json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": ask.prompt }],
+            "options": permission_options(&ask.kind),
+        })),
+    }
+}
+
+/// 一次待回执的权限请求。
+#[derive(Debug, Clone)]
+pub struct PendingPermission {
+    /// 所属会话 id。
+    pub session_id: String,
+    /// 内部 [`AskMessage`] 的 id（回执经 `ClientFrame::Respond` 投递）。
+    pub ask_id: String,
+    /// 回执截止时刻；过期按拒绝处理。
+    pub deadline: tokio::time::Instant,
+}
+
+/// 权限请求登记表（rpc id → 待回执项）。
+pub type PendingPermissions = HashMap<String, PendingPermission>;
+
+/// 已解析的权限回执：投递目标 + 映射后的应答 + 可选说明文案。
+#[derive(Debug, Clone)]
+pub struct ResolvedPermission {
+    /// 所属会话 id。
+    pub session_id: String,
+    /// 内部询问 id。
+    pub ask_id: String,
+    /// 映射后的应答。
+    pub response: AskResponse,
+    /// 拒绝原因说明（错误响应 / 无法解析 / 超时时附带）。
+    pub note: Option<String>,
+}
+
+/// 登记一条新的待回执权限请求，返回其 rpc id。
+pub fn register_permission(
+    pending: &mut PendingPermissions,
+    session_id: &str,
+    ask: &AskMessage,
+) -> String {
+    let rpc_id = next_permission_id();
+    pending.insert(
+        rpc_id.clone(),
+        PendingPermission {
+            session_id: session_id.to_string(),
+            ask_id: ask.id.clone(),
+            deadline: tokio::time::Instant::now()
+                + std::time::Duration::from_secs(PERMISSION_TIMEOUT_SECS),
+        },
+    );
+    rpc_id
+}
+
+/// 解析客户端对权限请求的 JSON-RPC 响应，并从登记表移除对应项。
+///
+/// 返回 `None` 表示该响应不属于任何待回执请求（未知 / 重复 id）。
+/// 错误响应与无法解析的 outcome 均按拒绝处理并附说明（fail closed）。
+pub fn resolve_permission_response(
+    pending: &mut PendingPermissions,
+    response: &Value,
+) -> Option<ResolvedPermission> {
+    let rpc_id = id_to_string(response.get("id"))?;
+    let entry = pending.remove(&rpc_id)?;
+    // 客户端以 JSON-RPC 错误回应：视为拒绝。
+    if let Some(err) = response.get("error").filter(|e| e.is_object()) {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("未知错误");
+        return Some(ResolvedPermission {
+            session_id: entry.session_id,
+            ask_id: entry.ask_id,
+            response: AskResponse::No,
+            note: Some(format!("客户端返回错误（{msg}），已按拒绝处理")),
+        });
+    }
+    let (response, note) = match outcome_to_ask_response(response.get("result")) {
+        Some(response) => (response, None),
+        None => (
+            AskResponse::No,
+            Some("权限响应无法解析，已按拒绝处理（fail closed）".into()),
+        ),
+    };
+    Some(ResolvedPermission {
+        session_id: entry.session_id,
+        ask_id: entry.ask_id,
+        response,
+        note,
+    })
+}
+
+/// 客户端响应 outcome → [`AskResponse`]。
+///
+/// ACP v1 outcome 形态：`{type:"selected", optionId}` 或 `{type:"text", text}`；
+/// 兼容 omp 变体（鉴别字段为 `outcome`）。`optionId` 与 option 的 `kind` 同值：
+/// `allow_once`/`allow_always` → 批准，`reject_once`/`reject_always` → 拒绝，
+/// `text` → 文本回答，`cancelled`（客户端关闭询问 UI）→ 拒绝。
+/// 未知选项 / 缺字段返回 `None`，由调用方按拒绝处理。
+#[must_use]
+pub fn outcome_to_ask_response(result: Option<&Value>) -> Option<AskResponse> {
+    let outcome = result?.get("outcome")?;
+    let kind = outcome
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| outcome.get("outcome").and_then(Value::as_str))?;
+    match kind {
+        "selected" => match outcome.get("optionId").and_then(Value::as_str)? {
+            "allow_once" | "allow_always" => Some(AskResponse::Yes),
+            "reject_once" | "reject_always" => Some(AskResponse::No),
+            _ => None,
+        },
+        "cancelled" => Some(AskResponse::No),
+        "text" => outcome
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| AskResponse::Text(text.to_string())),
+        _ => None,
+    }
+}
+
+/// 权限等待超时的回退应答：拒绝 + 注明文案。
+#[must_use]
+pub fn permission_timeout_resolution(entry: PendingPermission) -> ResolvedPermission {
+    ResolvedPermission {
+        session_id: entry.session_id,
+        ask_id: entry.ask_id,
+        response: AskResponse::No,
+        note: Some(format!(
+            "权限请求等待超过 {PERMISSION_TIMEOUT_SECS} 秒未收到回执，已按拒绝处理"
+        )),
+    }
+}
+
+/// 取出全部已到期的待回执项（按 rpc id 排序，保证确定性）。
+pub fn expired_permissions(pending: &mut PendingPermissions) -> Vec<PendingPermission> {
+    let now = tokio::time::Instant::now();
+    let mut expired_ids: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| p.deadline <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    expired_ids.sort();
+    expired_ids
+        .into_iter()
+        .filter_map(|id| pending.remove(&id))
+        .collect()
+}
+
+/// 判断 JSON 值是否为 JSON-RPC 响应（含 `id` 与 `result`/`error`、无 `method`）。
+///
+/// 用于在双向通道上区分客户端的「响应」与「请求/通知」。
+#[must_use]
+pub fn is_rpc_response(value: &Value) -> bool {
+    value.as_object().is_some_and(|obj| {
+        !obj.contains_key("method")
+            && obj.contains_key("id")
+            && (obj.contains_key("result") || obj.contains_key("error"))
+    })
+}
+
+/// JSON-RPC id（数字或字符串）归一化为字符串形式。
+#[must_use]
+pub fn id_to_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +640,262 @@ mod tests {
         // 非字符串的 cwd（协议误用）不得 panic，返回 None 安全回退。
         let params = json!({ "cwd": 42 });
         assert_eq!(param_path(Some(&params), "cwd"), None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // session/request_permission
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// 测试辅助：构造 AskMessage。
+    fn ask(kind: AskKind) -> AskMessage {
+        AskMessage {
+            id: "ask-1".into(),
+            kind,
+            prompt: "允许执行 rm -rf /tmp/demo？".into(),
+        }
+    }
+
+    #[test]
+    fn permission_options_tool_and_command_offer_four_kinds() {
+        for kind in [
+            AskKind::Tool {
+                tool: "bash".into(),
+            },
+            AskKind::Command {
+                command: "cargo test".into(),
+            },
+        ] {
+            let options = permission_options(&kind);
+            let kinds: Vec<&str> = options
+                .iter()
+                .map(|o| o["kind"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                kinds,
+                ["allow_once", "allow_always", "reject_once", "reject_always"]
+            );
+        }
+    }
+
+    #[test]
+    fn permission_options_followup_and_completion_are_text_only() {
+        for kind in [AskKind::Followup, AskKind::CompletionResult] {
+            let options = permission_options(&kind);
+            assert_eq!(options.len(), 1, "{kind:?} 应只有一个 text 选项");
+            assert_eq!(options[0]["kind"], "text");
+        }
+    }
+
+    #[test]
+    fn permission_request_serializes_acp_v1_envelope() {
+        let request = permission_request(
+            next_permission_id(),
+            "sess-9",
+            &ask(AskKind::Tool {
+                tool: "bash".into(),
+            }),
+        );
+        let v: Value = serde_json::to_value(&request).unwrap_or_default();
+        assert_eq!(v["method"], "session/request_permission");
+        // id 为字符串形式（与客户端请求 id 空间隔离）。
+        assert!(
+            v["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("gyre-perm-"))
+        );
+        assert_eq!(v["params"]["sessionId"], "sess-9");
+        assert_eq!(v["params"]["prompt"][0]["type"], "text");
+        assert_eq!(
+            v["params"]["prompt"][0]["text"],
+            "允许执行 rm -rf /tmp/demo？"
+        );
+        assert_eq!(v["params"]["options"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn outcome_selected_maps_allow_to_yes() {
+        for option in ["allow_once", "allow_always"] {
+            let result = json!({ "outcome": { "type": "selected", "optionId": option } });
+            assert!(
+                matches!(
+                    outcome_to_ask_response(Some(&result)),
+                    Some(AskResponse::Yes)
+                ),
+                "{option} 应映射为 Yes"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_selected_maps_reject_to_no() {
+        for option in ["reject_once", "reject_always"] {
+            let result = json!({ "outcome": { "type": "selected", "optionId": option } });
+            assert!(
+                matches!(
+                    outcome_to_ask_response(Some(&result)),
+                    Some(AskResponse::No)
+                ),
+                "{option} 应映射为 No"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_text_maps_to_text_response() {
+        let result = json!({ "outcome": { "type": "text", "text": "改用 cargo build" } });
+        assert!(
+            matches!(&outcome_to_ask_response(Some(&result)), Some(AskResponse::Text(t)) if t == "改用 cargo build")
+        );
+    }
+
+    #[test]
+    fn outcome_accepts_omp_variant_and_cancelled() {
+        // omp 变体：鉴别字段为 outcome 而非 type。
+        let omp = json!({ "outcome": { "outcome": "selected", "optionId": "allow_always" } });
+        assert!(matches!(
+            outcome_to_ask_response(Some(&omp)),
+            Some(AskResponse::Yes)
+        ));
+        // cancelled（客户端关闭询问 UI）：语义为拒绝。
+        let cancelled = json!({ "outcome": { "type": "cancelled" } });
+        assert!(matches!(
+            outcome_to_ask_response(Some(&cancelled)),
+            Some(AskResponse::No)
+        ));
+    }
+
+    #[test]
+    fn outcome_unknown_or_malformed_fails_closed() {
+        // 未知选项、缺失 outcome、空 result 均返回 None（调用方按拒绝处理）。
+        let unknown = json!({ "outcome": { "type": "selected", "optionId": "maybe" } });
+        assert!(outcome_to_ask_response(Some(&unknown)).is_none());
+        let no_outcome = json!({});
+        assert!(outcome_to_ask_response(Some(&no_outcome)).is_none());
+        assert!(outcome_to_ask_response(None).is_none());
+        let missing_option = json!({ "outcome": { "type": "selected" } });
+        assert!(outcome_to_ask_response(Some(&missing_option)).is_none());
+    }
+
+    #[test]
+    fn resolve_permission_response_delivers_registered_ask() {
+        let mut pending = PendingPermissions::new();
+        let rpc_id = register_permission(&mut pending, "sess-9", &ask(AskKind::Followup));
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": { "outcome": { "type": "text", "text": "继续" } },
+        });
+        let resolved = resolve_permission_response(&mut pending, &response).expect("应解析成功");
+        assert_eq!(resolved.session_id, "sess-9");
+        assert_eq!(resolved.ask_id, "ask-1");
+        assert!(
+            matches!(&resolved.response, AskResponse::Text(t) if t == "继续"),
+            "text outcome 应映射为文本回答"
+        );
+        assert!(resolved.note.is_none());
+        // 已回执的 id 再次响应：返回 None（不重复投递）。
+        assert!(resolve_permission_response(&mut pending, &response).is_none());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn resolve_permission_response_error_rejects_with_note() {
+        let mut pending = PendingPermissions::new();
+        let rpc_id = register_permission(
+            &mut pending,
+            "s",
+            &ask(AskKind::Tool {
+                tool: "bash".into(),
+            }),
+        );
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": { "code": -32603, "message": "internal" },
+        });
+        let resolved = resolve_permission_response(&mut pending, &response).expect("应解析成功");
+        assert!(matches!(resolved.response, AskResponse::No));
+        let note = resolved.note.expect("错误响应应附说明");
+        assert!(note.contains("internal"), "说明应包含错误信息: {note}");
+    }
+
+    #[test]
+    fn resolve_permission_response_unknown_id_is_ignored() {
+        let mut pending = PendingPermissions::new();
+        let response = json!({ "jsonrpc": "2.0", "id": "gyre-perm-999", "result": {} });
+        assert!(resolve_permission_response(&mut pending, &response).is_none());
+    }
+
+    #[test]
+    fn permission_timeout_maps_to_rejected_with_note() {
+        // 登记后人为把截止时刻改为过去：到期项被取出并映射为拒绝 + 注明。
+        let mut pending = PendingPermissions::new();
+        register_permission(
+            &mut pending,
+            "sess-9",
+            &ask(AskKind::Command {
+                command: "make".into(),
+            }),
+        );
+        let id = pending.keys().next().cloned().unwrap_or_default();
+        if let Some(entry) = pending.get_mut(&id) {
+            entry.deadline = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
+
+        let expired = expired_permissions(&mut pending);
+        assert_eq!(expired.len(), 1, "到期项应被取出");
+        assert!(pending.is_empty(), "取出后登记表应清空");
+
+        let resolved = permission_timeout_resolution(
+            expired
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("expired_permissions 应返回到期项")),
+        );
+        assert!(
+            matches!(resolved.response, AskResponse::No),
+            "超时应映射为拒绝"
+        );
+        assert_eq!(resolved.ask_id, "ask-1");
+        let note = resolved.note.expect("超时应附说明");
+        assert!(
+            note.contains(&PERMISSION_TIMEOUT_SECS.to_string()),
+            "说明应含超时秒数: {note}"
+        );
+        assert!(note.contains("拒绝"), "说明应注明按拒绝处理: {note}");
+    }
+
+    #[test]
+    fn expired_permissions_skips_unexpired_entries() {
+        let mut pending = PendingPermissions::new();
+        register_permission(&mut pending, "s", &ask(AskKind::Followup));
+        assert!(
+            expired_permissions(&mut pending).is_empty(),
+            "未到期项不应被取出"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn is_rpc_response_distinguishes_response_from_request() {
+        let response =
+            json!({ "jsonrpc": "2.0", "id": "gyre-perm-1", "result": { "outcome": {} } });
+        assert!(is_rpc_response(&response));
+        let error_response =
+            json!({ "jsonrpc": "2.0", "id": 7, "error": { "code": -1, "message": "x" } });
+        assert!(is_rpc_response(&error_response));
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "session/cancel" });
+        assert!(!is_rpc_response(&request));
+        let notification = json!({ "jsonrpc": "2.0", "method": "session/cancel" });
+        assert!(!is_rpc_response(&notification));
+    }
+
+    #[test]
+    fn id_to_string_normalizes_numbers_and_strings() {
+        assert_eq!(id_to_string(Some(&json!(42))), Some("42".into()));
+        assert_eq!(id_to_string(Some(&json!("abc"))), Some("abc".into()));
+        assert_eq!(id_to_string(None), None);
+        assert_eq!(id_to_string(Some(&json!(null))), None);
     }
 }

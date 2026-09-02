@@ -33,10 +33,10 @@ impl LspApplyTool {
 
 #[async_trait]
 impl Tool for LspApplyTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lsp_apply"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "应用 LSP 编辑（write_file 之外的结构化编辑）：\
 `edits` 直接传入 lsp rename/code_actions 返回的编辑列表；或 `code_action_index` + `uri`/`line`/`character`\
 取对应 code action 的 edits 应用、有 command 则执行。多文件自动分组，自底向上应用，区间重叠报错。"
@@ -79,9 +79,8 @@ impl Tool for LspApplyTool {
                     .ok_or_else(|| {
                         ToolError::InvalidArgs("需要 `edits` 或 `code_action_index`".into())
                     })?;
-                let idx = usize::try_from(idx).map_err(|_| {
-                    ToolError::InvalidArgs("code_action_index 超出平台范围".into())
-                })?;
+                let idx = usize::try_from(idx)
+                    .map_err(|_| ToolError::InvalidArgs("code_action_index 超出平台范围".into()))?;
                 let uri = input
                     .get("uri")
                     .and_then(serde_json::Value::as_str)
@@ -110,9 +109,9 @@ impl Tool for LspApplyTool {
                         "未找到匹配工作区的 LSP 管理器（先确认 lsp 工具已初始化）".into(),
                     ));
                 };
-                let manager = managers.get_mut(&root).ok_or_else(|| {
-                    ToolError::Execution("LSP 管理器缺失（内部错误）".into())
-                })?;
+                let manager = managers
+                    .get_mut(&root)
+                    .ok_or_else(|| ToolError::Execution("LSP 管理器缺失（内部错误）".into()))?;
                 let actions = manager
                     .code_actions(&uri, line, character)
                     .await
@@ -205,9 +204,8 @@ impl Tool for LspApplyTool {
 
 /// file:// URI → 本地路径（浅解码）。
 fn uri_path(uri: &url::Url) -> std::path::PathBuf {
-    uri.to_file_path().unwrap_or_else(|_| {
-        std::path::PathBuf::from(uri.as_str().trim_start_matches("file://"))
-    })
+    uri.to_file_path()
+        .unwrap_or_else(|()| std::path::PathBuf::from(uri.as_str().trim_start_matches("file://")))
 }
 
 /// 为路径找最深的已注册工作区根。
@@ -260,7 +258,7 @@ mod tests {
         let mut m: std::collections::HashMap<PathBuf, ()> = std::collections::HashMap::new();
         let r1 = PathBuf::from("/ws");
         let r2 = PathBuf::from("/ws/sub");
-        m.insert(r1.clone(), ());
+        m.insert(r1, ());
         m.insert(r2.clone(), ());
         let p = std::path::Path::new("/ws/sub/file.rs");
         assert_eq!(find_root(&m, p), Some(r2));

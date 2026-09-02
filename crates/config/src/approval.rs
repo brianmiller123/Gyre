@@ -45,7 +45,10 @@ const fn mode_str(mode: ApprovalMode) -> &'static str {
 
 /// 读取 sidecar 持久化模式；缺失/损坏返回 `None`（用配置默认）。
 fn read_state(path: &Path) -> Option<ApprovalMode> {
-    let s = std::fs::read_to_string(path).ok()?.trim().to_ascii_lowercase();
+    let s = std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase();
     match s.as_str() {
         "always-ask" => Some(ApprovalMode::AlwaysAsk),
         "write" => Some(ApprovalMode::Write),
@@ -141,7 +144,10 @@ mod tests {
     fn fresh_controller_uses_config_default() {
         let c = ApprovalModeController::new(None);
         assert_eq!(c.current(), None);
-        assert_eq!(c.effective(ApprovalMode::AlwaysAsk), ApprovalMode::AlwaysAsk);
+        assert_eq!(
+            c.effective(ApprovalMode::AlwaysAsk),
+            ApprovalMode::AlwaysAsk
+        );
     }
 
     #[test]

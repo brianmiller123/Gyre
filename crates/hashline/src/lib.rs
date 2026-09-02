@@ -15,7 +15,6 @@
 //! - [`tool`] —— `apply_hashline` 工具
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 pub mod apply;
 pub mod format;
@@ -48,7 +47,7 @@ pub use types::{Anchor, ApplyResult, Cursor, FileOp, FileSection, Hunk, PatchRep
 
 /// 注入 system prompt 的 hashline 工具使用指引（启用时由装配层追加）。
 ///
-/// 工具收敛后：apply_hashline 为唯一编辑工具（write_file 仅整文件创建/覆写）。
+/// `工具收敛后：apply_hashline` `为唯一编辑工具（write_file` 仅整文件创建/覆写）。
 pub const PROMPT_SECTION: &str = "<hashline>\n\
 编辑文件用 `apply_hashline`：行锚定、一次调用可改多文件/多区间。\n\
 每段以 [path#hash] 开头（hash 取自最近一次 read 的段头标签，勿编造、勿跨会话复用）；段内用 SWAP/DEL/INS/REM/MV 描述行操作。\n\

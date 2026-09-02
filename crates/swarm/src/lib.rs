@@ -15,7 +15,6 @@
 //! 典型用法见 [`run_swarm`]。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 pub mod dag;
 pub mod executor;

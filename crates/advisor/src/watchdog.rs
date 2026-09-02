@@ -63,8 +63,13 @@ mod tests {
 
     #[test]
     fn discovers_walkup_and_project() {
-        let dir = std::env::temp_dir().join(format!("agent-wd-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "agent-wd-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(dir.join(".gyre")).unwrap();
         std::fs::create_dir_all(dir.join("sub/deep/.gyre")).unwrap();
         std::fs::write(dir.join(".gyre/WATCHDOG.md"), "project rules\n").unwrap();

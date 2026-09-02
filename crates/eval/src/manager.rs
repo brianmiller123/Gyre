@@ -1,10 +1,13 @@
-//! 会话级 Python 内核池：NDJSON 协议、串行化执行、空闲/keep 回收。
+//! 会话级持久内核池（Python / JavaScript 双语言）：NDJSON 协议、串行化执行、空闲/keep
+//! 回收。
 //!
-//! 每个 `session_key` 对应一个内核进程（`python3 -u -c <driver>`，共享命名空间）。
-//! 同一会话的并发 `execute` 经 per-session Mutex 串行化；`keep=false` 执行后立即回收，
-//! 空闲超过 `EvalSettings::idle_timeout`（后台清扫任务，幂等惰性启动）回收，执行期间
-//! 被取消（`EvalManager::abort`）时 kill 进程并注销会话。环回桥 token 按 run 轮换：
-//! 每次 execute 注册新 token 并经请求帧下发内核，run 结束（RunGuard drop）即注销。
+//! 每个 `session_key` 按语言各对应一个内核进程（py → `python3 -u -c <driver>`；
+//! js → `node --input-type=module -e <driver>`，共享命名空间；会话池内部键加
+//! `::py`/`::js` 后缀隔离）。同一会话同一语言的并发 `execute` 经 per-session Mutex
+//! 串行化；`keep=false` 执行后立即回收，空闲超过 `EvalSettings::idle_timeout`
+//! （后台清扫任务，幂等惰性启动）回收，执行期间被取消（`EvalManager::abort`，两种语言
+//! 一并回收）时 kill 进程并注销会话。环回桥 token 按 run 轮换：每次 execute 注册新
+//! token 并经请求帧下发内核，run 结束（RunGuard drop）即注销。
 
 use std::collections::HashMap;
 use std::io;
@@ -14,15 +17,45 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::EvalError;
 use crate::bridge::BridgeServer;
 use crate::driver::PYTHON_DRIVER;
-use crate::EvalError;
+use crate::driver_js::JS_DRIVER;
+
+/// 内核语言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    /// Python（`python3 -u -c PYTHON_DRIVER`）。
+    Python,
+    /// JavaScript（`node --input-type=module -e JS_DRIVER`，Node ≥18）。
+    JavaScript,
+}
+
+impl Language {
+    /// 会话池内部键后缀（同会话不同语言各自独立内核）。
+    const fn session_suffix(self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::JavaScript => "js",
+        }
+    }
+}
+
+/// 解析语言标识：`"py"`/`"python"` → [`Language::Python`]，`"js"`/`"javascript"` →
+/// [`Language::JavaScript`]。
+fn parse_language(language: &str) -> Result<Language, EvalError> {
+    match language {
+        "py" | "python" => Ok(Language::Python),
+        "js" | "javascript" => Ok(Language::JavaScript),
+        other => Err(EvalError::UnsupportedLanguage(other.to_string())),
+    }
+}
 
 /// 内核就绪帧等待上限。
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,18 +67,31 @@ const SWEEP_INTERVAL_CAP: Duration = Duration::from_secs(15);
 pub struct EvalSettings {
     /// Python 解释器路径。
     pub python: String,
+    /// Node.js 可执行路径（JS 内核；默认取 PATH 上的 `node`，spawn 时探测）。
+    pub node: String,
     /// 内核空闲回收超时；同时作为单次执行的墙钟上限。
     pub idle_timeout: Duration,
 }
 
 impl EvalSettings {
     /// 从配置字段构造（`EvalConfig` 未从 `agent_config` 根导出，cli 侧按字段映射）。
+    ///
+    /// Node 路径默认取 PATH 上的 `node`（启动内核时解析；不可用则 JS 执行返回
+    /// [`EvalError::NodeMissing`]，不影响 Python）；显式配置经 [`EvalSettings::with_node`]。
     #[must_use]
     pub fn from_parts(python: impl Into<String>, idle_timeout_secs: u64) -> Self {
         Self {
             python: python.into(),
+            node: "node".to_string(),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
         }
+    }
+
+    /// 指定 Node.js 可执行路径（映射配置 `eval.node`）。
+    #[must_use]
+    pub fn with_node(mut self, node: impl Into<String>) -> Self {
+        self.node = node.into();
+        self
     }
 }
 
@@ -231,7 +277,10 @@ impl EvalManager {
 
     /// 幂等启动空闲清扫任务（需 `Arc<Self>` 以持弱引用，随管理器 drop 退出）。
     pub fn ensure_sweeper(self: &Arc<Self>) {
-        let mut started = self.sweep_started.lock().unwrap_or_else(|e| e.into_inner());
+        let mut started = self
+            .sweep_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *started {
             return;
         }
@@ -265,7 +314,7 @@ impl EvalManager {
         let keys: Vec<String> = self
             .sessions
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
             .cloned()
             .collect();
@@ -273,7 +322,7 @@ impl EvalManager {
             let session = self
                 .sessions
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
                 .cloned();
             let Some(session) = session else {
@@ -281,7 +330,10 @@ impl EvalManager {
             };
             // busy 锁可获取 = 空闲；持锁回收杜绝与 execute 竞态。
             if let Ok(guard) = session.busy.try_lock() {
-                let last = *session.last_used.lock().unwrap_or_else(|e| e.into_inner());
+                let last = *session
+                    .last_used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if now.saturating_duration_since(last) > idle {
                     self.reap_session(&key).await;
                 }
@@ -295,22 +347,26 @@ impl EvalManager {
         let session = self
             .sessions
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
         if let Some(session) = session {
             session.kill().await;
         }
     }
 
-    /// 中止并回收会话（执行被取消/中断时调用）。
+    /// 中止并回收会话的**全部语言**内核（执行被取消/中断时调用）。
     pub async fn abort(&self, session_key: &str) {
-        self.reap_session(session_key).await;
+        for language in [Language::Python, Language::JavaScript] {
+            self.reap_session(&format!("{session_key}::{}", language.session_suffix()))
+                .await;
+        }
     }
 
-    /// 在 `session_key` 会话执行一段代码。
+    /// 在 `session_key` 会话以指定语言执行一段代码。
     ///
-    /// `language` 仅支持 `"py"`；`keep=false` 执行后立即回收内核；环回桥 token 按
-    /// 本次 run 轮换注册（结束即注销）。
+    /// `language` 支持 `"py"`/`"python"` 与 `"js"`/`"javascript"`（同一会话两种语言
+    /// 各自独立内核）；`keep=false` 执行后立即回收内核；环回桥 token 按本次 run
+    /// 轮换注册（结束即注销）。
     ///
     /// # Errors
     /// 内核缺失/启动失败/超时/死亡等子系统故障返回 [`EvalError`]；用户代码异常
@@ -326,24 +382,33 @@ impl EvalManager {
         keep: bool,
         bridge: &BridgeServer,
     ) -> Result<EvalOutput, EvalError> {
-        if language != "py" {
-            return Err(EvalError::UnsupportedLanguage(language.to_string()));
-        }
+        let language = parse_language(language)?;
+        // 语言维度隔离：会话池内部键加语言后缀，同会话 py/js 互不干扰。
+        let pool_key = format!("{session_key}::{}", language.session_suffix());
         let session = {
-            let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
-                map.entry(session_key.to_string())
+                map.entry(pool_key.clone())
                     .or_insert_with(|| Arc::new(Session::new())),
             )
         };
         // 串行化同一会话的并发 execute。
         let _busy = session.busy.lock().await;
-        *session.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-        let kernel = self.ensure_kernel(&session, bridge).await?;
+        *session
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+        let kernel = self.ensure_kernel(&session, bridge, language).await?;
         let result = run_once(&kernel, code, self.settings.idle_timeout, bridge).await;
-        *session.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *session
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
         if !keep {
-            self.reap_session(session_key).await;
+            self.reap_session(&pool_key).await;
         }
         result
     }
@@ -353,6 +418,7 @@ impl EvalManager {
         &self,
         session: &Arc<Session>,
         bridge: &BridgeServer,
+        language: Language,
     ) -> Result<Arc<Kernel>, EvalError> {
         {
             let slot = session.slot.lock().await;
@@ -362,7 +428,7 @@ impl EvalManager {
                 }
             }
         }
-        let kernel = spawn_kernel(&self.settings, bridge.addr()).await?;
+        let kernel = spawn_kernel(&self.settings, bridge.addr(), language).await?;
         let old = {
             let mut slot = session.slot.lock().await;
             slot.replace(Arc::clone(&kernel))
@@ -374,16 +440,26 @@ impl EvalManager {
     }
 }
 
-/// 启动内核进程并等待 ready 帧（就绪超时/取消则回收）。
 async fn spawn_kernel(
     settings: &EvalSettings,
     bridge_addr: SocketAddr,
+    language: Language,
 ) -> Result<Arc<Kernel>, EvalError> {
-    let mut cmd = tokio::process::Command::new(&settings.python);
-    cmd.arg("-u")
-        .arg("-c")
-        .arg(PYTHON_DRIVER)
-        .env("GYRE_BRIDGE_URL", bridge_url(bridge_addr))
+    // python → `python3 -u -c DRIVER`；js → `node --input-type=module -e DRIVER`
+    // （driver 短小，经命令行传入安全；两种内核协议完全同构）。
+    let mut cmd = match language {
+        Language::Python => {
+            let mut cmd = tokio::process::Command::new(&settings.python);
+            cmd.arg("-u").arg("-c").arg(PYTHON_DRIVER);
+            cmd
+        }
+        Language::JavaScript => {
+            let mut cmd = tokio::process::Command::new(&settings.node);
+            cmd.arg("--input-type=module").arg("-e").arg(JS_DRIVER);
+            cmd
+        }
+    };
+    cmd.env("GYRE_BRIDGE_URL", bridge_url(bridge_addr))
         .env("GYRE_BRIDGE_TOKEN", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -391,7 +467,10 @@ async fn spawn_kernel(
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            EvalError::PythonMissing(settings.python.clone())
+            match language {
+                Language::Python => EvalError::PythonMissing(settings.python.clone()),
+                Language::JavaScript => EvalError::NodeMissing(settings.node.clone()),
+            }
         } else {
             EvalError::KernelSpawnFailed(e.to_string())
         }
@@ -427,11 +506,11 @@ async fn spawn_kernel(
     tokio::select! {
         biased;
         _ = ready_rx => {}
-        _ = kernel.cancel.cancelled() => {
+        () = kernel.cancel.cancelled() => {
             kernel.kill().await;
             return Err(EvalError::Canceled);
         }
-        _ = tokio::time::sleep(READY_TIMEOUT) => {
+        () = tokio::time::sleep(READY_TIMEOUT) => {
             kernel.kill().await;
             return Err(EvalError::KernelSpawnFailed(format!(
                 "内核就绪超时（{}s）",
@@ -467,7 +546,7 @@ async fn run_once(
         .inner
         .pending
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
             id,
             PendingRun {
@@ -477,22 +556,33 @@ async fn run_once(
                 wake: Some(wake_tx),
             },
         );
-    *kernel.inner.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    *kernel
+        .inner
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
     let frame = encode_request(id, code, &token);
     let write_result = {
         let mut guard = kernel.stdin.lock().await;
         match guard.as_mut() {
-            Some(stdin) => stdin.write_all(frame.as_bytes()).await.map_err(|e| e.kind()),
+            Some(stdin) => stdin
+                .write_all(frame.as_bytes())
+                .await
+                .map_err(|e| e.kind()),
             None => Err(io::ErrorKind::BrokenPipe),
         }
     };
     if let Err(kind) = write_result {
-        *kernel.inner.current.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *kernel
+            .inner
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         kernel
             .inner
             .pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
         if kernel.inner.dead.load(Ordering::SeqCst) {
             return Err(EvalError::KernelDied);
@@ -507,7 +597,7 @@ async fn run_once(
                     .inner
                     .pending
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id);
                 match entry {
                     None => Err(EvalError::KernelDied),
@@ -534,19 +624,23 @@ async fn run_once(
             }
             Err(_) => Err(EvalError::KernelDied),
         },
-        _ = kernel.cancel.cancelled() => Err(EvalError::Canceled),
-        _ = tokio::time::sleep(run_timeout) => {
+        () = kernel.cancel.cancelled() => Err(EvalError::Canceled),
+        () = tokio::time::sleep(run_timeout) => {
             kernel.kill().await;
             Err(EvalError::Timeout(run_timeout))
         }
     };
     // 收尾：清 current/pending（取消/超时路径）。
-    *kernel.inner.current.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *kernel
+        .inner
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     kernel
         .inner
         .pending
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&id);
     outcome
 }
@@ -582,7 +676,12 @@ where
 fn handle_frame(frame: &Frame, inner: &Arc<Inner>) {
     match frame {
         Frame::Ready => {
-            if let Some(tx) = inner.ready.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(tx) = inner
+                .ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
                 let _ = tx.send(());
             }
         }
@@ -590,7 +689,7 @@ fn handle_frame(frame: &Frame, inner: &Arc<Inner>) {
             if let Some(p) = inner
                 .pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get_mut(id)
             {
                 p.stdout.push(text.clone());
@@ -600,7 +699,7 @@ fn handle_frame(frame: &Frame, inner: &Arc<Inner>) {
             if let Some(p) = inner
                 .pending
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get_mut(id)
             {
                 p.stderr.push(text.clone());
@@ -614,7 +713,10 @@ fn handle_frame(frame: &Frame, inner: &Arc<Inner>) {
 /// 完成一个 run：写入 done 并唤醒 execute；唤醒失败（execute 已放弃）则顺手清理。
 fn complete(inner: &Arc<Inner>, id: u64, done: Result<Option<String>, String>) {
     let remove = {
-        let mut pending = inner.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match pending.get_mut(&id) {
             None => false,
             Some(p) => {
@@ -630,14 +732,18 @@ fn complete(inner: &Arc<Inner>, id: u64, done: Result<Option<String>, String>) {
         inner
             .pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
     }
 }
 
 /// 失败当前在途 run（内核死亡/回收路径）。
 fn fail_current(inner: &Arc<Inner>, message: &str) {
-    let id = inner.current.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let id = inner
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if let Some(id) = id {
         complete(inner, id, Err(message.to_string()));
     }
@@ -645,12 +751,15 @@ fn fail_current(inner: &Arc<Inner>, message: &str) {
 
 /// 非 NDJSON 原生输出挂到当前 run 的 stderr。
 fn push_raw(inner: &Arc<Inner>, text: &str) {
-    let id = *inner.current.lock().unwrap_or_else(|e| e.into_inner());
+    let id = *inner
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(id) = id {
         if let Some(p) = inner
             .pending
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&id)
         {
             p.stderr.push(text.to_string());
@@ -676,32 +785,60 @@ mod tests {
     /// 输出帧解析（含 null output 与垃圾行）。
     #[test]
     fn frame_parsing() {
-        assert_eq!(
-            parse_frame(r#"{"type":"ready"}"#),
-            Some(Frame::Ready)
-        );
+        assert_eq!(parse_frame(r#"{"type":"ready"}"#), Some(Frame::Ready));
         assert_eq!(
             parse_frame(r#"{"type":"stdout","id":3,"text":"hi\n"}"#),
-            Some(Frame::Stdout { id: 3, text: "hi\n".into() })
+            Some(Frame::Stdout {
+                id: 3,
+                text: "hi\n".into()
+            })
         );
         assert_eq!(
             parse_frame(r#"{"type":"stderr","id":3,"text":"oops"}"#),
-            Some(Frame::Stderr { id: 3, text: "oops".into() })
+            Some(Frame::Stderr {
+                id: 3,
+                text: "oops".into()
+            })
         );
         assert_eq!(
             parse_frame(r#"{"type":"result","id":3,"ok":true,"output":"2"}"#),
-            Some(Frame::Result { id: 3, output: Some("2".into()) })
+            Some(Frame::Result {
+                id: 3,
+                output: Some("2".into())
+            })
         );
         assert_eq!(
             parse_frame(r#"{"type":"result","id":3,"ok":true,"output":null}"#),
-            Some(Frame::Result { id: 3, output: None })
+            Some(Frame::Result {
+                id: 3,
+                output: None
+            })
         );
         assert_eq!(
             parse_frame(r#"{"type":"error","id":3,"message":"boom"}"#),
-            Some(Frame::Error { id: 3, message: "boom".into() })
+            Some(Frame::Error {
+                id: 3,
+                message: "boom".into()
+            })
         );
         assert_eq!(parse_frame("not json"), None);
         assert_eq!(parse_frame(r#"{"type":"bogus","id":1}"#), None);
+    }
+
+    /// 语言解析：别名归一与不支持语言报错。
+    #[test]
+    fn language_parsing() {
+        assert!(matches!(parse_language("py"), Ok(Language::Python)));
+        assert!(matches!(parse_language("python"), Ok(Language::Python)));
+        assert!(matches!(parse_language("js"), Ok(Language::JavaScript)));
+        assert!(matches!(
+            parse_language("javascript"),
+            Ok(Language::JavaScript)
+        ));
+        match parse_language("rb") {
+            Err(EvalError::UnsupportedLanguage(lang)) => assert_eq!(lang, "rb"),
+            other => panic!("应返回 UnsupportedLanguage：{other:?}"),
+        }
     }
 
     /// keep=false 语义：执行后会话被回收（不 spawn 真内核，直接操作池）。
@@ -709,15 +846,26 @@ mod tests {
     async fn reap_removes_session() {
         let mgr = Arc::new(EvalManager::new(EvalSettings {
             python: "python3".into(),
+            node: "node".into(),
             idle_timeout: Duration::from_secs(60),
         }));
-        let key = "unit|sess";
+        let key = "unit|sess::py";
         mgr.sessions
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key.to_string(), Arc::new(Session::new()));
-        assert!(mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(key));
+        assert!(
+            mgr.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(key)
+        );
         mgr.reap_session(key).await;
-        assert!(!mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(key));
+        assert!(
+            !mgr.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(key)
+        );
     }
 }

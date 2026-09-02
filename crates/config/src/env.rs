@@ -10,18 +10,15 @@ pub fn expand_env(input: &str) -> String {
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                let value = std::env::var(name).unwrap_or_default();
-                out.push_str(&value);
-                rest = &after[end + 1..];
-            }
-            None => {
-                // 无闭合 `}`，原样输出从 `${` 起的剩余。
-                out.push_str(&rest[start..]);
-                return out;
-            }
+        if let Some(end) = after.find('}') {
+            let name = &after[..end];
+            let value = std::env::var(name).unwrap_or_default();
+            out.push_str(&value);
+            rest = &after[end + 1..];
+        } else {
+            // 无闭合 `}`，原样输出从 `${` 起的剩余。
+            out.push_str(&rest[start..]);
+            return out;
         }
     }
     out.push_str(rest);

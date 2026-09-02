@@ -1,13 +1,13 @@
 //! [`InbandProvider`]：用 in-band 方言包装任意 [`LlmProvider`]，把工具规格移入
 //! system prompt、从模型文本输出解析工具调用——对 function-calling 不稳的模型
-//! （GLM / DeepSeek 等）提供稳定的「提示词 + 文本协议」工具能力。
+//! （GLM / `DeepSeek` 等）提供稳定的「提示词 + 文本协议」工具能力。
 //!
 //! 工作流：
 //! 1. 请求侧：若 `tools` 非空，渲染工具段追加到 `system`，清空 `tools`/`tool_choice`
 //!    （不发原生 function-calling，避免不稳的 backend 误解析）。
 //! 2. 响应侧：透传流式事件并累积文本；在 `MessageEnd` 处用方言解析工具调用，重建
-//!    消息内容为「纯文本 + ToolCall 块」，并把 `stop_reason` 修正为 `ToolUse`。
-//!    agent 循环据此执行工具（与原生 tool_calls 路径一致）。
+//!    消息内容为「纯文本 + `ToolCall` 块」，并把 `stop_reason` 修正为 `ToolUse`。
+//!    agent 循环据此执行工具（与原生 `tool_calls` 路径一致）。
 
 use std::sync::Arc;
 
@@ -230,7 +230,7 @@ mod tests {
     }
 
     /// 桩 Provider：把含工具调用的文本切成多 chunk（`<tool_call>`/`</tool_call>` 跨 chunk），
-    /// 验证 InbandProvider 增量解析时不泄露标记、仍能正确提取工具调用。
+    /// 验证 `InbandProvider` 增量解析时不泄露标记、仍能正确提取工具调用。
     struct ChunkedFakeProvider;
 
     #[async_trait]

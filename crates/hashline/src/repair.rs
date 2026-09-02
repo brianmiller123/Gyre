@@ -5,7 +5,7 @@
 //! `findOneSidedBoundaryEcho` / `findDuplicateSuffix` / `findDuplicatePrefix` /
 //! `findDroppedSuffixClosers` 等）。
 //!
-//! ## 为何是「专项重写」而非「搬运扁平 AppliedEdit 管线」
+//! ## 为何是「专项重写」而非「搬运扁平 `AppliedEdit` 管线」
 //! Gyre 的 [`Hunk::Replace`](crate::types::Hunk::Replace) `{ start, end, body }`
 //! 天然对应上游一个 `ReplacementGroup`（`payload` = `body`，`startLine`/`endLine`
 //! = `start`/`end`）。上游需用 `findReplacementGroup` 从扁平的每行一个 insert/delete
@@ -76,7 +76,7 @@ impl DelimiterBalance {
     }
 
     /// `self` 是否在三分量上各自「覆盖」`target`（同号且绝对值不小于）。
-    fn covers(self, target: Self) -> bool {
+    const fn covers(self, target: Self) -> bool {
         covers_component(self.paren, target.paren)
             && covers_component(self.bracket, target.bracket)
             && covers_component(self.brace, target.brace)
@@ -154,10 +154,6 @@ fn compute_delimiter_balance<L: AsRef<str>>(lines: &[L]) -> DelimiterBalance {
             }
             i += 1;
         }
-        // `"` / `'` 不跨行；只反引号模板与块注释跨行。
-        if matches!(quote, Some(b'"') | Some(b'\'')) {
-            quote = None;
-        }
     }
     bal
 }
@@ -195,10 +191,10 @@ fn is_jsx_closer_line(text: &str) -> bool {
     if core == "</>" || core == "/>" {
         return true;
     }
-    if let Some(rest) = core.strip_prefix("</") {
-        if let Some(name) = rest.strip_suffix('>') {
-            return is_valid_tag_name(name);
-        }
+    if let Some(rest) = core.strip_prefix("</")
+        && let Some(name) = rest.strip_suffix('>')
+    {
+        return is_valid_tag_name(name);
     }
     false
 }
@@ -208,21 +204,20 @@ fn is_structural_closer_line(text: &str) -> bool {
     is_punct_closer(text) || is_jsx_closer_line(text)
 }
 
-/// JSX 闭合符的标签名：`Some(None)` = 片段 `</>`，`Some(Some(name))` = `</name>`，
-/// `None` = 非命名闭合符（含 `/>`）。
-fn jsx_closer_name(text: &str) -> Option<Option<&str>> {
+/// JSX 闭合符的标签名：`Some("")` = 片段 `</>`，`Some(name)` = `</name>`，
+/// `None` = 非闭合符行（含 `/>`）。
+fn jsx_closer_name(text: &str) -> Option<&str> {
     let t = text.trim();
     let core = t.strip_suffix(|c| c == ';' || c == ',').unwrap_or(t);
     let core = core.trim();
     if core == "</>" {
-        return Some(None);
+        return Some("");
     }
-    if let Some(rest) = core.strip_prefix("</") {
-        if let Some(name) = rest.strip_suffix('>') {
-            if is_valid_tag_name(name) {
-                return Some(Some(name));
-            }
-        }
+    if let Some(rest) = core.strip_prefix("</")
+        && let Some(name) = rest.strip_suffix('>')
+        && is_valid_tag_name(name)
+    {
+        return Some(name);
     }
     None
 }
@@ -355,11 +350,10 @@ fn payload_has_jsx_opener_for_echo(payload_prefix: &[String], echo_lines: &[Stri
         }
     }
     for line in echo_lines {
-        if let Some(name_opt) = jsx_closer_name(line) {
-            let target = name_opt.unwrap_or("");
-            if open_tags.iter().any(|n| n == target) {
-                return true;
-            }
+        if let Some(target) = jsx_closer_name(line)
+            && open_tags.iter().any(|n| n == target)
+        {
+            return true;
         }
     }
     false
@@ -371,7 +365,7 @@ fn payload_has_jsx_opener_for_echo(payload_prefix: &[String], echo_lines: &[Stri
 
 /// 一个待修复的替换组（= 一个 [`Hunk::Replace`](crate::types::Hunk::Replace)）。
 #[derive(Debug, Clone)]
-pub(crate) struct ReplaceGroup {
+pub struct ReplaceGroup {
     /// 起始行（含，1-indexed）。
     pub(crate) start: Anchor,
     /// 结束行（含，1-indexed）。
@@ -382,7 +376,7 @@ pub(crate) struct ReplaceGroup {
 
 /// 修复后的替换组。
 #[derive(Debug, Clone)]
-pub(crate) struct RepairedReplace {
+pub struct RepairedReplace {
     /// 起始行（含）。
     pub(crate) start: Anchor,
     /// 正文替换的区间尾（含）；保留闭合符后可能小于原始 `end`。
@@ -443,8 +437,7 @@ fn count_dup_leading(payload: &[String], start_line: Anchor, file_lines: &[&str]
     let max = payload.len().min((start_line - 1) as usize);
     'outer: for count in (1..=max).rev() {
         let mut has_content = false;
-        for offset in 0..count {
-            let line = &payload[offset];
+        for (offset, line) in payload.iter().enumerate().take(count) {
             let fidx = start_line as usize - 1 - count + offset;
             if line.as_str() != file_lines.get(fidx).copied().unwrap_or("") {
                 continue 'outer;
@@ -611,9 +604,9 @@ fn find_duplicate_prefix(
     let max_j = payload.len().min((start_line - 1) as usize);
     for j in (1..=max_j).rev() {
         let mut matches = true;
-        for t in 0..j {
+        for (t, pline) in payload.iter().enumerate().take(j) {
             let fidx = start_line as usize - 1 - j + t;
-            if payload[t].as_str() != file_lines.get(fidx).copied().unwrap_or("") {
+            if pline.as_str() != file_lines.get(fidx).copied().unwrap_or("") {
                 matches = false;
                 break;
             }
@@ -762,7 +755,7 @@ fn net_deleted_prefix_balance(
 ) -> DelimiterBalance {
     let mut deleted: Vec<String> = Vec::new();
     let mut inserted: Vec<String> = Vec::new();
-    let mut line = group.start as i64 - 1;
+    let mut line = i64::from(group.start) - 1;
     while line >= 1 && deleted_lines.contains(&(line as Anchor)) {
         deleted.push(file_lines[line as usize - 1].to_string());
         if let Some(ins) = inserted_by_line.get(&(line as Anchor)) {
@@ -776,6 +769,8 @@ fn net_deleted_prefix_balance(
 }
 
 /// 区间删除的尾部结构闭合符中「应保留」的中间段。
+// 迭代修复管线传递上下文切片；引入参数聚合结构体超出本次机械清理范围。
+#[allow(clippy::too_many_arguments)]
 fn find_dropped_suffix_closers(
     group: &ReplaceGroup,
     file_lines: &[&str],
@@ -1021,7 +1016,7 @@ fn build_inserted(
 ///
 /// `deletes` / `before` / `after` 仅参与全局投影（整 patch 分隔符残差、区间上下方
 /// 投影），自身不被修改。
-pub(crate) fn repair_replacement_boundaries(
+pub fn repair_replacement_boundaries(
     groups: &[ReplaceGroup],
     deletes: &[(Anchor, Anchor)],
     before: &BTreeMap<Anchor, Vec<Vec<String>>>,

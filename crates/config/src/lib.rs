@@ -6,7 +6,6 @@
 //! 移植 oh-my-pi 分层配置与逐工具/命令审批语义。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod approval;
 mod config;
@@ -16,11 +15,11 @@ mod rules;
 pub use approval::ApprovalModeController;
 
 pub use config::{
-    AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config, EditToolsConfig,
-    EvalConfig, GithubConfig, GoalsConfig, InterceptorConfig, McpConfig, McpServerConfig,
-    MemoryBackend, MemoryConfig, MinimizerConfig, ModelProfile, ServerConfig, SkillsConfig,
-    Socks5Config, SubagentConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig, TtsrConfig,
-    parse_compaction_backend, wildcard_match,
+    AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config,
+    EditToolsConfig, EvalConfig, GithubConfig, GoalsConfig, InterceptorConfig, McpConfig,
+    McpServerConfig, MemoryBackend, MemoryConfig, MinimizerConfig, ModelProfile, ServerConfig,
+    SkillsConfig, Socks5Config, SubagentConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig,
+    TtsrConfig, parse_compaction_backend, wildcard_match,
 };
 pub use config::{CustomCommand, discover_commands, discover_context_files};
 pub use env::expand_env;

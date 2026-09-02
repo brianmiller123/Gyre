@@ -114,7 +114,8 @@ pub enum ToolError {
 
 impl ToolError {
     /// 该错误是否可恢复（循环可继续，而非致命）。
-    pub fn is_recoverable(&self) -> bool {
+    #[must_use]
+    pub const fn is_recoverable(&self) -> bool {
         !matches!(self, Self::Rejected)
     }
 }

@@ -5,6 +5,11 @@
 # （CLI 读 LANG/LC_*；Web 读 navigator.languages）。新增语言见 crates/i18n/locales。
 # language = "zh"
 
+# LLM 请求 User-Agent。缺省/空字符串 = 与 OMP 对齐的默认 UA
+# `pi/<version> (platform release; arch)`（格式同 oh-my-pi 线上请求）；
+# 部分上游/网关按 UA 识别客户端，需要自定义身份时在此覆盖。
+# user_agent = "my-agent/1.0"
+
 [default_model]
 id               = "gpt-4o-mini"
 api              = "openai-completions"   # 决定 Provider 路由
@@ -146,9 +151,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 enabled = false          # 默认关；启用后跨会话积累技术决策/惯例/已踩坑
 # 后端：local（默认，MEMORY.md + notes.jsonl + LLM 合并）|
 #       structured（records.jsonl + 向量融合检索；L2 语义嵌入需以 --features vec-embed 编译，
-#                   否则回退 L1 确定性投影嵌入；无 LLM 合并，逐条积累）
+#                   否则回退 L1 确定性投影嵌入；任务末 LLM 沉淀 working → episodic）
 backend = "local"
-auto_consolidate = true  # 任务结束触发 LLM 合并 raw notes → MEMORY.md（仅 local 后端生效）
+auto_consolidate = true  # 任务结束触发 LLM 合并（local：raw notes → MEMORY.md；structured：未沉淀记录 → 提炼条目）
 auto_retain_every_n_turns = 4  # 循环内自动沉淀：每 N 个停止轮把本轮输出写入记忆（0 = 关闭）
 
 # GitHub 工具（查询/操作 PR、issue、Actions(CI)），按需加载以控制上下文成本。

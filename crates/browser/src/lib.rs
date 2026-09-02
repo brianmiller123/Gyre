@@ -15,7 +15,6 @@
 //! v1 明确不做：多标签页、网络拦截、headless 之外模式。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod browser_tool;
 mod cdp;

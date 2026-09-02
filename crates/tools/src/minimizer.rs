@@ -246,7 +246,7 @@ fn git_status_minimize(output: &str) -> Option<String> {
         let entries: Vec<String> = lines
             .iter()
             .filter(|l| is_short_status(l))
-            .map(|l| l.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         let shown = fold_untracked(&entries, true);
         folded_any |= shown.iter().any(|e| e.contains(" 个文件)"));
@@ -285,9 +285,7 @@ fn is_status_section(l: &str) -> bool {
 
 /// 前置信息行：`On branch …` / `Your branch …` / `HEAD detached …`。
 fn is_status_preamble(l: &str) -> bool {
-    l.starts_with("On branch")
-        || l.starts_with("Your branch")
-        || l.starts_with("HEAD detached")
+    l.starts_with("On branch") || l.starts_with("Your branch") || l.starts_with("HEAD detached")
 }
 
 /// 末尾总结行：`nothing to commit …` / `no changes added to commit …`。
@@ -312,8 +310,11 @@ fn is_short_status(l: &str) -> bool {
 }
 
 /// git 短格式状态字符（含首位空格：未暂存改动形如 ` M …`）。
-fn is_status_byte(c: u8) -> bool {
-    matches!(c, b' ' | b'M' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?' | b'!' | b'T' | b'X')
+const fn is_status_byte(c: u8) -> bool {
+    matches!(
+        c,
+        b' ' | b'M' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?' | b'!' | b'T' | b'X'
+    )
 }
 
 /// 把未跟踪条目按**父目录**折叠：同一目录下 ≥2 项合并为 `dir/ (N 个文件)`，保持首次出现顺序。
@@ -421,7 +422,7 @@ fn git_diff_minimize(output: &str) -> Option<String> {
 /// diff stat 行判定：` path | 3 ++-`（文件行）或 ` 3 files changed, … insertions(+), … deletions(-)`（汇总行）。
 fn is_diff_stat_line(l: &str) -> bool {
     if let Some(idx) = l.find(" | ") {
-        if l[idx + 3..].as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        if l.as_bytes().get(idx + 3).is_some_and(u8::is_ascii_digit) {
             return true;
         }
     }
@@ -574,9 +575,7 @@ fn cargo_minimize(output: &str) -> Option<String> {
     for (i, l) in lines.iter().enumerate() {
         if is_cargo_diagnostic(l) {
             let end = (i + 1 + CARGO_CONTEXT_LINES).min(lines.len());
-            for k in i..end {
-                kept[k] = true;
-            }
+            kept[i..end].fill(true);
         }
     }
     // 2) 进度与结果汇总行（进度仅保留最后一条）。
@@ -586,7 +585,9 @@ fn cargo_minimize(output: &str) -> Option<String> {
         if t.starts_with("Compiling ") || t.starts_with("Checking ") {
             last_progress = Some(i);
         }
-        if t.starts_with("Finished ") || l.contains("could not compile") || t.starts_with("test result:")
+        if t.starts_with("Finished ")
+            || l.contains("could not compile")
+            || t.starts_with("test result:")
         {
             kept[i] = true;
         }
@@ -789,10 +790,7 @@ mod tests {
                 Some("second-summary".to_string())
             }
         }
-        let m = Minimizer::new(
-            vec![Box::new(First), Box::new(Second)],
-            0,
-        );
+        let m = Minimizer::new(vec![Box::new(First), Box::new(Second)], 0);
         let r = m.apply("any", &[], "output").expect("应命中过滤器");
         assert_eq!(r.filter, "first");
         assert_eq!(r.summary, "first-summary\n");
@@ -801,14 +799,20 @@ mod tests {
     #[test]
     fn disabled_always_none() {
         let m = disabled();
-        assert!(m.apply("git", &["status".to_string()], "anything\n").is_none());
+        assert!(
+            m.apply("git", &["status".to_string()], "anything\n")
+                .is_none()
+        );
     }
 
     #[test]
     fn split_command_parses_program_and_args() {
         assert_eq!(
             split_command("git status --short"),
-            ("git".to_string(), vec!["status".to_string(), "--short".to_string()])
+            (
+                "git".to_string(),
+                vec!["status".to_string(), "--short".to_string()]
+            )
         );
         assert_eq!(split_command("cargo"), ("cargo".to_string(), Vec::new()));
     }
@@ -822,9 +826,15 @@ mod tests {
         let f = GitStatusFilter;
         let s = f.minimize(STATUS_LONG).expect("长格式 status 应命中");
         assert!(s.contains("On branch main\n"), "应保留分支信息");
-        assert!(s.contains("Changes not staged for commit:\n共 3 条变更\n"), "应保留节头与计数");
+        assert!(
+            s.contains("Changes not staged for commit:\n共 3 条变更\n"),
+            "应保留节头与计数"
+        );
         assert!(s.contains("\tmodified:   src/foo.rs\n"), "应保留关键文件名");
-        assert!(s.contains("Untracked files:\n共 3 条变更\n"), "未跟踪节应计数");
+        assert!(
+            s.contains("Untracked files:\n共 3 条变更\n"),
+            "未跟踪节应计数"
+        );
         assert!(s.contains("\tsrc/new/ (2 个文件)\n"), "未跟踪目录应折叠");
         assert!(!s.contains("\tsrc/new/a.rs\n"), "折叠组成员不再单列");
         assert!(s.contains("\tnotes.txt\n"), "单文件应原样保留");
@@ -849,17 +859,29 @@ mod tests {
         let input = " M src/foo.rs\n?? src/a.rs\n?? src/b.rs\n?? notes.txt\n";
         let s = GitStatusFilter.minimize(input).expect("短格式应命中");
         assert!(s.contains("共 4 条变更\n"));
-        assert!(s.contains("\t?? src/ (2 个文件)\n"), "短格式未跟踪应折叠: {s}");
+        assert!(
+            s.contains("\t?? src/ (2 个文件)\n"),
+            "短格式未跟踪应折叠: {s}"
+        );
         assert!(s.contains("\t M src/foo.rs\n"));
     }
 
     #[test]
     fn git_status_miss_and_empty() {
         let f = GitStatusFilter;
-        assert!(f.minimize("just some text\nno status markers\n").is_none(), "非 status 输出不适用");
+        assert!(
+            f.minimize("just some text\nno status markers\n").is_none(),
+            "非 status 输出不适用"
+        );
         assert!(f.minimize("").is_none(), "空输出不适用");
-        assert!(!f.matches("git", &["status".to_string(), "--porcelain".to_string()]), "--porcelain 应排除");
-        assert!(f.matches("git", &["status".to_string()]), "git status 应命中");
+        assert!(
+            !f.matches("git", &["status".to_string(), "--porcelain".to_string()]),
+            "--porcelain 应排除"
+        );
+        assert!(
+            f.matches("git", &["status".to_string()]),
+            "git status 应命中"
+        );
     }
 
     // ── git diff ─────────────────────────────────────────────────────────────
@@ -889,8 +911,14 @@ index abc..def 100644\n\
         assert!(s.contains("@@ -1,5 +1,6 @@\n"), "应保留 hunk 头");
         assert!(s.contains("@@ -10,3 +10,4 @@\n"), "应保留全部 hunk 头");
         assert!(s.contains("统计：+3 -1\n"), "无 --stat 应追加增减统计: {s}");
-        assert!(!s.contains("println!(\"new\")"), "应丢弃 hunk 内 +/- 内容行");
-        assert!(!s.contains("diff --git a/src/main.rs"), "应丢弃 diff 文件头");
+        assert!(
+            !s.contains("println!(\"new\")"),
+            "应丢弃 hunk 内 +/- 内容行"
+        );
+        assert!(
+            !s.contains("diff --git a/src/main.rs"),
+            "应丢弃 diff 文件头"
+        );
         assert_deterministic(&|o| f.minimize(o), DIFF_HUNKS);
     }
 
@@ -899,7 +927,10 @@ index abc..def 100644\n\
         let input = " src/main.rs | 3 ++-\n src/other.rs | 5 +++--\n 1 file changed, 8 insertions(+), 2 deletions(-)\nrandom noise line\nmore noise here\n";
         let s = GitDiffFilter.minimize(input).expect("stat 输出应命中");
         assert!(s.contains("src/main.rs | 3 ++"), "应保留 stat 行");
-        assert!(s.contains("1 file changed, 8 insertions(+), 2 deletions(-)"), "应保留 stat 汇总");
+        assert!(
+            s.contains("1 file changed, 8 insertions(+), 2 deletions(-)"),
+            "应保留 stat 汇总"
+        );
         assert!(!s.contains("noise"), "非 stat 行应折叠");
         assert!(!s.contains("统计："), "--stat 已含统计，不应再追加");
     }
@@ -907,7 +938,10 @@ index abc..def 100644\n\
     #[test]
     fn git_diff_miss_and_empty() {
         let f = GitDiffFilter;
-        assert!(f.minimize("hello world\nnothing to do\n").is_none(), "非 diff 输出不适用");
+        assert!(
+            f.minimize("hello world\nnothing to do\n").is_none(),
+            "非 diff 输出不适用"
+        );
         assert!(f.minimize("").is_none(), "空输出不适用");
         assert!(f.matches("git", &["diff".to_string(), "--stat".to_string()]));
         assert!(!f.matches("git", &["status".to_string()]));
@@ -940,7 +974,9 @@ index abc..def 100644\n\
 
     #[test]
     fn git_log_oneline_truncates() {
-        let input: String = (0..40).map(|i| format!("abc123{i:x} subject {i}\n")).collect();
+        let input: String = (0..40)
+            .map(|i| format!("abc123{i:x} subject {i}\n"))
+            .collect();
         let s = GitLogFilter.minimize(&input).expect("oneline log 应命中");
         assert!(s.contains("… 还有 10 条提交\n"));
         assert!(!s.contains("subject 30"));
@@ -949,7 +985,10 @@ index abc..def 100644\n\
     #[test]
     fn git_log_miss_and_empty() {
         let f = GitLogFilter;
-        assert!(f.minimize("random text\nnot a log\n").is_none(), "非 log 输出不适用");
+        assert!(
+            f.minimize("random text\nnot a log\n").is_none(),
+            "非 log 输出不适用"
+        );
         assert!(f.minimize("").is_none(), "空输出不适用");
         assert!(f.matches("git", &["log".to_string(), "--oneline".to_string()]));
         assert!(!f.matches("git", &["status".to_string()]));
@@ -963,19 +1002,34 @@ index abc..def 100644\n\
     fn cargo_keeps_diagnostics_and_summaries() {
         let f = CargoFilter;
         let s = f.minimize(CARGO_OUT).expect("cargo 输出应命中");
-        assert!(s.contains("warning: unused variable: `x`\n  --> src/main.rs:9:7\n"), "应保留诊断与上下文");
-        assert!(s.contains("error[E0308]: mismatched types\n  --> src/main.rs:5:3\n"), "应保留 error[E..] 汇总");
+        assert!(
+            s.contains("warning: unused variable: `x`\n  --> src/main.rs:9:7\n"),
+            "应保留诊断与上下文"
+        );
+        assert!(
+            s.contains("error[E0308]: mismatched types\n  --> src/main.rs:5:3\n"),
+            "应保留 error[E..] 汇总"
+        );
         assert!(s.contains("error: could not compile"), "应保留编译失败汇总");
-        assert!(s.contains("Compiling xyzzy v0.12.0\n"), "应保留最后一条进度");
+        assert!(
+            s.contains("Compiling xyzzy v0.12.0\n"),
+            "应保留最后一条进度"
+        );
         assert!(!s.contains("Compiling foo v0.1.0"), "早期进度行应折叠");
-        assert!(s.contains("… 已折叠 11 行（cargo 输出）…\n"), "应含折叠标记: {s}");
+        assert!(
+            s.contains("… 已折叠 11 行（cargo 输出）…\n"),
+            "应含折叠标记: {s}"
+        );
         assert_deterministic(&|o| f.minimize(o), CARGO_OUT);
     }
 
     #[test]
     fn cargo_miss_and_empty() {
         let f = CargoFilter;
-        assert!(f.minimize("hello\nworld\n").is_none(), "无 cargo 标记不适用");
+        assert!(
+            f.minimize("hello\nworld\n").is_none(),
+            "无 cargo 标记不适用"
+        );
         assert!(f.minimize("").is_none(), "空输出不适用");
         assert!(f.matches("cargo", &["build".to_string()]));
         assert!(f.matches("cargo", &["clippy".to_string(), "--all".to_string()]));
@@ -994,9 +1048,15 @@ index abc..def 100644\n\
         let f = PythonFilter;
         let s = f.minimize(PY_TRACEBACK).expect("traceback 输出应命中");
         assert!(s.contains("Traceback (most recent call last):\n"));
-        assert!(s.contains("File \"/tmp/foo.py\", line 7, in main\n"), "应保留帧行");
+        assert!(
+            s.contains("File \"/tmp/foo.py\", line 7, in main\n"),
+            "应保留帧行"
+        );
         assert!(s.contains("ValueError: boom\n"), "应保留异常行");
-        assert!(!s.contains("test session starts"), "应折叠 traceback 前的会话噪声");
+        assert!(
+            !s.contains("test session starts"),
+            "应折叠 traceback 前的会话噪声"
+        );
         assert!(s.contains("… 已折叠"), "应含折叠标记");
         assert_deterministic(&|o| f.minimize(o), PY_TRACEBACK);
     }
@@ -1005,7 +1065,10 @@ index abc..def 100644\n\
     fn python_pytest_summary_and_failures() {
         let f = PythonFilter;
         let s = f.minimize(PY_PYTEST).expect("pytest 输出应命中");
-        assert!(s.contains("FAILED tests/test_x.py::test_a - AssertionError: assert 1 == 2\n"), "应保留失败测试名");
+        assert!(
+            s.contains("FAILED tests/test_x.py::test_a - AssertionError: assert 1 == 2\n"),
+            "应保留失败测试名"
+        );
         assert!(s.contains("1 failed, 2 passed in 0.05s"), "应保留结果汇总");
         assert!(!s.contains("def test_a()"), "应折叠测试细节");
         assert!(s.contains("… 已折叠"), "应含折叠标记");
@@ -1014,7 +1077,10 @@ index abc..def 100644\n\
     #[test]
     fn python_miss_and_empty() {
         let f = PythonFilter;
-        assert!(f.minimize("hello world\n").is_none(), "非 python 输出不适用");
+        assert!(
+            f.minimize("hello world\n").is_none(),
+            "非 python 输出不适用"
+        );
         assert!(f.minimize("").is_none(), "空输出不适用");
         assert!(f.matches("python3", &["-m".to_string(), "pytest".to_string()]));
         assert!(f.matches("python", &[]));

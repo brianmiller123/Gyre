@@ -88,12 +88,7 @@ pub fn common_ancestor(nodes: &[SessionNode], a: &str, b: &str) -> Option<NodeId
     let path_a: HashSet<NodeId> = path_to_root(nodes, a).into_iter().collect();
     let path_b = branch_path_ids(nodes, b); // 根→叶
     // path_b 根→叶，从深往浅找第一个也在 path_a 中的 → 最近公共祖先。
-    for id in path_b.into_iter().rev() {
-        if path_a.contains(&id) {
-            return Some(id);
-        }
-    }
-    None
+    path_b.into_iter().rev().find(|id| path_a.contains(id))
 }
 
 /// 全部叶子节点（无人以其为父的节点）。

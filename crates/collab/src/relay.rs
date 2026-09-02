@@ -34,11 +34,13 @@ pub fn generate_write_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; WRITE_TOKEN_LEN];
     rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().fold(String::with_capacity(WRITE_TOKEN_LEN * 2), |mut s, b| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(WRITE_TOKEN_LEN * 2), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// 房间状态：广播发送端 + 密封帧历史环（供新订阅者重放）。
@@ -95,14 +97,15 @@ impl Relay {
     /// 房间仍存活（哪怕当前无订阅者）时复用既有 sender 与历史——掉线期间的帧
     /// 由 [`publish_with_token`](Self::publish_with_token) 持续记入历史，重连可完整找回；
     /// 无订阅者的空房间由 [`cleanup_empty`](Self::cleanup_empty) 统一回收。
-    pub async fn join_with_replay(&self, room_id: &str) -> (Vec<Vec<u8>>, broadcast::Receiver<Vec<u8>>) {
+    pub async fn join_with_replay(
+        &self,
+        room_id: &str,
+    ) -> (Vec<Vec<u8>>, broadcast::Receiver<Vec<u8>>) {
         let mut rooms = self.rooms.lock().await;
-        let room = rooms
-            .entry(room_id.to_string())
-            .or_insert_with(|| Room {
-                sender: broadcast::channel(self.capacity).0,
-                history: VecDeque::new(),
-            });
+        let room = rooms.entry(room_id.to_string()).or_insert_with(|| Room {
+            sender: broadcast::channel(self.capacity).0,
+            history: VecDeque::new(),
+        });
         let history = room.history.iter().cloned().collect();
         let rx = room.sender.subscribe();
         drop(rooms); // 历史与订阅在同一锁内完成后尽早释放
@@ -554,9 +557,7 @@ mod tests {
         ));
         // 错误令牌同样被拒。
         assert!(matches!(
-            relay
-                .publish_with_token(room, vec![2], Some("wrong"))
-                .await,
+            relay.publish_with_token(room, vec![2], Some("wrong")).await,
             Err(CollabError::WriteForbidden)
         ));
         // 正确令牌成功。
@@ -629,7 +630,12 @@ mod tests {
         let sealed = rx.recv().await.expect("应有帧");
         let frame = guest.decode(&sealed).expect("解封");
         match frame {
-            WireFrame::Hello { proto, name, write_token, .. } => {
+            WireFrame::Hello {
+                proto,
+                name,
+                write_token,
+                ..
+            } => {
                 assert_eq!(proto, 1);
                 assert_eq!(name.as_deref(), Some("host"));
                 assert_eq!(write_token.as_deref(), Some("abc"));

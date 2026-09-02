@@ -18,11 +18,11 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![warn(clippy::pedantic)]
 
 pub mod context;
 pub mod error;
 pub mod hook;
+pub mod hub;
 pub mod llm;
 pub mod memory;
 pub mod message;

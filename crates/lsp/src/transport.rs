@@ -80,11 +80,9 @@ pub struct LspTransport {
     _write_task: tokio::task::JoinHandle<()>,
 }
 
-/// 出站请求（含响应信道）。
+/// 出站请求。
 struct OutboundRequest {
     payload: String,
-    /// 非空表示期待响应；空表示通知。
-    response_tx: Option<oneshot::Sender<Result<String, TransportError>>>,
 }
 
 impl LspTransport {
@@ -177,10 +175,7 @@ impl LspTransport {
 
         // 发送到写任务
         self.request_tx
-            .send(OutboundRequest {
-                payload,
-                response_tx: None, // 响应由读任务通过 pending map 路由
-            })
+            .send(OutboundRequest { payload })
             .await
             .map_err(|_| TransportError::ChannelClosed)?;
 
@@ -213,7 +208,10 @@ impl LspTransport {
 
                 // 检查 JSON-RPC 错误
                 if let Some(err) = response.get("error") {
-                    let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    let code = err
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(-1);
                     let message = err
                         .get("message")
                         .and_then(|v| v.as_str())
@@ -251,10 +249,7 @@ impl LspTransport {
             .map_err(|e| TransportError::Frame(e.to_string()))?;
 
         self.request_tx
-            .send(OutboundRequest {
-                payload,
-                response_tx: None,
-            })
+            .send(OutboundRequest { payload })
             .await
             .map_err(|_| TransportError::ChannelClosed)?;
 
@@ -365,12 +360,11 @@ async fn read_loop(
             }
         }
 
-        let content_length = match parse_content_length(line.trim()) {
-            Some(len) => len,
-            None => {
-                warn!(line = %line.trim(), "无法解析 Content-Length 头，跳过");
-                continue;
-            }
+        let content_length = if let Some(len) = parse_content_length(line.trim()) {
+            len
+        } else {
+            warn!(line = %line.trim(), "无法解析 Content-Length 头，跳过");
+            continue;
         };
 
         // 跳过空行
@@ -415,7 +409,7 @@ async fn read_loop(
 
         if has_id && has_result_or_error {
             // 这是一个响应
-            let id = parsed.get("id").and_then(|v| v.as_u64());
+            let id = parsed.get("id").and_then(serde_json::Value::as_u64);
             if let Some(id) = id {
                 let mut pending_map = pending.lock().await;
                 if let Some(tx) = pending_map.remove(&id) {

@@ -73,17 +73,26 @@ mod tests {
 
         let text2 = "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
         let out2 = o.obfuscate(text2);
-        assert!(out2.contains("<redacted>") && !out2.contains("ghp_"), "{out2}");
+        assert!(
+            out2.contains("<redacted>") && !out2.contains("ghp_"),
+            "{out2}"
+        );
     }
 
     #[test]
     fn masks_bearer_and_env() {
         let o = SecretObfuscator::new();
         let out = o.obfuscate("Authorization: Bearer abc.def.ghi-jkl_mno");
-        assert!(out.contains("<redacted>") && !out.contains("abc.def"), "{out}");
+        assert!(
+            out.contains("<redacted>") && !out.contains("abc.def"),
+            "{out}"
+        );
 
         let out2 = o.obfuscate("export OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx");
-        assert!(out2.contains("<redacted>") && !out2.contains("sk-xxx"), "{out2}");
+        assert!(
+            out2.contains("<redacted>") && !out2.contains("sk-xxx"),
+            "{out2}"
+        );
     }
 
     #[test]
@@ -98,6 +107,9 @@ mod tests {
         let mut o = SecretObfuscator::new();
         o.add_pattern(Regex::new(r"MYCORP-[A-Za-z0-9]{10,}").unwrap());
         let out = o.obfuscate("key MYCORP-abc123xyz999 here");
-        assert!(out.contains("<redacted>") && !out.contains("MYCORP"), "{out}");
+        assert!(
+            out.contains("<redacted>") && !out.contains("MYCORP"),
+            "{out}"
+        );
     }
 }

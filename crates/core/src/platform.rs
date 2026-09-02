@@ -17,7 +17,7 @@ pub fn config_dir() -> Option<PathBuf> {
 
 /// 返回项目级配置目录候选（`.agent/`，相对工作区根）。
 #[must_use]
-pub fn project_config_dir_name() -> &'static str {
+pub const fn project_config_dir_name() -> &'static str {
     ".agent"
 }
 
@@ -81,6 +81,66 @@ pub fn forced_utf8_locale() -> Option<&'static str> {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// LLM 请求 User-Agent（与 OMP 对齐）
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// 默认 LLM 请求 User-Agent 与 oh-my-pi（OMP）线上一致：
+// `pi/<version> (<platform> <release>; <arch>)`（见 upstream
+// `packages/ai/src/providers/openai-codex-responses.ts` 的
+// `User-Agent: pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`）。
+// 部分上游/网关按 UA 识别客户端，保持同一指纹可避免行为差异。
+
+/// OMP 版本号（锁定自 `third/oh-my-pi/packages/ai/package.json`；升级上游时同步更新）。
+pub const OMP_VERSION: &str = "17.2.3";
+
+/// 映射为 Node `os.platform()` 的取值（`linux` / `darwin` / `win32`）。
+fn omp_platform() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+/// 映射为 Node `os.arch()` 的取值（`x64` / `arm64` / `ia32`）。
+fn omp_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        other => other,
+    }
+}
+
+/// 内核版本号（对齐 Node `os.release()` / `uname -r`）。
+///
+/// Linux 读 `/proc/sys/kernel/osrelease`（无依赖、无子进程）；其余平台回退到
+/// 编译期 OS 名（UA 格式仍然合法，仅 release 段非内核版本）。
+fn kernel_release() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    std::env::consts::OS.to_string()
+}
+
+/// 默认 LLM 请求 User-Agent：`pi/<version> (<platform> <release>; <arch>)`，
+/// 与 OMP 线上格式完全一致。配置文件 `user_agent` 键可覆盖（见 `agent-config`）。
+#[must_use]
+pub fn default_llm_user_agent() -> String {
+    format!(
+        "pi/{OMP_VERSION} ({} {}; {})",
+        omp_platform(),
+        kernel_release(),
+        omp_arch()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +178,21 @@ mod tests {
         // 全部空 / 未设置 → 非 UTF-8（等价 C/POSIX）。
         assert!(!effective_utf8_from(Some(""), None, None));
         assert!(!effective_utf8_from(None, None, None));
+    }
+
+    #[test]
+    fn default_llm_user_agent_matches_omp_format() {
+        // 与 OMP 线上格式一致：`pi/<version> (<platform> <release>; <arch>)`。
+        let ua = default_llm_user_agent();
+        assert!(
+            ua.starts_with(&format!("pi/{OMP_VERSION} (")),
+            "UA 应以 OMP 版本开头: {ua}"
+        );
+        assert!(ua.ends_with(')'), "UA 应以右括号结尾: {ua}");
+        // `(platform release; arch)` 结构：括号内恰含一个分号，分号两侧均非空。
+        let inner = &ua[ua.find('(').unwrap() + 1..ua.rfind(')').unwrap()];
+        let (plat_release, arch) = inner.split_once(';').expect("应含 `;` 分隔: {ua}");
+        assert!(!plat_release.trim().is_empty() && !arch.trim().is_empty());
+        assert_eq!(plat_release.split_whitespace().count(), 2);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 移植自 oh-my-pi [`normalize.ts`](../../../third/oh-my-pi/packages/coding-agent/src/edit/normalize.ts)
 //! 的 `normalizeForFuzzy`。原供 SEARCH 类编辑工具在硬匹配失败时容错（行尾空白、fancy 引号 /
-//! 破折号、空白折叠差异）；该工具已随 str_replace/apply_diff 移除，此处保留为工具库。
+//! 破折号、空白折叠差异）；该工具已随 `str_replace/apply_diff` 移除，此处保留为工具库。
 //!
 //! ## 三级策略
 //!
@@ -37,7 +37,7 @@ impl FuzzyOpts {
     pub fn from_env() -> Self {
         let enabled = matches!(
             std::env::var("PI_EDIT_FUZZY").ok().as_deref(),
-            Some("on") | Some("1") | Some("true")
+            Some("on" | "1" | "true")
         );
         let threshold = std::env::var("PI_EDIT_FUZZY_THRESHOLD")
             .ok()
@@ -53,14 +53,6 @@ static FUZZY_OVERRIDE: std::sync::OnceLock<FuzzyOpts> = std::sync::OnceLock::new
 /// 设置全局 fuzzy 配置覆盖（装配层从 `[tools].edit` 读取后调用；优先于 env）。
 pub fn set_fuzzy_opts(opts: FuzzyOpts) {
     let _ = FUZZY_OVERRIDE.set(opts);
-}
-
-/// 解析 fuzzy 选项：配置覆盖 > 环境变量。
-pub(crate) fn resolve_opts() -> FuzzyOpts {
-    FUZZY_OVERRIDE
-        .get()
-        .copied()
-        .unwrap_or_else(FuzzyOpts::from_env)
 }
 
 /// 匹配方法。
@@ -272,13 +264,13 @@ fn normalize_for_fuzzy(line: &str) -> String {
     for ch in trimmed.chars() {
         match ch {
             '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{00AB}' | '\u{00BB}' => {
-                s.push('"')
+                s.push('"');
             }
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{0060}' | '\u{00B4}' => {
-                s.push('\'')
+                s.push('\'');
             }
             '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}' => {
-                s.push('-')
+                s.push('-');
             }
             ' ' | '\t' => {
                 if !s.ends_with(' ') {
@@ -306,7 +298,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=n {
         curr[0] = i;
         for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
@@ -346,7 +338,7 @@ fn is_non_empty_line(line: &str) -> bool {
     !line.trim().is_empty()
 }
 
-fn gcd(mut a: usize, mut b: usize) -> usize {
+const fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
         let t = b;
         b = a % b;
@@ -485,7 +477,7 @@ fn convert_leading_tabs_to_spaces(text: &str, spaces_per_tab: usize) -> String {
 /// 移植 oh-my-pi [`normalize.ts adjustIndentation`](../../../third/oh-my-pi/packages/coding-agent/src/edit/normalize.ts:303)。
 /// 仅在「均匀缩进偏移」或「tab↔space 转换」时调整；混合缩进或不一致则原样返回。
 ///
-/// 注：原消费工具 str_replace/apply_diff 已移除；保留为工具库，供未来 fuzzy 编辑能力复用。
+/// 注：原消费工具 `str_replace/apply_diff` 已移除；保留为工具库，供未来 fuzzy 编辑能力复用。
 #[must_use]
 #[allow(dead_code)]
 pub fn adjust_indentation(old_text: &str, actual_text: &str, new_text: &str) -> String {

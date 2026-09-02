@@ -145,10 +145,7 @@ pub fn mask_non_prose(text: &str) -> String {
                         .iter()
                         .position(|c| *c == '\n')
                         .map_or(n, |p| i + p);
-                    if let Some(pair) = chars[i + run..line_end]
-                        .iter()
-                        .position(|c| *c == '`')
-                    {
+                    if let Some(pair) = chars[i + run..line_end].iter().position(|c| *c == '`') {
                         let end = i + run + pair + 1;
                         blank_range(&mut chars, i, end);
                         i = end;
@@ -162,10 +159,7 @@ pub fn mask_non_prose(text: &str) -> String {
             '<' => {
                 // HTML 注释 `<!-- ... -->` 或标签（含自闭合与嵌套同名标签）。
                 if chars[i..].starts_with(&['<', '!', '-', '-']) {
-                    if let Some(end) = chars[i..]
-                        .windows(3)
-                        .position(|w| w == ['-', '-', '>'])
-                    {
+                    if let Some(end) = chars[i..].windows(3).position(|w| w == ['-', '-', '>']) {
                         let end = i + end + 3;
                         blank_range(&mut chars, i, end);
                         i = end;
@@ -307,7 +301,10 @@ mod tests {
     fn plain_prose_hits() {
         assert!(word_boundary_contains("orchestrate this", "orchestrate"));
         assert!(word_boundary_contains("请 ultrathink 分析", "ultrathink"));
-        assert!(word_boundary_contains("（orchestrate，继续）", "orchestrate"));
+        assert!(word_boundary_contains(
+            "（orchestrate，继续）",
+            "orchestrate"
+        ));
     }
 
     #[test]

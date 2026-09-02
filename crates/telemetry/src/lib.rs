@@ -2,11 +2,10 @@
 //!
 //! OpenTelemetry 遥测桥：初始化 OTLP/控制台 span exporter，将 `tracing` span 导出。
 //!
-//! 保持解耦：本 crate 依赖 OTel，而 `agent`/`core` 仅用 `tracing`（不依赖 OTel），
-//! 满足依赖洁癖守卫（核心 crate 不引入 OTel）。
+//! 保持解耦：本 crate 依赖 OTel，而 `agent`/`core` 仅用 `tracing`（不依赖 `OTel`），
+//! 满足依赖洁癖守卫（核心 crate 不引入 `OTel`）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::runtime::Tokio;

@@ -145,7 +145,7 @@ mod tests {
     fn openai_counter_runs() {
         let counter = TokenCounter::openai().expect("cl100k 加载");
         let n = counter.count_text("Hello, world!");
-        assert!(n >= 3 && n <= 6, "expected ~4 tokens, got {n}");
+        assert!((3..=6).contains(&n), "expected ~4 tokens, got {n}");
     }
 
     #[test]

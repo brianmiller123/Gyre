@@ -89,7 +89,7 @@ pub struct ApplyResult {
 /// 一次 hashline patch 应用到多文件的结果汇总。
 #[derive(Debug, Clone, Default)]
 pub struct PatchReport {
-    /// 逐文件结果：path → ApplyResult。
+    /// 逐文件结果：path → `ApplyResult`。
     pub files: BTreeMap<String, ApplyResult>,
     /// 跨文件告警。
     pub warnings: Vec<String>,

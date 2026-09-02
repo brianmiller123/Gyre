@@ -98,8 +98,8 @@ impl StopDetails {
     ///
     /// 移植 oh-my-pi [`recoverTransientErrorToolTurn`](https://github.com/can1357/oh-my-pi/blob/master/packages/agent/src/agent-loop.ts)
     /// 的「瞬时错误白名单」语义：仅当 provider 显式标记本轮 Error 为瞬时类（流读取 / 解析
-    /// 错误、流中断）时，agent 循环才把 stop_reason 改写为 ToolUse 续跑、执行已完成的工具，
-    /// 而非整轮废弃。refusal/sensitive 类（[`Self::is_refusal_like`]）不在此列；无 stop_details
+    /// 错误、流中断）时，agent 循环才把 `stop_reason` 改写为 `ToolUse` 续跑、执行已完成的工具，
+    /// 而非整轮废弃。refusal/sensitive 类（[`Self::is_refusal_like`]）不在此列；无 `stop_details`
     /// 的泛化 Error 也不恢复（保守，避免对未知错误形态误执行副作用工具）。
     #[must_use]
     pub fn is_transient_stream_error(&self) -> bool {
@@ -137,7 +137,7 @@ impl Usage {
 
     /// token 总数（输入 + 输出）。
     #[must_use]
-    pub fn total_tokens(&self) -> u64 {
+    pub const fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
 }
@@ -284,9 +284,9 @@ impl UserMessage {
 }
 
 /// 工具结果消息。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultMessage {
-    /// 对应的 tool_call_id。
+    /// 对应的 `tool_call_id`。
     pub tool_call_id: String,
     /// 结构化结果。
     pub result: ToolResult,
@@ -304,7 +304,7 @@ pub struct StatusMessage {
 impl StatusMessage {
     /// 类别的人类可读文本。
     #[must_use]
-    pub fn kind_text(&self) -> &'static str {
+    pub const fn kind_text(&self) -> &'static str {
         match self.kind {
             StatusKind::Info => "信息",
             StatusKind::Thinking => "思考",
@@ -401,14 +401,14 @@ pub enum ProviderMessage {
     },
     /// 工具结果。
     Tool {
-        /// 对应 tool_call_id。
+        /// 对应 `tool_call_id`。
         tool_call_id: String,
         /// 文本结果。
         content: String,
         /// 是否为错误结果。
         is_error: bool,
         /// 附带的图像（多模态工具结果；Anthropic 端可作为 image block 真实传递，
-        /// OpenAI 端 tool role 仅支持文本，自动降级为占位提示）。
+        /// `OpenAI` 端 tool role 仅支持文本，自动降级为占位提示）。
         images: Vec<ToolImage>,
     },
 }
@@ -439,7 +439,7 @@ impl AgentMessage {
 
     /// 从内容块（可含图像等多模态）构造用户消息的便捷方法。
     #[must_use]
-    pub fn user(content: Vec<UserContent>) -> Self {
+    pub const fn user(content: Vec<UserContent>) -> Self {
         Self::User(UserMessage { content })
     }
 }
@@ -553,7 +553,7 @@ pub enum AgentEvent {
         message: AssistantMessage,
         /// 本轮产出的工具结果（含实际执行与占位 skipped，按回填顺序）。
         tool_results: Vec<ToolResultMessage>,
-        /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / max_turns）。
+        /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / `max_turns`）。
         will_continue: bool,
     },
 

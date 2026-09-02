@@ -1,15 +1,16 @@
-//! `eval` 工具：向 LLM 暴露持久 Python 内核。
+//! `eval` 工具：向 LLM 暴露持久 Python / JavaScript 内核。
 
 use std::sync::Arc;
 
 use agent_core::{CapabilityTier, ToolError, ToolResult};
 use agent_tools::{Concurrency, Tool, ToolContext};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{BridgeServer, EvalError, EvalManager, EvalOutput};
 
-/// `eval` 工具：在持久 Python 内核中执行代码，内核内可经 `tool.<name>` 回调宿主工具。
+/// `eval` 工具：在持久内核中执行 Python（`"py"`，默认）或 JavaScript（`"js"`，需 node）
+/// 代码，内核内可经 `tool` 代理回调宿主工具。
 ///
 /// 执行经 [`EvalManager::execute`] 落盘；`ctx.cancel` 触发时中止（kill 内核并注销会话）。
 /// 环回桥**懒加载**：首次 execute 时按构造时注入的 registry/workspace/approval 在
@@ -17,7 +18,7 @@ use crate::{BridgeServer, EvalError, EvalManager, EvalOutput};
 /// 无法 await spawn，且 `/mode` 热切换重建 Agent 时新工具实例自然携带新审批策略。
 pub struct EvalTool {
     manager: Arc<EvalManager>,
-    /// 会话标签（cli 建议传 agent session_id；与 workspace 根拼成 session_key）。
+    /// 会话标签（cli 建议传 agent `session_id；与` workspace 根拼成 `session_key`）。
     session: String,
     /// 懒加载桥（首次 execute spawn，之后复用）。
     bridge: tokio::sync::OnceCell<Arc<BridgeServer>>,
@@ -48,7 +49,7 @@ impl EvalTool {
         }
     }
 
-    /// 构造并指定会话标签（session_key = `"{workspace 根}|{session}"`）。
+    /// `构造并指定会话标签（session_key` = `"{workspace 根}|{session}"`）。
     #[must_use]
     pub fn with_session(
         manager: Arc<EvalManager>,
@@ -85,15 +86,16 @@ impl EvalTool {
 
 #[async_trait]
 impl Tool for EvalTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "eval"
     }
 
-    fn description(&self) -> &str {
-        "在持久 Python 内核中执行代码（同一会话共享命名空间）。\n\
-         language 仅支持 \"py\"（默认）。keep=true（默认）保留内核供后续调用共享状态；\n\
-         keep=false 执行后立即回收。内核内置 `tool` 代理：`tool.<name>(**kwargs)` 会调用\n\
-         宿主的同名工具（如 tool.read_file(path=\"...\")），返回其输出；`tool.reset()` 清空\n\
+    fn description(&self) -> &'static str {
+        "在持久内核中执行代码（同一会话共享命名空间；python 与 js 各自独立内核）。\n\
+         language：\"py\"（Python，默认，需 python3）或 \"js\"（JavaScript/Node，需 node ≥18）。\n\
+         keep=true（默认）保留内核供后续调用共享状态；keep=false 执行后立即回收。内核内置\n\
+         `tool` 代理回调宿主工具：Python 侧 `tool.<name>(**kwargs)`，JS 侧\n\
+         `tool.call(name, args)` 或 `tool.<name>(args)`，返回其输出；`tool.reset()` 清空\n\
          命名空间。适合快速原型、数据处理与多步数值探索。"
     }
 
@@ -103,13 +105,13 @@ impl Tool for EvalTool {
             "properties": {
                 "language": {
                     "type": "string",
-                    "enum": ["py"],
+                    "enum": ["py", "js"],
                     "default": "py",
-                    "description": "代码语言（当前仅支持 \"py\"）"
+                    "description": "代码语言：\"py\"（Python，默认，别名 \"python\"）或 \"js\"（JavaScript，需 node，别名 \"javascript\"）"
                 },
                 "code": {
                     "type": "string",
-                    "description": "要执行的 Python 代码"
+                    "description": "要执行的代码（Python 或 JavaScript）"
                 },
                 "keep": {
                     "type": "boolean",
@@ -133,11 +135,7 @@ impl Tool for EvalTool {
         true
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let language = input
             .get("language")
             .and_then(Value::as_str)
@@ -153,7 +151,7 @@ impl Tool for EvalTool {
         let session_key = format!("{}|{}", ctx.workspace.root().display(), self.session);
         tokio::select! {
             biased;
-            _ = ctx.cancel.cancelled() => {
+            () = ctx.cancel.cancelled() => {
                 self.manager.abort(&session_key).await;
                 Err(ToolError::Execution("eval 执行被取消".into()))
             }

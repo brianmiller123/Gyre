@@ -64,7 +64,7 @@
   "tools.enabled": "[tools] {key} 已启用（工具与提示词已注入）",
   "tools.disabled": "[tools] {key} 已禁用（工具与提示词已屏蔽）",
   "tools.title": "╭─ 可选工具 ──────────────────────────────────────────",
-  "tools.core_line": "│ 核心工具（read_file/write_file/str_replace/apply_diff/list_files/run_command/grep/glob）始终启用",
+  "tools.core_line": "│ 核心工具（read_file/write_file/list_files/run_command/grep/glob/web_search）+ 会话工具（todo/ask/checkpoint/rewind/security_scan）始终启用",
   "tools.entry": "│ [{state}] {key:<9} {label}",
   "tools.hint_toggle": "│ 提示      : /tools <key> on|off 按需切换（仅启用时注入工具与提示词）",
   "tools.hint_config": "│           : 或配置 [tools].enabled.<key> = true 启动即开",

@@ -10,16 +10,16 @@ pub enum Api {
     /// Anthropic Messages API（Claude）。
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
-    /// OpenAI Responses API。
+    /// `OpenAI` Responses API。
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    /// OpenAI Chat Completions API（兼容网关/本地 vLLM 最广）。
+    /// `OpenAI` Chat Completions API（兼容网关/本地 vLLM 最广）。
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
-    /// DeepSeek API（基于 OpenAI 兼容，含 reasoning_content / R1 格式 / thinking 模式特化）。
+    /// `DeepSeek` API（基于 `OpenAI` 兼容，含 `reasoning_content` / R1 格式 / thinking 模式特化）。
     #[serde(rename = "deepseek")]
     DeepSeek,
-    /// GLM（智谱 / Z.ai）官方 API（OpenAI 兼容 + thinking 开关 + reasoning_content / preserveReasoning 特化）。
+    /// GLM（智谱 / Z.ai）官方 API（OpenAI 兼容 + thinking 开关 + `reasoning_content` / preserveReasoning 特化）。
     #[serde(rename = "zai")]
     Zai,
     /// Google Generative AI（Gemini）。
@@ -33,7 +33,7 @@ pub enum Api {
 impl Api {
     /// 线协议的人类可读标识。
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiResponses => "openai-responses",

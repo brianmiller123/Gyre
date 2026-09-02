@@ -54,20 +54,12 @@ impl Tool for McpTool {
 
 /// 多 MCP server 注册表：启动、握手、收集全部工具。
 ///
-/// 单个 server 失败（spawn/initialize/list_tools）不阻断其余；失败告警并跳过。
+/// 单个 server `失败（spawn/initialize/list_tools）不阻断其余；失败告警并跳过`。
+#[derive(Default)]
 pub struct McpRegistry {
     /// server 名 → client（按 `[mcp.servers]` 配置顺序；既保活又供 `mcp://` 资源路由）。
     named: Vec<(String, Arc<McpClient>)>,
     tools: Vec<McpTool>,
-}
-
-impl Default for McpRegistry {
-    fn default() -> Self {
-        Self {
-            named: Vec::new(),
-            tools: Vec::new(),
-        }
-    }
 }
 
 impl McpRegistry {

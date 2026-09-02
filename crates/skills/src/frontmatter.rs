@@ -13,7 +13,7 @@ use agent_core::Mode;
 
 /// 解析出的 frontmatter。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Frontmatter {
+pub struct Frontmatter {
     /// skill 名（缺省取目录名）。
     pub name: Option<String>,
     /// 描述（native provider 必填）。
@@ -28,7 +28,7 @@ pub(crate) struct Frontmatter {
 
 /// 解析结果。
 #[derive(Debug, Clone)]
-pub(crate) struct ParsedSkillFile {
+pub struct ParsedSkillFile {
     /// frontmatter。
     pub frontmatter: Frontmatter,
     /// 正文（已剥离 frontmatter）；保留供未来 `/skill:<name>` 命令注入正文使用。
@@ -37,7 +37,7 @@ pub(crate) struct ParsedSkillFile {
 }
 
 /// 解析 SKILL.md 内容。
-pub(crate) fn parse_skill_file(content: &str) -> ParsedSkillFile {
+pub fn parse_skill_file(content: &str) -> ParsedSkillFile {
     let (fm, body) = split_frontmatter(content);
     let frontmatter = parse_fields(fm.as_deref());
     ParsedSkillFile { frontmatter, body }
@@ -133,7 +133,7 @@ fn collect_block_items(lines: &[&str], i: &mut usize) -> Vec<String> {
 
 /// 解析内联数组 `[a, b, c]`。
 fn parse_inline_array(value: &str) -> Vec<String> {
-    let start = value.find('[').map(|p| p + 1).unwrap_or(0);
+    let start = value.find('[').map_or(0, |p| p + 1);
     let end = value.rfind(']').unwrap_or(value.len());
     let inner = &value[start..end];
     inner
@@ -161,10 +161,8 @@ fn apply_scalar(out: &mut Frontmatter, key: &str, value: &str) {
         "name" => out.name = Some(value.to_string()),
         "description" => out.description = Some(value.to_string()),
         "hide" => out.hide = value.eq_ignore_ascii_case("true"),
-        "disable-model-invocation" => {
-            if value.eq_ignore_ascii_case("true") {
-                out.hide = true;
-            }
+        "disable-model-invocation" if value.eq_ignore_ascii_case("true") => {
+            out.hide = true;
         }
         _ => {}
     }
@@ -178,10 +176,8 @@ fn apply_array(out: &mut Frontmatter, key: &str, items: Vec<String>) {
                 out.modes = Some(modes);
             }
         }
-        "globs" => {
-            if !items.is_empty() {
-                out.globs = Some(items);
-            }
+        "globs" if !items.is_empty() => {
+            out.globs = Some(items);
         }
         _ => {}
     }

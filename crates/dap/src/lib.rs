@@ -18,7 +18,6 @@
 //! （`stack_trace` / `threads` / `variables` 等）读取，不阻塞工具返回。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod error;
 mod frame;

@@ -11,7 +11,7 @@
     clippy::cast_sign_loss
 )]
 
-use ab_glyph::{FontArc, Font, Glyph, OutlinedGlyph, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, Glyph, OutlinedGlyph, PxScale, ScaleFont};
 use image::GrayImage;
 use std::io::Cursor;
 
@@ -94,8 +94,8 @@ pub fn render_frame(page: &str, shape: &Shape) -> Result<Frame, RenderError> {
                 glyph = font.glyph_id('?');
             }
             let id = glyph;
-            let glyph: Glyph = glyph
-                .with_scale_and_position(scale, ab_glyph::point(pen_x, baseline));
+            let glyph: Glyph =
+                glyph.with_scale_and_position(scale, ab_glyph::point(pen_x, baseline));
             if let Some(outlined) = font.outline_glyph(glyph) {
                 paint_outlined(&mut img, &outlined);
             }
@@ -121,7 +121,10 @@ pub fn render_frame(page: &str, shape: &Shape) -> Result<Frame, RenderError> {
 /// 把一个已定位字形绘制到图像（逐像素 alpha 覆盖）。
 fn paint_outlined(img: &mut GrayImage, outlined: &OutlinedGlyph) {
     let bounds = outlined.px_bounds();
-    let (ox, oy) = (i64::from(bounds.min.x as u32), i64::from(bounds.min.y as u32));
+    let (ox, oy) = (
+        i64::from(bounds.min.x as u32),
+        i64::from(bounds.min.y as u32),
+    );
     outlined.draw(|x, y, cover| {
         let px = ox + i64::from(x);
         let py = oy + i64::from(y);
@@ -164,7 +167,10 @@ mod tests {
 
     #[test]
     fn caps_lines_at_frame_rows() {
-        let page = (0..200).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let page = (0..200)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let frame = render_frame(&page, &crate::DEFAULT_SHAPE).unwrap();
         assert_eq!(frame.height, 98 * 16, "超出行数被裁剪");
     }

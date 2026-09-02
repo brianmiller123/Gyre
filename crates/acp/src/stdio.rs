@@ -4,20 +4,34 @@
 //!
 //! `session/prompt` 是请求（有 id），需阻塞到 prompt turn 完成后才返回 `PromptResponse`。
 //! 在此期间，`session/update` 通知持续写入 stdout；同时监听 stdin 以处理
-//! `session/cancel` 通知（用户取消）。turn 完成后写入最终响应。
+//! `session/cancel` 通知（用户取消）与 JSON-RPC 响应（权限回执）。turn 完成后写入最终响应。
+//!
+//! ## 权限交互（`session/request_permission`）
+//!
+//! turn 进行中收到 [`ServerFrame::Ask`]（工具审批 / 追问）时不再丢弃：转为 JSON-RPC
+//! **请求** `session/request_permission` 写入 stdout（params 按 ACP v1），并登记待回执。
+//! 客户端对同一 id 写回 JSON-RPC 响应，outcome 映射为 [`AskResponse`] 后经
+//! `ClientFrame::Respond` 投递到会话 inbound 通道（与 Web 前端同一 pending 通道），
+//! 被阻塞的工具审批 / 询问继续执行。等待上限 [`crate::rpc::PERMISSION_TIMEOUT_SECS`]
+//! （10 分钟）：超时按拒绝处理并以 `session/update` 通知注明。
 //!
 //! stdout 写入采用同步方式（`std::io::stdout` lock + flush），避免异步 writer task
 //! 在进程退出时被 runtime 中断导致输出丢失。stdout 写极快，阻塞可忽略。
 
 use std::io::Write;
 
-use agent_server::{ClientFrame, SessionManager};
+use agent_server::{ClientFrame, ServerFrame, SessionManager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::adapter::{is_terminal_frame, server_frame_to_acp};
-use crate::rpc::{dispatch_rpc, extract_prompt_text, parse_error_line, start_prompt};
+use crate::rpc::{
+    PendingPermissions, ResolvedPermission, dispatch_rpc, expired_permissions, extract_prompt_text,
+    is_rpc_response, parse_error_line, permission_request, permission_timeout_resolution,
+    register_permission, resolve_permission_response, start_prompt,
+};
 use crate::types::{
     AcpError, JsonRpcError, JsonRpcRequest, JsonRpcResponse, SessionNotification, SessionUpdate,
+    TextContent,
 };
 
 /// stdio 模式：阻塞读取 stdin 直到 EOF，处理 JSON-RPC 请求并向 stdout 写响应与事件。
@@ -84,7 +98,7 @@ pub async fn run_stdio(state: SessionManager) -> Result<(), AcpError> {
 
 /// 处理一次 `session/prompt` turn：投递消息 → 持续推送 session/update → 返回 PromptResponse。
 ///
-/// 使用 `select!` 同时监听 broadcast（agent 事件）和 stdin（cancel 通知），
+/// 使用 `select!` 同时监听 broadcast（agent 事件）和 stdin（cancel 通知 / 权限回执），
 /// 直到收到终止帧（Done/Error）。
 async fn handle_prompt_turn<R>(
     state: &SessionManager,
@@ -161,7 +175,7 @@ async fn handle_prompt_turn<R>(
     }
 }
 
-/// prompt turn 主循环：消费 broadcast 事件推送通知，同时监听 stdin cancel。
+/// prompt turn 主循环：消费 broadcast 事件推送通知，同时监听 stdin 与权限超时。
 ///
 /// 返回 `stopReason` 字符串或错误。
 async fn run_prompt_loop<R>(
@@ -177,12 +191,22 @@ where
 
     let mut rx = start_prompt(state, session_id, prompt_text).await?;
     let mut cancel_buf = String::new();
+    // 待回执权限请求（session/request_permission → 客户端 JSON-RPC 响应）。
+    let mut pending = PendingPermissions::new();
 
     loop {
+        // 最早到期的权限截止时刻；无待回执时超时分支永久挂起。
+        let next_deadline = pending.values().map(|p| p.deadline).min();
         tokio::select! {
             biased;
             // 优先消费 agent 事件。
             frame_result = rx.recv() => match frame_result {
+                // 审批/追问：转为 session/request_permission 请求发给客户端，不阻塞事件循环。
+                Ok(ServerFrame::Ask { ask }) => {
+                    let rpc_id = register_permission(&mut pending, session_id, &ask);
+                    let request = permission_request(rpc_id, session_id, &ask);
+                    write_line(&serde_json::to_string(&request).unwrap_or_default());
+                }
                 Ok(frame) => {
                     if is_terminal_frame(&frame) {
                         return Ok(crate::rpc::stop_reason(&frame));
@@ -194,7 +218,7 @@ where
                 Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return Ok("end_turn"),
             },
-            // 同时监听 stdin：处理 session/cancel 通知。
+            // 同时监听 stdin：处理 session/cancel 通知与权限回执。
             n = reader.read_line(&mut cancel_buf) => {
                 let n = n.unwrap_or(0);
                 if n == 0 {
@@ -203,34 +227,106 @@ where
                 }
                 let trimmed = cancel_buf.trim();
                 if !trimmed.is_empty() {
-                    if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
-                        if req.method == "session/cancel" {
-                            if let Some(session) = state.get(session_id).await {
-                                let _ = session.inbound.send(ClientFrame::Cancel);
-                            }
-                        } else {
-                            // 非 cancel 请求：立即 dispatch 并写响应，避免消息丢失。
-                            let id = req.id.clone();
-                            match dispatch_rpc(state, &req).await {
-                                Ok(result) => {
-                                    if let Some(id) = id {
-                                        let resp = JsonRpcResponse { jsonrpc: "2.0".into(), id: Some(id), result };
-                                        write_line(&serde_json::to_string(&resp).unwrap_or_default());
-                                    }
-                                }
-                                Err(err) => {
-                                    if let Some(id) = id {
-                                        let resp = JsonRpcError { jsonrpc: "2.0".into(), id: Some(id), error: err };
-                                        write_line(&serde_json::to_string(&resp).unwrap_or_default());
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    handle_stdio_line(state, session_id, &mut pending, trimmed).await;
                 }
                 cancel_buf.clear();
             }
+            // 权限等待超时：按拒绝处理并以 session/update 注明。
+            _ = permission_deadline(next_deadline) => {
+                for entry in expired_permissions(&mut pending) {
+                    deliver_resolution(state, permission_timeout_resolution(entry)).await;
+                }
+            }
         }
+    }
+}
+
+/// 等待到最早的权限回执截止时刻；无待回执项时永久挂起。
+async fn permission_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// 处理 prompt turn 期间 stdin 的一行输入。
+///
+/// 先识别 JSON-RPC 响应（客户端回答 `session/request_permission`），
+/// 再按请求/通知走既有分发（`session/cancel` 作用于当前 turn 的会话）。
+async fn handle_stdio_line(
+    state: &SessionManager,
+    session_id: &str,
+    pending: &mut PendingPermissions,
+    line: &str,
+) {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            write_line(&parse_error_line(e.to_string()));
+            return;
+        }
+    };
+
+    if is_rpc_response(&value) {
+        match resolve_permission_response(pending, &value) {
+            Some(resolved) => deliver_resolution(state, resolved).await,
+            None => tracing::debug!("收到未知 id 的 JSON-RPC 响应，忽略"),
+        }
+        return;
+    }
+
+    let Ok(req) = serde_json::from_value::<JsonRpcRequest>(value) else {
+        return;
+    };
+    if req.method == "session/cancel" {
+        if let Some(session) = state.get(session_id).await {
+            let _ = session.inbound.send(ClientFrame::Cancel);
+        }
+        return;
+    }
+    // 其他请求：立即 dispatch 并写响应，避免消息丢失。
+    let id = req.id.clone();
+    match dispatch_rpc(state, &req).await {
+        Ok(result) => {
+            if let Some(id) = id {
+                let resp = JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: Some(id),
+                    result,
+                };
+                write_line(&serde_json::to_string(&resp).unwrap_or_default());
+            }
+        }
+        Err(err) => {
+            if let Some(id) = id {
+                let resp = JsonRpcError {
+                    jsonrpc: "2.0".into(),
+                    id: Some(id),
+                    error: err,
+                };
+                write_line(&serde_json::to_string(&resp).unwrap_or_default());
+            }
+        }
+    }
+}
+
+/// 将已解析的权限回执经 `ClientFrame::Respond` 投递到会话 inbound 通道
+/// （驱动任务据此解析 pending oneshot，与 Web 前端回执同一路径），
+/// 存在说明文案（超时 / 错误 / 无法解析）时以 `session/update` 告知客户端。
+async fn deliver_resolution(state: &SessionManager, resolved: ResolvedPermission) {
+    if let Some(session) = state.get(&resolved.session_id).await {
+        let _ = session.inbound.send(ClientFrame::Respond {
+            ask_id: resolved.ask_id,
+            response: resolved.response,
+        });
+    }
+    if let Some(note) = resolved.note {
+        push_update(
+            &resolved.session_id,
+            SessionUpdate::AgentMessageChunk {
+                content: TextContent::new(note),
+            },
+        );
     }
 }
 

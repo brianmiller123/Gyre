@@ -197,7 +197,6 @@ fn default_jsonrpc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
 
     #[test]
     fn session_notification_serializes_to_standard_acp() {

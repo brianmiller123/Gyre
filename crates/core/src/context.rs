@@ -75,7 +75,7 @@ pub enum CompactionStrategy {
     Shake,
 }
 
-/// 压缩后端选择（装配期从配置解析，注入 AgentBuilder）。
+/// 压缩后端选择（装配期从配置解析，注入 `AgentBuilder`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionBackend {
     /// 本地 LLM handoff 摘要（默认，向后兼容）。
@@ -106,7 +106,7 @@ pub struct SessionNode {
 impl SessionNode {
     /// 构造一个根节点（无父）。
     #[must_use]
-    pub fn root(id: NodeId, message: AgentMessage) -> Self {
+    pub const fn root(id: NodeId, message: AgentMessage) -> Self {
         Self {
             id,
             parent_id: None,
@@ -116,7 +116,7 @@ impl SessionNode {
 
     /// 构造一个带父节点的子节点。
     #[must_use]
-    pub fn child(id: NodeId, parent_id: NodeId, message: AgentMessage) -> Self {
+    pub const fn child(id: NodeId, parent_id: NodeId, message: AgentMessage) -> Self {
         Self {
             id,
             parent_id: Some(parent_id),
@@ -130,7 +130,7 @@ impl SessionNode {
 /// 实现要点（移植 oh-my-pi `append-only-context`）：
 /// - [`ContextManager::append`] 是日常唯一变异路径（AppendOnlyLog 只追加）。
 /// - [`ContextManager::build_provider_context`] 经 transformContext → convertToLlm →
-///   StablePrefix 冻结，产出稳定字节序列以最大化 provider 前缀缓存命中。
+///   `StablePrefix` 冻结，产出稳定字节序列以最大化 provider 前缀缓存命中。
 /// - [`ContextManager::compact`] 是除 append 外唯一可 replaceTail 的合法路径。
 #[async_trait::async_trait]
 pub trait ContextManager: Send + Sync {
@@ -179,7 +179,7 @@ pub trait ContextManager: Send + Sync {
         Usage::default()
     }
 
-    /// StablePrefix 指纹（缓存命中判断）。
+    /// `StablePrefix` 指纹（缓存命中判断）。
     fn prefix_fingerprint(&self) -> String;
 
     // ── 会话树 / 分支导航（P1-3）─────────────────────────────────────────

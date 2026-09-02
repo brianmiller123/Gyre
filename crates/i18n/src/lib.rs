@@ -25,7 +25,6 @@
 //! ```
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use std::collections::HashMap;
 use std::fmt;

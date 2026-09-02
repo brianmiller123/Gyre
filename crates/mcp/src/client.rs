@@ -125,7 +125,7 @@ impl McpClient {
                             let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                                 continue;
                             };
-                            if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
+                            if let Some(id) = val.get("id").and_then(serde_json::Value::as_u64) {
                                 let mut p = pending_clone.lock().await;
                                 if let Some(tx) = p.remove(&id) {
                                     let _ = tx.send(val);

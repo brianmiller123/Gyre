@@ -126,7 +126,8 @@ impl ConflictHistory {
     pub fn remove(&mut self, id: usize) {
         if let Some(pos) = self.blocks.iter().position(|b| b.id == id) {
             let block = self.blocks.remove(pos);
-            self.by_key.remove(&format!("{}:{}", block.path, block.start_line));
+            self.by_key
+                .remove(&format!("{}:{}", block.path, block.start_line));
         }
     }
 
@@ -181,9 +182,8 @@ pub fn scan_conflict_blocks(lines: &[&str]) -> Vec<RawBlock> {
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_end();
-        let is_marker = |prefix: &str| {
-            trimmed == prefix || trimmed.starts_with(&format!("{prefix} "))
-        };
+        let is_marker =
+            |prefix: &str| trimmed == prefix || trimmed.starts_with(&format!("{prefix} "));
         match phase {
             Phase::Idle => {
                 if is_marker("<<<<<<<") {
@@ -264,7 +264,9 @@ pub fn block_to_entry(raw: &RawBlock, path: &str) -> ConflictBlock {
 pub fn register_all(history: &mut ConflictHistory, path: &str, text: &str) -> Vec<usize> {
     let lines: Vec<&str> = text.lines().collect();
     let raw = scan_conflict_blocks(&lines);
-    raw.iter().map(|r| history.register(block_to_entry(r, path))).collect()
+    raw.iter()
+        .map(|r| history.register(block_to_entry(r, path)))
+        .collect()
 }
 
 /// 解析 `conflict://` 目标：`conflict://<N>`、`conflict://<N>/<side>`、`conflict://*`。
@@ -332,7 +334,11 @@ pub fn expand_content_tokens(content: &str, block: &ConflictBlock) -> Result<Str
 ///
 /// # Errors
 /// 行号越界或标记行不匹配（文件已变化）时返回错误。
-pub fn splice_block(current_text: &str, block: &ConflictBlock, replacement: &str) -> Result<String, String> {
+pub fn splice_block(
+    current_text: &str,
+    block: &ConflictBlock,
+    replacement: &str,
+) -> Result<String, String> {
     // 按 1-based 行号定位字节区间。
     let mut line_starts: Vec<usize> = Vec::new();
     let mut offset = 0usize;
@@ -345,7 +351,12 @@ pub fn splice_block(current_text: &str, block: &ConflictBlock, replacement: &str
         .start_line
         .checked_sub(1)
         .and_then(|i| line_starts.get(i).copied())
-        .ok_or_else(|| format!("冲突 #{}({}) 行号越界，文件已变化？请重新 :conflicts 扫描", block.id, block.path))?;
+        .ok_or_else(|| {
+            format!(
+                "冲突 #{}({}) 行号越界，文件已变化？请重新 :conflicts 扫描",
+                block.id, block.path
+            )
+        })?;
     let end_off = block
         .end_line
         .checked_sub(1)
@@ -369,11 +380,7 @@ pub fn splice_block(current_text: &str, block: &ConflictBlock, replacement: &str
             .position(|l| *l == block.markers.1)
             .is_some_and(|p| sep_pos.is_some_and(|s| p < s))
     };
-    if first != block.markers.0
-        || last != block.markers.3
-        || sep_pos.is_none()
-        || !base_ok
-    {
+    if first != block.markers.0 || last != block.markers.3 || sep_pos.is_none() || !base_ok {
         return Err(format!(
             "冲突 #{}({}) 区域内容已变化（标记行不匹配），拒绝写入；请重新 :conflicts 扫描",
             block.id, block.path
@@ -406,11 +413,13 @@ mod tests {
     use super::*;
 
     fn sample_2way() -> String {
-        "line1\n<<<<<<< HEAD\nours-a\nours-b\n=======\ntheirs-a\n>>>>>>> branch\nline9\n".to_string()
+        "line1\n<<<<<<< HEAD\nours-a\nours-b\n=======\ntheirs-a\n>>>>>>> branch\nline9\n"
+            .to_string()
     }
 
     fn sample_3way() -> String {
-        "line1\n<<<<<<< HEAD\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> branch\nline9\n".to_string()
+        "line1\n<<<<<<< HEAD\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> branch\nline9\n"
+            .to_string()
     }
 
     #[test]
@@ -495,7 +504,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let raw = &scan_conflict_blocks(&lines)[0];
         let block = block_to_entry(raw, "a.txt");
-        let out = splice_block(&text, &block, "resolved").unwrap();
+        let out = splice_block(text, &block, "resolved").unwrap();
         assert_eq!(out, "line1\r\nresolved\r\nline9\r\n");
     }
 
@@ -516,8 +525,14 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let raw = &scan_conflict_blocks(&lines)[0];
         let block = block_to_entry(raw, "a.txt");
-        assert_eq!(expand_content_tokens("@ours", &block).unwrap(), "ours-a\nours-b");
-        assert_eq!(expand_content_tokens("@theirs", &block).unwrap(), "theirs-a");
+        assert_eq!(
+            expand_content_tokens("@ours", &block).unwrap(),
+            "ours-a\nours-b"
+        );
+        assert_eq!(
+            expand_content_tokens("@theirs", &block).unwrap(),
+            "theirs-a"
+        );
         assert!(expand_content_tokens("@base", &block).is_err()); // 2-way 无 base
         assert_eq!(
             expand_content_tokens("@both", &block).unwrap(),

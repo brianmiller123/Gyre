@@ -13,10 +13,10 @@ pub struct ReplaceBlockTool;
 
 #[async_trait]
 impl Tool for ReplaceBlockTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "replace_block"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "用 tree-sitter 解析文件，将「某行起始的句法块」（如函数/结构体/方法）整体替换为新内容。当前支持 Rust。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -45,7 +45,7 @@ impl Tool for ReplaceBlockTool {
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `path`".into()))?;
         let line = input
             .get("line")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `line`".into()))? as u32;
         let content = input
             .get("content")
@@ -104,10 +104,10 @@ pub struct AstSearchTool;
 
 #[async_trait]
 impl Tool for AstSearchTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ast_search"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "用 ast-grep 按结构化 pattern 在源码文件中搜索（支持 $X / $$$Y meta 变量），\
 返回每处匹配的行号与片段。多语言：rust/python/javascript/typescript/go。"
     }
@@ -209,10 +209,10 @@ pub struct PendingRewrite {
 
 #[async_trait]
 impl Tool for AstRewriteTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ast_rewrite"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "用 ast-grep 按结构化 pattern 重写源码文件（支持 $X / $$$Y meta 变量，原地改写）。\
 多语言：rust/python/javascript/typescript/go。"
     }
@@ -269,7 +269,7 @@ impl Tool for AstRewriteTool {
         // 暂存模式：预览替换计数 + 新文本，不落盘；应用经 `write_file xd://resolve`。
         let preview = input
             .get("preview")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if preview {
             let matches = agent_ast::search(&text, lang, pattern, strictness)
@@ -387,7 +387,7 @@ mod tests {
     use crate::Tool;
     use agent_core::{ApprovalDecision, ApprovalRequest, Workspace};
 
-    fn auto_ctx<'a>(ws: &'a Workspace) -> ToolContext<'a> {
+    fn auto_ctx(ws: &Workspace) -> ToolContext<'_> {
         struct Auto;
         #[async_trait::async_trait]
         impl agent_core::ApprovalPolicy for Auto {
@@ -415,6 +415,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         }
     }
 

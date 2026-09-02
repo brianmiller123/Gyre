@@ -1,5 +1,5 @@
 //! 验证 skill 发现：扫描当前 cwd 的 skill，打印并演示 skill:// 解析。
-//! 用法（在项目根）：cargo run -p agent-skills --example verify_skills
+//! 用法（在项目根）：cargo run -p agent-skills --example `verify_skills`
 
 use agent_core::{SkillLoadOptions, SkillResolver};
 use agent_skills::SkillRegistry;

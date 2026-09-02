@@ -40,7 +40,7 @@ pub fn jaccard_similarity(tokens_a: &[String], tokens_b: &[String]) -> f64 {
 /// 单字级 tokenize 下“的/了/在”等虚词为所有中文记录共享，抬高 Jaccard 与
 /// containment 的假交集；过滤后相似度只反映实词重叠。注意：**不参与 BM25 检索**
 /// （检索停用词另见 [`super::synonyms::STOP_WORDS`]，默认未启用）。
-const CJK_STOP_CHARS: &str = "的了在是与和及或等对为从到于之其被把让给也都还很更最就又并而但且只才已曾正将这那我你他她它它们不有无上下中内外前后间时后年里来出过个些样种" ;
+const CJK_STOP_CHARS: &str = "的了在是与和及或等对为从到于之其被把让给也都还很更最就又并而但且只才已曾正将这那我你他她它它们不有无上下中内外前后间时后年里来出过个些样种";
 
 /// 过滤中文停用单字（MMR 相似度输入专用）：保留拉丁/数字 token 与中文实词单字。
 ///
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn strip_cjk_stop_chars_filters_only_single_cjk_virtual_chars() {
         // 单字中文虚词被过滤；实词单字、拉丁词、多字串保留。
-        let t = strip_cjk_stop_chars(&vec![
+        let t = strip_cjk_stop_chars(&[
             "了".into(),
             "的".into(),
             "修复".into(),
@@ -214,7 +214,10 @@ mod tests {
     #[test]
     fn mmr_single_and_limit() {
         assert_eq!(mmr_rerank_indices(1, &[1.0], |_, _| 0.0, 0.7, 5), vec![0]);
-        assert_eq!(mmr_rerank_indices(0, &[], |_, _| 0.0, 0.7, 5), Vec::<usize>::new());
+        assert_eq!(
+            mmr_rerank_indices(0, &[], |_, _| 0.0, 0.7, 5),
+            Vec::<usize>::new()
+        );
         let idx = mmr_rerank_indices(4, &[1.0; 4], |_, _| 0.0, 0.7, 2);
         assert_eq!(idx.len(), 2);
     }

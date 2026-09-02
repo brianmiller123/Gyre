@@ -92,12 +92,13 @@ impl RulesEngine {
             return None;
         }
         match self.agent.mode {
-            Mode::Ask => Some(ApprovalDecision::Deny(
-                "ask 模式为只读，禁止任何写操作",
-            )),
+            Mode::Ask => Some(ApprovalDecision::Deny("ask 模式为只读，禁止任何写操作")),
             Mode::Architect | Mode::Plan => {
-                if architect_write_allowed(request.tool, request.args, self.workspace_root.as_deref())
-                {
+                if architect_write_allowed(
+                    request.tool,
+                    request.args,
+                    self.workspace_root.as_deref(),
+                ) {
                     Some(ApprovalDecision::Allow)
                 } else {
                     Some(ApprovalDecision::Deny(
@@ -248,9 +249,7 @@ fn architect_write_allowed(
     if targets.is_empty() {
         return false;
     }
-    targets
-        .iter()
-        .all(|t| is_plans_markdown(t, workspace_root))
+    targets.iter().all(|t| is_plans_markdown(t, workspace_root))
 }
 
 /// 收集写工具的目标文件路径（相对工作区根的原始字符串，可能多个）。
@@ -407,9 +406,7 @@ fn matches_any(rules: &[CommandPattern], command: &str, is_deny: bool) -> bool {
         return false;
     }
     rules.iter().any(|rule| {
-        glob::Pattern::new(rule.pattern())
-            .map(|compiled| compiled.matches(command))
-            .unwrap_or(false)
+        glob::Pattern::new(rule.pattern()).is_ok_and(|compiled| compiled.matches(command))
     })
 }
 
@@ -424,8 +421,10 @@ mod tests {
     use agent_core::{ApprovalRequest, CapabilityTier, Mode};
 
     fn engine(mode: ApprovalMode) -> RulesEngine {
-        let mut agent = AgentConfig::default();
-        agent.approval_mode = mode;
+        let agent = AgentConfig {
+            approval_mode: mode,
+            ..Default::default()
+        };
         RulesEngine::new(Arc::new(agent))
     }
 
@@ -537,13 +536,15 @@ ask = []
     fn yolo_overrides_per_tool_ask() {
         // yolo 为判定链最高优先级：逐工具 ask/prompt 也被压过，全自动放行。
         // （config.example.toml 默认带 run_command = "ask"，yolo 必须能压过它才真正全自动。）
-        let mut agent = AgentConfig::default();
-        agent.approval_mode = ApprovalMode::Yolo;
         let mut tools = ToolsConfig::default();
         tools
             .approval
             .insert("run_command".into(), ToolApproval::Ask);
-        agent.tools = tools;
+        let agent = AgentConfig {
+            approval_mode: ApprovalMode::Yolo,
+            tools,
+            ..Default::default()
+        };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
             e.decide(&req("run_command", CapabilityTier::Execute, Some("ls"))),
@@ -554,14 +555,16 @@ ask = []
     #[test]
     fn yolo_overrides_command_ask_glob() {
         // yolo 压过命令级 ask glob（docker * 不再弹确认）。
-        let mut agent = AgentConfig::default();
-        agent.approval_mode = ApprovalMode::Yolo;
-        agent.commands = CommandRules {
-            allow: vec![],
-            deny: vec![],
-            ask: vec![CommandPattern::Simple("docker *".into())],
-            interceptor: Default::default(),
-            minimizer: Default::default(),
+        let agent = AgentConfig {
+            approval_mode: ApprovalMode::Yolo,
+            commands: CommandRules {
+                allow: vec![],
+                deny: vec![],
+                ask: vec![CommandPattern::Simple("docker *".into())],
+                interceptor: Default::default(),
+                minimizer: Default::default(),
+            },
+            ..Default::default()
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -577,13 +580,15 @@ ask = []
     #[test]
     fn yolo_still_respects_per_tool_deny() {
         // 安全护栏：yolo 不压过逐工具 deny。
-        let mut agent = AgentConfig::default();
-        agent.approval_mode = ApprovalMode::Yolo;
         let mut tools = ToolsConfig::default();
         tools
             .approval
             .insert("write_file".into(), ToolApproval::Deny);
-        agent.tools = tools;
+        let agent = AgentConfig {
+            approval_mode: ApprovalMode::Yolo,
+            tools,
+            ..Default::default()
+        };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
             e.decide(&req("write_file", CapabilityTier::Write, None)),
@@ -594,14 +599,16 @@ ask = []
     #[test]
     fn yolo_still_respects_command_deny_blacklist() {
         // 安全护栏：yolo 不压过命令 deny 黑名单（rm -rf * 仍拦截）。
-        let mut agent = AgentConfig::default();
-        agent.approval_mode = ApprovalMode::Yolo;
-        agent.commands = CommandRules {
-            allow: vec![],
-            deny: vec![CommandPattern::Simple("rm -rf *".into())],
-            ask: vec![],
-            interceptor: Default::default(),
-            minimizer: Default::default(),
+        let agent = AgentConfig {
+            approval_mode: ApprovalMode::Yolo,
+            commands: CommandRules {
+                allow: vec![],
+                deny: vec![CommandPattern::Simple("rm -rf *".into())],
+                ask: vec![],
+                interceptor: Default::default(),
+                minimizer: Default::default(),
+            },
+            ..Default::default()
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -625,13 +632,15 @@ ask = []
 
     #[test]
     fn command_allowlist_allows() {
-        let mut agent = AgentConfig::default();
-        agent.commands = CommandRules {
-            allow: vec![CommandPattern::Simple("git status".into())],
-            deny: vec![],
-            ask: vec![],
-            interceptor: Default::default(),
-            minimizer: Default::default(),
+        let agent = AgentConfig {
+            commands: CommandRules {
+                allow: vec![CommandPattern::Simple("git status".into())],
+                deny: vec![],
+                ask: vec![],
+                interceptor: Default::default(),
+                minimizer: Default::default(),
+            },
+            ..Default::default()
         };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
@@ -661,9 +670,11 @@ ask = []
     }
 
     fn engine_with(mode: Mode, approval: ApprovalMode) -> RulesEngine {
-        let mut agent = AgentConfig::default();
-        agent.mode = mode;
-        agent.approval_mode = approval;
+        let agent = AgentConfig {
+            mode,
+            approval_mode: approval,
+            ..Default::default()
+        };
         RulesEngine::new(Arc::new(agent))
     }
 
@@ -818,14 +829,16 @@ ask = []
     #[test]
     fn per_tool_allow_cannot_bypass_ask_readonly() {
         // ask 只读为硬契约：显式逐工具 allow 仍被模式约束拒绝（步骤 2 先于步骤 3）。
-        let mut agent = AgentConfig::default();
-        agent.mode = Mode::Ask;
-        agent.approval_mode = ApprovalMode::AlwaysAsk;
         let mut tools = ToolsConfig::default();
         tools
             .approval
             .insert("write_file".into(), ToolApproval::Allow);
-        agent.tools = tools;
+        let agent = AgentConfig {
+            mode: Mode::Ask,
+            approval_mode: ApprovalMode::AlwaysAsk,
+            tools,
+            ..Default::default()
+        };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
             e.decide(&req("write_file", CapabilityTier::Write, None)),
@@ -904,14 +917,16 @@ ask = []
     #[test]
     fn per_tool_prompt_overrides_code_mode_auto_write() {
         // 逐工具覆盖优先级最高：code 模式下显式 prompt 仍询问（逃生舱）。
-        let mut agent = AgentConfig::default();
-        agent.mode = Mode::Code;
-        agent.approval_mode = ApprovalMode::AlwaysAsk;
         let mut tools = ToolsConfig::default();
         tools
             .approval
             .insert("write_file".into(), ToolApproval::Prompt);
-        agent.tools = tools;
+        let agent = AgentConfig {
+            mode: Mode::Code,
+            approval_mode: ApprovalMode::AlwaysAsk,
+            tools,
+            ..Default::default()
+        };
         let e = RulesEngine::new(Arc::new(agent));
         assert!(matches!(
             e.decide(&req("write_file", CapabilityTier::Write, None)),

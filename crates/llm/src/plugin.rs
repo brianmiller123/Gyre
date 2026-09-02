@@ -28,6 +28,7 @@ impl inventory::Collect for LlmProviderPlugin {
 }
 
 /// 收集所有自荐的 Provider 插件（用共享 `client` 构造），返回可注册的 trait object 列表。
+#[must_use]
 pub fn collect_providers(client: reqwest::Client) -> Vec<Box<dyn LlmProvider>> {
     inventory::iter::<LlmProviderPlugin>()
         .map(|p| (p.factory)(client.clone()))
@@ -46,6 +47,9 @@ inventory::submit! {
 }
 inventory::submit! {
     LlmProviderPlugin::new(|client| Box::new(crate::GlmProvider::new(client)))
+}
+inventory::submit! {
+    LlmProviderPlugin::new(|client| Box::new(crate::GeminiProvider::new(client)))
 }
 
 #[cfg(test)]
@@ -83,5 +87,6 @@ mod tests {
         assert!(providers.iter().any(|p| p.id() == "anthropic-messages"));
         assert!(providers.iter().any(|p| p.id() == "deepseek"));
         assert!(providers.iter().any(|p| p.id() == "glm"));
+        assert!(providers.iter().any(|p| p.id() == "google-generative-ai"));
     }
 }

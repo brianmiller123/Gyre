@@ -9,7 +9,6 @@
 //! 协议参考：https://modelcontextprotocol.io（stdio transport，行分隔 JSON-RPC 2.0）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod client;
 mod tool;

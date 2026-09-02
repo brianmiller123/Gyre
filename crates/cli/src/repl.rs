@@ -137,6 +137,8 @@ pub struct CommandContext<'a> {
     pub optional: &'a std::collections::HashMap<String, bool>,
     /// goals 目标预算共享状态（`/goal` 查看/调整；未配置时为 `None`）。
     pub goal: Option<Arc<std::sync::Mutex<agent::GoalState>>>,
+    /// todo 清单共享状态（`/todo` 查看当前清单）。
+    pub todo: Arc<agent_tools::TodoState>,
 }
 
 /// 内置命令名（带 `/`），用于补全与帮助。
@@ -145,7 +147,9 @@ pub const fn builtin_commands() -> &'static [&'static str] {
     &[
         "/h",
         "/help",
+        "/?",
         "/status",
+        "/todo",
         "/goal",
         "/diff",
         "/fresh",
@@ -161,6 +165,8 @@ pub const fn builtin_commands() -> &'static [&'static str] {
         "/skill",
         "/skills",
         "/sessions",
+        "/session",
+        "/resume",
         "/swarm",
         "/agents",
         "/collab",
@@ -260,6 +266,11 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             print_status(ctx);
             CommandOutcome::Handled
         }
+        "/todo" => {
+            // P0：查看当前任务清单（与 todo 工具同一状态；Markdown 直出 stderr）。
+            eprintln!("{}", ctx.todo.render_markdown());
+            CommandOutcome::Handled
+        }
         "/goal" => {
             handle_goal(input, ctx);
             CommandOutcome::Handled
@@ -330,8 +341,7 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             let staged = rest.split_whitespace().any(|t| t == "--staged");
             let ref_name = rest
                 .split_whitespace()
-                .filter(|t| !t.starts_with("--"))
-                .next()
+                .find(|t| !t.starts_with("--"))
                 .map(str::to_string);
             CommandOutcome::Diff { staged, ref_name }
         }
@@ -633,7 +643,10 @@ fn handle_goal(input: &str, ctx: &CommandContext<'_>) {
     if let Some(n) = rest.strip_prefix("set ") {
         g.budget.token_budget = n.trim().parse().unwrap_or(0);
     } else if let Some(n) = rest.strip_prefix("extend ") {
-        g.budget.token_budget = g.budget.token_budget.saturating_add(n.trim().parse().unwrap_or(0));
+        g.budget.token_budget = g
+            .budget
+            .token_budget
+            .saturating_add(n.trim().parse().unwrap_or(0));
     } else {
         eprintln!("{}", t!("goal.usage"));
         return;
@@ -646,7 +659,11 @@ fn handle_goal(input: &str, ctx: &CommandContext<'_>) {
     let g = goal.lock().expect("goal 锁中毒");
     eprintln!(
         "{}",
-        t!("goal.updated", budget = g.budget.token_budget, tokens = tokens)
+        t!(
+            "goal.updated",
+            budget = g.budget.token_budget,
+            tokens = tokens
+        )
     );
 }
 
@@ -1044,7 +1061,10 @@ fn print_collab(ctx: &CommandContext<'_>) {
     eprintln!("{}", t!("collab.room", room = room));
     eprintln!("{}", t!("collab.fragment", fragment = fragment));
     eprintln!("{}", t!("collab.relay", bind = bind, room = room));
-    eprintln!("{}", t!("collab.write_link", bind = bind, room = room, token = token));
+    eprintln!(
+        "{}",
+        t!("collab.write_link", bind = bind, room = room, token = token)
+    );
     eprintln!("{}", t!("collab.view_link", bind = bind, room = room));
     eprintln!("{}", t!("collab.link", bind = bind, fragment = fragment));
     eprintln!("{}", t!("collab.footer"));
@@ -1588,14 +1608,19 @@ mod tests {
     #[test]
     fn parses_enhance_draft() {
         // 多词草稿拼接。
-        let CommandOutcome::Enhance { draft } = handle_enhance("/enhance fix the login bug")
-        else {
+        let CommandOutcome::Enhance { draft } = handle_enhance("/enhance fix the login bug") else {
             panic!("期望 Enhance");
         };
         assert_eq!(draft, "fix the login bug");
         // 空草稿 → Handled（打印用法）。
-        assert!(matches!(handle_enhance("/enhance"), CommandOutcome::Handled));
-        assert!(matches!(handle_enhance("/enhance   "), CommandOutcome::Handled));
+        assert!(matches!(
+            handle_enhance("/enhance"),
+            CommandOutcome::Handled
+        ));
+        assert!(matches!(
+            handle_enhance("/enhance   "),
+            CommandOutcome::Handled
+        ));
     }
 
     #[test]
@@ -1604,7 +1629,10 @@ mod tests {
             panic!("期望 Suggest");
         };
         assert_eq!(query, "auth login");
-        assert!(matches!(handle_suggest("/suggest"), CommandOutcome::Handled));
+        assert!(matches!(
+            handle_suggest("/suggest"),
+            CommandOutcome::Handled
+        ));
     }
 
     #[test]
@@ -1717,6 +1745,7 @@ mod tests {
                 eval: agent_config::EvalConfig::default(),
                 compaction: agent_config::CompactionConfig::default(),
                 socks5: agent_config::Socks5Config::default(),
+                user_agent: None,
             };
             Self {
                 model: agent_core::Model::with_defaults(
@@ -1755,6 +1784,7 @@ mod tests {
                 github_allow_write: false,
                 optional: &self.optional,
                 goal,
+                todo: agent_tools::TodoState::in_memory().shared(),
             }
         }
     }
@@ -1786,10 +1816,17 @@ mod tests {
             CommandOutcome::Handled
         ));
         assert_eq!(goal.lock().unwrap().budget.token_budget, 5300);
-        assert!(
-            !goal.lock().unwrap().notified,
-            "未超限时重置一次性提醒标记"
-        );
+        assert!(!goal.lock().unwrap().notified, "未超限时重置一次性提醒标记");
+    }
+
+    #[test]
+    fn todo_command_prints_current_list() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        // 空清单下 /todo 正常 Handled（输出走 stderr，不 panic）。
+        assert!(matches!(
+            handle_command("/todo", &ctx),
+            CommandOutcome::Handled
+        ));
     }
 }
-

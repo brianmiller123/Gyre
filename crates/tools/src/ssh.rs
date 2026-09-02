@@ -4,7 +4,7 @@
 //! **无状态直连**：不维护长连接（`list`/`disconnect` 为占位语义）、不做 sshfs 挂载
 //! （P2 后续）、不支持交互式会话与密码认证（`BatchMode=yes` + stdin 关闭，避免挂起）。
 //!
-//! ssh_config 解析为轻量 OpenSSH 子集：仅识别 `Host`/`HostName`/`Port`/`User`/
+//! `ssh_config` 解析为轻量 OpenSSH 子集：仅识别 `Host`/`HostName`/`Port`/`User`/
 //! `IdentityFile`/`ProxyJump`，支持 `Host *` 通配与精确匹配（**精确优先**——与 OpenSSH
 //! 「文件顺序先得」不同，这是对用户直觉的刻意简化，避免 `Host *` 默认段覆盖精确别名）、
 //! `!` 否定、引号值与行内注释；不支持 `Include`/`Match`/续行（v1 静默忽略）。
@@ -161,11 +161,11 @@ impl Default for SshTool {
 
 #[async_trait]
 impl Tool for SshTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ssh"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "解析 ~/.ssh/config 并在远端主机执行命令（action ∈ connect/exec/list/disconnect）。\
          属于执行类操作，默认需审批；v1 每次 exec 直连，不维护长连接。"
     }
@@ -232,9 +232,9 @@ impl Tool for SshTool {
                 self.exec(host, command).await
             }
             "list" => self.list(),
-            "disconnect" => Ok(self.disconnect(
-                input.get("host").and_then(serde_json::Value::as_str),
-            )),
+            "disconnect" => {
+                Ok(self.disconnect(input.get("host").and_then(serde_json::Value::as_str)))
+            }
             other => Err(ToolError::InvalidArgs(format!(
                 "未知 action `{other}`（可用：connect/exec/list/disconnect）"
             ))),
@@ -279,7 +279,7 @@ enum MatchKind {
 }
 
 impl SshConfig {
-    /// 解析 ssh_config 文本（忽略注释/空行/未知关键字；不支持 `Include`/`Match`/续行）。
+    /// 解析 `ssh_config` 文本（忽略注释/空行/未知关键字；不支持 `Include`/`Match`/续行）。
     fn parse(text: &str) -> Self {
         let mut sections: Vec<SshHostSection> = Vec::new();
         for raw in text.lines() {
@@ -341,13 +341,9 @@ impl SshConfig {
             }
         }
         let port = match kv.get("port") {
-            Some(raw) => raw
-                .parse::<u16>()
-                .ok()
-                .filter(|p| *p != 0)
-                .ok_or_else(|| {
-                    ToolError::Execution(format!("主机 `{host}` 的 Port 配置无效：{raw}"))
-                })?,
+            Some(raw) => raw.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| {
+                ToolError::Execution(format!("主机 `{host}` 的 Port 配置无效：{raw}"))
+            })?,
             None => 22,
         };
         Ok(Some(ResolvedHost {
@@ -421,15 +417,15 @@ impl SshHostSection {
 struct ResolvedHost {
     /// 请求的主机别名（作为 ssh 目标）。
     host: String,
-    /// 实际连接地址（未配置 HostName 时为别名本身）。
+    /// 实际连接地址（未配置 `HostName` 时为别名本身）。
     hostname: String,
     /// 端口（默认 22）。
     port: u16,
     /// 用户名（未配置时为 None，沿用本地用户）。
     user: Option<String>,
-    /// IdentityFile 路径（已展开 `~`；未配置为 None）。
+    /// `IdentityFile` 路径（已展开 `~`；未配置为 None）。
     identity_file: Option<String>,
-    /// ProxyJump 目标（已展开 `~`；未配置为 None）。
+    /// `ProxyJump` 目标（已展开 `~`；未配置为 None）。
     proxy_jump: Option<String>,
 }
 
@@ -541,9 +537,10 @@ fn home_dir() -> Option<PathBuf> {
 
 /// 默认 ssh 配置路径：`~/.ssh/config`（Unix）/ `%USERPROFILE%\.ssh\config`（Windows）。
 fn default_config_path() -> PathBuf {
-    home_dir()
-        .map(|home| home.join(".ssh").join("config"))
-        .unwrap_or_else(|| PathBuf::from(".ssh/config"))
+    home_dir().map_or_else(
+        || PathBuf::from(".ssh/config"),
+        |home| home.join(".ssh").join("config"),
+    )
 }
 
 /// 展开值开头的 `~` 为家目录（`~/x` → 家目录/x，`~` → 家目录）；无家目录或值不以 `~`
@@ -768,9 +765,8 @@ Host \"quoted host\"
 
     #[test]
     fn parse_config_quoted_values() {
-        let cfg = parse(
-            "Host box\n    HostName \"my box\"\n    IdentityFile \"/path with space/id\"\n",
-        );
+        let cfg =
+            parse("Host box\n    HostName \"my box\"\n    IdentityFile \"/path with space/id\"\n");
         assert_eq!(cfg.sections.len(), 1);
         let section = &cfg.sections[0];
         assert_eq!(
@@ -796,8 +792,14 @@ Host \"quoted host\"
             "\n  \n# 整行注释\nHost a\n  # 缩进注释\n  User u1  # 行内注释\n\nHost b\n\tUser u2\n",
         );
         assert_eq!(cfg.sections.len(), 2);
-        assert_eq!(cfg.sections[0].kv.get("user").map(String::as_str), Some("u1"));
-        assert_eq!(cfg.sections[1].kv.get("user").map(String::as_str), Some("u2"));
+        assert_eq!(
+            cfg.sections[0].kv.get("user").map(String::as_str),
+            Some("u1")
+        );
+        assert_eq!(
+            cfg.sections[1].kv.get("user").map(String::as_str),
+            Some("u2")
+        );
     }
 
     #[test]
@@ -815,7 +817,10 @@ Host \"quoted host\"
     #[test]
     fn resolve_exact_host_beats_wildcard_default() {
         let cfg = parse("Host *\n    User default-user\n\nHost myserver\n    User alice\n");
-        let r = cfg.resolve("myserver").expect("解析不失败").expect("应命中");
+        let r = cfg
+            .resolve("myserver")
+            .expect("解析不失败")
+            .expect("应命中");
         assert_eq!(r.user.as_deref(), Some("alice"));
         assert_eq!(r.port, 22);
         assert_eq!(r.hostname, "myserver");
@@ -869,9 +874,23 @@ Host \"quoted host\"
         assert_eq!(
             args,
             [
-                "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-p", "2222", "-l",
-                "deploy", "-i", "/home/u/.ssh/deploy_key", "-J", "bastion", "-o",
-                "HostName=10.0.0.5", "web-prod", "uname -a",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "-p",
+                "2222",
+                "-l",
+                "deploy",
+                "-i",
+                "/home/u/.ssh/deploy_key",
+                "-J",
+                "bastion",
+                "-o",
+                "HostName=10.0.0.5",
+                "web-prod",
+                "uname -a",
             ]
         );
     }
@@ -882,7 +901,15 @@ Host \"quoted host\"
         let args = build_ssh_args(&h, "pwd");
         assert_eq!(
             args,
-            ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "defaults", "pwd"]
+            [
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "defaults",
+                "pwd"
+            ]
         );
     }
 

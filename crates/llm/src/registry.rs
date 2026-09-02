@@ -117,7 +117,7 @@ impl Default for ProviderRegistry {
     }
 }
 
-/// ProviderRegistry 自身也实现 [`LlmProvider`]，便于上层（`crates/agent`）只依赖 trait，
+/// `ProviderRegistry` 自身也实现 [`LlmProvider`]，便于上层（`crates/agent`）只依赖 trait，
 /// 与具体适配器实现解耦：注入 `Arc<dyn LlmProvider>` 即可，无需直接依赖本 crate。
 #[async_trait::async_trait]
 impl LlmProvider for ProviderRegistry {
@@ -241,7 +241,11 @@ mod tests {
             .await
             .expect("第二适配器应成功");
         drop(stream);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "两个适配器都应被调用");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两个适配器都应被调用"
+        );
     }
 
     #[tokio::test]
@@ -291,7 +295,11 @@ mod tests {
             Ok(_) => panic!("400 应立即失败"),
         };
         assert!(!err.is_fallbackable(), "400 不可 fallback: {err}");
-        assert_eq!(calls2.load(std::sync::atomic::Ordering::SeqCst), 1, "400 不应尝试第二适配器");
+        assert_eq!(
+            calls2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "400 不应尝试第二适配器"
+        );
     }
 
     #[tokio::test]

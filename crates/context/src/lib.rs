@@ -11,14 +11,13 @@
 //! 以及会话树（`SessionEntry` parentId 模型，见 [`tree`] 模块）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 pub mod compaction;
 pub mod persistence;
 pub mod token;
-pub mod tree;
 /// 工具调用配对保护（压缩安全网 + skill read 保护辅助）。内部模块。
 mod tool_protection;
+pub mod tree;
 
 pub use persistence::delete_message_in_file;
 pub use persistence::{SessionInfo, SessionStore};
@@ -129,9 +128,9 @@ impl Inner {
         let mut preserved_ids: HashSet<NodeId> = HashSet::new();
         for msg in &new_messages {
             let mut reused: Option<(usize, NodeId)> = None;
-            for j in mi..active.len() {
-                if &active[j].2 == msg {
-                    reused = Some((j, active[j].0.clone()));
+            for (j, entry) in active.iter().enumerate().skip(mi) {
+                if &entry.2 == msg {
+                    reused = Some((j, entry.0.clone()));
                     break;
                 }
             }
@@ -295,7 +294,7 @@ impl InMemoryContext {
         inner.nodes = nodes;
         inner.rebuild_index();
         // 活跃叶子缺失（如首次加载）→ 默认末节点。
-        if leaf.as_ref().map_or(true, |l| !inner.index.contains_key(l)) {
+        if leaf.as_ref().is_none_or(|l| !inner.index.contains_key(l)) {
             inner.active_leaf = inner.nodes.last().map(|n| n.id.clone());
         }
     }
@@ -359,20 +358,20 @@ impl InMemoryContext {
             (entries, summarizer)
         };
         // 阶段二（锁外）：生成摘要（LLM 调用，可能耗时）。
-        let summary = if entries.is_empty() || summarizer.is_none() {
-            None
-        } else {
-            let summarizer = summarizer.unwrap();
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|n| compaction::message_to_summary_line(&n.message))
-                .collect();
-            let result = summarizer.summarize(&lines).await;
-            // 阶段三前先把 summarizer 放回（无论成功失败）。
-            let mut inner = self.inner.lock().await;
-            inner.summarizer = Some(summarizer);
-            drop(inner);
-            Some(result.map_err(ContextError::Compaction)?)
+        let summary = match summarizer {
+            Some(summarizer) if !entries.is_empty() => {
+                let lines: Vec<String> = entries
+                    .iter()
+                    .map(|n| compaction::message_to_summary_line(&n.message))
+                    .collect();
+                let result = summarizer.summarize(&lines).await;
+                // 阶段三前先把 summarizer 放回（无论成功失败）。
+                let mut inner = self.inner.lock().await;
+                inner.summarizer = Some(summarizer);
+                drop(inner);
+                Some(result.map_err(ContextError::Compaction)?)
+            }
+            _ => None,
         };
         // 阶段三（锁内）：切换 + 追加 handoff 消息。
         let mut inner = self.inner.lock().await;

@@ -33,15 +33,15 @@ pub enum HookEvent {
 /// turn 结束钩子上下文：每轮模型响应 + 工具处理完毕后的快照（移植 oh-my-pi `onTurnEnd`）。
 ///
 /// 与 [`crate::AgentEvent::TurnEnd`] 事件配对，但面向**不经事件流的程序化 hook**
-///（审计、指标、memory 更新、telemetry span 等）。事件消费者（如 server 的 to_server_frame）
-/// 已能从 TurnEnd 事件观测；本钩子供 agent 内部 / 装配层注入的程序化副作用使用。
+///（审计、指标、memory 更新、telemetry span 等）。事件消费者（如 server 的 `to_server_frame`）
+/// 已能从 `TurnEnd` 事件观测；本钩子供 agent 内部 / 装配层注入的程序化副作用使用。
 #[derive(Debug)]
 pub struct TurnEndContext<'a> {
     /// 本轮最终化的 assistant 消息。
     pub message: &'a AssistantMessage,
     /// 本轮工具结果（含实际执行与占位 skipped）。
     pub tool_results: &'a [ToolResultMessage],
-    /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / max_turns）。
+    /// 是否将继续下一轮（有工具调用且未触达 deadline / cancel / `max_turns`）。
     pub will_continue: bool,
 }
 
@@ -84,7 +84,7 @@ mod tests {
             tool: "list_files".into(),
             args: serde_json::json!({"path":"."}),
         };
-        match e.clone() {
+        match e {
             HookEvent::BeforeTool { tool, args } => {
                 assert_eq!(tool, "list_files");
                 assert_eq!(args["path"], ".");

@@ -11,7 +11,6 @@
 //! - [`render_skills_section`] —— system prompt `<skills>` 段渲染
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod frontmatter;
 mod native;

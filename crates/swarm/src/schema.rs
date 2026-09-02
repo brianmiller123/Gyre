@@ -34,7 +34,7 @@ pub struct SwarmAgent {
     pub extra_context: Option<String>,
     /// 显式依赖：必须等待其完成的代理。
     pub reports_to: Vec<String>,
-    /// 显式依赖：同 `reports_to` 语义别名（waits_for）。
+    /// 显式依赖：同 `reports_to` `语义别名（waits_for`）。
     pub waits_for: Vec<String>,
     /// 模型覆盖。
     pub model: Option<String>,
@@ -176,7 +176,7 @@ pub fn parse_swarm_yaml(content: &str) -> Result<SwarmDefinition, String> {
     })
 }
 
-/// 语义校验：引用合法性、自环、target_count 约束。返回错误列表（空表示通过）。
+/// `语义校验：引用合法性、自环、target_count` 约束。返回错误列表（空表示通过）。
 #[must_use]
 pub fn validate_swarm_definition(def: &SwarmDefinition) -> Vec<String> {
     let mut errors = Vec::new();

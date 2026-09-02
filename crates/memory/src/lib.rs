@@ -16,8 +16,8 @@
 //! Zoo-Code 无此能力，本项目补齐项目作用域的跨会话记忆。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
+mod consolidate;
 mod intent;
 mod mental_models;
 mod mmr;
@@ -27,22 +27,26 @@ mod synonyms;
 mod temporal;
 mod vec_memory;
 
-pub use intent::{classify_intent, adjust_weights, IntentCategory, IntentWeights, QueryIntent};
+pub use consolidate::{
+    CONSOLIDATE_BATCH_MAX, CONSOLIDATE_CHARS_BUDGET, CONSOLIDATE_MIN_RECORDS, CONSOLIDATION_SYSTEM,
+    ConsolidateReport, structured_consolidation_prompt,
+};
+pub use intent::{IntentCategory, IntentWeights, QueryIntent, adjust_weights, classify_intent};
 pub use mental_models::{
-    format_ts, load_seeds, merge_mental_models, mental_model_consolidation_prompt, MentalModelsConfig,
-    SeedEntry, MENTAL_MODEL_CONSOLIDATION_PROMPT, SEEDS_JSON,
+    MENTAL_MODEL_CONSOLIDATION_PROMPT, MentalModelsConfig, SEEDS_JSON, SeedEntry, format_ts,
+    load_seeds, mental_model_consolidation_prompt, merge_mental_models,
 };
 pub use mmr::{jaccard_similarity, mmr_rerank_indices};
-pub use store::{consolidation_prompt, LocalMemoryStore};
+pub use store::{LocalMemoryStore, consolidation_prompt};
 pub use structured::{
     MemoryRecord, MemoryStats, RecallHit, RecallOptions, SearchFilter, SleepReport,
     StructuredMemoryStore,
 };
 pub use synonyms::{canonical_of, canonicalize_tokens, get_synonyms};
-pub use temporal::{extract_temporal, parse_nl_date, temporal_boost, ParsedDate, TemporalInfo};
-pub use vec_memory::{Embedder, ProjectionEmbedder, StubEmbedder, VecEntry, VectorStore};
+pub use temporal::{ParsedDate, TemporalInfo, extract_temporal, parse_nl_date, temporal_boost};
 #[cfg(feature = "vec-embed")]
 pub use vec_memory::FastembedEmbedder;
+pub use vec_memory::{Embedder, ProjectionEmbedder, StubEmbedder, VecEntry, VectorStore};
 
 /// 默认嵌入器（装配层入口）：`vec-embed` feature 开启时用 L2 fastembed 语义嵌入
 /// （懒加载 + 失败自动降级 L1），关闭时用 L1 固定种子随机投影，确定性离线可用。

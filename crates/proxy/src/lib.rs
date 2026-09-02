@@ -18,7 +18,6 @@
 //! [`Socks5Controller::redacted`] 脱敏描述，**绝不打印明文密码**。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -142,6 +141,11 @@ impl Socks5Controller {
 ///   控制器配置（覆盖 SOCKS5 握手阶段）。
 /// - 无控制器：行为与现状完全一致（直连 + 默认 10s 连接超时），不装代理。
 ///
+/// 所有经此工厂构建的客户端都携带 User-Agent（LLM 请求默认与 OMP 对齐的
+/// `pi/<version> (<platform> <release>; <arch>)`，见
+/// [`agent_core::platform::default_llm_user_agent`]）；`user_agent` 传入配置覆盖值
+/// （`None` 或空字符串 = 默认），空字符串不会产生空 UA 头。
+///
 /// 既有各 client 的 `tcp_keepalive` / `pool_idle_timeout` 等定制经 `configure` 闭包
 /// 原样保留。
 ///
@@ -149,6 +153,7 @@ impl Socks5Controller {
 /// 底层 `reqwest::ClientBuilder::build` 失败（如 TLS 后端初始化失败）。
 pub fn build_http_client(
     socks5: Option<Arc<Socks5Controller>>,
+    user_agent: Option<&str>,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
 ) -> reqwest::Result<reqwest::Client> {
     let mut b = reqwest::Client::builder();
@@ -168,6 +173,11 @@ pub fn build_http_client(
             b = b.connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS));
         }
     }
+    let ua = user_agent
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(agent_core::platform::default_llm_user_agent);
+    b = b.user_agent(ua);
     configure(b).build()
 }
 
@@ -240,8 +250,13 @@ mod tests {
 
     #[test]
     fn proxy_url_with_auth_percent_encodes() {
-        let u = build_proxy_url(&cfg("proxy.example.com", Some(1080), Some("us@er"), "p@ss:w/rd"))
-            .expect("应构造 URL");
+        let u = build_proxy_url(&cfg(
+            "proxy.example.com",
+            Some(1080),
+            Some("us@er"),
+            "p@ss:w/rd",
+        ))
+        .expect("应构造 URL");
         assert_eq!(
             u.as_str(),
             "socks5://us%40er:p%40ss%3Aw%2Frd@proxy.example.com:1080",
@@ -312,14 +327,14 @@ mod tests {
             .expect("已配置");
         assert!(ctrl.enabled(), "sidecar true 应压过配置默认 false");
         // 无 CLI 无 sidecar → 配置。
-        let ctrl = Socks5Controller::new(&cfg("h", Some(1080), None, ""), None, None)
-            .expect("已配置");
+        let ctrl =
+            Socks5Controller::new(&cfg("h", Some(1080), None, ""), None, None).expect("已配置");
         assert!(!ctrl.enabled());
     }
 
     #[test]
     fn build_http_client_without_controller_matches_plain_builder() {
-        let client = build_http_client(None, |b| b).expect("构建");
+        let client = build_http_client(None, None, |b| b).expect("构建");
         // 直连行为由 reqwest 保证；此处仅验证无控制器时工厂不装代理（成功构建即足够）。
         let _ = client;
     }

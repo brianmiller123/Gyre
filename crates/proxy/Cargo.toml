@@ -8,6 +8,7 @@ description = "SOCKS5 outbound proxy controller: runtime toggle + reqwest dynami
 
 [dependencies]
 agent-config = { workspace = true }
+agent-core   = { workspace = true }
 reqwest      = { workspace = true }
 url          = { workspace = true }
 secrecy      = { workspace = true }

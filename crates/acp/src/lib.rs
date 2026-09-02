@@ -29,7 +29,6 @@
 //! ```
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod adapter;
 mod http;

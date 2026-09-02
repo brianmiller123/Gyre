@@ -56,5 +56,8 @@ arboard      = { workspace = true }
 image        = { workspace = true }
 base64       = { workspace = true }
 
+[dev-dependencies]
+parking_lot = { workspace = true }
+
 [lints]
 workspace = true

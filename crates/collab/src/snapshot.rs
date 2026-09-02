@@ -124,7 +124,9 @@ impl SnapshotAssembler {
     /// 尚未收到 `final_chunk` 时返回 [`CollabError`]（帧协议错误描述）。
     pub fn finish(self) -> Result<String, CollabError> {
         if !self.finalized {
-            return Err(CollabError::Frame("snapshot incomplete: final chunk not received".into()));
+            return Err(CollabError::Frame(
+                "snapshot incomplete: final chunk not received".into(),
+            ));
         }
         Ok(self.parts.concat())
     }
@@ -202,7 +204,12 @@ mod tests {
         let frames = chunk_snapshot("hello", 48 * 1024);
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            WireFrame::SnapshotChunk { seq, final_chunk, chunk, .. } => {
+            WireFrame::SnapshotChunk {
+                seq,
+                final_chunk,
+                chunk,
+                ..
+            } => {
                 assert_eq!(*seq, 0);
                 assert!(*final_chunk);
                 assert_eq!(chunk, "hello");
@@ -216,7 +223,9 @@ mod tests {
         let frames = chunk_snapshot("", 8);
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            WireFrame::SnapshotChunk { chunk, final_chunk, .. } => {
+            WireFrame::SnapshotChunk {
+                chunk, final_chunk, ..
+            } => {
                 assert!(chunk.is_empty());
                 assert!(*final_chunk);
             }
@@ -242,7 +251,9 @@ mod tests {
 
     #[test]
     fn chunk_roundtrip_large_snapshot() {
-        let s: String = (0..10_000).map(|i| char::from_u32(0x4e00 + (i % 100) as u32).unwrap()).collect();
+        let s: String = (0..10_000)
+            .map(|i| char::from_u32(0x4e00 + (i % 100) as u32).unwrap())
+            .collect();
         let frames = chunk_snapshot(&s, 48 * 1024);
         assert_eq!(assembled_len(&frames), s.len());
         assert_eq!(assemble_all(&frames), s);
@@ -257,7 +268,13 @@ mod tests {
     fn assemble_all(frames: &[WireFrame]) -> String {
         let mut a = SnapshotAssembler::new();
         for f in frames {
-            if let WireFrame::SnapshotChunk { seq, final_chunk, chunk, .. } = f {
+            if let WireFrame::SnapshotChunk {
+                seq,
+                final_chunk,
+                chunk,
+                ..
+            } = f
+            {
                 a.push(*seq, chunk, *final_chunk).expect("顺序合法");
             }
         }
@@ -300,7 +317,7 @@ mod tests {
         let mut a = SnapshotAssembler::new();
         a.push(0, "aa", false).expect("首块");
         assert!(!a.is_complete());
-        assert!(matches!(a.finish(), Err(_)), "未收 final 不可 finish");
+        assert!(a.finish().is_err(), "未收 final 不可 finish");
         // finish 消费聚合器，完整路径重建。
         let mut a = SnapshotAssembler::new();
         a.push(0, "aa", false).expect("首块");

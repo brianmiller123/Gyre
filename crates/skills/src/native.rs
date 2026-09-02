@@ -24,7 +24,7 @@ pub struct NativeSkillProvider {
 impl NativeSkillProvider {
     /// 构造；`cwd` 为 project walkup 起点。
     #[must_use]
-    pub fn new(cwd: PathBuf) -> Self {
+    pub const fn new(cwd: PathBuf) -> Self {
         Self { cwd }
     }
 }
@@ -107,8 +107,7 @@ fn load_skill_file(skill_md: &Path, level: SkillLevel) -> Result<Skill, SkillErr
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| dir_name.to_string());
+        .map_or_else(|| dir_name.to_string(), str::to_string);
     let base_dir = skill_md.parent().map(Path::to_path_buf).unwrap_or_default();
     Ok(Skill {
         name,

@@ -26,7 +26,7 @@ use crate::launcher::{BrowserProcess, LaunchOptions};
 
 /// 导航后等待加载事件的超时。
 const NAV_TIMEOUT: Duration = Duration::from_secs(5);
-/// 浏览器启动等待 DevTools 端点的超时。
+/// 浏览器启动等待 `DevTools` 端点的超时。
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 浏览器会话：chromium 进程 + CDP 连接 + 附加的页面目标会话。
@@ -37,7 +37,7 @@ struct BrowserSession {
 }
 
 impl BrowserSession {
-    /// 连接 DevTools 端点，新建 about:blank 页面目标并附加（flatten 会话），启用 Page/Runtime 域。
+    /// 连接 `DevTools` 端点，新建 about:blank 页面目标并附加（flatten 会话），启用 Page/Runtime 域。
     async fn new(proc: BrowserProcess) -> Result<Self, ToolError> {
         let cdp = CdpConnection::connect(proc.ws_url())
             .await
@@ -119,7 +119,7 @@ fn tool_err<E: std::fmt::Display>(e: E) -> ToolError {
     ToolError::Execution(e.to_string())
 }
 
-/// 把字符串编码为 JS 字符串字面量（经 serde_json 转义，防注入）。
+/// 把字符串编码为 JS 字符串字面量（经 `serde_json` 转义，防注入）。
 fn js_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
@@ -251,7 +251,7 @@ impl BrowserTool {
                 |e| e.method == "Page.loadEventFired" && e.session_id.as_deref() == Some(session_id.as_str()),
                 NAV_TIMEOUT,
             ) => r,
-            _ = cancel.cancelled() => Err(CdpError::Closed),
+            () = cancel.cancelled() => Err(CdpError::Closed),
         };
         let note = match loaded {
             Ok(ev) => match ev.params.get("errorText").and_then(Value::as_str) {
@@ -468,11 +468,11 @@ async fn save_screenshot(
 
 #[async_trait]
 impl agent_tools::Tool for BrowserTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "browser"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "控制 headless chromium 浏览网页：navigate(url) 打开页面；evaluate(js) 在页面执行 JavaScript（returnByValue 取回结果）；screenshot(selector?, full_page?) 截图保存；click(selector)、text(selector, text)、scroll(selector?/direction?/amount?) 模拟交互；close 关闭浏览器实例。"
     }
 
@@ -503,25 +503,22 @@ impl agent_tools::Tool for BrowserTool {
         // 先校验参数再启动浏览器：无效调用不得拉起进程
         Self::validate(action, &input)?;
         let mut guard = self.state.lock().await;
-        match action {
-            "close" => {
-                let Some(sess) = guard.take() else {
-                    return Ok(ToolResult::text("browser: 无运行中的浏览器实例"));
-                };
-                sess.close().await?;
-                Ok(ToolResult::text("browser: 已关闭浏览器实例"))
-            }
-            _ => {
-                let sess = Self::ensure_session(&mut guard).await?;
-                match action {
-                    "navigate" => self.navigate(sess, &input, ctx.cancel).await,
-                    "evaluate" => self.evaluate(sess, &input).await,
-                    "screenshot" => self.screenshot(sess, &input, ctx).await,
-                    "click" => self.click(sess, &input).await,
-                    "text" => self.text(sess, &input).await,
-                    "scroll" => self.scroll(sess, &input).await,
-                    other => Err(ToolError::InvalidArgs(format!("未知动作: {other}"))),
-                }
+        if action == "close" {
+            let Some(sess) = guard.take() else {
+                return Ok(ToolResult::text("browser: 无运行中的浏览器实例"));
+            };
+            sess.close().await?;
+            Ok(ToolResult::text("browser: 已关闭浏览器实例"))
+        } else {
+            let sess = Self::ensure_session(&mut guard).await?;
+            match action {
+                "navigate" => self.navigate(sess, &input, ctx.cancel).await,
+                "evaluate" => self.evaluate(sess, &input).await,
+                "screenshot" => self.screenshot(sess, &input, ctx).await,
+                "click" => self.click(sess, &input).await,
+                "text" => self.text(sess, &input).await,
+                "scroll" => self.scroll(sess, &input).await,
+                other => Err(ToolError::InvalidArgs(format!("未知动作: {other}"))),
             }
         }
     }
@@ -564,6 +561,7 @@ mod tests {
             update_tx: None,
             conflicts: None,
             pending_rewrites: None,
+            context: None,
         }
     }
 

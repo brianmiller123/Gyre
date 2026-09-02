@@ -1,0 +1,3 @@
+# 根 rustfmt 配置：默认风格（无自定义覆盖，保持 rustc 生态零惊讶）。
+# 注意：vendor/ 下的 fork 镜像上游风格，不追求 rustfmt 整洁；若 rustfmt 在 vendor
+# 报「left behind trailing whitespace」类内部错误，直接清理对应空白即可，勿改 fork 代码。

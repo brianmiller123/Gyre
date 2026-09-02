@@ -21,7 +21,7 @@ use crate::types::{ApplyResult, FileOp};
 /// 应用 hashline patch 到工作区文件。
 pub struct HashlineTool {
     /// 会话级快照存储：写前记录版本，stale hash 失配时供恢复使用。
-    /// `&self` 在注册表内全会话复用，故用内部可变状态而无需改 ToolContext。
+    /// `&self` 在注册表内全会话复用，故用内部可变状态而无需改 `ToolContext`。
     snapshots: Arc<RwLock<crate::snapshots::InMemorySnapshotStore>>,
 }
 
@@ -43,10 +43,10 @@ impl Default for HashlineTool {
 
 #[async_trait]
 impl Tool for HashlineTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "apply_hashline"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "按 hashline 行锚定格式批量编辑文件：每段以 [path#hash] 开头，含 SWAP/DEL/INS/REM/MV 操作。\
          每次编辑后行号重新编号，须基于最新 read 的行号。"
     }
@@ -225,12 +225,12 @@ async fn write_ensure_parent(
     content: &str,
     ctx: &ToolContext<'_>,
 ) -> Result<WriteReport, ToolError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(ToolError::Io)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(ToolError::Io)?;
     }
     write_with_effects(path, content, ctx).await
 }

@@ -53,7 +53,9 @@ pub fn decode_frames(input: &[u8]) -> Result<(Vec<Value>, usize), DapError> {
         };
         let content_length = parse_content_length(&rest[..header_len])?;
         if content_length > MAX_BODY_LEN {
-            return Err(DapError::Protocol(format!("Content-Length 超限: {content_length}")));
+            return Err(DapError::Protocol(format!(
+                "Content-Length 超限: {content_length}"
+            )));
         }
         let total = body_start + content_length;
         if rest.len() < total {
@@ -158,8 +160,11 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(consumed, raw.len());
         // \r\n 行尾 + 附带 Content-Type 头
-        let mut raw2 =
-            format!("Content-Length: {}\r\nContent-Type: application/json\r\n\r\n", body.len()).into_bytes();
+        let mut raw2 = format!(
+            "Content-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
         raw2.extend_from_slice(body);
         let (frames2, consumed2) = decode_frames(&raw2).expect("解码不应失败");
         assert_eq!(frames2.len(), 1);
@@ -190,12 +195,18 @@ mod tests {
     #[test]
     fn oversized_content_length_is_protocol_error() {
         let raw = format!("Content-Length: {}\r\n\r\n", MAX_BODY_LEN + 1);
-        assert!(matches!(decode_frames(raw.as_bytes()), Err(DapError::Protocol(_))));
+        assert!(matches!(
+            decode_frames(raw.as_bytes()),
+            Err(DapError::Protocol(_))
+        ));
     }
 
     #[test]
     fn garbage_stream_is_protocol_error() {
         let garbage = vec![b'x'; MAX_HEADER_LEN + 1];
-        assert!(matches!(decode_frames(&garbage), Err(DapError::Protocol(_))));
+        assert!(matches!(
+            decode_frames(&garbage),
+            Err(DapError::Protocol(_))
+        ));
     }
 }

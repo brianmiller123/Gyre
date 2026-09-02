@@ -229,17 +229,16 @@ mod tests {
     /// 用真实 python3 编译内嵌驱动做语法检查；python3 不存在则跳过。
     #[test]
     fn driver_python_syntax_ok() {
-        let probe = std::process::Command::new("python3").arg("--version").output();
+        let probe = std::process::Command::new("python3")
+            .arg("--version")
+            .output();
         let Ok(probe) = probe else {
             return;
         };
         if !probe.status.success() {
             return;
         }
-        let workdir = std::env::temp_dir().join(format!(
-            "gyre_eval_driver_{}",
-            std::process::id()
-        ));
+        let workdir = std::env::temp_dir().join(format!("gyre_eval_driver_{}", std::process::id()));
         std::fs::create_dir_all(&workdir).expect("创建临时目录失败");
         let path = workdir.join("driver.py");
         std::fs::write(&path, PYTHON_DRIVER).expect("写入临时驱动失败");

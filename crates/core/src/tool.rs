@@ -27,7 +27,7 @@ pub enum ToolChoice {
     },
 }
 
-/// 软工具需求：先提醒后强制，保护 provider 前缀缓存（强制 tool_choice 会使其失效）。
+/// 软工具需求：先提醒后强制，保护 provider 前缀缓存（强制 `tool_choice` 会使其失效）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoftToolRequirement {
     /// 稳定 id，变更才重新注入 reminder。
@@ -131,11 +131,11 @@ pub enum ApprovalMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityTier {
-    /// 只读（read_file / grep / ast 查询）。
+    /// `只读（read_file` / grep / ast 查询）。
     ReadOnly,
-    /// 写入（write_file / apply_hashline / ast 重写）。
+    /// `写入（write_file` / `apply_hashline` / ast 重写）。
     Write,
-    /// 执行（run_command）。
+    /// `执行（run_command`）。
     Execute,
     /// 网络。
     Network,

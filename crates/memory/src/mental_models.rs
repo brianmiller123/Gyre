@@ -214,11 +214,8 @@ mod tests {
     }
 
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "agent-mem-mm-{}-{:#x}",
-            std::process::id(),
-            nano()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("agent-mem-mm-{}-{:#x}", std::process::id(), nano()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -316,7 +313,10 @@ mod tests {
         // 2026-08-02 00:00:00 UTC（与 Python datetime 交叉验证）
         assert_eq!(format_ts(1_785_628_800), "2026-08-02 00:00:00");
         // 2026-08-02 12:34:56
-        assert_eq!(format_ts(1_785_628_800 + 12 * 3600 + 34 * 60 + 56), "2026-08-02 12:34:56");
+        assert_eq!(
+            format_ts(1_785_628_800 + 12 * 3600 + 34 * 60 + 56),
+            "2026-08-02 12:34:56"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::info;
 use url::Url;
 
 use crate::detect::LspServerInfo;
@@ -151,7 +151,7 @@ impl LspClient {
 
         // ── initialize 握手 ──────────────────────────────────────────
         let root_uri = Url::from_directory_path(&root)
-            .map_err(|_| LspError::InvalidUri(root.display().to_string()))?;
+            .map_err(|()| LspError::InvalidUri(root.display().to_string()))?;
 
         let init_params = serde_json::json!({
             "processId": std::process::id(),
@@ -404,7 +404,7 @@ impl LspClient {
         self.server_info
             .get("capabilities")
             .and_then(|c| c.get("documentFormattingProvider"))
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }
 
@@ -505,13 +505,16 @@ fn try_parse_diagnostics(payload: &str) -> Option<(String, Vec<LspDiagnostic>)> 
         .as_array()?
         .iter()
         .map(|d| LspDiagnostic {
-            severity: d.get("severity").and_then(|s| s.as_u64()).map(|n| match n {
-                1 => DiagnosticSeverity::Error,
-                2 => DiagnosticSeverity::Warning,
-                3 => DiagnosticSeverity::Information,
-                4 => DiagnosticSeverity::Hint,
-                _ => DiagnosticSeverity::Information,
-            }),
+            severity: d
+                .get("severity")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| match n {
+                    1 => DiagnosticSeverity::Error,
+                    2 => DiagnosticSeverity::Warning,
+                    3 => DiagnosticSeverity::Information,
+                    4 => DiagnosticSeverity::Hint,
+                    _ => DiagnosticSeverity::Information,
+                }),
             message: d
                 .get("message")
                 .and_then(|m| m.as_str())
@@ -521,22 +524,20 @@ fn try_parse_diagnostics(payload: &str) -> Option<(String, Vec<LspDiagnostic>)> 
                 .get("range")
                 .and_then(|r| r.get("start"))
                 .and_then(|s| s.get("line"))
-                .and_then(|l| l.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             character: d
                 .get("range")
                 .and_then(|r| r.get("start"))
                 .and_then(|s| s.get("character"))
-                .and_then(|c| c.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             source: d.get("source").and_then(|s| s.as_str()).map(String::from),
             code: d.get("code").and_then(|c| {
                 if let Some(s) = c.as_str() {
                     Some(s.to_string())
-                } else if let Some(n) = c.as_i64() {
-                    Some(n.to_string())
                 } else {
-                    None
+                    c.as_i64().map(|n| n.to_string())
                 }
             }),
         })
@@ -562,8 +563,14 @@ fn parse_single_location(v: &serde_json::Value) -> Option<LspLocation> {
     let start = range.get("start")?;
     Some(LspLocation {
         uri: uri.to_string(),
-        line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-        character: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+        line: start
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        character: start
+            .get("character")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
     })
 }
 
@@ -579,11 +586,22 @@ fn parse_text_edits(v: &serde_json::Value) -> Vec<LspTextEdit> {
             let start = range.get("start")?;
             let end = range.get("end")?;
             Some(LspTextEdit {
-                start_line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                start_character: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0)
-                    as u32,
-                end_line: end.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                end_character: end.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                start_line: start
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                start_character: start
+                    .get("character")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                end_line: end
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                end_character: end
+                    .get("character")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
                 new_text: e
                     .get("newText")
                     .and_then(|t| t.as_str())
@@ -639,7 +657,7 @@ pub fn apply_text_edits(text: &str, edits: &[LspTextEdit]) -> String {
             )
         })
         .collect();
-    spans.sort_by(|a, b| b.0.cmp(&a.0));
+    spans.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut result = text.to_string();
     for (start, end, new) in spans {
         if start <= end && end <= result.len() {
@@ -682,12 +700,12 @@ fn parse_hover(v: &serde_json::Value) -> LspHover {
         line: range
             .and_then(|r| r.get("start"))
             .and_then(|s| s.get("line"))
-            .and_then(|l| l.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|n| n as u32),
         character: range
             .and_then(|r| r.get("start"))
             .and_then(|s| s.get("character"))
-            .and_then(|c| c.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|n| n as u32),
     }
 }
@@ -712,16 +730,18 @@ fn parse_symbols(v: &serde_json::Value, file_uri: &Url) -> Vec<LspSymbol> {
                             .to_string(),
                         kind: format!(
                             "{:?}",
-                            elem.get("kind").and_then(|k| k.as_u64()).unwrap_or(0)
+                            elem.get("kind")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0)
                         ),
                         uri: uri.to_string(),
                         line: start
                             .and_then(|s| s.get("line"))
-                            .and_then(|l| l.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         character: start
                             .and_then(|s| s.get("character"))
-                            .and_then(|c| c.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         container: elem
                             .get("containerName")
@@ -742,7 +762,12 @@ fn flatten_symbol(
     result: &mut Vec<LspSymbol>,
 ) {
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let kind = format!("{:?}", v.get("kind").and_then(|k| k.as_u64()).unwrap_or(0));
+    let kind = format!(
+        "{:?}",
+        v.get("kind")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
     let start = v.get("selectionRange").and_then(|r| r.get("start"));
     result.push(LspSymbol {
         name: name.to_string(),
@@ -750,13 +775,13 @@ fn flatten_symbol(
         uri: file_uri.to_string(),
         line: start
             .and_then(|s| s.get("line"))
-            .and_then(|l| l.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
         character: start
             .and_then(|s| s.get("character"))
-            .and_then(|c| c.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
-        container: container.clone(),
+        container,
     });
     if let Some(children) = v.get("children").and_then(|c| c.as_array()) {
         for child in children {
@@ -777,19 +802,19 @@ fn parse_workspace_edit(v: &serde_json::Value) -> Vec<LspRenameEdit> {
                         uri: uri.clone(),
                         line: start
                             .and_then(|s| s.get("line"))
-                            .and_then(|l| l.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         character: start
                             .and_then(|s| s.get("character"))
-                            .and_then(|c| c.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         end_line: end
                             .and_then(|e| e.get("line"))
-                            .and_then(|l| l.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         end_character: end
                             .and_then(|e| e.get("character"))
-                            .and_then(|c| c.as_u64())
+                            .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as u32,
                         new_text: edit
                             .get("newText")
@@ -819,7 +844,7 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
                 .map(String::from);
             let is_preferred = action
                 .get("isPreferred")
-                .and_then(|b| b.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let mut edits = Vec::new();
             if let Some(edit) = action.get("edit") {
@@ -833,22 +858,22 @@ fn parse_code_actions(v: &serde_json::Value) -> Vec<LspCodeAction> {
                                     uri: uri.clone(),
                                     line: start
                                         .and_then(|s| s.get("line"))
-                                        .and_then(|l| l.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0)
                                         as u32,
                                     character: start
                                         .and_then(|s| s.get("character"))
-                                        .and_then(|c| c.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0)
                                         as u32,
                                     end_line: end
                                         .and_then(|e| e.get("line"))
-                                        .and_then(|l| l.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0)
                                         as u32,
                                     end_character: end
                                         .and_then(|e| e.get("character"))
-                                        .and_then(|c| c.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0)
                                         as u32,
                                     new_text: e

@@ -1,5 +1,5 @@
-//! 文件系统工具：read_file / write_file。
-//! （str_replace/apply_diff 已按工具收敛移除，编辑走 apply_hashline。）
+//! `文件系统工具：read_file` / `write_file`。
+//! （`str_replace/apply_diff` 已按工具收敛移除，编辑走 `apply_hashline`。）
 
 use std::path::Path;
 use std::time::Duration;
@@ -16,10 +16,10 @@ pub struct ReadFileTool;
 
 #[async_trait]
 impl Tool for ReadFileTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "read_file"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "读取工作区内文件内容并附行号。仅限只读，不修改文件。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -100,29 +100,32 @@ fn render_summary(text: &str, lang: SupportLang) -> String {
             SegmentKind::Kept => {
                 if let Some(body) = &seg.text {
                     for (offset, line) in body.lines().enumerate() {
-                        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(
-                            "{:>5}\t{line}\n",
-                            seg.start_line as usize + offset
-                        ));
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut out,
+                            format_args!("{:>5}\t{line}\n", seg.start_line as usize + offset),
+                        );
                     }
                 }
             }
             SegmentKind::Elided => {
-                let _ = std::fmt::Write::write_fmt(&mut out, format_args!(
-                    "     ⋯⋯ (折叠第 {}-{} 行，共 {} 行) ⋯⋯\n",
-                    seg.start_line,
-                    seg.end_line,
-                    seg.end_line
-                        .saturating_sub(seg.start_line)
-                        .saturating_add(1),
-                ));
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "     ⋯⋯ (折叠第 {}-{} 行，共 {} 行) ⋯⋯\n",
+                        seg.start_line,
+                        seg.end_line,
+                        seg.end_line
+                            .saturating_sub(seg.start_line)
+                            .saturating_add(1),
+                    ),
+                );
             }
         }
     }
     out
 }
 
-/// 解析 read_file 的 `path`：内部协议路由 + 裸本地路径，返回原始文本。
+/// 解析 `read_file` 的 `path`：内部协议路由 + 裸本地路径，返回原始文本。
 ///
 /// 支持协议（按前缀分流）：
 /// - `skill://<name>[/<rel>]` → SkillResolver（skill 内容）
@@ -158,8 +161,12 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
                 .map(|p| {
                     format!(
                         "{} (pattern: {}; {}) — {} replacements ({} → {} 字节)",
-                        p.path, p.pattern, p.strictness.as_deref().unwrap_or("smart"), p.count,
-                        p.old_len, p.new_len
+                        p.path,
+                        p.pattern,
+                        p.strictness.as_deref().unwrap_or("smart"),
+                        p.count,
+                        p.old_len,
+                        p.new_len
                     )
                 })
                 .collect::<Vec<_>>()
@@ -187,22 +194,27 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
     } else if let Some(id) = path.strip_prefix("artifact://") {
         resolve_artifact(id, ctx).await
     } else if let Some(rel) = path.strip_prefix("local://") {
-        let full = ctx.workspace.resolve(Path::new(rel));
+        let (pure, sel) = split_path_selector(rel);
+        let full = ctx.workspace.resolve(Path::new(pure));
+        if let Some(out) = read_binary_format(&full, sel).await? {
+            return Ok(out);
+        }
         Ok(read_bounded(&full).await?)
     } else if path.starts_with("http://") || path.starts_with("https://") {
         fetch_http(path).await
     } else {
-        let full = ctx.workspace.resolve(Path::new(path));
+        let (pure, sel) = split_path_selector(path);
+        let full = ctx.workspace.resolve(Path::new(pure));
+        if let Some(out) = read_binary_format(&full, sel).await? {
+            return Ok(out);
+        }
         Ok(read_bounded(&full).await?)
     }
 }
 
 /// `conflict://<N>[/ours|theirs|base]` 读取：完整块带原文行号，或单侧文本。
 /// 非 conflict URI 返回 `Ok(None)`。
-async fn read_conflict_uri(
-    uri: &str,
-    ctx: &ToolContext<'_>,
-) -> Result<Option<String>, ToolError> {
+async fn read_conflict_uri(uri: &str, ctx: &ToolContext<'_>) -> Result<Option<String>, ToolError> {
     if !uri.starts_with("conflict://") {
         return Ok(None);
     }
@@ -211,15 +223,17 @@ async fn read_conflict_uri(
             "conflict:// 未启用（无会话冲突注册表）".into(),
         ));
     };
-    let (target, id, side) = crate::conflict::parse_conflict_uri(uri)
-        .map_err(ToolError::InvalidArgs)?;
+    let (target, id, side) =
+        crate::conflict::parse_conflict_uri(uri).map_err(ToolError::InvalidArgs)?;
     match target {
         crate::conflict::ConflictTarget::Wildcard => Err(ToolError::InvalidArgs(
             "conflict://* 仅支持写入（批量解决）".into(),
         )),
         crate::conflict::ConflictTarget::Single => {
             let block = {
-                let h = history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let h = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 h.get(id).cloned().ok_or_else(|| {
                     ToolError::InvalidArgs(format!(
                         "冲突 #{id} 未注册（先用 read_file <file>:conflicts 扫描）"
@@ -237,7 +251,10 @@ async fn read_conflict_uri(
                     if block.is_two_way { "" } else { "/@base" },
                 );
                 for (i, line) in block.region_text().lines().enumerate() {
-                    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{:>5}\t{line}\n", block.start_line + i));
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("{:>5}\t{line}\n", block.start_line + i),
+                    );
                 }
                 Ok(Some(out))
             } else {
@@ -252,17 +269,15 @@ async fn read_conflict_uri(
 }
 
 /// `path:conflicts` 扫描：注册全部冲突块并返回逐块摘要（id 供 `conflict://` 使用）。
-fn summarize_conflicts(
-    path: &str,
-    text: &str,
-    ctx: &ToolContext<'_>,
-) -> Result<String, ToolError> {
+fn summarize_conflicts(path: &str, text: &str, ctx: &ToolContext<'_>) -> Result<String, ToolError> {
     let Some(history) = ctx.conflicts else {
         return Err(ToolError::Execution(
             ":conflicts 未启用（无会话冲突注册表）".into(),
         ));
     };
-    let mut h = history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut h = history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ids = crate::conflict::register_all(&mut h, path, text);
     if ids.is_empty() {
         return Ok(format!("{path}：无合并冲突"));
@@ -293,10 +308,13 @@ fn summarize_conflicts(
                 .chars()
                 .take(60)
                 .collect();
-            let _ = std::fmt::Write::write_fmt(&mut out, format_args!(
-                "  conflict://{} L{}-L{}  ours: {} | theirs: {}\n",
-                b.id, b.start_line, b.end_line, ours_preview, theirs_preview
-            ));
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "  conflict://{} L{}-L{}  ours: {} | theirs: {}\n",
+                    b.id, b.start_line, b.end_line, ours_preview, theirs_preview
+                ),
+            );
         }
     }
     Ok(out)
@@ -328,20 +346,23 @@ async fn resolve_conflict(
             }
             // 锁内取出块 + 展开 token，尽早释放锁（不跨 await 持锁）。
             let (block, replacement) = {
-                let h = history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let h = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let block = h.get(id).cloned().ok_or_else(|| {
                     ToolError::InvalidArgs(format!(
                         "冲突 #{id} 未注册（先用 read_file <file>:conflicts 扫描）"
                     ))
                 })?;
                 drop(h);
-                let replacement =
-                    crate::conflict::expand_content_tokens(content, &block)
-                        .map_err(ToolError::InvalidArgs)?;
+                let replacement = crate::conflict::expand_content_tokens(content, &block)
+                    .map_err(ToolError::InvalidArgs)?;
                 (block, replacement)
             };
             let full = ctx.workspace.resolve(Path::new(&block.path));
-            let current = tokio::fs::read_to_string(&full).await.map_err(ToolError::Io)?;
+            let current = tokio::fs::read_to_string(&full)
+                .await
+                .map_err(ToolError::Io)?;
             let new_text = crate::conflict::splice_block(&current, &block, &replacement)
                 .map_err(ToolError::Execution)?;
             write_with_effects(&full, &new_text, ctx).await?;
@@ -357,7 +378,9 @@ async fn resolve_conflict(
         crate::conflict::ConflictTarget::Wildcard => {
             // 锁内快照全部块 + 解析指令，尽早释放锁。
             let (blocks, directives) = {
-                let h = history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let h = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let blocks = h.all().to_vec();
                 let directives = parse_directives(content);
                 drop(h);
@@ -377,21 +400,25 @@ async fn resolve_conflict(
                     },
                     None => content.to_string(),
                 };
-                let repl =
-                    crate::conflict::expand_content_tokens(&repl, b).map_err(ToolError::InvalidArgs)?;
-                by_file.entry(b.path.clone()).or_default().push((b.clone(), repl));
+                let repl = crate::conflict::expand_content_tokens(&repl, b)
+                    .map_err(ToolError::InvalidArgs)?;
+                by_file
+                    .entry(b.path.clone())
+                    .or_default()
+                    .push((b.clone(), repl));
             }
             if by_file.is_empty() {
                 return Err(ToolError::InvalidArgs(
-                    "指令未命中任何已注册冲突（可用 read_file <file>:conflicts 查看 id）"
-                        .into(),
+                    "指令未命中任何已注册冲突（可用 read_file <file>:conflicts 查看 id）".into(),
                 ));
             }
             let mut solved: Vec<usize> = Vec::new();
             let mut failed: Vec<String> = Vec::new();
             for (path, mut items) in by_file {
                 let full = ctx.workspace.resolve(Path::new(&path));
-                let current = tokio::fs::read_to_string(&full).await.map_err(ToolError::Io)?;
+                let current = tokio::fs::read_to_string(&full)
+                    .await
+                    .map_err(ToolError::Io)?;
                 items.sort_by_key(|(b, _)| std::cmp::Reverse(b.end_line));
                 let mut text = current;
                 let mut ok = true;
@@ -412,7 +439,9 @@ async fn resolve_conflict(
             }
             // 移除已解决条目。
             if !solved.is_empty() {
-                let mut h = history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut h = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for id in &solved {
                     h.remove(*id);
                 }
@@ -511,22 +540,26 @@ async fn resolve_pending_rewrites(
         if matches.len() != p.count || text.len() != p.old_len {
             failures.push(format!(
                 "{}: 文件已变化（暂存 {} 处 / 当前 {} 处），拒绝写入；请重新 ast_rewrite preview",
-                p.path, p.count, matches.len()
+                p.path,
+                p.count,
+                matches.len()
             ));
             continue;
         }
-        let new_text =
-            match agent_ast::rewrite(&text, lang, &p.pattern, &p.replacement, strictness) {
-                Ok(t) => t,
-                Err(e) => {
-                    failures.push(format!("{}: 重写失败: {e}", p.path));
-                    continue;
-                }
-            };
+        let new_text = match agent_ast::rewrite(&text, lang, &p.pattern, &p.replacement, strictness)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push(format!("{}: 重写失败: {e}", p.path));
+                continue;
+            }
+        };
         if new_text.len() != p.new_len {
             failures.push(format!(
                 "{}: 重写结果与预览不一致（{} vs {} 字节），拒绝写入；请重新 preview",
-                p.path, new_text.len(), p.new_len
+                p.path,
+                new_text.len(),
+                p.new_len
             ));
             continue;
         }
@@ -562,11 +595,10 @@ fn parse_directives(content: &str) -> Option<std::collections::HashMap<usize, St
         }
         let (id_s, val) = if let Some((a, b)) = t.split_once(':') {
             (a.trim(), b.trim().to_string())
-        } else if let Some(rest) = t.strip_prefix('#') {
+        } else {
+            let rest = t.strip_prefix('#')?;
             let (a, b) = rest.split_once('=')?;
             (a.trim(), b.trim().to_string())
-        } else {
-            return None;
         };
         let id: usize = id_s.parse().ok()?;
         map.insert(id, val);
@@ -628,7 +660,7 @@ async fn resolve_artifact(id: &str, ctx: &ToolContext<'_>) -> Result<String, Too
     }
     let rel = format!(".gyre/artifacts/{id}");
     let full = ctx.workspace.resolve(Path::new(&rel));
-    Ok(read_bounded(&full).await?)
+    read_bounded(&full).await
 }
 
 /// `memory://` 路由：`` / `summary` → 启动摘要；`full` → 完整 MEMORY.md。
@@ -688,7 +720,7 @@ const HTTP_FETCH_MAX_REDIRECTS: usize = 3;
 /// SSRF 防护对**首层 URL 与每一跳重定向目标**均执行校验（拦截字面量内网 IP 与已知元数据
 /// 主机名），杜绝「公网 URL 302 → 内网/元数据地址」绕过。**不**防御 DNS rebinding
 /// （主机名解析到内网）。生产环境如需更强保证，应在此之上叠加 DNS 解析钉扎。
-pub(crate) async fn fetch_http(url: &str) -> Result<String, ToolError> {
+pub async fn fetch_http(url: &str) -> Result<String, ToolError> {
     ssrf_guard(url)?;
     let client = fetch_client();
 
@@ -723,7 +755,7 @@ pub(crate) async fn fetch_http(url: &str) -> Result<String, ToolError> {
             .get(current.as_str())
             .send()
             .await
-            .map_err(|e| ToolError::Execution(format!("fetch {} 失败: {e}", current)))?;
+            .map_err(|e| ToolError::Execution(format!("fetch {current} 失败: {e}")))?;
     }
 
     if !resp.status().is_success() {
@@ -748,7 +780,7 @@ pub(crate) async fn fetch_http(url: &str) -> Result<String, ToolError> {
 }
 
 /// 基础 SSRF 防护：仅允许 http/https，拒绝回环/私有/链路本地 IP 字面量与已知元数据主机名。
-pub(crate) fn ssrf_guard(raw: &str) -> Result<(), ToolError> {
+pub fn ssrf_guard(raw: &str) -> Result<(), ToolError> {
     let url = url::Url::parse(raw).map_err(|e| ToolError::Execution(format!("非法 URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ToolError::Execution(format!(
@@ -827,14 +859,437 @@ fn fetch_client() -> &'static reqwest::Client {
             .timeout(HTTP_FETCH_TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             // 身份 UA：crates.io / npm / GitHub 等 API 对无 UA 请求返回 403。
-            .user_agent(concat!("gyre-agent/", env!("CARGO_PKG_VERSION"), " (+https://github.com/Gyre)"))
+            .user_agent(concat!(
+                "gyre-agent/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/Gyre)"
+            ))
             // 禁用自动重定向：手动跟随并对每一跳的目标重新做 SSRF 校验。
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("构造 HTTP client 失败")
     })
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// 二进制格式面（移植 omp read 的归档/SQLite/notebook 支持）
+// ─────────────────────────────────────────────────────────────────────────────
 
+/// `read_file` 单条目成员数上限（防巨型归档撑爆上下文）。
+const MAX_ARCHIVE_ENTRIES: usize = 200;
+/// 单成员/单表渲染字节上限。
+const MAX_MEMBER_BYTES: usize = 256 * 1024;
+/// `SQLite` 表浏览行数上限。
+const MAX_SQL_ROWS: usize = 50;
+
+/// 拆 `路径:selector`（首个 `:` 分隔；无冒号 → selector None）。
+///
+/// `:conflicts` 后缀已在 [`ReadFileTool::execute`] 前置分支消费，此处不再处理。
+fn split_path_selector(path: &str) -> (&str, Option<&str>) {
+    match path.find(':') {
+        Some(i) => (&path[..i], Some(&path[i + 1..])),
+        None => (path, None),
+    }
+}
+
+/// 按扩展名分派二进制格式读取：归档（zip/tar 族）成员浏览与读取、SQLite 表浏览与
+/// 只读查询、Jupyter notebook 渲染。其它扩展名返回 `Ok(None)` 走普通文本路径。
+///
+/// - `archive.zip` → 成员清单；`archive.zip:member/path` → 成员内容
+/// - `db.sqlite` → 表清单；`db.sqlite:表名` → 建表语句 + 前 [`MAX_SQL_ROWS`] 行；
+///   `db.sqlite::SELECT …` → 只读 SQL（仅 SELECT/PRAGMA/EXPLAIN，多语句拒绝）
+/// - `note.ipynb` → 单元格渲染（markdown/code/输出摘要）
+async fn read_binary_format(full: &Path, sel: Option<&str>) -> Result<Option<String>, ToolError> {
+    let ext = full
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let is_gz = ext == "gz" || ext == "tgz" || ext == "bz2" || ext == "xz" || ext == "zst";
+    // tar 族：tar / tar.gz / tgz（bz2/xz/zst v1 不支持，明确报错而非误读为文本）。
+    let base_ext = if is_gz {
+        full.with_extension("")
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default()
+    } else {
+        ext.clone()
+    };
+
+    let kind = match (base_ext.as_str(), ext.as_str()) {
+        ("zip" | "jar" | "war" | "ear" | "apk" | "whl" | "ipa", _) => FormatKind::Zip,
+        ("tar", "tar") => FormatKind::Tar,
+        ("tar", "gz") => FormatKind::TarGz,
+        (_, "tgz") => FormatKind::TarGz,
+        ("tar", other) if is_gz => {
+            return Err(ToolError::Execution(format!(
+                "暂不支持 .tar.{other}（支持 .tar / .tar.gz）"
+            )));
+        }
+        ("sqlite" | "sqlite3" | "db" | "db3", _) => FormatKind::Sqlite,
+        ("ipynb", _) => FormatKind::Notebook,
+        _ => return Ok(None),
+    };
+
+    // 阻塞解压/SQL 在专用线程执行，路径按值 move。
+    let path_buf = full.to_path_buf();
+    let sel_owned = sel.map(str::to_string);
+    let out = tokio::task::spawn_blocking(move || match kind {
+        FormatKind::Zip => read_zip(&path_buf, sel_owned.as_deref()),
+        FormatKind::Tar => read_tar(&path_buf, sel_owned.as_deref(), false),
+        FormatKind::TarGz => read_tar(&path_buf, sel_owned.as_deref(), true),
+        FormatKind::Sqlite => read_sqlite(&path_buf, sel_owned.as_deref()),
+        FormatKind::Notebook => read_notebook(&path_buf),
+    })
+    .await
+    .map_err(|e| ToolError::Execution(format!("格式读取线程失败: {e}")))??;
+    Ok(Some(out))
+}
+
+/// 二进制格式族。
+#[derive(Debug, Clone, Copy)]
+enum FormatKind {
+    /// zip 家族（zip/jar/war/ear/apk/whl/ipa）。
+    Zip,
+    /// 裸 tar。
+    Tar,
+    /// gzip 压缩 tar（tar.gz/tgz）。
+    TarGz,
+    /// `SQLite` 数据库。
+    Sqlite,
+    /// Jupyter notebook。
+    Notebook,
+}
+
+/// zip 家族：成员清单（无 selector）或单成员内容。
+fn read_zip(path: &Path, sel: Option<&str>) -> Result<String, ToolError> {
+    let file = std::fs::File::open(path).map_err(ToolError::Io)?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| ToolError::Execution(format!("zip 打开失败: {e}")))?;
+    let Some(member) = sel else {
+        let mut out = format!("# {}（zip，{} 个条目）\n", path.display(), zip.len());
+        let mut shown = 0;
+        for i in 0..zip.len() {
+            let entry = zip
+                .by_index_raw(i)
+                .map_err(|e| ToolError::Execution(format!("zip 条目读取失败: {e}")))?;
+            let name = entry.name().to_string();
+            let size = entry.size();
+            if shown < MAX_ARCHIVE_ENTRIES {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("- {name} ({size} B)\n"));
+                shown += 1;
+            }
+        }
+        if zip.len() > shown {
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("…（共 {} 条目，仅列前 {shown}）\n", zip.len()),
+            );
+        }
+        out.push_str(&format!(
+            "\n读成员：read_file path = `{}`（路径:成员）",
+            path.display()
+        ));
+        return Ok(out);
+    };
+    let mut entry = zip
+        .by_name(member)
+        .map_err(|e| ToolError::Execution(format!("zip 成员 {member:?} 不存在: {e}")))?;
+    let mut buf = Vec::with_capacity(entry.size().min(MAX_MEMBER_BYTES as u64) as usize);
+    std::io::Read::read_to_end(&mut entry, &mut buf)
+        .map_err(|e| ToolError::Execution(format!("zip 成员读取失败: {e}")))?;
+    bounded_lossy(&buf, member)
+}
+
+/// tar / tar.gz：成员清单或单成员内容。
+fn read_tar(path: &Path, sel: Option<&str>, gz: bool) -> Result<String, ToolError> {
+    let file = std::fs::File::open(path).map_err(ToolError::Io)?;
+    let reader: Box<dyn std::io::Read> = if gz {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut archive = tar::Archive::new(reader);
+    let mut entries = archive
+        .entries()
+        .map_err(|e| ToolError::Execution(format!("tar 打开失败: {e}")))?;
+    let mut listing = Vec::new();
+    while let Some(mut entry) = entries
+        .next()
+        .transpose()
+        .map_err(|e| ToolError::Execution(format!("tar 条目读取失败: {e}")))?
+    {
+        let name = entry
+            .path()
+            .map_err(|e| ToolError::Execution(format!("tar 路径解码失败: {e}")))?
+            .to_string_lossy()
+            .into_owned();
+        let size = entry.size();
+        if let Some(member) = sel {
+            if name == member {
+                let mut buf = Vec::with_capacity(size.min(MAX_MEMBER_BYTES as u64) as usize);
+                std::io::Read::read_to_end(&mut entry, &mut buf).map_err(ToolError::Io)?;
+                return bounded_lossy(&buf, member);
+            }
+            continue;
+        }
+        if listing.len() < MAX_ARCHIVE_ENTRIES {
+            listing.push(format!("- {name} ({size} B)"));
+        }
+    }
+    if let Some(member) = sel {
+        return Err(ToolError::Execution(format!("tar 成员 {member:?} 不存在")));
+    }
+    let kind = if gz { "tar.gz" } else { "tar" };
+    let mut out = format!("# {}（{kind}，{} 个条目）\n", path.display(), listing.len());
+    for l in &listing {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{l}\n"));
+    }
+    out.push_str(&format!(
+        "\n读成员：read_file path = `{}`（路径:成员）",
+        path.display()
+    ));
+    Ok(out)
+}
+
+/// SQLite：表清单 / 单表浏览（建表语句 + 前 N 行）/ `::` 前缀只读 SQL。
+fn read_sqlite(path: &Path, sel: Option<&str>) -> Result<String, ToolError> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| ToolError::Execution(format!("SQLite 打开失败: {e}")))?;
+
+    // 只读 SQL：`db.sqlite::SELECT …`（双冒号与「表名」区分）。
+    // `db.sqlite::SELECT …`：首个 `:` 已被 split_path_selector 消耗，此处再剥一个。
+    if let Some(sql) = sel.and_then(|s| s.strip_prefix(':')) {
+        let trimmed = sql.trim().trim_end_matches(';');
+        let head = trimmed
+            .split_whitespace()
+            .next()
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_default();
+        if !matches!(head.as_str(), "SELECT" | "PRAGMA" | "EXPLAIN" | "WITH") {
+            return Err(ToolError::Execution(format!(
+                "只读 SQL 仅接受 SELECT/PRAGMA/EXPLAIN/WITH（收到 {head:?}）"
+            )));
+        }
+        if trimmed.contains(';') {
+            return Err(ToolError::Execution("拒绝多语句 SQL".into()));
+        }
+        return query_rows(&conn, trimmed, MAX_SQL_ROWS);
+    }
+
+    let tables: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+            .map_err(|e| ToolError::Execution(format!("sqlite_master 读取失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| ToolError::Execution(format!("表枚举失败: {e}")))?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let Some(table) = sel else {
+        let mut out = format!("# {}（SQLite，{} 张表）\n", path.display(), tables.len());
+        for (name, sql) in &tables {
+            let first_line = sql.lines().next().unwrap_or("");
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("- {name} — {first_line}\n"));
+        }
+        out.push_str(&format!(
+            "\n浏览表：read_file path = `{}:表名`；只读查询：`{}::SELECT …`",
+            path.display(),
+            path.display()
+        ));
+        return Ok(out);
+    };
+    if !tables.iter().any(|(n, _)| n == table) {
+        return Err(ToolError::Execution(format!("表 {table:?} 不存在")));
+    }
+    let schema = tables
+        .iter()
+        .find(|(n, _)| n == table)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_default();
+    let rows = query_rows(&conn, &format!("SELECT * FROM \"{table}\""), MAX_SQL_ROWS)?;
+    Ok(format!("-- {table} 建表语句\n{schema}\n\n{rows}"))
+}
+
+/// 执行只读查询并渲染为管道分隔表（行数上限 `limit`）。
+fn query_rows(conn: &rusqlite::Connection, sql: &str, limit: usize) -> Result<String, ToolError> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| ToolError::Execution(format!("SQL 预备失败: {e}")))?;
+    let cols: Vec<String> = stmt
+        .column_names()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let ncols = cols.len();
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| ToolError::Execution(format!("SQL 执行失败: {e}")))?;
+    let mut out = format!("| {} |\n|{}|\n", cols.join(" | "), "-|".repeat(ncols));
+    let mut n = 0;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| ToolError::Execution(format!("行读取失败: {e}")))?
+    {
+        if n >= limit {
+            let _ =
+                std::fmt::Write::write_fmt(&mut out, format_args!("…（仅显示前 {limit} 行）\n"));
+            break;
+        }
+        let mut cells = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            let v = row
+                .get_ref(i)
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            cells.push(match v {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                rusqlite::types::ValueRef::Text(t) => {
+                    String::from_utf8_lossy(t).truncate_chars_sql()
+                }
+                rusqlite::types::ValueRef::Blob(b) => format!("<blob {}B>", b.len()),
+            });
+        }
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("| {} |\n", cells.join(" | ")));
+        n += 1;
+    }
+    Ok(out)
+}
+
+/// `SQLite` 文本单元格截断（80 字符）。
+trait SqlCellTruncate {
+    fn truncate_chars_sql(self) -> String;
+}
+impl SqlCellTruncate for std::borrow::Cow<'_, str> {
+    fn truncate_chars_sql(self) -> String {
+        let mut s: String = self.chars().take(80).collect();
+        s = s.replace('\n', "\\n").replace('\r', "");
+        s
+    }
+}
+
+/// Jupyter notebook 渲染：markdown/code 单元格与输出摘要。
+fn read_notebook(path: &Path) -> Result<String, ToolError> {
+    let raw = std::fs::read_to_string(path).map_err(ToolError::Io)?;
+    let nb: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| ToolError::Execution(format!("notebook JSON 解析失败: {e}")))?;
+    let empty = Vec::new();
+    let cells = nb
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let mut out = format!(
+        "# {}（notebook，{} 单元格；cells 可编辑，其它字段只读）\n",
+        path.display(),
+        cells.len()
+    );
+    for (i, cell) in cells.iter().enumerate() {
+        let ty = cell
+            .get("cell_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let source = join_nb_source(cell.get("source"));
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n[{i}] {ty}:\n{}\n", number_lines(&source)),
+        );
+        if ty == "code" {
+            if let Some(outputs) = cell.get("outputs").and_then(serde_json::Value::as_array) {
+                for o in outputs {
+                    // 注意：键名 "text/plain" 自带斜杠，JSON Pointer 会误当层级分隔，
+                    // 必须用 get 链而非 pointer。
+                    let text = o
+                        .get("data")
+                        .and_then(|d| d.get("text/plain"))
+                        .and_then(|v| {
+                            v.as_str().map(str::to_string).or_else(|| {
+                                v.as_array().map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                })
+                            })
+                        })
+                        .or_else(|| {
+                            o.get("text").and_then(|v| {
+                                v.as_str().map(str::to_string).or_else(|| {
+                                    v.as_array().map(|a| {
+                                        a.iter()
+                                            .filter_map(|x| x.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("")
+                                    })
+                                })
+                            })
+                        })
+                        .unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        let t: String = text.chars().take(2000).collect();
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut out,
+                            format_args!("  out: {}\n", t.trim_end()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if out.len() > MAX_MEMBER_BYTES {
+        out.truncate(MAX_MEMBER_BYTES);
+        out.push_str("\n…（notebook 渲染超长已截断）");
+    }
+    Ok(out)
+}
+
+/// notebook source 字段（字符串或字符串数组两种形态）拼接。
+fn join_nb_source(v: Option<&serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// 简单行号前缀（notebook 内嵌渲染用）。
+fn number_lines(text: &str) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(i, l)| format!("  {i}\t{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bounded_lossy(buf: &[u8], label: &str) -> Result<String, ToolError> {
+    if buf.len() > MAX_MEMBER_BYTES {
+        let mut end = MAX_MEMBER_BYTES;
+        while end > 0 && std::str::from_utf8(&buf[..end]).is_err() {
+            end -= 1;
+        }
+        let mut s = String::from_utf8_lossy(&buf[..end]).into_owned();
+        s.push_str(&format!(
+            "\n…（{label} 超过 {MAX_MEMBER_BYTES} 字节已截断）"
+        ));
+        Ok(s)
+    } else {
+        Ok(String::from_utf8_lossy(buf).into_owned())
+    }
+}
 /// 本地文件读取大小上限（超出截断并标注，避免大文件整段入内存）。
 const MAX_READ_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 
@@ -886,10 +1341,10 @@ pub struct WriteFileTool;
 
 #[async_trait]
 impl Tool for WriteFileTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "write_file"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "写入文件（覆盖）。自动创建父目录。属于写入类操作，通常需审批。"
     }
     fn schema(&self) -> serde_json::Value {
@@ -948,7 +1403,7 @@ mod tests {
     use crate::Tool;
     use agent_core::{ApprovalMode, ApprovalRequest, CapabilityTier, Workspace};
 
-    fn dummy_ctx<'a>(ws: &'a Workspace) -> ToolContext<'a> {
+    fn dummy_ctx(ws: &Workspace) -> ToolContext<'_> {
         dummy_ctx_q(ws, None)
     }
 
@@ -1004,6 +1459,7 @@ mod tests {
             update_tx: None,
             conflicts: history,
             pending_rewrites: queue,
+            context: None,
         }
     }
 
@@ -1124,7 +1580,10 @@ mod tests {
             ToolResult::Text(t) => t,
             _ => panic!("应为文本"),
         };
-        assert!(msg.contains("1 处合并冲突") && msg.contains("L2-L9"), "{msg}");
+        assert!(
+            msg.contains("1 处合并冲突") && msg.contains("L2-L9"),
+            "{msg}"
+        );
         assert_eq!(history.lock().unwrap().len(), 1);
 
         let res = ReadFileTool
@@ -1134,7 +1593,10 @@ mod tests {
         assert!(matches!(res, ToolResult::Text(t) if t.contains("ours-a")));
 
         let res = WriteFileTool
-            .execute(serde_json::json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "conflict://1", "content": "@ours" }),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(res, ToolResult::Text(t) if t.contains("已解决冲突 #1")));
@@ -1143,7 +1605,10 @@ mod tests {
         assert_eq!(history.lock().unwrap().len(), 0, "解决后注册表应清空");
 
         let err = WriteFileTool
-            .execute(serde_json::json!({ "path": "conflict://1", "content": "@theirs" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "conflict://1", "content": "@theirs" }),
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("未注册"), "{err}");
@@ -1154,7 +1619,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agent-cf-{}", uuid_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(CONFLICT_FILE);
-        std::fs::write(&file, "a\n<<<<<<< x\n1\n=======\n2\n>>>>>>> y\nc\n<<<<<<< x\n3\n=======\n4\n>>>>>>> y\nz\n").unwrap();
+        std::fs::write(
+            &file,
+            "a\n<<<<<<< x\n1\n=======\n2\n>>>>>>> y\nc\n<<<<<<< x\n3\n=======\n4\n>>>>>>> y\nz\n",
+        )
+        .unwrap();
         let ws = Workspace::new(&dir);
         let history = std::sync::Arc::new(std::sync::Mutex::new(ConflictHistory::new()));
         let ctx = dummy_ctx_h(&ws, Some(&history));
@@ -1198,7 +1667,10 @@ mod tests {
             .unwrap();
         std::fs::write(&file, "line1\n<<<<<<< HEAD\nCHANGED\n||||||| base\nbase-c\n=======\ntheirs-d\n>>>>>>> branch\nline9\n").unwrap();
         let err = WriteFileTool
-            .execute(serde_json::json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "conflict://1", "content": "@ours" }),
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("标记行不匹配"), "{err}");
@@ -1213,7 +1685,10 @@ mod tests {
         let ctx = dummy_ctx(&ws);
 
         let err = WriteFileTool
-            .execute(serde_json::json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "conflict://1", "content": "@ours" }),
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("未启用"), "{err}");
@@ -1235,7 +1710,7 @@ mod tests {
         assert!(err.to_string().contains("仅支持写入"), "{err}");
     }
 
-   // ── resolve 暂存（ast_rewrite preview → xd://resolve/reject）────────────────
+    // ── resolve 暂存（ast_rewrite preview → xd://resolve/reject）────────────────
 
     const REWRITE_FILE: &str = "rw.rs";
 
@@ -1284,11 +1759,17 @@ mod tests {
             ToolResult::Text(t) => t,
             _ => panic!("应为文本"),
         };
-        assert!(listing.contains("rw.rs") && listing.contains("2 replacements"), "{listing}");
+        assert!(
+            listing.contains("rw.rs") && listing.contains("2 replacements"),
+            "{listing}"
+        );
 
         // 应用。
         let res = WriteFileTool
-            .execute(serde_json::json!({ "path": "xd://resolve", "content": "" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "xd://resolve", "content": "" }),
+                &ctx,
+            )
             .await
             .unwrap();
         let applied = match res {
@@ -1302,7 +1783,10 @@ mod tests {
         assert!(queue.lock().unwrap().is_empty(), "应用后队列应清空");
         // 再应用 → 空队列提示。
         let res = WriteFileTool
-            .execute(serde_json::json!({ "path": "xd://resolve", "content": "" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "xd://resolve", "content": "" }),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(res, ToolResult::Text(t) if t.contains("暂存队列为空")));
@@ -1322,17 +1806,25 @@ mod tests {
         // 文件在预览后被外部修改（字节数变化）→ 应用必须拒绝。
         std::fs::write(&file, "fn a() {}\n// external edit\n").unwrap();
         let res = WriteFileTool
-            .execute(serde_json::json!({ "path": "xd://resolve", "content": "" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "xd://resolve", "content": "" }),
+                &ctx,
+            )
             .await
             .unwrap();
         let msg = match res {
             ToolResult::Text(t) => t,
             _ => panic!("应为文本"),
         };
-        assert!(msg.contains("文件已变化") && msg.contains("拒绝写入"), "{msg}");
+        assert!(
+            msg.contains("文件已变化") && msg.contains("拒绝写入"),
+            "{msg}"
+        );
         assert!(!queue.lock().unwrap().is_empty(), "失败条目保留可重试");
         assert!(
-            std::fs::read_to_string(&file).unwrap().contains("external edit"),
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("external edit"),
             "文件不应被改写"
         );
     }
@@ -1349,7 +1841,10 @@ mod tests {
 
         preview_rewrite(&ctx).await;
         let res = WriteFileTool
-            .execute(serde_json::json!({ "path": "xd://reject", "content": "" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "xd://reject", "content": "" }),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(res, ToolResult::Text(t) if t.contains("已丢弃 1 条")));
@@ -1413,7 +1908,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("owner"), "{err}");
         let err = ReadFileTool
-            .execute(serde_json::json!({ "path": "pr://rust-lang/rust/abc" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "pr://rust-lang/rust/abc" }),
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("编号"), "{err}");
@@ -1434,10 +1932,17 @@ mod tests {
         let cache_dir = dir.join(".gyre/cache/github");
         std::fs::create_dir_all(&cache_dir).unwrap();
         let body = r#"[{"number": 42, "title": "fix cache", "state": "open", "user": {"login": "tester"}}]"#;
-        std::fs::write(cache_dir.join("anon__octo__repo__pulls_state_open_per_page_10.json"), body).unwrap();
+        std::fs::write(
+            cache_dir.join("anon__octo__repo__pulls_state_open_per_page_10.json"),
+            body,
+        )
+        .unwrap();
 
         let res = ReadFileTool
-            .execute(serde_json::json!({ "path": "pr://octo/repo?state=open" }), &ctx)
+            .execute(
+                serde_json::json!({ "path": "pr://octo/repo?state=open" }),
+                &ctx,
+            )
             .await
             .unwrap();
         let text = match res {
@@ -1445,5 +1950,200 @@ mod tests {
             _ => panic!("应为文本"),
         };
         assert!(text.contains("#42") && text.contains("fix cache"), "{text}");
+    }
+
+    // ── 二进制格式面（归档/SQLite/notebook）───────────────────────────────────
+
+    /// 构造含两个文件的 zip。
+    fn make_zip(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join("bundle.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+        w.start_file("a.txt", opts).unwrap();
+        w.write_all(b"alpha content").unwrap();
+        w.start_file("sub/b.txt", opts).unwrap();
+        w.write_all(b"beta").unwrap();
+        w.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn zip_listing_and_member_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let _zip_path = make_zip(dir.path());
+        let ws = Workspace::new(dir.path().to_path_buf());
+        let ctx = dummy_ctx(&ws);
+        // 清单。
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "bundle.zip"}), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(text.contains("2 个条目"), "{text}");
+        assert!(
+            text.contains("a.txt") && text.contains("sub/b.txt"),
+            "{text}"
+        );
+        // 成员读取。
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "bundle.zip:a.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.to_llm_text().contains("alpha content"));
+        // 不存在的成员。
+        let err = ReadFileTool
+            .execute(serde_json::json!({"path": "bundle.zip:nope.txt"}), &ctx)
+            .await;
+        assert!(err.is_err());
+    }
+
+    /// 构造 tar（可选 gzip）。
+    fn make_tar(dir: &std::path::Path, gz: bool) -> std::path::PathBuf {
+        let path = dir.join(if gz { "b.tgz" } else { "b.tar" });
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(6);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder
+            .append_data(&mut h, "x.txt", std::io::Cursor::new(b"tar-ok".to_vec()))
+            .unwrap();
+        builder.finish().unwrap();
+        if gz {
+            let raw = std::fs::read(&path).unwrap();
+            let mut enc = flate2::write::GzEncoder::new(
+                std::fs::File::create(&path).unwrap(),
+                flate2::Compression::default(),
+            );
+            std::io::Write::write_all(&mut enc, &raw).unwrap();
+            enc.finish().unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn tar_and_tgz_member_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf());
+        let ctx = dummy_ctx(&ws);
+        for (_path, expect) in [
+            (make_tar(dir.path(), false), "b.tar"),
+            (make_tar(dir.path(), true), "b.tgz"),
+        ] {
+            let out = ReadFileTool
+                .execute(serde_json::json!({"path": format!("{expect}:x.txt")}), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                out.to_llm_text().contains("tar-ok"),
+                "{expect}: {}",
+                out.to_llm_text()
+            );
+        }
+        // 清单。
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "b.tar"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.to_llm_text().contains("x.txt"));
+    }
+
+    fn make_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("data.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO users(name) VALUES ('alice'), ('bob');",
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn sqlite_tables_rows_and_readonly_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = make_db(dir.path());
+        let ws = Workspace::new(dir.path().to_path_buf());
+        let ctx = dummy_ctx(&ws);
+        // 表清单（相对工作区路径；绝对路径会被沙箱词法钳制）。
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "data.db"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.to_llm_text().contains("users"), "{}", out.to_llm_text());
+        // 表浏览。
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "data.db:users"}), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(
+            text.contains("CREATE TABLE") && text.contains("alice"),
+            "{text}"
+        );
+        // 只读查询。
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "data.db::SELECT COUNT(*) AS n FROM users"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.to_llm_text().contains("| 2 |"), "{}", out.to_llm_text());
+        // 写语句拒绝。
+        let err = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "data.db::INSERT INTO users(name) VALUES('x')"}),
+                &ctx,
+            )
+            .await;
+        assert!(err.is_err());
+        // 多语句拒绝。
+        let err = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "data.db::SELECT 1; SELECT 2"}),
+                &ctx,
+            )
+            .await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn ipynb_renders_cells_and_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nb.ipynb");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "cells": [
+                    {"cell_type": "markdown", "source": ["# Title\n", "desc"]},
+                    {"cell_type": "code", "source": "print('hi')",
+                     "outputs": [{"data": {"text/plain": ["hi\n"]}, "output_type": "stream"}]}
+                ],
+                "metadata": {}, "nbformat": 4
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf());
+        let ctx = dummy_ctx(&ws);
+        let out = ReadFileTool
+            .execute(serde_json::json!({"path": "nb.ipynb"}), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(text.contains("2 单元格"), "{text}");
+        assert!(
+            text.contains("[0] markdown") && text.contains("# Title"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[1] code") && text.contains("print('hi')"),
+            "{text}"
+        );
+        assert!(text.contains("out: hi"), "{text}");
     }
 }

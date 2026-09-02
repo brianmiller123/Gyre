@@ -1,4 +1,4 @@
-//! CDP（Chrome DevTools Protocol）最小传输层。
+//! CDP（Chrome `DevTools` Protocol）最小传输层。
 //!
 //! 基于 tokio-tungstenite 的 WebSocket JSON-RPC 帧收发：
 //! - 请求/响应按自增 `id` 配对（`HashMap<u64, oneshot>`），发送超时 10s（可配置）；
@@ -59,8 +59,8 @@ pub struct CdpEvent {
 }
 
 /// 解析后的入站帧。
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum IncomingFrame {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingFrame {
     /// 请求响应（`id` + `result`，或 `id` + `error`）。
     Response {
         /// 对应请求 id。
@@ -82,12 +82,7 @@ pub(crate) enum IncomingFrame {
 }
 
 /// 封装 JSON-RPC 请求帧（纯函数，供测试）。
-pub(crate) fn encode_request(
-    id: u64,
-    method: &str,
-    params: &Value,
-    session_id: Option<&str>,
-) -> Value {
+pub fn encode_request(id: u64, method: &str, params: &Value, session_id: Option<&str>) -> Value {
     let mut frame = json!({ "id": id, "method": method, "params": params });
     if let Some(sid) = session_id {
         frame["sessionId"] = Value::String(sid.to_string());
@@ -96,7 +91,7 @@ pub(crate) fn encode_request(
 }
 
 /// 解析入站帧（纯函数，供测试）：有 `id` → 响应；有 `method` → 事件；否则无法识别。
-pub(crate) fn parse_frame(v: &Value) -> Option<IncomingFrame> {
+pub fn parse_frame(v: &Value) -> Option<IncomingFrame> {
     if let Some(id) = v.get("id").and_then(Value::as_u64) {
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         let error = v.get("error").map(|e| {
@@ -132,10 +127,13 @@ struct EventStore {
     next_seq: u64,
 }
 
+/// 在途 CDP 命令等待表：请求 id → 响应 oneshot 发送端。
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>;
+
 /// CDP WebSocket 连接：id 配对 + 事件分流。
 pub struct CdpConnection {
     tx: mpsc::UnboundedSender<String>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>,
+    pending: PendingMap,
     events: Arc<Mutex<EventStore>>,
     notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -146,7 +144,7 @@ pub struct CdpConnection {
 }
 
 impl CdpConnection {
-    /// 连接浏览器级 DevTools WebSocket 端点（默认 10s 命令超时）。
+    /// 连接浏览器级 `DevTools` WebSocket 端点（默认 10s 命令超时）。
     ///
     /// # Errors
     /// 连接建立失败时返回 [`CdpError::Connect`]。
@@ -237,7 +235,10 @@ impl CdpConnection {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (otx, orx) = oneshot::channel();
         {
-            let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.insert(id, otx);
         }
         let frame = encode_request(id, method, &params, session_id);
@@ -246,8 +247,8 @@ impl CdpConnection {
         let received = tokio::time::timeout(self.send_timeout, orx)
             .await
             .map_err(|_| CdpError::Timeout(self.send_timeout))?;
-        let res = received.map_err(|_| CdpError::Closed)?;
-        res
+
+        received.map_err(|_| CdpError::Closed)?
     }
 
     /// 当前事件入队水位（配合 [`Self::wait_for_event_since`] 区分新旧事件）。
@@ -255,13 +256,16 @@ impl CdpConnection {
     pub fn event_seq(&self) -> u64 {
         self.events
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .next_seq
     }
 
     /// 取出满足谓词的首个事件（队列非空且命中则立即返回，否则 `None`）。
     pub fn try_take_event(&self, pred: impl Fn(&CdpEvent) -> bool) -> Option<CdpEvent> {
-        let mut store = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let idx = store.queue.iter().position(pred)?;
         store.queue.remove(idx)
     }
@@ -309,7 +313,10 @@ impl CdpConnection {
     /// 取出队列中全部事件（控制台消息等）并清空。
     #[must_use]
     pub fn drain_events(&self) -> Vec<CdpEvent> {
-        let mut store = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         store.queue.drain(..).collect()
     }
 }
@@ -321,7 +328,7 @@ async fn reader_task(
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     >,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>,
+    pending: PendingMap,
     events: Arc<Mutex<EventStore>>,
     notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -355,7 +362,7 @@ async fn reader_task(
 /// 按帧类型分流：响应 → 配对 oneshot；事件 → 入队 + 唤醒。
 fn dispatch_frame(
     v: Value,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>,
+    pending: &PendingMap,
     events: &Arc<Mutex<EventStore>>,
     notify: &Arc<Notify>,
 ) {
@@ -365,7 +372,9 @@ fn dispatch_frame(
     };
     match frame {
         IncomingFrame::Response { id, result, error } => {
-            let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(tx) = map.remove(&id) {
                 let outcome = match error {
                     Some((code, message)) => Err(CdpError::Protocol { code, message }),
@@ -381,7 +390,9 @@ fn dispatch_frame(
             params,
             session_id,
         } => {
-            let mut store = events.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let seq = store.next_seq;
             store.next_seq += 1;
             store.queue.push_back(CdpEvent {
@@ -396,13 +407,13 @@ fn dispatch_frame(
 }
 
 /// 连接断开：失败全部在途请求（错误经构造器惰性创建，避免 `CdpError` 需 `Clone`）。
-fn fail_all_pending<F>(
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>,
-    err: F,
-) where
+fn fail_all_pending<F>(pending: &PendingMap, err: F)
+where
     F: Fn() -> CdpError,
 {
-    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(err()));
     }

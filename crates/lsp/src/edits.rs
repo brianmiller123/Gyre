@@ -38,10 +38,7 @@ pub fn apply_text_edits(text: &str, edits: &[LspRenameEdit]) -> Result<String, L
         .collect::<Result<Vec<_>, LspError>>()?;
 
     // 自底向上：按起点降序（同起点按终点降序）。
-    resolved.sort_unstable_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.cmp(&a.1))
-    });
+    resolved.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
     // 重叠校验：相邻项（排序后）区间交叉即冲突。
     for w in resolved.windows(2) {
@@ -154,7 +151,14 @@ pub fn uri_to_path(uri: &str) -> String {
 mod tests {
     use super::*;
 
-    fn edit(uri: &str, line: u32, ch: u32, end_line: u32, end_ch: u32, new_text: &str) -> LspRenameEdit {
+    fn edit(
+        uri: &str,
+        line: u32,
+        ch: u32,
+        end_line: u32,
+        end_ch: u32,
+        new_text: &str,
+    ) -> LspRenameEdit {
         LspRenameEdit {
             uri: uri.into(),
             line,
@@ -170,20 +174,14 @@ mod tests {
     fn applies_bottom_up() {
         let text = "aaa\nbbb\nccc\n";
         // 两处替换：L1 与 L2 同时改。
-        let edits = vec![
-            edit("u", 1, 0, 1, 3, "BBB"),
-            edit("u", 2, 0, 2, 3, "CCC"),
-        ];
+        let edits = vec![edit("u", 1, 0, 1, 3, "BBB"), edit("u", 2, 0, 2, 3, "CCC")];
         assert_eq!(apply_text_edits(text, &edits).unwrap(), "aaa\nBBB\nCCC\n");
     }
 
     #[test]
     fn overlapping_edits_rejected() {
         let text = "abcdef";
-        let edits = vec![
-            edit("u", 0, 1, 0, 4, "X"),
-            edit("u", 0, 2, 0, 5, "Y"),
-        ];
+        let edits = vec![edit("u", 0, 1, 0, 4, "X"), edit("u", 0, 2, 0, 5, "Y")];
         let err = apply_text_edits(text, &edits).unwrap_err();
         assert!(err.to_string().contains("重叠"), "{err}");
     }

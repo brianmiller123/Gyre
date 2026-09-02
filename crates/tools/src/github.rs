@@ -55,7 +55,7 @@ impl Default for GithubTool {
     }
 }
 
-/// 只读动作集合（`graphql` 不在此列——GraphQL 可执行 mutation，需 allow_write）。
+/// 只读动作集合（`graphql` 不在此列——GraphQL 可执行 mutation，需 `allow_write`）。
 const READ_ACTIONS: &[&str] = &[
     "get_pr",
     "list_prs",
@@ -361,7 +361,7 @@ fn build_client() -> Result<&'static reqwest::Client, ToolError> {
 }
 
 /// 读取鉴权 token（`GH_TOKEN` 优先于 `GITHUB_TOKEN`），空值视为无。
-pub(crate) fn auth_token() -> Option<String> {
+pub fn auth_token() -> Option<String> {
     std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .ok()
@@ -375,7 +375,7 @@ pub(crate) fn auth_token() -> Option<String> {
 ///
 /// # Errors
 /// 网络错误、HTTP 非 2xx 或缓存读写失败时返回 [`ToolError::Execution`]。
-pub(crate) async fn api_get_json(
+pub async fn api_get_json(
     owner: &str,
     repo: &str,
     path: &str,
@@ -386,14 +386,13 @@ pub(crate) async fn api_get_json(
     let url = format!("{API_BASE}/repos/{owner}/{repo}/{path}");
     // auth 指纹：token 前 8 字符 + 有无（匿名缓存与鉴权缓存隔离）。
     let auth = auth_token();
-    let fingerprint = auth
-        .as_ref()
-        .map(|t| format!("tok-{}", &t[..t.len().min(8)]))
-        .unwrap_or_else(|| "anon".into());
+    let fingerprint = auth.as_ref().map_or_else(
+        || "anon".into(),
+        |t| format!("tok-{}", &t[..t.len().min(8)]),
+    );
     // 列表（含 `?`）TTL 短：60s；单对象 TTL 长：300s。
     let ttl = if path.contains('?') { 60 } else { 300 };
-    let safe_key = format!("{owner}__{repo}__{path}")
-        .replace(['/', '?', '=', '&'], "_");
+    let safe_key = format!("{owner}__{repo}__{path}").replace(['/', '?', '=', '&'], "_");
     let cache_dir = ctx.workspace.root().join(".gyre/cache/github");
     let cache_file = cache_dir.join(format!("{fingerprint}__{safe_key}.json"));
 
@@ -431,7 +430,7 @@ pub(crate) async fn api_get_json(
 ///
 /// # Errors
 /// 网络/解析失败时返回 [`ToolError::Execution`]。
-pub(crate) async fn render_gh_uri(
+pub async fn render_gh_uri(
     kind: &str,
     owner: &str,
     repo: &str,
@@ -442,58 +441,91 @@ pub(crate) async fn render_gh_uri(
     let endpoint = match kind {
         "pr" => "pulls",
         "issue" => "issues",
-        other => return Err(ToolError::InvalidArgs(format!("未知 GitHub 类型 `{other}`（pr|issue）"))),
+        other => {
+            return Err(ToolError::InvalidArgs(format!(
+                "未知 GitHub 类型 `{other}`（pr|issue）"
+            )));
+        }
     };
     let display = format!("{owner}/{repo}");
-    match number {
-        Some(n) => {
-            let v = api_get_json(owner, repo, &format!("{endpoint}/{n}"), ctx).await?;
-            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("(无标题)");
-            let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
-            let user = v.pointer("/user/login").and_then(|x| x.as_str()).unwrap_or("?");
-            let created = v
-                .get("created_at")
+    if let Some(n) = number {
+        let v = api_get_json(owner, repo, &format!("{endpoint}/{n}"), ctx).await?;
+        let title = v
+            .get("title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(无标题)");
+        let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+        let user = v
+            .pointer("/user/login")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let created = v.get("created_at").and_then(|x| x.as_str()).unwrap_or("?");
+        let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+        let comments = v
+            .get("comments")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let mut out = format!("#{n} {title} [{state}] — @{user} · {created}\n\n");
+        if kind == "pr" {
+            let merged = v
+                .get("merged")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let additions = v
+                .pointer("/additions")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let deletions = v
+                .pointer("/deletions")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "合并: {} · +{additions}/-{deletions} 行\n\n",
+                if merged { "是" } else { "否" }
+            ));
+        }
+        if !body.is_empty() {
+            out.push_str(&format!("{body}\n\n"));
+        }
+        out.push_str(&format!(
+            "评论 {comments} 条 · 来源: <https://github.com/{display}/{endpoint}/{n}>\n"
+        ));
+        Ok(out)
+    } else {
+        let v = api_get_json(owner, repo, &format!("{endpoint}?{query}"), ctx).await?;
+        let arr = match v.as_array() {
+            Some(a) => a,
+            None => {
+                return Err(ToolError::Execution(format!(
+                    "{display} {endpoint} 列表响应非数组（可能是速率限制或 repo 不存在）"
+                )));
+            }
+        };
+        let mut out = format!(
+            "{display} 的 {} 列表（共 {} 条，{query}）：\n",
+            kind,
+            arr.len()
+        );
+        for item in arr {
+            let n = item
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let title = item
+                .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(无标题)");
+            let state = item.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+            let user = item
+                .pointer("/user/login")
                 .and_then(|x| x.as_str())
                 .unwrap_or("?");
-            let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-            let comments = v.get("comments").and_then(|x| x.as_u64()).unwrap_or(0);
-            let mut out = format!("#{n} {title} [{state}] — @{user} · {created}\n\n");
-            if kind == "pr" {
-                let merged = v
-                    .get("merged")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false);
-                let additions = v.pointer("/additions").and_then(|x| x.as_u64()).unwrap_or(0);
-                let deletions = v.pointer("/deletions").and_then(|x| x.as_u64()).unwrap_or(0);
-                out.push_str(&format!("合并: {} · +{additions}/-{deletions} 行\n\n", if merged { "是" } else { "否" }));
-            }
-            if !body.is_empty() {
-                out.push_str(&format!("{body}\n\n"));
-            }
-            out.push_str(&format!("评论 {comments} 条 · 来源: <https://github.com/{display}/{endpoint}/{n}>\n"));
-            Ok(out)
+            out.push_str(&format!("  #{n} [{state}] {title} — @{user}\n"));
         }
-        None => {
-            let v = api_get_json(owner, repo, &format!("{endpoint}?{query}"), ctx).await?;
-            let arr = match v.as_array() {
-                Some(a) => a,
-                None => {
-                    return Err(ToolError::Execution(format!(
-                        "{display} {endpoint} 列表响应非数组（可能是速率限制或 repo 不存在）"
-                    )));
-                }
-            };
-            let mut out = format!("{display} 的 {} 列表（共 {} 条，{query}）：\n", kind, arr.len());
-            for item in arr {
-                let n = item.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
-                let title = item.get("title").and_then(|x| x.as_str()).unwrap_or("(无标题)");
-                let state = item.get("state").and_then(|x| x.as_str()).unwrap_or("?");
-                let user = item.pointer("/user/login").and_then(|x| x.as_str()).unwrap_or("?");
-                out.push_str(&format!("  #{n} [{state}] {title} — @{user}\n"));
-            }
-            out.push_str(&format!("\n`read_file` 可读 `{kind}://{display}/<编号>` 看详情\n"));
-            Ok(out)
-        }
+        out.push_str(&format!(
+            "\n`read_file` 可读 `{kind}://{display}/<编号>` 看详情\n"
+        ));
+        Ok(out)
     }
 }
 
@@ -505,7 +537,7 @@ async fn fetch(req: RequestBuilder, ctx: &ToolContext<'_>) -> Result<String, Too
     let cancel = ctx.cancel;
     let resp = tokio::select! {
         biased;
-        _ = cancel.cancelled() => {
+        () = cancel.cancelled() => {
             return Err(ToolError::Execution("GitHub 请求被取消".into()));
         }
         r = req.send() => r.map_err(|e| ToolError::Execution(format!("GitHub 请求失败：{e}")))?,

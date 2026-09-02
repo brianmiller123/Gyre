@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use agent_core::message::ContentBlock;
 use crate::rule::{InterruptMode, Repeat, Rule};
+use agent_core::message::ContentBlock;
 
 /// 匹配结果：命中的规则名列表（去重，保持注册顺序）。
 pub type MatchResult = Vec<String>;
@@ -58,7 +58,11 @@ impl TtsrManager {
     /// 仅 `repeat=once` 的规则被抑制（`always` 规则天然不抑制）。
     pub fn restore(&mut self, names: &[String]) {
         for name in names {
-            if self.rules.iter().any(|r| r.name == *name && r.repeat == Repeat::Once) {
+            if self
+                .rules
+                .iter()
+                .any(|r| r.name == *name && r.repeat == Repeat::Once)
+            {
                 self.injected.insert(name.clone());
             }
         }
@@ -111,10 +115,16 @@ impl TtsrManager {
             if rule.matches_condition(digest) {
                 hits.push(rule.name.clone());
             } else if let Some(pattern) = &rule.ast_condition {
-                if let Some(lang) = path.and_then(|p| agent_ast::SupportLang::from_path(std::path::Path::new(p)))
+                if let Some(lang) =
+                    path.and_then(|p| agent_ast::SupportLang::from_path(std::path::Path::new(p)))
                 {
-                    if agent_ast::search(digest, lang, pattern, agent_ast::AstMatchStrictness::Smart)
-                        .is_ok_and(|m| !m.is_empty())
+                    if agent_ast::search(
+                        digest,
+                        lang,
+                        pattern,
+                        agent_ast::AstMatchStrictness::Smart,
+                    )
+                    .is_ok_and(|m| !m.is_empty())
                     {
                         hits.push(rule.name.clone());
                     }
@@ -138,7 +148,10 @@ impl TtsrManager {
     /// 取规则正文（注入渲染用）。
     #[must_use]
     pub fn rule_body(&self, name: &str) -> Option<&str> {
-        self.rules.iter().find(|r| r.name == name).map(|r| r.body.as_str())
+        self.rules
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.body.as_str())
     }
 
     /// 规则中断模式。
@@ -212,7 +225,9 @@ pub fn path_of(arguments: &serde_json::Value) -> Option<String> {
 
 /// 从 assistant 消息抽取工具调用元组（id, name, args）。
 #[must_use]
-pub fn tool_calls_of(message: &agent_core::AssistantMessage) -> Vec<(String, String, serde_json::Value)> {
+pub fn tool_calls_of(
+    message: &agent_core::AssistantMessage,
+) -> Vec<(String, String, serde_json::Value)> {
     message
         .content
         .iter()
@@ -237,7 +252,11 @@ mod tests {
     }
 
     fn text_rule(name: &str, condition: &str) -> Rule {
-        parse_rule(name, &format!("---\ncondition: [{condition:?}]\n---\nbody {name}")).unwrap()
+        parse_rule(
+            name,
+            &format!("---\ncondition: [{condition:?}]\n---\nbody {name}"),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -270,11 +289,13 @@ mod tests {
 
     #[test]
     fn always_rule_never_suppressed() {
-        let mut m = manager(vec![parse_rule(
-            "always-rule",
-            "---\nrepeat: always\ncondition: [x]\n---\nbody",
-        )
-        .unwrap()]);
+        let mut m = manager(vec![
+            parse_rule(
+                "always-rule",
+                "---\nrepeat: always\ncondition: [x]\n---\nbody",
+            )
+            .unwrap(),
+        ]);
         m.on_turn_start();
         assert_eq!(m.check_delta("text", "x"), vec!["always-rule"]);
         m.mark_injected("always-rule");
@@ -294,7 +315,10 @@ mod tests {
 
     #[test]
     fn disabled_rules_filtered() {
-        let mut m = TtsrManager::new(vec![text_rule("a", "x"), text_rule("b", "x")], &["a".into()]);
+        let mut m = TtsrManager::new(
+            vec![text_rule("a", "x"), text_rule("b", "x")],
+            &["a".into()],
+        );
         m.on_turn_start();
         assert_eq!(m.check_delta("text", "x"), vec!["b"]);
     }
@@ -310,7 +334,11 @@ mod tests {
         m.on_turn_start();
         let args = serde_json::json!({ "path": "src/lib.rs", "content": "let x = Box::leak(y);" });
         assert_eq!(
-            m.check_tool_call("write_file", Some("src/lib.rs"), &digest_for("write_file", &args)),
+            m.check_tool_call(
+                "write_file",
+                Some("src/lib.rs"),
+                &digest_for("write_file", &args)
+            ),
             vec!["no-leak"]
         );
         // 其他工具不匹配。
@@ -332,13 +360,21 @@ mod tests {
         m.on_turn_start();
         let args = serde_json::json!({ "path": "src/lib.rs", "content": "x" });
         assert_eq!(
-            m.check_tool_call("write_file", Some("src/lib.rs"), &digest_for("write_file", &args)),
+            m.check_tool_call(
+                "write_file",
+                Some("src/lib.rs"),
+                &digest_for("write_file", &args)
+            ),
             vec!["rust-only"]
         );
         let py = serde_json::json!({ "path": "src/lib.py", "content": "x" });
         assert!(
-            m.check_tool_call("write_file", Some("src/lib.py"), &digest_for("write_file", &py))
-                .is_empty()
+            m.check_tool_call(
+                "write_file",
+                Some("src/lib.py"),
+                &digest_for("write_file", &py)
+            )
+            .is_empty()
         );
     }
 
@@ -349,7 +385,11 @@ mod tests {
         m.on_turn_start();
         let args = serde_json::json!({ "path": "a.txt", "content": "secret" });
         assert_eq!(
-            m.check_tool_call("write_file", Some("a.txt"), &digest_for("write_file", &args)),
+            m.check_tool_call(
+                "write_file",
+                Some("a.txt"),
+                &digest_for("write_file", &args)
+            ),
             vec!["any"]
         );
         let run = serde_json::json!({ "command": "cat secret" });
@@ -373,7 +413,11 @@ mod tests {
             "content": "if (id) clearTimeout(id);"
         });
         assert_eq!(
-            m.check_tool_call("write_file", Some("src/app.js"), &digest_for("write_file", &bad)),
+            m.check_tool_call(
+                "write_file",
+                Some("src/app.js"),
+                &digest_for("write_file", &bad)
+            ),
             vec!["no-clear-timeout-if"]
         );
         // 不满足 metavariable 同一性：不匹配。
@@ -382,8 +426,12 @@ mod tests {
             "content": "if (a) clearTimeout(b);"
         });
         assert!(
-            m.check_tool_call("write_file", Some("src/app.js"), &digest_for("write_file", &ok))
-                .is_empty()
+            m.check_tool_call(
+                "write_file",
+                Some("src/app.js"),
+                &digest_for("write_file", &ok)
+            )
+            .is_empty()
         );
     }
 

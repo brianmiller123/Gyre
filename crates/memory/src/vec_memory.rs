@@ -480,9 +480,18 @@ mod tests {
     #[test]
     fn projection_ranks_paraphrase_above_unrelated() {
         let e = ProjectionEmbedder::new(128);
-        let q = e.embed(&["cargo workspace build".into()]).unwrap().remove(0);
-        let para = e.embed(&["build the cargo workspace".into()]).unwrap().remove(0);
-        let other = e.embed(&["lunch pasta recipe dinner".into()]).unwrap().remove(0);
+        let q = e
+            .embed(&["cargo workspace build".into()])
+            .unwrap()
+            .remove(0);
+        let para = e
+            .embed(&["build the cargo workspace".into()])
+            .unwrap()
+            .remove(0);
+        let other = e
+            .embed(&["lunch pasta recipe dinner".into()])
+            .unwrap()
+            .remove(0);
         let sim_para = cosine_similarity(&q, &para);
         let sim_other = cosine_similarity(&q, &other);
         assert!(

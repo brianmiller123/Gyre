@@ -60,6 +60,10 @@ pub struct Config {
     /// SOCKS5 出站代理配置（`[socks5]`；仅影响后端出站 HTTP/HTTPS，可运行时切换）。
     #[serde(default)]
     pub socks5: Socks5Config,
+    /// LLM 请求 User-Agent 覆盖。缺省/空字符串 = 与 OMP 对齐的默认 UA
+    /// `pi/<version> (<platform> <release>; <arch>)`（见 `agent_core::platform::default_llm_user_agent`）。
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 impl Config {
@@ -108,7 +112,7 @@ impl Config {
         // round-trip 通过字符串完成 toml::Value → Config（加载时一次性，开销可忽略）。
         let merged_str = toml::to_string(&merged)
             .map_err(|e| ConfigError::Parse(format!("合并配置序列化失败: {e}")))?;
-        let cfg: Config = toml::from_str(&merged_str).map_err(|e| {
+        let cfg: Self = toml::from_str(&merged_str).map_err(|e| {
             ConfigError::Parse(format!(
                 "合并后配置解析失败（可能为项目级与用户级配置键冲突）: {e}"
             ))
@@ -200,7 +204,7 @@ impl Config {
     }
 }
 
-/// toml::Value 深度合并：overlay 覆盖 base 同路径字段，table 递归合并。
+/// `toml::Value` 深度合并：overlay 覆盖 base 同路径字段，table 递归合并。
 fn merge_value(base: &mut toml::Value, overlay: &toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base_t), toml::Value::Table(overlay_t)) => {
@@ -340,7 +344,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub auto_thinking: bool,
     /// P1-K：自适应思考用的 tiny 模型 id（如 "gpt-4o-mini" / "glm-4-flash"）。
-    /// 复用当前 profile 的 provider/api。`None` 时 auto_thinking 不生效（回退静态预算）。
+    /// 复用当前 profile 的 provider/api。`None` 时 `auto_thinking` 不生效（回退静态预算）。
     #[serde(default)]
     pub auto_thinking_model: Option<String>,
     /// 逐工具审批覆盖。
@@ -369,13 +373,13 @@ impl Default for AgentConfig {
     }
 }
 
-fn default_max_mistakes() -> usize {
+const fn default_max_mistakes() -> usize {
     3
 }
-fn default_max_turns() -> usize {
+const fn default_max_turns() -> usize {
     1000
 }
-fn default_guard() -> f32 {
+const fn default_guard() -> f32 {
     0.8
 }
 
@@ -433,7 +437,7 @@ fn default_edit_fuzzy() -> String {
     "off".into()
 }
 
-fn default_edit_fuzzy_threshold() -> f64 {
+const fn default_edit_fuzzy_threshold() -> f64 {
     0.9
 }
 
@@ -493,8 +497,8 @@ impl CommandPattern {
     #[must_use]
     pub fn pattern(&self) -> &str {
         match self {
-            CommandPattern::Simple(s) => s,
-            CommandPattern::Full { pattern } => pattern,
+            Self::Simple(s) => s,
+            Self::Full { pattern } => pattern,
         }
     }
 }
@@ -646,11 +650,11 @@ pub struct MemoryConfig {
     pub auto_retain_every_n_turns: usize,
 }
 
-fn default_auto_consolidate() -> bool {
+const fn default_auto_consolidate() -> bool {
     true
 }
 
-fn default_auto_retain_every_n_turns() -> usize {
+const fn default_auto_retain_every_n_turns() -> usize {
     4
 }
 
@@ -686,7 +690,7 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -765,7 +769,7 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
 /// 从命令文件内容分离 frontmatter description 与正文。
 fn split_command_frontmatter(content: &str) -> (String, String) {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.first().map_or(false, |l| l.trim() == "---") {
+    if lines.first().is_some_and(|l| l.trim() == "---") {
         let mut desc = String::new();
         let mut idx = 1;
         while idx < lines.len() && lines[idx].trim() != "---" {
@@ -792,6 +796,7 @@ fn split_command_frontmatter(content: &str) -> (String, String) {
 /// 2. 项目级：自 cwd 向上 walkup 的 `<ancestor>/.agent/AGENTS.md`（cwd 最近者排最后，覆盖更远者）
 ///
 /// 缺失或读取失败静默跳过。移植自 oh-my-pi context-files（AGENTS.md）能力。
+#[must_use]
 pub fn discover_context_files(cwd: &Path) -> Vec<String> {
     let mut out = Vec::new();
     // 用户级
@@ -827,13 +832,13 @@ pub fn discover_context_files(cwd: &Path) -> Vec<String> {
 /// GitHub 工具配置（对应 TOML `[github]`）。
 ///
 /// `enabled = true` 时装配层注册 `GithubTool` 并把使用指引注入 system prompt；
-/// `allow_write = true` 另允许 create_pr/merge_pr/comment（提升至更高审批门禁）。
+/// `allow_write = true` 另允许 `create_pr/merge_pr/comment（提升至更高审批门禁`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GithubConfig {
     /// 是否启用 GitHub 工具（默认 `false`：显式开启，因涉及网络与 token）。
     #[serde(default)]
     pub enabled: bool,
-    /// 是否允许写操作（create_pr/merge_pr/comment）；默认 `false`。
+    /// `是否允许写操作（create_pr/merge_pr/comment）；默认` `false`。
     #[serde(default)]
     pub allow_write: bool,
 }
@@ -841,8 +846,8 @@ pub struct GithubConfig {
 /// 可选工具开关配置（对应 TOML `[tools]`）。
 ///
 /// 仅作用于「可选工具组」（ast / lsp / image / hashline / pty）：
-/// - 核心工具（read_file / write_file / list_files /
-///   run_command / grep / glob）始终启用，不受此控制。
+/// - `核心工具（read_file` / `write_file` / `list_files` /
+///   `run_command` / grep / glob）始终启用，不受此控制。
 /// - GitHub 工具仍由 `[github] enabled` 控制（保留其 `allow_write` 子选项）。
 ///
 /// 语义：键为工具组 key，值为是否启用；未列出的组使用各组内置默认（默认关闭，
@@ -905,11 +910,11 @@ impl SubagentConfig {
     }
 }
 
-fn default_subagent_enabled() -> bool {
+const fn default_subagent_enabled() -> bool {
     true
 }
 
-fn default_max_concurrent() -> usize {
+const fn default_max_concurrent() -> usize {
     4
 }
 
@@ -955,10 +960,10 @@ fn default_acp_transport() -> String {
 
 /// goals 目标预算配置（对应 TOML `[goals]`）。
 ///
-/// 累计记账口径 = input + cache_write + output（cache_read 为折扣价不计入，同 oh-my-pi
+/// 累计记账口径 = input + `cache_write` + `output（cache_read` 为折扣价不计入，同 oh-my-pi
 /// GoalRuntime）；墙钟自 run 首次用量起计。超限后软模式在停止边界注入一条预算提醒并
 /// 续跑一轮（模型自行收尾），硬模式在下一停止边界直接结束。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct GoalsConfig {
     /// token 累计预算（0 = 不限）。
     #[serde(default)]
@@ -969,16 +974,6 @@ pub struct GoalsConfig {
     /// 超限后硬停（true 停止；false 注入提醒后继续）。默认 `false`。
     #[serde(default)]
     pub hard_stop: bool,
-}
-
-impl Default for GoalsConfig {
-    fn default() -> Self {
-        Self {
-            token_budget: 0,
-            time_budget_secs: 0,
-            hard_stop: false,
-        }
-    }
 }
 
 /// eval 内核配置（对应 TOML `[eval]`）。
@@ -1013,7 +1008,7 @@ fn default_eval_python() -> String {
     "python3".into()
 }
 
-fn default_eval_idle_timeout() -> u64 {
+const fn default_eval_idle_timeout() -> u64 {
     300
 }
 
@@ -1024,7 +1019,7 @@ fn default_eval_idle_timeout() -> u64 {
 /// 读图回放；非视觉模型请勿启用）。
 ///
 /// `remote_endpoint`（可选）：远程摘要端点。设置后 `summarize` 后端先 POST
-/// 远程生成摘要——路径以 `/chat/completions` 结尾走 OpenAI 兼容格式（覆盖
+/// 远程生成摘要——路径以 `/chat/completions` 结尾走 `OpenAI` 兼容格式（覆盖
 /// llama.cpp / vLLM 自托管），其余走自定义 `{systemPrompt, prompt}` 格式；
 /// 远程失败（非 2xx / 超时 / 解析失败）或摘要为空时自动回退本地 LLM。
 #[derive(Debug, Clone, Deserialize)]
@@ -1059,7 +1054,7 @@ fn default_compaction_backend() -> String {
     "summarize".into()
 }
 
-fn default_compaction_max_frames() -> usize {
+const fn default_compaction_max_frames() -> usize {
     80
 }
 
@@ -1099,7 +1094,7 @@ impl Default for Socks5Config {
     }
 }
 
-fn default_socks5_connect_timeout() -> u64 {
+const fn default_socks5_connect_timeout() -> u64 {
     10
 }
 
@@ -1150,9 +1145,7 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     fn inner(p: &[char], t: &[char]) -> bool {
         match p.first() {
             None => t.is_empty(),
-            Some('*') => {
-                inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..]))
-            }
+            Some('*') => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
             Some('?') => !t.is_empty() && inner(&p[1..], &t[1..]),
             Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
         }
@@ -1165,14 +1158,13 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// 解析压缩后端；未知值回退 `summarize` 并记录警告。
 #[must_use]
 pub fn parse_compaction_backend(raw: &str) -> agent_core::CompactionBackend {
-    match raw.trim() {
-        "snapcompact" => agent_core::CompactionBackend::Snapcompact,
-        _ => {
-            if raw.trim() != "summarize" {
-                tracing::warn!("未知压缩后端 '{raw}'，回退 summarize");
-            }
-            agent_core::CompactionBackend::Summarize
+    if raw.trim() == "snapcompact" {
+        agent_core::CompactionBackend::Snapcompact
+    } else {
+        if raw.trim() != "summarize" {
+            tracing::warn!("未知压缩后端 '{raw}'，回退 summarize");
         }
+        agent_core::CompactionBackend::Summarize
     }
 }
 
@@ -1191,7 +1183,10 @@ mod tests {
     #[test]
     fn wildcard_match_basic() {
         assert!(wildcard_match("claude-*", "claude-sonnet-4-5"));
-        assert!(!wildcard_match("claude-*", "claude"), "`claude-*` 要求 `-` 前缀");
+        assert!(
+            !wildcard_match("claude-*", "claude"),
+            "`claude-*` 要求 `-` 前缀"
+        );
         assert!(wildcard_match("claude*", "claude"));
         assert!(!wildcard_match("claude-*", "gpt-4o"));
         assert!(wildcard_match("gpt-4o*", "gpt-4o-mini"));
@@ -1240,10 +1235,9 @@ mod tests {
     // P2：remote_endpoint 反序列化（远程压缩模式）。
     #[test]
     fn compaction_config_remote_endpoint_from_toml() {
-        let cfg: CompactionConfig = toml::from_str(
-            "remote_endpoint = \"http://127.0.0.1:8080/v1/chat/completions\"\n",
-        )
-        .unwrap();
+        let cfg: CompactionConfig =
+            toml::from_str("remote_endpoint = \"http://127.0.0.1:8080/v1/chat/completions\"\n")
+                .unwrap();
         assert_eq!(
             cfg.remote_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/v1/chat/completions")
@@ -1405,7 +1399,7 @@ base_url = "https://api.openai.com/v1"
 
     /// 复现用户配置：`agent.commands` 同时含简写 allow（字符串数组）与
     /// 数组表 deny/ask，且 deny/ask 定义在 `[agent.tools.approval]` 之后。
-    /// 验证 round-trip（toml::Value → to_string → Config）不会丢失或重复键。
+    /// 验证 `round-trip（toml::Value` → `to_string` → Config）不会丢失或重复键。
     #[test]
     fn roundtrip_mixed_command_rules_after_tools_approval() {
         let toml_src = r#"
@@ -1457,12 +1451,18 @@ api      = "deepseek"
 base_url = "https://api.deepseek.com"
 "#;
         let cfg: Config = toml::from_str(toml_src).expect("解析应成功");
-        assert!(cfg.agent.commands.interceptor.enabled, "interceptor 默认应启用");
+        assert!(
+            cfg.agent.commands.interceptor.enabled,
+            "interceptor 默认应启用"
+        );
 
         // 显式关闭。
         let off = format!("{toml_src}\n[agent.commands.interceptor]\nenabled = false\n");
         let cfg: Config = toml::from_str(&off).expect("解析应成功");
-        assert!(!cfg.agent.commands.interceptor.enabled, "interceptor 应被关闭");
+        assert!(
+            !cfg.agent.commands.interceptor.enabled,
+            "interceptor 应被关闭"
+        );
     }
 
     // ── P2：fallback 链 + key 轮换 ────────────────────────────────────────
@@ -1545,9 +1545,9 @@ fallbacks = ["a"]
         ));
     }
 
-    /// 多 key 环优先于单 key；${ENV} 展开；to_model 正确映射。
-    /// 多 key 环优先于单 key；to_model 正确映射。
-    /// （`${ENV}` 展开逻辑由 env.rs 单测覆盖，此处用字面量避免 unsafe set_var。）
+    /// 多 key 环优先于单 key；${ENV} `展开；to_model` 正确映射。
+    /// 多 key 环优先于单 `key；to_model` 正确映射。
+    /// （`${ENV}` 展开逻辑由 env.rs 单测覆盖，此处用字面量避免 unsafe `set_var`。）
     #[test]
     fn key_ring_and_to_model() {
         let toml_src = r#"
@@ -1658,7 +1658,9 @@ password = "${GYRE_TEST_SOCKS5_PASS}"
         assert!(cfg.socks5.auth().is_none(), "仅密码时应忽略密码");
 
         // 未配置 → redacted 明示未配置。
-        let cfg: Config = toml::from_str("[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"").expect("解析");
+        let cfg: Config =
+            toml::from_str("[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"")
+                .expect("解析");
         assert!(cfg.socks5.redacted().contains("未配置"));
 
         // SAFETY: 同上，仅本测试函数使用该变量。

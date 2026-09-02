@@ -8,17 +8,46 @@
 /// 同义词组：canonical 词 → 组内同义词（来自 mnemopi，43 组）。
 pub const SYNONYM_GROUPS: &[(&str, &[&str])] = &[
     ("database", &["db", "datastore", "data_store"]),
-    ("password", &["pass", "pwd", "passwd", "credential", "secret", "token"]),
+    (
+        "password",
+        &["pass", "pwd", "passwd", "credential", "secret", "token"],
+    ),
     ("config", &["configuration", "settings", "cfg", "setup"]),
-    ("error", &["bug", "issue", "fault", "failure", "crash", "exception", "traceback"]),
-    ("fix", &["repair", "resolve", "solve", "patch", "correct", "address"]),
-    ("deploy", &["deployment", "release", "ship", "push", "rollout"]),
-    ("server", &["host", "machine", "vm", "instance", "node", "vps"]),
+    (
+        "error",
+        &[
+            "bug",
+            "issue",
+            "fault",
+            "failure",
+            "crash",
+            "exception",
+            "traceback",
+        ],
+    ),
+    (
+        "fix",
+        &["repair", "resolve", "solve", "patch", "correct", "address"],
+    ),
+    (
+        "deploy",
+        &["deployment", "release", "ship", "push", "rollout"],
+    ),
+    (
+        "server",
+        &["host", "machine", "vm", "instance", "node", "vps"],
+    ),
     ("api", &["endpoint", "interface", "service"]),
     ("key", &["token", "credential", "secret", "api_key"]),
     ("user", &["account", "profile", "identity", "person"]),
-    ("model", &["llm", "ai", "provider", "gpt", "claude", "gemini"]),
-    ("speed", &["fast", "quick", "performance", "latency", "throughput"]),
+    (
+        "model",
+        &["llm", "ai", "provider", "gpt", "claude", "gemini"],
+    ),
+    (
+        "speed",
+        &["fast", "quick", "performance", "latency", "throughput"],
+    ),
     ("memory", &["recall", "remember", "storage", "retention"]),
     ("search", &["find", "lookup", "query", "retrieve", "locate"]),
     ("file", &["document", "doc", "text", "note"]),
@@ -27,16 +56,25 @@ pub const SYNONYM_GROUPS: &[(&str, &[&str])] = &[
     ("backup", &["snapshot", "copy", "save", "archive"]),
     ("install", &["setup", "configure", "bootstrap", "init"]),
     ("update", &["upgrade", "refresh", "renew", "sync"]),
-    ("delete", &["remove", "destroy", "purge", "clean", "wipe", "erase"]),
+    (
+        "delete",
+        &["remove", "destroy", "purge", "clean", "wipe", "erase"],
+    ),
     ("list", &["show", "display", "enumerate", "catalog"]),
     ("time", &["date", "when", "timestamp", "schedule"]),
     ("url", &["link", "address", "uri", "path"]),
     ("health", &["status", "check", "pulse", "alive", "up"]),
     ("service", &["daemon", "process", "systemd", "worker"]),
     ("port", &["socket", "bind", "listen"]),
-    ("network", &["internet", "connection", "connectivity", "dns"]),
+    (
+        "network",
+        &["internet", "connection", "connectivity", "dns"],
+    ),
     ("ssh", &["terminal", "shell", "remote", "connect"]),
-    ("git", &["commit", "push", "pull", "repo", "repository", "branch"]),
+    (
+        "git",
+        &["commit", "push", "pull", "repo", "repository", "branch"],
+    ),
     ("log", &["output", "stdout", "stderr", "trace", "debug"]),
     ("cron", &["schedule", "job", "task", "timer", "periodic"]),
     ("email", &["mail", "message", "inbox", "smtp"]),
@@ -52,29 +90,122 @@ pub const SYNONYM_GROUPS: &[(&str, &[&str])] = &[
 /// 停用词表（对齐 mnemopi；当前不参与过滤，保留供后续使用）。
 #[allow(dead_code)]
 pub const STOP_WORDS: &[&str] = &[
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do",
-    "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall", "must",
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your",
-    "his", "its", "our", "their", "mine", "yours", "hers", "ours", "theirs", "what", "which",
-    "who", "whom", "where", "when", "why", "how", "this", "that", "these", "those", "of", "in",
-    "to", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during", "before",
-    "after", "above", "below", "between", "under", "and", "but", "or", "nor", "not", "so",
-    "than", "too", "very", "just", "about", "also", "really", "actually", "basically", "simply",
-    "if", "then", "else", "while", "because", "though", "although",
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "can",
+    "shall",
+    "must",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "him",
+    "her",
+    "us",
+    "them",
+    "my",
+    "your",
+    "his",
+    "its",
+    "our",
+    "their",
+    "mine",
+    "yours",
+    "hers",
+    "ours",
+    "theirs",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "where",
+    "when",
+    "why",
+    "how",
+    "this",
+    "that",
+    "these",
+    "those",
+    "of",
+    "in",
+    "to",
+    "for",
+    "on",
+    "with",
+    "at",
+    "by",
+    "from",
+    "as",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "between",
+    "under",
+    "and",
+    "but",
+    "or",
+    "nor",
+    "not",
+    "so",
+    "than",
+    "too",
+    "very",
+    "just",
+    "about",
+    "also",
+    "really",
+    "actually",
+    "basically",
+    "simply",
+    "if",
+    "then",
+    "else",
+    "while",
+    "because",
+    "though",
+    "although",
 ];
 
 /// 词 → canonical 的反向映射（canonical 自身映射到自身）。
-static WORD_TO_CANONICAL: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static str>> =
-    std::sync::LazyLock::new(|| {
-        let mut map = std::collections::HashMap::new();
-        for &(canonical, synonyms) in SYNONYM_GROUPS {
-            map.insert(canonical, canonical);
-            for synonym in synonyms {
-                map.insert(synonym, canonical);
-            }
+static WORD_TO_CANONICAL: std::sync::LazyLock<
+    std::collections::HashMap<&'static str, &'static str>,
+> = std::sync::LazyLock::new(|| {
+    let mut map = std::collections::HashMap::new();
+    for &(canonical, synonyms) in SYNONYM_GROUPS {
+        map.insert(canonical, canonical);
+        for synonym in synonyms {
+            map.insert(synonym, canonical);
         }
-        map
-    });
+    }
+    map
+});
 
 /// 单个词映射到 canonical；不在表中则原样返回。
 #[must_use]

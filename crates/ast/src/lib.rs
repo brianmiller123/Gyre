@@ -5,7 +5,6 @@
 //! 「命名块」行范围（爬到在该行起始的最外层命名祖先，排除整文件根）。
 
 #![deny(unsafe_code)]
-#![warn(clippy::pedantic)]
 
 mod pattern;
 pub mod summary;

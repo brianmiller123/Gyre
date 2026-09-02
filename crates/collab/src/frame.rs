@@ -1,6 +1,6 @@
 //! Collab 线协议帧（`WireFrame`）：密封前后的明文载荷。
 //!
-//! 移植自 [`oh-my-pi collab-web`](../../../third/oh-my-pi/packages/collab-web)（浏览器侧 WebCrypto seal/open 的 Rust 对偶）。
+//! 移植自 [`oh-my-pi collab-web`](../../../third/oh-my-pi/packages/collab-web)（浏览器侧 `WebCrypto` seal/open 的 Rust 对偶）。
 //! 覆盖协同会话所需的最小消息集：聊天、工具活动、在线状态、状态快照同步。
 
 use serde::{Deserialize, Serialize};

@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_proxy::{Socks5Controller, build_http_client};
 use agent_config::Socks5Config;
+use agent_proxy::{Socks5Controller, build_http_client};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -31,14 +31,20 @@ impl Socks5Server {
         let (c, t) = (Arc::clone(&connects), Arc::clone(&targets));
         tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let (c, t) = (Arc::clone(&c), Arc::clone(&t));
                 tokio::spawn(async move {
                     let _ = handle_conn(sock, c, t).await;
                 });
             }
         });
-        Self { addr, connects, targets }
+        Self {
+            addr,
+            connects,
+            targets,
+        }
     }
 
     fn connect_count(&self) -> usize {
@@ -125,12 +131,16 @@ async fn start_http() -> SocketAddr {
     let addr = listener.local_addr().expect("HTTP 地址");
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    )
                     .await;
             });
         }
@@ -151,7 +161,7 @@ fn socks5_cfg(host: &str, port: u16, timeout_secs: u64) -> Socks5Config {
 
 /// 无连接复用的测试客户端（每次请求新建连接 → 路由方向可被代理计数精确观测）。
 fn test_client(ctrl: Option<Arc<Socks5Controller>>) -> reqwest::Client {
-    build_http_client(ctrl, |b| b.pool_max_idle_per_host(0)).expect("构建客户端")
+    build_http_client(ctrl, None, |b| b.pool_max_idle_per_host(0)).expect("构建客户端")
 }
 
 /// 启用 → 请求经代理到达（代理侧记录目标 host:port）。
@@ -209,12 +219,8 @@ async fn disabled_connects_directly() {
 async fn runtime_toggle_reroutes_next_request() {
     let proxy = Socks5Server::start().await;
     let http_addr = start_http().await;
-    let ctrl = Socks5Controller::new(
-        &socks5_cfg("127.0.0.1", proxy.addr.port(), 5),
-        None,
-        None,
-    )
-    .expect("已配置");
+    let ctrl = Socks5Controller::new(&socks5_cfg("127.0.0.1", proxy.addr.port(), 5), None, None)
+        .expect("已配置");
     assert!(!ctrl.enabled(), "配置默认关");
     let client = test_client(Some(Arc::clone(&ctrl)));
 
@@ -257,12 +263,8 @@ async fn unreachable_proxy_fails_gracefully() {
     let dead_port = dead.local_addr().expect("addr").port();
     drop(dead);
 
-    let ctrl = Socks5Controller::new(
-        &socks5_cfg("127.0.0.1", dead_port, 1),
-        None,
-        Some(true),
-    )
-    .expect("已配置");
+    let ctrl = Socks5Controller::new(&socks5_cfg("127.0.0.1", dead_port, 1), None, Some(true))
+        .expect("已配置");
     let client = test_client(Some(ctrl));
 
     let result = tokio::time::timeout(
@@ -285,4 +287,64 @@ async fn no_controller_falls_back_to_direct() {
         .await
         .expect("直连应成功");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// 回环 HTTP 服务器：捕获每个请求的 User-Agent 头（供 UA 断言）。
+async fn start_http_capture_ua() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind HTTP");
+    let addr = listener.local_addr().expect("HTTP 地址");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let s = Arc::clone(&s);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let ua = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("user-agent:")
+                            .or_else(|| l.strip_prefix("User-Agent:"))
+                    })
+                    .map(|v| v.trim().to_string());
+                s.lock().expect("锁").push(ua.unwrap_or_default());
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, seen)
+}
+
+/// LLM 客户端携带 User-Agent：默认 = OMP 对齐 UA，配置覆盖 / 空串 = 默认。
+#[tokio::test]
+async fn llm_client_sends_user_agent_with_config_override() {
+    let (http_addr, seen) = start_http_capture_ua().await;
+    let url = format!("http://{http_addr}/chat");
+
+    // 1) 缺省 → OMP 对齐默认 UA。
+    let client = build_http_client(None, None, |b| b).expect("构建客户端");
+    client.get(&url).send().await.expect("请求应成功");
+    let ua = seen.lock().expect("锁").pop().expect("应捕获 UA");
+    assert_eq!(ua, agent_core::platform::default_llm_user_agent());
+
+    // 2) 配置覆盖生效。
+    let client = build_http_client(None, Some("my-agent/1.0"), |b| b).expect("构建客户端");
+    client.get(&url).send().await.expect("请求应成功");
+    let ua = seen.lock().expect("锁").pop().expect("应捕获 UA");
+    assert_eq!(ua, "my-agent/1.0");
+
+    // 3) 空字符串视同缺省（不产生空 UA 头）。
+    let client = build_http_client(None, Some(""), |b| b).expect("构建客户端");
+    client.get(&url).send().await.expect("请求应成功");
+    let ua = seen.lock().expect("锁").pop().expect("应捕获 UA");
+    assert_eq!(ua, agent_core::platform::default_llm_user_agent());
 }

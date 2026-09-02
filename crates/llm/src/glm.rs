@@ -5,15 +5,15 @@
 //!
 //! 1. **thinking 开关**：GLM 思考模型（glm-4.7+ / glm-5+）思考**默认开启**，必须显式
 //!    `thinking:{type:"enabled"|"disabled"}` 控制（[`is_glm_thinking_model`]）。
-//! 2. **reasoning_effort 档位**：GLM 自有阶梯 none/minimal/low/medium/high/xhigh/max，
+//! 2. **`reasoning_effort` 档位**：GLM 自有阶梯 none/minimal/low/medium/high/xhigh/max，
 //!    默认 high、深度 max（[`normalize_glm_reasoning_effort`]）。
-//! 3. **reasoning_content 字段**：流式 delta 含 `reasoning_content`（非 OpenAI 标准），
+//! 3. **`reasoning_content` 字段**：流式 delta 含 `reasoning_content`（非 `OpenAI` 标准），
 //!    提取为 thinking 事件，并回填到 [`ContentBlock::Thinking`] 以支持多轮 preserveReasoning。
 //! 4. **Z.ai 消息格式**：assistant 的思考内容序列化为 `reasoning_content` 回传；tool 结果后
-//!    的纯文本（如 environment_details）合并进最后一条 tool 消息，避免 user 消息导致
-//!    GLM 丢弃 reasoning_content（[`convert_to_zai_format`]）。
+//!    的纯文本（如 `environment_details）合并进最后一条` tool 消息，避免 user 消息导致
+//!    GLM 丢弃 `reasoning_content`（[`convert_to_zai_format`]）。
 //! 5. **缓存用量**：`prompt_tokens_details.cached_tokens`（GLM 支持 prompt 缓存）。
-//! 6. **max_tokens**：用标准 `max_tokens`（GLM 不使用 DeepSeek 的 `max_completion_tokens`）。
+//! 6. **`max_tokens`**：用标准 `max_tokens`（GLM 不使用 `DeepSeek` 的 `max_completion_tokens`）。
 
 use std::pin::Pin;
 
@@ -35,9 +35,9 @@ pub struct GlmProvider {
 }
 
 impl GlmProvider {
-    /// 构造（复用外部 reqwest::Client）。
+    /// 构造（复用外部 `reqwest::Client`）。
     #[must_use]
-    pub fn new(client: reqwest::Client) -> Self {
+    pub const fn new(client: reqwest::Client) -> Self {
         Self { client }
     }
 }
@@ -101,12 +101,12 @@ pub fn is_glm_thinking_model(model_id: &str) -> bool {
     id.starts_with("glm-4.7") || id.starts_with("glm-4-7") || id.starts_with("glm-5")
 }
 
-/// 归一化 reasoning_effort 为 GLM 取值。
+/// 归一化 `reasoning_effort` 为 GLM 取值。
 ///
 /// GLM 自有阶梯 none/minimal/low/medium/high/xhigh/max。GLM-5.2 默认 high，
-/// 深度推理（budget ≥ 32_000）映射为 max。
+/// 深度推理（budget ≥ `32_000）映射为` max。
 #[must_use]
-pub fn normalize_glm_reasoning_effort(budget_tokens: usize) -> &'static str {
+pub const fn normalize_glm_reasoning_effort(budget_tokens: usize) -> &'static str {
     if budget_tokens >= 32_000 {
         "max"
     } else {
@@ -183,8 +183,7 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
     match directive {
         ToolChoiceDirective::Hard(ToolChoice::Auto) => serde_json::json!("auto"),
         ToolChoiceDirective::Hard(ToolChoice::None) => serde_json::json!("none"),
-        ToolChoiceDirective::Hard(ToolChoice::Any)
-        | ToolChoiceDirective::Hard(ToolChoice::Required) => {
+        ToolChoiceDirective::Hard(ToolChoice::Any | ToolChoice::Required) => {
             serde_json::json!("required")
         }
         ToolChoiceDirective::Hard(ToolChoice::Function { name }) => {
@@ -201,11 +200,11 @@ fn map_tool_choice(directive: &ToolChoiceDirective) -> serde_json::Value {
 
 /// 将 system + messages 转为 GLM Z.ai 格式。
 ///
-/// 关键差异（vs 标准 OpenAI）：
+/// 关键差异（vs 标准 `OpenAI`）：
 /// - assistant 的 [`ContentBlock::Thinking`] 序列化为顶层 `reasoning_content` 回传（interleaved
 ///   thinking 的 preserveReasoning 所必需）。
 /// - 思考模型下，tool 结果后紧跟的纯文本 user 消息合并进最后一条 tool 消息，避免 GLM 见到
-///   user 消息而丢弃全部 reasoning_content。
+///   user 消息而丢弃全部 `reasoning_content`。
 pub fn convert_to_zai_format(
     system: &[String],
     messages: &[ProviderMessage],
@@ -321,9 +320,9 @@ pub fn convert_to_zai_format(
 fn join_user_text(content: &[UserContent]) -> String {
     content
         .iter()
-        .filter_map(|c| match c {
-            UserContent::Text { text } => Some(text.as_str()),
-            UserContent::Image { .. } => Some("[image]"),
+        .map(|c| match c {
+            UserContent::Text { text } => text.as_str(),
+            UserContent::Image { .. } => "[image]",
         })
         .collect::<Vec<_>>()
         .join("")
@@ -335,7 +334,7 @@ fn join_user_text(content: &[UserContent]) -> String {
 
 /// 从流式 delta 提取 reasoning 文本。
 ///
-/// 优先 `reasoning_content`（GLM / DeepSeek-R1 风格），回退 `reasoning`（OpenRouter 风格）。
+/// 优先 `reasoning_content`（GLM / DeepSeek-R1 风格），回退 `reasoning`（`OpenRouter` 风格）。
 #[must_use]
 pub fn extract_reasoning_from_delta(delta: &serde_json::Value) -> Option<String> {
     if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
@@ -379,7 +378,7 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// GLM delta：含标准 content/tool_calls + reasoning_content。
+/// GLM delta：含标准 `content/tool_calls` + `reasoning_content`。
 #[derive(Deserialize, Default)]
 struct GlmDelta {
     #[serde(default)]
@@ -407,7 +406,7 @@ struct GlmFn {
     arguments: Option<String>,
 }
 
-/// GLM 用量：含 prompt_tokens_details（缓存计量）。
+/// GLM 用量：含 `prompt_tokens_details（缓存计量`）。
 #[derive(Deserialize, Default)]
 struct GlmUsage {
     #[serde(default)]
@@ -490,8 +489,7 @@ fn parse_glm_stream(resp: reqwest::Response, model_id: String) -> AssistantEvent
                 }
             };
             buf.extend_from_slice(chunk.as_ref());
-            loop {
-                let Some(line_bytes) = crate::drain_line(&mut buf) else { break };
+            while let Some(line_bytes) = crate::drain_line(&mut buf) {
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() { continue; }
                 let Some(data) = line.strip_prefix("data:") else { continue };
@@ -633,7 +631,7 @@ fn build_glm_message(
     // P2-P：content_filter → Error + sensitive（GLM/Z.ai OpenAI 兼容，含 content_filter）。
     let (stop_reason, stop_details) = match finish.as_deref() {
         Some("length") => (Some(StopReason::Length), None),
-        Some("tool_calls") | Some("function_call") => (Some(StopReason::ToolUse), None),
+        Some("tool_calls" | "function_call") => (Some(StopReason::ToolUse), None),
         Some("content_filter") => (
             Some(StopReason::Error),
             Some(agent_core::StopDetails::new("sensitive")),
@@ -933,10 +931,12 @@ mod tests {
 
     #[test]
     fn build_message_backfills_thinking_block() {
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
         let msg = build_glm_message(
             "glm-5.2",
             "done",
@@ -959,17 +959,20 @@ mod tests {
     fn finalize_stream_interrupt_retains_completed_toolcall() {
         // P0-自愈激活：finish 未收 + 已完成工具调用（参数合法 JSON）→ 标记瞬时错误，
         // 供 agent 瞬时恢复保留并执行已完成工具（而非整轮废弃）。
-        let mut tc = ToolCallAccum::default();
-        tc.id = Some("call_1".into());
-        tc.name = Some("read_file".into());
-        tc.args = r#"{"path":"a.rs"}"#.into();
+        let tc = ToolCallAccum {
+            id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            args: r#"{"path":"a.rs"}"#.into(),
+            ..Default::default()
+        };
         let msg = finalize_stream_interrupt("glm-5.2", "", "", &[tc], &None, &Usage::default())
             .expect("已完成工具调用应可恢复");
         assert_eq!(msg.stop_reason, Some(StopReason::Error));
-        assert!(msg
-            .stop_details
-            .as_ref()
-            .is_some_and(agent_core::StopDetails::is_transient_stream_error));
+        assert!(
+            msg.stop_details
+                .as_ref()
+                .is_some_and(agent_core::StopDetails::is_transient_stream_error)
+        );
     }
 
     #[test]
