@@ -5,9 +5,10 @@
 //! `cat`、`grep`、`sed`、`ls`、`find`、`jq`、`sponge` 等工具，**不 fork 外部
 //! 二进制**，行为跨平台一致（Windows 上同样可用，不依赖宿主安装 coreutils）。
 //!
-//! 与 `agent-tools` 的 `run_command`（`/bin/sh -c` 子进程）互补：本 crate 面向
-//! 长驻会话内的零 fork 执行与可编程输出裁剪；`run_command` 保留给必须真正
-//! 落到子进程的场景。
+//! `agent-tools` 的 `run_command` 以本 crate 为首选引擎：全部命令经 brush 的 bash
+//! 兼容语义在进程内执行，三平台行为一致；系统 shell 子进程（`/bin/sh -c` /
+//! `cmd /C`）仅兜底——withheld 的 rm/mv/ln 与显式退出（`GYRE_DISABLE_INPROC_BUILTINS`）
+//! 的场景。
 //!
 //! # 示例
 //!
@@ -215,6 +216,15 @@ pub fn inproc_command_names() -> &'static HashSet<String> {
         names
     });
     &NAMES
+}
+
+/// `name` 是否属于 withheld 三件套（`rm`/`mv`/`ln`）。
+///
+/// 工具层（`run_command`）据此把这三者分派到系统二进制；进程内注册表另以
+/// `PI_DISABLE_UUTILS_DESTRUCTIVE` 兜底禁用，覆盖管道内嵌（如 `xargs rm`）场景。
+#[must_use]
+pub fn is_withheld_command(name: &str) -> bool {
+    WITHHELD_UTILITIES.contains(&name)
 }
 
 /// `name` 是否可进程内执行（不 fork 外部二进制）。

@@ -48,8 +48,8 @@ impl PromptCatalog {
 
     /// 检测当前操作系统与架构，生成平台感知系统提示词段落。
     ///
-    /// 让模型知晓运行环境，从而使用正确的 `shell` 语法、路径分隔符与原生命令，
-    /// 避免在 `Windows` 上生成 `bash` 语法或在 `unix` 上生成 `PowerShell` 语法。
+    /// 让模型知晓运行环境与 shell 语义：执行引擎为内嵌 bash 兼容 shell，三平台
+    /// 命令语义一致；避免生成平台错位语法（如 Windows 上的 PowerShell/cmd 语法）。
     /// 输出在进程运行期内固定不变，属稳定前缀，不破坏 `provider` 前缀缓存。
     #[must_use]
     pub fn platform_section(&self) -> String {
@@ -58,26 +58,25 @@ impl PromptCatalog {
         let (platform_name, shell, notes): (&str, &str, &[&str]) = match os {
             "windows" => (
                 "Windows",
-                "PowerShell",
+                "bash 兼容内嵌 shell（POSIX 语法）",
                 &[
-                    "路径分隔符为反斜杠 `\\`",
-                    "列出文件用 `dir` 或 `Get-ChildItem`，而非 `ls`",
-                    "读取环境变量用 `$env:VAR`（而非 `$VAR` 或 `%VAR%`）",
-                    "换行符为 CRLF（`\\r\\n`）",
+                    "命令一律使用 POSIX/bash 语法：管道、重定向、`$VAR`、通配符均可用；不要使用 PowerShell 语法（`$env:VAR`、`Get-ChildItem`）",
+                    "命令内路径推荐使用正斜杠 `/`（内嵌 shell 自动适配 Windows 路径）",
+                    "换行符为 CRLF(`\\r\\n`)",
                 ],
             ),
             "macos" => (
                 "macOS",
-                "zsh / bash",
+                "bash 兼容内嵌 shell（POSIX 语法）",
                 &[
                     "路径分隔符为正斜杠 `/`",
-                    "文件系统默认大小写不敏感（APFS）",
-                    "macOS 专有命令：`open`、`pbcopy`/`pbpaste`、`defaults`",
+                    "文件系统默认大小写不敏感(APFS)",
+                    "macOS 专有命令:`open`、`pbcopy`/`pbpaste`、`defaults`",
                 ],
             ),
             "linux" => (
                 "Linux",
-                "bash / sh",
+                "bash 兼容内嵌 shell（POSIX 语法）",
                 &["路径分隔符为正斜杠 `/`", "文件系统大小写敏感"],
             ),
             _ => ("类 Unix", "sh", &["路径分隔符为正斜杠 `/`"]),

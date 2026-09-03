@@ -408,14 +408,72 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn shell_program() -> String {
+    // 用户显式覆盖优先（三平台一致）。
+    if let Ok(s) = std::env::var("GYRE_SHELL")
+        && !s.trim().is_empty()
+    {
+        return s;
+    }
     #[cfg(unix)]
     {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
     #[cfg(windows)]
     {
-        "cmd".to_string()
+        windows_shell_program()
     }
+}
+
+/// Windows PTY shell 发现链（对齐上游 `resolveWindowsShell`，procmgr.ts:130-176）：
+/// `GIT_INSTALL_ROOT` → Program Files/MinGit → scoop → LocalAppData →
+/// PATH 上的 `bash.exe`/`sh.exe`（Cygwin/MSYS2 若在 PATH 即被覆盖）→ `cmd` 兜底。
+#[cfg(windows)]
+fn windows_shell_program() -> String {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("GIT_INSTALL_ROOT") {
+        let root = PathBuf::from(root);
+        candidates.push(root.join("bin").join("bash.exe"));
+        candidates.push(root.join("usr").join("bin").join("bash.exe"));
+    }
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(dir) = std::env::var(var) {
+            for sub in ["Git", "MinGit"] {
+                let base = PathBuf::from(&dir).join(sub);
+                candidates.push(base.join("bin").join("bash.exe"));
+                candidates.push(base.join("usr").join("bin").join("bash.exe"));
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let home = PathBuf::from(home);
+        candidates.push(
+            home.join("scoop")
+                .join("apps")
+                .join("git")
+                .join("current")
+                .join("bin")
+                .join("bash.exe"),
+        );
+    }
+    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(lad)
+                .join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe"),
+        );
+    }
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            candidates.push(dir.join("bash.exe"));
+            candidates.push(dir.join("sh.exe"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .map_or_else(|| "cmd".to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 fn next_id() -> u64 {
