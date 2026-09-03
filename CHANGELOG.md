@@ -32,6 +32,9 @@
 - 跨平台命令语义分叉：模型按提示词写 bash，Linux（Debian 系 `/bin/sh` → dash）下数组/`[[ ]]`
   失败、Windows 落到 `cmd` 而提示词却宣称 PowerShell——引擎统一后消除。
 - 子进程与进程内输出统一 CRLF/裸 CR → LF 归一化（对齐 PTY 路径既有行为）。
+- REPL `/help` 与命令表漂移修正：补齐 `/todo` `/goal` `/diff` `/fresh` `/plan` `/paste`
+  `/enhance` `/suggest` `/agents` 九条帮助条目（en/zh/ru/ja 四语）；`/mode` 帮助文案补 `plan`
+  模式；`/enhance` `/suggest` 空参用法提示接入 i18n；新增「帮助表覆盖内置命令全量」回归测试。
 
 ### Changed
 - CI 移除 `RUSTFLAGS=-A warnings`，新增 rustfmt / clippy（`-D warnings`）/ nextest 三道执法门；

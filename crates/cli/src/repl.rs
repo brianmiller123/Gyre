@@ -178,6 +178,39 @@ pub const fn builtin_commands() -> &'static [&'static str] {
     ]
 }
 
+/// `/help` 展示顺序（即 [`print_help`] 的渲染清单，也是帮助覆盖回归测试的事实源）。
+///
+/// 新增内置命令时：先在 [`builtin_commands`] 登记名字，再补一条 `help.*` 文案并在此登记——
+/// `help_covers_all_builtin_commands` 会同时校验两侧不漂移。
+const HELP_KEYS: &[&str] = &[
+    "help.h",
+    "help.status",
+    "help.todo",
+    "help.goal",
+    "help.diff",
+    "help.fresh",
+    "help.model",
+    "help.mode",
+    "help.plan",
+    "help.paste",
+    "help.enhance",
+    "help.suggest",
+    "help.compact",
+    "help.mcp",
+    "help.skill",
+    "help.skill_colon",
+    "help.sessions",
+    "help.session",
+    "help.swarm",
+    "help.agents",
+    "help.review",
+    "help.collab",
+    "help.github",
+    "help.tools",
+    "help.lang",
+    "help.exit",
+];
+
 /// 所有可选模型（alias 与 id 并集，去重排序），用于补全。
 #[must_use]
 pub fn model_choices(config: &Config) -> Vec<String> {
@@ -500,23 +533,9 @@ fn read_clipboard_image() -> Result<UserContent, String> {
 
 fn print_help(ctx: &CommandContext<'_>) {
     eprintln!("{}", t!("help.title"));
-    eprintln!("{}", t!("help.h"));
-    eprintln!("{}", t!("help.status"));
-    eprintln!("{}", t!("help.model"));
-    eprintln!("{}", t!("help.mode"));
-    eprintln!("{}", t!("help.compact"));
-    eprintln!("{}", t!("help.mcp"));
-    eprintln!("{}", t!("help.skill"));
-    eprintln!("{}", t!("help.skill_colon"));
-    eprintln!("{}", t!("help.sessions"));
-    eprintln!("{}", t!("help.session"));
-    eprintln!("{}", t!("help.swarm"));
-    eprintln!("{}", t!("help.review"));
-    eprintln!("{}", t!("help.collab"));
-    eprintln!("{}", t!("help.github"));
-    eprintln!("{}", t!("help.tools"));
-    eprintln!("{}", t!("help.lang"));
-    eprintln!("{}", t!("help.exit"));
+    for key in HELP_KEYS {
+        eprintln!("{}", agent_i18n::tr(key, &[]));
+    }
     if !ctx.commands.is_empty() {
         eprintln!("{}", t!("help.custom_title"));
         for c in ctx.commands {
@@ -1108,7 +1127,7 @@ fn handle_enhance(input: &str) -> CommandOutcome {
         .collect::<Vec<_>>()
         .join(" ");
     if draft.is_empty() {
-        eprintln!("用法：/enhance <draft>   （Roo-Code 风格：让模型重写为更有效的 prompt）");
+        eprintln!("{}", t!("enhance.usage"));
         return CommandOutcome::Handled;
     }
     CommandOutcome::Enhance { draft }
@@ -1122,7 +1141,7 @@ fn handle_suggest(input: &str) -> CommandOutcome {
         .collect::<Vec<_>>()
         .join(" ");
     if query.is_empty() {
-        eprintln!("用法：/suggest <query>");
+        eprintln!("{}", t!("suggest.usage"));
         return CommandOutcome::Handled;
     }
     CommandOutcome::Suggest { query }
@@ -1828,5 +1847,44 @@ mod tests {
             handle_command("/todo", &ctx),
             CommandOutcome::Handled
         ));
+    }
+
+    /// 边界匹配：`cmd` 出现且其后是命令列的对齐边界（空格/逗号/参数列起始），
+    /// 防止 `/mode` 被 `/model` 行这类子串误判为已覆盖。
+    fn help_line_mentions(line: &str, cmd: &str) -> bool {
+        let Some(i) = line.find(cmd) else {
+            return false;
+        };
+        let after = &line[i + cmd.len()..];
+        after.is_empty()
+            || after.starts_with(' ')
+            || after.starts_with(',')
+            || after.starts_with('[')
+    }
+
+    #[test]
+    fn help_covers_all_builtin_commands() {
+        agent_i18n::init(Some("en"));
+        // 纯别名不在帮助表单独出现：/help、/? 归 /h 行；/resume 归 /session 行；/skills 归 /skill 行。
+        const ALIASES: [&str; 4] = ["/help", "/?", "/resume", "/skills"];
+        let rendered = HELP_KEYS
+            .iter()
+            .map(|key| agent_i18n::tr(key, &[]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for cmd in builtin_commands() {
+            if ALIASES.contains(cmd) {
+                continue;
+            }
+            assert!(
+                rendered.lines().any(|line| help_line_mentions(line, cmd)),
+                "帮助表缺少内置命令 `{cmd}` 的条目：新增命令请同步 help.* 文案与 HELP_KEYS"
+            );
+        }
+        // 帮助文案中的模式枚举必须覆盖 parse_mode 接受的全部模式名。
+        let mode_line = agent_i18n::tr("help.mode", &[]);
+        for m in ["code", "architect", "ask", "debug", "plan"] {
+            assert!(mode_line.contains(m), "help.mode 缺少模式 `{m}`");
+        }
     }
 }
