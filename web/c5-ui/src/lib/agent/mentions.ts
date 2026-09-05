@@ -130,6 +130,8 @@ export interface ExpandCtx {
   apiGet: <T>(path: string) => Promise<T | null>
   /** Optional toast for skipped/failed attachments. Tolerant when absent. */
   say?: (text: string, level?: string) => void
+  /** i18n translator（警告文案本地化必需，调用方必须传入）。 */
+  t: (key: string, args?: Record<string, unknown>) => string
 }
 
 /**
@@ -148,7 +150,7 @@ export async function expandMentions(text: string, ctx: ExpandCtx): Promise<stri
     if (data && data.content !== null && !data.binary) {
       blocks.push(formatFileBlock(m.path, data.content))
     } else {
-      ctx.say?.(`Could not attach @file ${m.path} (missing or binary).`, 'warning')
+      ctx.say?.(ctx.t('mentions.attach_failed', { path: m.path }), 'warning')
     }
   }
   return renderAttached(text, blocks)

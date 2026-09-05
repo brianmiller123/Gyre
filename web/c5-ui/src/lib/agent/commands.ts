@@ -267,7 +267,7 @@ export function customCommandsToCommands(custom: CustomCommandInfo[]): Command[]
       ? { desc: cc.description }
       : { desc: '', descKey: 'cmd.custom.desc', descArgs: { name: cc.name } }),
     run: (c, arg) => {
-      c.send(arg ? `${cc.body}\n\n# 命令参数\n${arg}` : cc.body)
+      c.send(arg ? `${cc.body}\n\n${c.t('commands.args_heading')}\n${arg}` : cc.body)
     },
   }))
 }

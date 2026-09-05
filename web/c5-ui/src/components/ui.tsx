@@ -45,6 +45,49 @@ function useLockBody(active: boolean) {
   }, [active])
 }
 
+/**
+ * Dialog semantics shared by Modal and overlay panels/drawers: on open the
+ * focus moves into the container and returns to the trigger on close, Tab is
+ * trapped inside, and Escape closes. Attach `ref` + `onKeyDown` to the
+ * container element and add `role="dialog"` / `aria-modal="true"`.
+ */
+export function useDialogA11y(open: boolean, onClose: () => void) {
+  const ref = useRef<HTMLDivElement>(null)
+  useLockBody(open)
+  useEffect(() => {
+    if (!open) return
+    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    ref.current?.focus()
+    return () => prev?.focus()
+  }, [open])
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+  // 简易焦点陷阱：Tab 循环限制在容器内，防止焦点落到背景内容上。
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Tab') return
+    const root = ref.current
+    if (!root) return
+    const focusables = root.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )
+    if (focusables.length === 0) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault()
+      last.focus()
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault()
+      first.focus()
+    }
+  }
+  return { ref, onKeyDown }
+}
+
 /* --------------------------------- Button --------------------------------- */
 type ButtonVariant = 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger'
 type ButtonSize = 'sm' | 'md' | 'lg' | 'icon' | 'icon-sm'
@@ -88,7 +131,7 @@ export function Button({
   return (
     <button
       className={cn(
-        'inline-flex select-none items-center justify-center whitespace-nowrap font-medium transition-all duration-150 active:scale-[.97] disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none',
+        'inline-flex select-none items-center justify-center whitespace-nowrap font-medium transition-all duration-150 active:scale-[.97] disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
         buttonVariants[variant],
         buttonSizes[size],
         className,
@@ -109,6 +152,38 @@ export function Button({
   )
 }
 
+
+/* ------------------------------- IconButton ------------------------------- */
+/** 方形图标按钮：统一工具栏/关闭钮的尺寸与焦点态，替代手写的 h-9 w-9 类串。 */
+export interface IconButtonProps
+  extends Omit<
+    ButtonProps,
+    'children' | 'leftIcon' | 'rightIcon' | 'loading' | 'size'
+  > {
+  icon: string
+  /** 可访问名（aria-label + title），必填：纯图标按钮不能没有文本替代。 */
+  label: string
+  size?: 'sm' | 'md'
+}
+
+export function IconButton({
+  icon,
+  label,
+  size = 'md',
+  variant = 'ghost',
+  ...rest
+}: IconButtonProps) {
+  return (
+    <Button
+      variant={variant}
+      size={size === 'sm' ? 'icon-sm' : 'icon'}
+      aria-label={label}
+      title={label}
+      leftIcon={icon}
+      {...rest}
+    />
+  )
+}
 
 /* --------------------------------- Badge ---------------------------------- */
 export type Tone =
@@ -394,48 +469,12 @@ export function Modal({
 }) {
   const { t } = useI18n()
   const titleId = useId()
-  const dialogRef = useRef<HTMLDivElement>(null)
-  useLockBody(open)
-  // 焦点管理：打开时移入对话框（键盘/读屏用户可直接 Tab 操作），关闭时归还给触发元素。
-  useEffect(() => {
-    if (!open) return
-    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    dialogRef.current?.focus()
-    return () => prev?.focus()
-  }, [open])
-  // 简易焦点陷阱：Tab 循环限制在对话框内，防止焦点落到背景内容上。
-  const trapTab = (e: React.KeyboardEvent) => {
-    if (e.key !== 'Tab') return
-    const root = dialogRef.current
-    if (!root) return
-    const focusables = root.querySelectorAll<HTMLElement>(
-      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-    )
-    if (focusables.length === 0) return
-    const first = focusables[0]
-    const last = focusables[focusables.length - 1]
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault()
-      last.focus()
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault()
-      first.focus()
-    }
-  }
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
+  const { ref: dialogRef, onKeyDown: trapTab } = useDialogA11y(open, onClose)
 
   if (!open) return null
   return createPortal(
-    <div className="fixed inset-0 z-[100] flex items-end justify-center p-0 sm:items-center sm:p-4">
-      <div
-        className="absolute inset-0 bg-black/55 backdrop-blur-sm animate-fade-in"
-        onClick={onClose}
-      />
+    <div className="fixed inset-0 z-modal flex items-end justify-center p-0 sm:items-center sm:p-4">
+      <div className="app-backdrop" onClick={onClose} />
       <div
         ref={dialogRef}
         role="dialog"
@@ -482,6 +521,55 @@ export function Modal({
   )
 }
 
+/* ------------------------------ ConfirmDialog ----------------------------- */
+/** 二次确认对话框：破坏性操作（清空/删除）统一走这里，策略对齐删除会话。 */
+export function ConfirmDialog({
+  open,
+  onClose,
+  onConfirm,
+  title,
+  body,
+  confirmLabel,
+  danger = true,
+}: {
+  open: boolean
+  onClose: () => void
+  onConfirm: () => void
+  title: string
+  body?: ReactNode
+  confirmLabel: string
+  danger?: boolean
+}) {
+  const { t } = useI18n()
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={title}
+      icon={danger ? 'alert' : 'info'}
+      size="sm"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant={danger ? 'danger' : 'primary'}
+            onClick={() => {
+              onConfirm()
+              onClose()
+            }}
+          >
+            {confirmLabel}
+          </Button>
+        </>
+      }
+    >
+      {body && <p className="text-sm leading-relaxed text-text-2">{body}</p>}
+    </Modal>
+  )
+}
+
 /* -------------------------------- Dropdown -------------------------------- */
 export interface MenuItem {
   label?: string
@@ -509,14 +597,55 @@ export function Dropdown({
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLSpanElement>(null)
+  // 由键盘（ArrowDown）打开时自动聚焦首个菜单项；指针打开则不打断焦点。
+  const openedViaKeyboard = useRef(false)
   const close = useCallback(() => setOpen(false), [])
   useClickOutside(ref, close)
+
+  const menuItems = () =>
+    Array.from(
+      ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+    )
+  const triggerButton = () =>
+    ref.current?.querySelector<HTMLButtonElement>(':scope > button')
+
   useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && close()
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, close])
+    if (!open || !openedViaKeyboard.current) return
+    openedViaKeyboard.current = false
+    menuItems()[0]?.focus()
+  }, [open])
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (!open) {
+        openedViaKeyboard.current = true
+        setOpen(true)
+        return
+      }
+      const nav = menuItems()
+      if (nav.length === 0) return
+      const idx = nav.indexOf(document.activeElement as HTMLButtonElement)
+      const next =
+        e.key === 'ArrowDown'
+          ? (idx + 1 + nav.length) % nav.length
+          : (idx - 1 + nav.length) % nav.length
+      nav[next].focus()
+    } else if (open && e.key === 'Home') {
+      e.preventDefault()
+      menuItems()[0]?.focus()
+    } else if (open && e.key === 'End') {
+      e.preventDefault()
+      const nav = menuItems()
+      nav[nav.length - 1]?.focus()
+    } else if (open && e.key === 'Escape') {
+      e.stopPropagation()
+      close()
+      triggerButton()?.focus()
+    } else if (open && e.key === 'Tab') {
+      close()
+    }
+  }
 
   const triggerEl = isValidElement(trigger)
     ? cloneElement(trigger, {
@@ -524,17 +653,20 @@ export function Dropdown({
           ;(trigger.props as { onClick?: (e: React.MouseEvent) => void }).onClick?.(e)
           setOpen((o) => !o)
         },
+        'aria-haspopup': 'menu',
+        'aria-expanded': open,
       } as Record<string, unknown>)
     : trigger
 
   return (
-    <span className="relative inline-flex" ref={ref}>
+    <span className="relative inline-flex" ref={ref} onKeyDown={onKeyDown}>
       {triggerEl}
       {open && (
         <div
           role="menu"
+          aria-orientation="vertical"
           className={cn(
-            'absolute z-50 min-w-[12rem] rounded-xl border border-border bg-surface p-1.5 shadow-pop animate-scale-in',
+            'absolute z-dropdown min-w-[12rem] rounded-xl border border-border bg-surface p-1.5 shadow-pop animate-scale-in',
             direction === 'up' ? 'bottom-full mb-2 origin-bottom' : 'mt-2 origin-top',
             align === 'right' ? 'right-0' : 'left-0',
             panelClassName,
@@ -548,12 +680,13 @@ export function Dropdown({
                 key={i}
                 role="menuitem"
                 disabled={it.disabled}
+                tabIndex={-1}
                 onClick={() => {
                   it.onClick?.()
                   close()
                 }}
                 className={cn(
-                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-40',
+                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:bg-surface-2 focus-visible:text-text disabled:cursor-not-allowed disabled:opacity-40',
                   it.danger
                     ? 'text-danger hover:bg-danger/10'
                     : 'text-text-2 hover:bg-surface-2 hover:text-text',

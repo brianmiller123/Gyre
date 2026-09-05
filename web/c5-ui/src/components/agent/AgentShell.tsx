@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Badge, Button } from '@/components/ui'
+import { Badge, Button, ConfirmDialog, IconButton, useDialogA11y } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { Sidebar } from '@/components/agent/Sidebar'
 import { Transcript } from '@/components/agent/Transcript'
@@ -13,6 +13,7 @@ import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact } from '@/lib/format'
 import { useI18n } from '@/lib/i18n'
+import { cn } from '@/lib/cn'
 
 /** 统计页面的 URL 路由锚点（应用无路由库，用 `#/stats` hash 表达页面级导航）。 */
 const STATS_ROUTE = '#/stats'
@@ -23,6 +24,7 @@ export function AgentShell() {
   const [mobileNav, setMobileNav] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   // 统计页：与 URL hash 同步（`#/stats` 直达 / 可刷新 / 可分享）。
   const [statsOpen, setStatsOpen] = useState(() => window.location.hash === STATS_ROUTE)
   useEffect(() => {
@@ -30,6 +32,10 @@ export function AgentShell() {
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
+
+  // 抽屉的 dialog 语义（焦点陷阱 + Esc + 锁滚动）——hook 必须无条件调用。
+  const mobileNavA11y = useDialogA11y(mobileNav, () => setMobileNav(false))
+  const inspectorA11y = useDialogA11y(inspectorOpen, () => setInspectorOpen(false))
 
   const openStats = () => {
     window.location.hash = STATS_ROUTE
@@ -43,7 +49,8 @@ export function AgentShell() {
     }
   }
 
-  const { state, usage, error, running, stopping, clear, cancel } = useAgentSession()
+  const { state, usage, error, running, stopping, clear, cancel, connect, sessionId } =
+    useAgentSession()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
   const totalTokens = usage.input_tokens + usage.output_tokens
@@ -61,9 +68,17 @@ export function AgentShell() {
 
       {/* Mobile sidebar drawer */}
       {mobileNav && (
-        <div className="fixed inset-0 z-[90] lg:hidden">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={() => setMobileNav(false)} />
-          <div className="absolute left-0 top-0 h-full animate-slide-left">
+        <div className="fixed inset-0 z-drawer lg:hidden">
+          <div className="app-backdrop" onClick={() => setMobileNav(false)} />
+          <div
+            ref={mobileNavA11y.ref}
+            onKeyDown={mobileNavA11y.onKeyDown}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('shell.conversation')}
+            tabIndex={-1}
+            className="absolute left-0 top-0 h-full animate-slide-left outline-none"
+          >
             <Sidebar
               onOpenSettings={() => { setSettingsOpen(true); setMobileNav(false) }}
               onOpenWorkspace={() => { setWorkspaceOpen(true); setMobileNav(false) }}
@@ -86,16 +101,11 @@ export function AgentShell() {
           stopping={stopping}
           onMenu={() => setMobileNav(true)}
           onInspector={() => setInspectorOpen(true)}
-          onClear={clear}
+          onClear={() => setConfirmClear(true)}
           onCancel={cancel}
         />
 
-        {error && (
-          <div className="flex items-center gap-2 border-b border-danger/20 bg-danger/[0.06] px-4 py-2 text-xs text-danger">
-            <Icon name="alert" size={14} className="shrink-0" />
-            <span className="flex-1 truncate">{error}</span>
-          </div>
-        )}
+        {error && <ErrorBanner message={error} onRetry={() => connect(sessionId)} />}
 
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
@@ -117,9 +127,17 @@ export function AgentShell() {
 
       {/* Mobile inspector drawer */}
       {inspectorOpen && (
-        <div className="fixed inset-0 z-[90] xl:hidden">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in" onClick={() => setInspectorOpen(false)} />
-          <div className="absolute right-0 top-0 h-full w-80 animate-slide-right">
+        <div className="fixed inset-0 z-drawer xl:hidden">
+          <div className="app-backdrop" onClick={() => setInspectorOpen(false)} />
+          <div
+            ref={inspectorA11y.ref}
+            onKeyDown={inspectorA11y.onKeyDown}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('shell.run_panel')}
+            tabIndex={-1}
+            className="absolute right-0 top-0 h-full w-80 animate-slide-right outline-none"
+          >
             <Inspector onClose={() => setInspectorOpen(false)} />
           </div>
         </div>
@@ -131,7 +149,50 @@ export function AgentShell() {
 
       {workspaceOpen && <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />}
 
+      <ConfirmDialog
+        open={confirmClear}
+        onClose={() => setConfirmClear(false)}
+        onConfirm={clear}
+        title={t('shell.clear')}
+        body={t('shell.clear_confirm_body')}
+        confirmLabel={t('shell.clear')}
+      />
+
       <Toaster />
+    </div>
+  )
+}
+
+/** 连接错误横幅：长错误可展开查看全文，并提供一键重连。 */
+function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const { t } = useI18n()
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="flex items-start gap-2 border-b border-danger/20 bg-danger/[0.06] px-4 py-2 text-xs text-danger">
+      <Icon name="alert" size={14} className="mt-0.5 shrink-0" />
+      <span
+        className={cn('flex-1 text-danger', expanded ? 'whitespace-pre-wrap break-all' : 'truncate')}
+        title={message}
+      >
+        {message}
+      </span>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        className="shrink-0 rounded px-1 font-medium transition-colors hover:bg-danger/10"
+      >
+        {expanded ? t('common.collapse') : t('common.expand')}
+      </button>
+      <Button
+        size="sm"
+        variant="outline"
+        leftIcon="refresh"
+        onClick={onRetry}
+        className="h-6 shrink-0 border-danger/30 px-2 text-danger hover:bg-danger/10"
+      >
+        {t('common.retry')}
+      </Button>
     </div>
   )
 }
@@ -164,13 +225,12 @@ function TopBar({
   const { t } = useI18n()
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface/70 px-3 backdrop-blur-xl sm:px-5">
-      <button
+      <IconButton
+        icon="menu"
+        label={t('shell.menu')}
         onClick={onMenu}
-        className="flex h-9 w-9 items-center justify-center rounded-lg text-text-2 hover:bg-surface-2 hover:text-text lg:hidden"
-        aria-label={t('shell.menu')}
-      >
-        <Icon name="menu" size={20} />
-      </button>
+        className="lg:hidden"
+      />
 
       <h1 className="font-display text-[15px] font-semibold text-text">{t('shell.conversation')}</h1>
 
@@ -205,13 +265,12 @@ function TopBar({
         <span className="hidden sm:inline">{t('shell.clear')}</span>
       </Button>
 
-      <button
+      <IconButton
+        icon="gauge"
+        label={t('shell.run_panel')}
         onClick={onInspector}
-        className="flex h-9 w-9 items-center justify-center rounded-lg text-text-2 hover:bg-surface-2 hover:text-text xl:hidden"
-        aria-label={t('shell.run_panel')}
-      >
-        <Icon name="gauge" size={19} />
-      </button>
+        className="xl:hidden"
+      />
     </header>
   )
 }

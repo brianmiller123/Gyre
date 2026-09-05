@@ -1,73 +1,85 @@
 import { useEffect, useState } from 'react'
+import { useDeferredValue } from 'react'
 // highlight.js core + languages are bundled locally (no CDN at runtime).
 import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/github-dark.min.css'
 
-// Register the language set the file viewer may encounter. Each import is a
-// static ES module so Vite bundles it; tree-shaking keeps the bundle lean.
-import rust from 'highlight.js/lib/languages/rust'
-import typescript from 'highlight.js/lib/languages/typescript'
-import javascript from 'highlight.js/lib/languages/javascript'
-import json from 'highlight.js/lib/languages/json'
-import yaml from 'highlight.js/lib/languages/yaml'
-import ini from 'highlight.js/lib/languages/ini'
-import markdown from 'highlight.js/lib/languages/markdown'
-import python from 'highlight.js/lib/languages/python'
-import go from 'highlight.js/lib/languages/go'
-import java from 'highlight.js/lib/languages/java'
-import c from 'highlight.js/lib/languages/c'
-import cpp from 'highlight.js/lib/languages/cpp'
-import csharp from 'highlight.js/lib/languages/csharp'
-import bash from 'highlight.js/lib/languages/bash'
-import xml from 'highlight.js/lib/languages/xml'
-import css from 'highlight.js/lib/languages/css'
-import scss from 'highlight.js/lib/languages/scss'
-import sql from 'highlight.js/lib/languages/sql'
-import php from 'highlight.js/lib/languages/php'
-import ruby from 'highlight.js/lib/languages/ruby'
-import kotlin from 'highlight.js/lib/languages/kotlin'
-import swift from 'highlight.js/lib/languages/swift'
-import scala from 'highlight.js/lib/languages/scala'
-import lua from 'highlight.js/lib/languages/lua'
-import graphql from 'highlight.js/lib/languages/graphql'
-import dockerfile from 'highlight.js/lib/languages/dockerfile'
-import makefile from 'highlight.js/lib/languages/makefile'
-import protobuf from 'highlight.js/lib/languages/protobuf'
+/**
+ * 语言模块按需加载：只静态打包 core（很小），29 种语言各自成为独立 chunk，
+ * 首次需要高亮时并行 `import()` 并注册。此前全部静态 import 进主 bundle，
+ * 489KB 的产物里语言定义占了大头，而首屏对话流往往一个代码块都没有。
+ */
+const LANGUAGE_LOADERS: Record<string, () => Promise<{ default: any }>> = {
+  rust: () => import('highlight.js/lib/languages/rust'),
+  typescript: () => import('highlight.js/lib/languages/typescript'),
+  javascript: () => import('highlight.js/lib/languages/javascript'),
+  json: () => import('highlight.js/lib/languages/json'),
+  yaml: () => import('highlight.js/lib/languages/yaml'),
+  ini: () => import('highlight.js/lib/languages/ini'),
+  markdown: () => import('highlight.js/lib/languages/markdown'),
+  python: () => import('highlight.js/lib/languages/python'),
+  go: () => import('highlight.js/lib/languages/go'),
+  java: () => import('highlight.js/lib/languages/java'),
+  c: () => import('highlight.js/lib/languages/c'),
+  cpp: () => import('highlight.js/lib/languages/cpp'),
+  csharp: () => import('highlight.js/lib/languages/csharp'),
+  bash: () => import('highlight.js/lib/languages/bash'),
+  xml: () => import('highlight.js/lib/languages/xml'),
+  css: () => import('highlight.js/lib/languages/css'),
+  scss: () => import('highlight.js/lib/languages/scss'),
+  sql: () => import('highlight.js/lib/languages/sql'),
+  php: () => import('highlight.js/lib/languages/php'),
+  ruby: () => import('highlight.js/lib/languages/ruby'),
+  kotlin: () => import('highlight.js/lib/languages/kotlin'),
+  swift: () => import('highlight.js/lib/languages/swift'),
+  scala: () => import('highlight.js/lib/languages/scala'),
+  lua: () => import('highlight.js/lib/languages/lua'),
+  graphql: () => import('highlight.js/lib/languages/graphql'),
+  dockerfile: () => import('highlight.js/lib/languages/dockerfile'),
+  makefile: () => import('highlight.js/lib/languages/makefile'),
+  protobuf: () => import('highlight.js/lib/languages/protobuf'),
+}
 
 let registered = false
-function registerAll() {
-  if (registered) return
-  registered = true
-  const langs: Record<string, any> = {
-    rust, typescript, javascript, json, yaml, ini, markdown, python, go, java,
-    c, cpp, csharp, bash, xml, css, scss, sql, php, ruby, kotlin, swift, scala,
-    lua, graphql, dockerfile, makefile, protobuf,
-  }
-  for (const [name, def] of Object.entries(langs)) hljs.registerLanguage(name, def)
+let registering: Promise<void> | null = null
+
+/** 注册全部支持的语言（幂等；首次调用并行拉取语言 chunk）。 */
+export function ensureLanguages(): Promise<void> {
+  if (registered) return Promise.resolve()
+  registering ??= Promise.all(
+    Object.entries(LANGUAGE_LOADERS).map(async ([name, load]) => {
+      hljs.registerLanguage(name, (await load()).default)
+    }),
+  ).then(() => {
+    registered = true
+  })
+  return registering
 }
-registerAll()
 
 /**
- * With everything bundled, highlighting is available synchronously on mount.
- * The hook keeps a `ready` flag (true after first effect) so callers can defer
- * the first paint imperceptibly; no network is involved.
+ * The hook keeps a `ready` flag (true once language chunks are registered) so
+ * callers can defer the first paint imperceptibly; no network is involved.
  *
  * The github-dark theme is imported statically and styles `.hljs`. The code
  * viewer always renders on a dark background, so a single theme suits both
  * light and dark app modes — no runtime theme swap needed.
  */
 export function useHighlighter(_theme: 'light' | 'dark'): boolean {
-  const [ready, setReady] = useState(false)
+  const [ready, setReady] = useState(registered)
   useEffect(() => {
-    registerAll()
-    setReady(true)
+    if (registered) return
+    let on = true
+    void ensureLanguages().then(() => on && setReady(true))
+    return () => {
+      on = false
+    }
   }, [])
   return ready
 }
 
 /** Highlight a code string for the given language; returns safe HTML. */
-export function highlight(code: string, lang: string): string {
-  registerAll()
+export async function highlight(code: string, lang: string): Promise<string> {
+  await ensureLanguages()
   try {
     if (lang && lang !== 'plaintext' && hljs.getLanguage(lang)) {
       return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
@@ -76,6 +88,26 @@ export function highlight(code: string, lang: string): string {
   } catch {
     return escapeHtml(code)
   }
+}
+
+/**
+ * React 侧统一入口：deferred code（流式期间合并高亮帧）→ 异步高亮 → 带
+ * 过期结果守卫地 setState。初始值是转义后的纯文本，语言 chunk 到位前代码块
+ * 仍立即可读（无空白闪烁）；流式期间展示 deferred 内容的高亮（与原实现一致）。
+ */
+export function useHighlightedCode(code: string, lang: string): string {
+  const deferred = useDeferredValue(code)
+  const [html, setHtml] = useState(() => escapeHtml(code))
+  useEffect(() => {
+    let on = true
+    void highlight(deferred, lang).then((h) => {
+      if (on) setHtml(h)
+    })
+    return () => {
+      on = false
+    }
+  }, [deferred, lang])
+  return html
 }
 
 function escapeHtml(s: string): string {

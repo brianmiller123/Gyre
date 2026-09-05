@@ -123,8 +123,11 @@ interface AgentSessionValue {
   fetchSkillBody: (name: string) => Promise<string | null>
   /** 拉取已加载 MCP 工具列表（`/api/sessions/{id}/mcp`）。 */
   fetchMcp: () => Promise<McpToolInfo[]>
-  /** 拉取指定会话的分支树（`/api/sessions/{id}/branches`）。 */
-  fetchBranches: (sessionId: string) => Promise<BranchTree | null>
+  /** 拉取指定会话的分支树（`/api/sessions/{id}/branches`）。`error` 非空 = 网络/服务端失败；
+   *  `tree.nodes` 为空 = 合法空树——两者必须区分，模态框才能给出错误态而非空白。 */
+  fetchBranches: (
+    sessionId: string,
+  ) => Promise<{ tree: BranchTree | null; error: string | null }>
   /** 拉取子 Agent 快照（REST 补全；WS sub_agents 是事件广播，迟加入客户端用它补齐初始状态）。 */
   fetchAgents: (sessionId: string) => Promise<void>
   /** 切换活跃分支（重连 resume 重载该会话 transcript；`handoff` 注入被离开分支的摘要；
@@ -138,8 +141,8 @@ interface AgentSessionValue {
   apiGet: <T>(path: string) => Promise<T | null>
   /** SOCKS5 代理状态（null = 尚未拉取）。 */
   socks5Status: Socks5Status | null
-  /** 拉取 SOCKS5 代理状态（`/api/socks5`）。 */
-  refreshSocks5Status: () => Promise<void>
+  /** 拉取 SOCKS5 代理状态（`/api/socks5`）。false = 拉取失败（网络/服务端错误）。 */
+  refreshSocks5Status: () => Promise<boolean>
   /** 运行时切换 SOCKS5 代理开关（`POST /api/socks5`，实时生效 + 服务端持久化）。成功返回 true。 */
   setSocks5Enabled: (on: boolean) => Promise<boolean>
   /** 审批模式状态（null = 尚未拉取）。 */
@@ -394,21 +397,24 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  /** 拉取 SOCKS5 代理状态（服务端权威）。连接建立与设置面板打开时调用。 */
-  const refreshSocks5Status = useCallback(async () => {
+  /** 拉取 SOCKS5 代理状态（服务端权威）。连接建立与设置面板打开时调用。
+   *  返回是否拉取成功：面板据此区分「未配置」与「拉取失败」（此前两者混同展示）。 */
+  const refreshSocks5Status = useCallback(async (): Promise<boolean> => {
     const cfg = settingsRef.current
     const origin = cfg.serverUrl.replace(/\/$/, '')
     const qs = new URLSearchParams()
     if (cfg.token) qs.set('token', cfg.token)
     try {
       const r = await fetch(`${origin}/api/socks5${qs.toString() ? `?${qs}` : ''}`)
-      if (!r.ok) return
+      if (!r.ok) return false
       const d = (await r.json()) as Socks5Status
       // 只写服务端权威状态，不回写 settings：本地镜像曾使 settings 身份每次刷新都变，
       // 触发设置面板 effect 无限重取循环（详见 SettingsPanel 的 open 上升沿刷新）。
       setSocks5Status(d)
+      return true
     } catch {
-      /* 静默：状态拉取失败不影响主流程 */
+      /* 拉取失败不抛出，由返回值告知调用方（UI 显示失败态 + 重试） */
+      return false
     }
   }, [])
 
@@ -914,12 +920,14 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   /** Switch the active model by starting a fresh session with the given alias. */
   const switchModel = useCallback(
     (alias: string | null) => {
+      // 运行中先下发 cancel：与 newChat 一致——否则旧任务在后端继续跑完并持续消耗 token。
+      if (running) sendFrame({ type: 'cancel' })
       update({ model: alias })
       clear()
       disconnect()
       setTimeout(() => void connect(null), 60)
     },
-    [update, clear, disconnect, connect],
+    [running, sendFrame, update, clear, disconnect, connect],
   )
 
   /** 切换模式：以 resume=当前会话 重连，应用新 system prompt 但保留对话历史。 */
@@ -1129,13 +1137,28 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     return d?.tools ?? []
   }, [apiGet, sessionId])
 
-  /** 拉取指定会话的分支树（活跃与非活跃会话皆可）。 */
+  /** 拉取指定会话的分支树（活跃与非活跃会话皆可）。
+   *  不走 apiGet：这里必须把失败原因带回给调用方（apiGet 会把所有错误吞成 null）。 */
   const fetchBranches = useCallback(
-    async (sid: string): Promise<BranchTree | null> => {
-      if (!sid) return null
-      return apiGet<BranchTree>(`/api/sessions/${encodeURIComponent(sid)}/branches`)
+    async (
+      sid: string,
+    ): Promise<{ tree: BranchTree | null; error: string | null }> => {
+      if (!sid) return { tree: null, error: null }
+      const cfg = settingsRef.current
+      const origin = cfg.serverUrl.replace(/\/$/, '')
+      const qs = new URLSearchParams()
+      if (cfg.token) qs.set('token', cfg.token)
+      try {
+        const res = await fetch(
+          `${origin}/api/sessions/${encodeURIComponent(sid)}/branches?${qs}`,
+        )
+        if (!res.ok) return { tree: null, error: `HTTP ${res.status}` }
+        return { tree: (await res.json()) as BranchTree, error: null }
+      } catch (e) {
+        return { tree: null, error: e instanceof Error ? e.message : String(e) }
+      }
     },
-    [apiGet],
+    [],
   )
 
   /** 切换指定会话的活跃分支：POST 成功后重连 resume=目标会话，重载新分支的 transcript。

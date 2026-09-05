@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Modal, Field, Input, Select, Button, Divider, Switch } from '@/components/ui'
+import { Modal, Field, Input, Select, Button, ConfirmDialog, Divider, Switch } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useSettings } from '@/lib/settings'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
@@ -34,14 +34,37 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const [testing, setTesting] = useState(false)
   // SOCKS5 开关在途状态（防止连点；请求失败 toast 提示）。
   const [socks5Busy, setSocks5Busy] = useState(false)
+  // SOCKS5 状态拉取过程/失败标记：与「服务端未配置」严格区分，避免误导读屏与用户。
+  const [socks5Loading, setSocks5Loading] = useState(false)
+  const [socks5LoadError, setSocks5LoadError] = useState(false)
   // 审批模式切换在途状态。
   const [approvalBusy, setApprovalBusy] = useState(false)
+  // 清空对话二次确认。
+  const [confirmClear, setConfirmClear] = useState(false)
+
+  // URL 即时内联校验：随输入给出错误态，而非等到保存时 toast（Field/Input 的
+  // error/invalid 能力此前一直闲置）。空值合法（保存时回退当前源）。
+  const urlError = (() => {
+    const raw = draft.serverUrl.trim()
+    if (!raw) return null
+    try {
+      const u = new URL(raw)
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return t('settings.invalid_url')
+      return null
+    } catch {
+      return t('settings.invalid_url')
+    }
+  })()
 
   useEffect(() => {
     if (open) {
       setDraft(settings)
       // 打开面板时主动刷新代理状态与审批模式（不依赖 WS 连接），保证控件即时显示。
-      void refreshSocks5Status()
+      setSocks5Loading(true)
+      void refreshSocks5Status().then((ok) => {
+        setSocks5Loading(false)
+        setSocks5LoadError(!ok)
+      })
       void refreshApprovalModeStatus()
     }
     // 仅依赖 open 上升沿：面板打开期间 settings 的身份变化（如刷新回写）不得重置草稿
@@ -86,16 +109,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
   function save() {
     // 校验并归一服务地址：非法值绝不入库（曾因 Sidebar 渲染期 new URL() 抛异常导致全屏白屏）。
-    const raw = draft.serverUrl.trim()
-    if (raw) {
-      try {
-        // eslint-disable-next-line no-new
-        new URL(raw)
-      } catch {
-        toast({ title: t('settings.invalid_url'), body: raw, severity: 'danger' })
-        return
-      }
+    // 复用输入期的 urlError 校验结果，保存与输入两个入口规则永远一致。
+    if (urlError) {
+      toast({ title: t('settings.invalid_url'), body: draft.serverUrl.trim(), severity: 'danger' })
+      return
     }
+    const raw = draft.serverUrl.trim()
     const next = raw ? raw : window.location.origin
     // 同源保存时保留当前会话（resume 重建连接，model/mode 覆盖随查询串生效）；
     // 跨服务器保存则开新会话（旧会话 id 在新服务器上不存在）。
@@ -137,11 +156,14 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             <Field
               label={t('settings.server_url')}
               hint={t('settings.server_hint')}
+              required
+              error={urlError ?? undefined}
             >
               <Input
                 value={draft.serverUrl}
                 leftIcon="server"
                 placeholder="http://127.0.0.1:8080"
+                invalid={!!urlError}
                 onChange={(e) => setDraft({ ...draft, serverUrl: e.target.value })}
               />
             </Field>
@@ -175,9 +197,30 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 <p className="mt-0.5 truncate text-xs text-muted">
                   {socks5Status?.configured
                     ? (socks5Status.redacted ?? '')
-                    : t('settings.socks5_unconfigured')}
+                    : socks5LoadError
+                      ? t('settings.socks5_load_failed')
+                      : socks5Loading
+                        ? t('settings.socks5_loading')
+                        : t('settings.socks5_unconfigured')}
                 </p>
               </div>
+              {socks5LoadError && !socks5Status && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  leftIcon="refresh"
+                  loading={socks5Loading}
+                  onClick={() => {
+                    setSocks5Loading(true)
+                    void refreshSocks5Status().then((ok) => {
+                      setSocks5Loading(false)
+                      setSocks5LoadError(!ok)
+                    })
+                  }}
+                >
+                  {t('common.retry')}
+                </Button>
+              )}
               {socks5Status?.configured && (
                 <Switch
                   checked={socks5Status.enabled}
@@ -295,15 +338,24 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             variant="ghost"
             leftIcon="trash"
             className="text-danger hover:bg-danger/10"
-            onClick={() => {
-              clear()
-              toast({ title: t('settings.clear_toast'), severity: 'info' })
-            }}
+            onClick={() => setConfirmClear(true)}
           >
             {t('settings.clear_conversation')}
           </Button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmClear}
+        onClose={() => setConfirmClear(false)}
+        onConfirm={() => {
+          clear()
+          toast({ title: t('settings.clear_toast'), severity: 'info' })
+        }}
+        title={t('settings.clear_conversation')}
+        body={t('shell.clear_confirm_body')}
+        confirmLabel={t('settings.clear_conversation')}
+      />
     </Modal>
   )
 }
@@ -317,10 +369,14 @@ function ThemePreview({ active, label, onClick, variant }: { active: boolean; la
         active ? 'border-primary shadow-glow' : 'border-border hover:border-border-strong',
       )}
     >
-      <div className={cn('flex h-16 items-end gap-1.5 p-3', variant === 'dark' ? 'bg-[#0b0d12]' : 'bg-[#f4f7fa]')}>
-        <div className={cn('h-8 w-2 rounded-full', variant === 'dark' ? 'bg-white/15' : 'bg-slate-300')} />
-        <div className="h-7 w-full rounded-md" style={{ background: 'linear-gradient(100deg, rgb(13 148 136), rgb(45 212 191))' }} />
-      </div>
+        {/* 渐变直接取主题令牌：跟随 accent 切换（此前硬编码 teal，accent 换色后预览不同步）。 */}
+        <div className={cn('flex h-16 items-end gap-1.5 p-3', variant === 'dark' ? 'bg-[#0b0d12]' : 'bg-[#f4f7fa]')}>
+          <div className={cn('h-8 w-2 rounded-full', variant === 'dark' ? 'bg-white/15' : 'bg-slate-300')} />
+          <div
+            className="h-7 w-full rounded-md"
+            style={{ background: 'linear-gradient(100deg, rgb(var(--c-primary)), rgb(var(--c-primary-glow)))' }}
+          />
+        </div>
       <div className="flex items-center justify-center gap-1.5 py-1.5 text-sm font-medium text-text">
         {active && <Icon name="check" size={13} className="text-primary" />}
         {label}

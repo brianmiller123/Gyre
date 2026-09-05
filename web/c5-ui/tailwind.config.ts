@@ -52,6 +52,15 @@ const config: Config = {
         xl: '14px',
         '2xl': '20px',
       },
+      /* Elevation layers: one token per overlay kind — never bare z-[N] values. */
+      zIndex: {
+        dropdown: '50',
+        stats: '80',
+        drawer: '90',
+        workspace: '95',
+        modal: '100',
+        toast: '120',
+      },
       keyframes: {
         'fade-in': { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
         'slide-up': {

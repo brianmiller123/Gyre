@@ -138,6 +138,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            aria-label={t('sessions.search_placeholder')}
             placeholder={t('sessions.search_placeholder')}
             className="h-8 w-full rounded-lg border border-border bg-surface-2 pl-8 pr-7 text-[12px] text-text outline-none transition-colors placeholder:text-muted/60 focus:border-primary focus:ring-2 focus:ring-primary/20"
           />
@@ -399,7 +400,7 @@ function SessionRow({
             panelClassName="min-w-[10rem]"
             trigger={
               <button
-                aria-label="更多操作"
+                aria-label={t('sessions.more_actions')}
                 className={cn(
                   'flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted transition-all hover:bg-surface-3 hover:text-text',
                   active ? 'opacity-70' : 'opacity-0 focus:opacity-100 group-hover:opacity-100',

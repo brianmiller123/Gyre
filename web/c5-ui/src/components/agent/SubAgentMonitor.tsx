@@ -140,7 +140,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
                   className="flex items-center gap-1 text-[10px] text-muted transition-colors hover:text-text-2"
                 >
                   <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={11} />
-                  日志（{a.logs.length}）
+                  {t('inspector.logs_count', { n: a.logs.length })}
                 </button>
                 {isOpen && (
                   <pre className="mt-1 max-h-32 overflow-y-auto rounded bg-surface-3/60 p-1.5 font-mono text-[10px] leading-relaxed">

@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { BranchNode, BranchTree } from '@/lib/agent/types'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { useNotifications } from '@/lib/notifications'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/cn'
 import { Icon } from '@/components/icons'
-import { Modal, Skeleton } from '@/components/ui'
+import { Button, Modal, Skeleton } from '@/components/ui'
 
 /**
  * 会话分支树模态框：渲染某会话的节点森林（缩进树形），高亮活跃路径，
@@ -29,26 +29,27 @@ export function BranchTreeModal({
 
   const [tree, setTree] = useState<BranchTree | null>(null)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [handoff, setHandoff] = useState(false)
   const [busyLeaf, setBusyLeaf] = useState<string | null>(null)
 
+  // 拉取分支树（可重试）：错误与空树分开展示，失败不再呈现空白盒。
+  const load = useCallback(async () => {
+    if (!sessionId) return
+    setLoading(true)
+    setError(null)
+    setTree(null)
+    const res = await fetchBranches(sessionId)
+    setTree(res.tree)
+    setError(res.error)
+    setLoading(false)
+  }, [sessionId, fetchBranches])
+
   // 打开时拉取分支树。
   useEffect(() => {
-    if (!open || !sessionId) return
-    let cancelled = false
-    setLoading(true)
-    setTree(null)
-    void (async () => {
-      const data = await fetchBranches(sessionId)
-      if (!cancelled) {
-        setTree(data)
-        setLoading(false)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [open, sessionId, fetchBranches])
+    if (!open) return
+    void load()
+  }, [open, load])
 
   // 活跃路径节点 id 集（active_leaf → root），用于高亮当前分支。
   const activePathIds = useMemo(() => {
@@ -106,7 +107,7 @@ export function BranchTreeModal({
             type="checkbox"
             checked={handoff}
             onChange={(e) => setHandoff(e.target.checked)}
-            className="h-3.5 w-3.5 accent-[var(--primary)]"
+            className="h-3.5 w-3.5 accent-primary"
           />
           {t('branches.handoff')}
         </label>
@@ -121,7 +122,20 @@ export function BranchTreeModal({
           </div>
         )}
 
-        {!loading && tree && tree.nodes.length === 0 && (
+        {!loading && error && (
+          <div className="flex flex-col items-center gap-2 px-3 py-8 text-center">
+            <Icon name="alert" size={20} className="text-danger" />
+            <p className="text-xs font-medium text-text-2">{t('branches.load_failed')}</p>
+            {error && (
+              <p className="max-w-xs break-all text-[11px] leading-relaxed text-muted">{error}</p>
+            )}
+            <Button size="sm" variant="outline" leftIcon="refresh" onClick={() => void load()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        )}
+
+        {!loading && !error && tree && tree.nodes.length === 0 && (
           <div className="flex items-center justify-center px-3 py-8 text-xs text-muted">
             {t('branches.empty')}
           </div>

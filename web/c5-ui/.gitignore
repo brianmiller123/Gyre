@@ -21,3 +21,7 @@ pnpm-debug.log*
 
 # typescript build info
 *.tsbuildinfo
+
+# vite.config.ts 的误生成编译产物（tsconfig.node.json 现已 noEmit）
+vite.config.js
+vite.config.d.ts

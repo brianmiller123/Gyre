@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { BarChart } from '@/components/charts'
-import { Badge, Button, EmptyState, Spinner } from '@/components/ui'
+import { Badge, Button, EmptyState, IconButton, Spinner, useDialogA11y } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useI18n } from '@/lib/i18n'
 import { compact, currency, formatNumber, percent } from '@/lib/format'
@@ -29,6 +29,8 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
   const [trend, setTrend] = useState<DailyStat[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // 全屏浮层的 dialog 语义（焦点陷阱 + Esc + 锁滚动）——此前仅 Esc，无焦点管理。
+  const a11y = useDialogA11y(true, onClose ?? (() => {}))
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -48,14 +50,6 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
     void load()
   }, [load])
 
-  // 全屏浮层：Esc 关闭（与 Modal 行为一致；onClose 缺省 = 由宿主控制显隐，不注册）。
-  useEffect(() => {
-    if (!onClose) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose?.()
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
-
   const usage = stats?.usage
   // 缓存命中率：命中读取占「输入侧总消耗」（非缓存输入 + 命中读取）的比例。
   const hitRate =
@@ -65,8 +59,17 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
   const totalTokens = (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0)
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm animate-fade-in">
-      <div className="flex h-full max-h-[88vh] w-full max-w-[1080px] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-pop">
+    <div className="fixed inset-0 z-stats flex items-center justify-center p-4">
+      <div className="app-backdrop" />
+      <div
+        ref={a11y.ref}
+        onKeyDown={a11y.onKeyDown}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('stats.title')}
+        tabIndex={-1}
+        className="relative z-10 flex h-full max-h-[88vh] w-full max-w-[1080px] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-pop outline-none animate-scale-in"
+      >
         {/* 头部 */}
         <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-6 py-4">
           <div className="flex items-center gap-3">
@@ -82,15 +85,7 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
             <Button variant="secondary" size="sm" leftIcon="refresh" onClick={load} loading={loading}>
               {t('stats.refresh')}
             </Button>
-            {onClose && (
-              <button
-                onClick={onClose}
-                className="flex h-8 w-8 items-center justify-center rounded-lg text-muted hover:bg-surface-2 hover:text-text"
-                aria-label={t('common.close')}
-              >
-                <Icon name="close" size={18} />
-              </button>
-            )}
+            {onClose && <IconButton icon="close" label={t('common.close')} size="sm" onClick={onClose} className="text-muted" />}
           </div>
         </div>
 

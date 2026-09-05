@@ -2,7 +2,6 @@ import {
   Fragment,
   memo,
   type ReactNode,
-  useDeferredValue,
   useMemo,
   useState,
 } from 'react'
@@ -10,7 +9,7 @@ import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
 import { copyText } from '@/lib/clipboard'
-import { highlight } from '@/lib/agent/highlight'
+import { useHighlightedCode } from '@/lib/agent/highlight'
 
 /**
  * Compact, dependency-light Markdown renderer tuned for assistant output.
@@ -231,11 +230,14 @@ export const Markdown = memo(function Markdown({
         if (b.type === 'table')
           return <TableBlock key={idx} headers={b.headers ?? []} rows={b.rows ?? []} idx={idx} />
         if (b.type === 'h') {
+          const level = Math.min(Math.max(b.level ?? 1, 1), 6)
+          const Tag = `h${level}` as 'h1'
           const sizes = ['text-xl', 'text-lg', 'text-base', 'text-base', 'text-sm', 'text-sm']
           return (
-            <p key={idx} className={cn('font-display font-bold text-text', sizes[(b.level ?? 1) - 1])}>
+            // 语义化标题标签：保留读屏文档大纲（此前渲染为 <p> 丢失结构）。
+            <Tag key={idx} className={cn('font-display font-bold text-text', sizes[level - 1])}>
               {inline(b.text ?? '', `h${idx}`)}
-            </p>
+            </Tag>
           )
         }
         if (b.type === 'quote') {
@@ -326,11 +328,9 @@ function TableBlock({
 }
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
-  // Defer the highlight pass during streaming so rapid token deltas don't
-  // re-tokenize on every frame. `deferred` lags behind `code` by at most a few
-  // frames (imperceptible), while the main thread stays responsive.
-  const deferred = useDeferredValue(code)
-  const html = useMemo(() => highlight(deferred, lang), [deferred, lang])
+  // Deferred + async highlighting: rapid token deltas don't re-tokenize on
+  // every frame; before the language chunks land the raw escaped text shows.
+  const html = useHighlightedCode(code, lang)
   const { t } = useI18n()
   const [copied, setCopied] = useState(false)
   const copy = async () => {
@@ -343,10 +343,10 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   return (
     <div className="group relative overflow-hidden rounded-xl border border-border text-[13px]">
       <div className="flex items-center justify-between border-b border-white/5 bg-black/20 px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-white/40">{lang || 'code'}</span>
+        <span className="font-mono text-[11px] uppercase tracking-wide text-white/60">{lang || 'code'}</span>
         <button
           onClick={copy}
-          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-white/65 transition-colors hover:bg-white/10 hover:text-white"
         >
           <Icon name={copied ? 'check' : 'copy'} size={12} /> {copied ? t('common.copied') : t('common.copy')}
         </button>

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Select } from '@/components/ui'
+import { Button, IconButton, Select } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { ModelSwitcher } from '@/components/agent/ModelSwitcher'
+import { useNotifications } from '@/lib/notifications'
 import { useSettings } from '@/lib/settings'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
@@ -63,6 +64,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     apiGet,
   } = useAgentSession()
   const { settings, update } = useSettings()
+  const { toast } = useNotifications()
   const { t } = useI18n()
   const [text, setText] = useState('')
   const [active, setActive] = useState(0)
@@ -72,6 +74,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   // 待发送的图片内容块（多模态）。
   const [images, setImages] = useState<ContentInput[]>([])
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const listRef = useRef<HTMLUListElement>(null)
   // submit 在途互斥：expandMentions await 期间二次 Enter 会双发同一消息。
   const sendingRef = useRef(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -130,6 +133,12 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   useEffect(() => {
     setActive(0)
   }, [text])
+
+  // 键盘高亮项跟随滚动：命令较多时方向键选中项可能滚出 max-h-64 可视区。
+  useEffect(() => {
+    const el = listRef.current?.children[active]
+    ;(el as HTMLElement | undefined)?.scrollIntoView({ block: 'nearest' })
+  }, [active, list])
 
 
   const ctx: CommandContext = useMemo(
@@ -204,7 +213,11 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     sendingRef.current = true
     try {
       if (isCommand) {
-        if (running) return // 斜杠命令运行中不响应；纯文本作 steering 插话（服务器忙时 steer）
+        if (running) {
+          // 斜杠命令运行中不响应（纯文本作 steering 插话）；必须给出反馈，不能静默。
+          toast({ title: t('composer.slash_running'), severity: 'warning' })
+          return
+        }
         // Execute a typed command directly (e.g. "/clear" or "/mode code").
         const p = parseCommandLine(raw)!
         const cmd = allCommands.find((c) => c.name === p.name)
@@ -219,7 +232,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
       // 非命令路径：若含 @file 提及，发送前展开为附加上下文块。
       let body = raw
       if (parseMentions(raw).length > 0) {
-        body = await expandMentions(raw, { apiGet, say })
+        body = await expandMentions(raw, { apiGet, say, t })
       }
       // 多模态：有图片时走 sendContent（已展开的文本作为 caption）。
       if (images.length > 0) {
@@ -260,7 +273,15 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   // 与 CLI read_image 的 MAX_IMAGE_BYTES 对齐：解码后超 10MiB 直接拦截并提示。
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024
   function handleFiles(files: FileList | File[]) {
-    const arr = Array.from(files).filter((f) => IMAGE_MIMES.includes(f.type))
+    const all = Array.from(files)
+    const arr = all.filter((f) => IMAGE_MIMES.includes(f.type))
+    const rejected = all.length - arr.length
+    if (rejected > 0) {
+      toast({
+        title: t('composer.attach_unsupported', { count: rejected }),
+        severity: 'warning',
+      })
+    }
     for (const f of arr) {
       if (f.size > MAX_IMAGE_BYTES) {
         say(t('composer.image_too_large', { name: f.name || '—' }), 'warning')
@@ -278,13 +299,11 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   }
 
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData.items)
-      .map((it) => it.getAsFile())
-      .filter((f): f is File => !!f && IMAGE_MIMES.includes(f.type))
-    if (files.length > 0) {
-      e.preventDefault()
-      handleFiles(files)
-    }
+    // 非图片文件（或混合粘贴）交由 handleFiles 统一拦截并提示，不再静默丢弃。
+    const files = Array.from(e.clipboardData.files)
+    if (files.length === 0) return
+    e.preventDefault()
+    handleFiles(files)
   }
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -343,7 +362,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                 <KbdMini>↑↓</KbdMini> {t('composer.hint_select')} <KbdMini>↵</KbdMini> {t('composer.hint_confirm')} <KbdMini>esc</KbdMini> {t('composer.hint_close')}
               </span>
             </div>
-            <ul id="slash-menu" role="listbox" aria-label={t('composer.menu')} className="max-h-64 overflow-y-auto py-1">
+            <ul ref={listRef} id="slash-menu" role="listbox" aria-label={t('composer.menu')} className="max-h-64 overflow-y-auto py-1">
               {list.map((item, i) => (
                 <li key={item.label} id={`slash-opt-${i}`} role="option" aria-selected={i === active}>
                   <button
@@ -414,14 +433,13 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                 e.target.value = ''
               }}
             />
-            <button
+            <IconButton
+              icon="image"
+              label={t('composer.upload_image')}
               onClick={() => fileRef.current?.click()}
               disabled={!connected}
-              title={t('composer.upload_image')}
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface hover:text-text disabled:cursor-not-allowed"
-            >
-              <Icon name="image" size={18} />
-            </button>
+              className="shrink-0 text-muted hover:bg-surface hover:text-text"
+            />
             <EnhanceButton
               text={text}
               setText={setText}
@@ -434,6 +452,9 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
             <textarea
               ref={taRef}
               rows={1}
+              role="combobox"
+              aria-autocomplete="list"
+              aria-label={t('composer.input_aria')}
               aria-expanded={menuOpen && list.length > 0}
               aria-controls="slash-menu"
               aria-activedescendant={menuOpen && list.length > 0 ? `slash-opt-${active}` : undefined}

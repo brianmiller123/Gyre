@@ -14,7 +14,7 @@ const DEFAULT_ALIAS = '__default__'
  * because it starts a fresh session.
  */
 export function ModelSwitcher() {
-  const { models, currentModel, items, switchModel } = useAgentSession()
+  const { models, currentModel, items, running, switchModel } = useAgentSession()
   const { t } = useI18n()
   // null = closed; otherwise the pending alias (DEFAULT_ALIAS for the server default).
   const [pending, setPending] = useState<string | null>(null)
@@ -86,6 +86,12 @@ export function ModelSwitcher() {
             model: pending === DEFAULT_ALIAS ? t('shell.default') : (pending ?? ''),
           })}
         </p>
+        {running && (
+          <p className="mt-2 flex items-start gap-1.5 rounded-lg bg-warning/10 px-2.5 py-2 text-xs font-medium text-warning">
+            <Icon name="alert" size={14} className="mt-0.5 shrink-0" />
+            {t('shell.switch_running_warn')}
+          </p>
+        )}
       </Modal>
     </>
   )

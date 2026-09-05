@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   fetchFile,
@@ -9,7 +9,7 @@ import {
   type FileContent,
   type WorkspaceInfo,
 } from '@/lib/agent/workspace'
-import { highlight, useHighlighter } from '@/lib/agent/highlight'
+import { useHighlightedCode, useHighlighter } from '@/lib/agent/highlight'
 import { useTheme } from '@/lib/theme'
 import { Icon } from '@/components/icons'
 import { Badge, Button, Spinner } from '@/components/ui'
@@ -185,8 +185,8 @@ export function WorkspacePanel({ onClose }: { onClose?: () => void }) {
   }, [])
 
   return createPortal(
-    <div className="fixed inset-0 z-[95]">
-      <div className="absolute inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" onClick={onClose} />
+    <div className="fixed inset-0 z-workspace">
+      <div className="app-backdrop" onClick={onClose} />
       <WindowChrome
         mode={mode}
         pos={pos}
@@ -460,13 +460,13 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
   }, [])
 
   const lang = activePath ? languageOf(activePath) : 'plaintext'
-  // 全文高亮较贵：memoize，避免拖拽分割条（treeW state）等无关重渲染反复重算。
-  // 超大文本（>256KiB）直接跳过高亮（尤其 highlightAuto 的多语言探测是主线程秒级阻塞），
-  // 由 CodeView 走 escapeHtml 纯文本路径。
+  // 全文高亮改为异步按需（useHighlightedCode）：语言 chunk 首次加载后注册，
+  // 高亮不进主 bundle，流式期间经 deferred 合并。超大文本（>256KiB，尤其
+  // highlightAuto 的多语言探测是主线程秒级阻塞）仍直接跳过高亮走纯文本路径。
   const skipHl = (file?.content?.length ?? 0) > 256 * 1024
-  const html = useMemo(
-    () => (file?.content && !skipHl ? highlight(file.content, lang) : ''),
-    [file?.content, lang, skipHl],
+  const html = useHighlightedCode(
+    skipHl || !file?.content ? '' : file.content,
+    skipHl ? 'plaintext' : lang,
   )
 
   return (
@@ -656,7 +656,7 @@ function CodeView({
     <div className="flex min-w-full">
       <pre
         aria-hidden
-        className="select-none border-r border-white/5 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-white/25"
+        className="select-none border-r border-white/5 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-white/45"
       >
         {gutter ?? lines.map((_, i) => <div key={i}>{i + 1}</div>)}
       </pre>

@@ -123,13 +123,9 @@
 }
 
 @layer components {
-  /* Frosted panel used by the top bar / floating surfaces */
-  .glass {
-    @apply border border-border bg-surface/70 backdrop-blur-xl;
-  }
-
-  .card {
-    @apply rounded-2xl border border-border bg-surface shadow-soft;
+  /* Shared overlay backdrop — one elevation for modal / drawer / full-screen panels */
+  .app-backdrop {
+    @apply absolute inset-0 bg-black/55 backdrop-blur-sm animate-fade-in;
   }
 
   /* Gradient text for the wordmark + hero numbers */

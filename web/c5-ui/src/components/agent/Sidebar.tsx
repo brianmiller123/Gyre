@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Button, Divider } from '@/components/ui'
+import { useEffect, useRef, useState } from 'react'
+import { Button, ConfirmDialog, Divider, IconButton } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { SessionList } from '@/components/agent/SessionList'
@@ -32,6 +32,55 @@ export function Sidebar({
   const { theme, toggle } = useTheme()
   const { t, preference, setPreference, locale } = useI18n()
   const [langMenuOpen, setLangMenuOpen] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  // 语言菜单键盘导航：Arrow 循环移动高亮，Esc 关闭并归还焦点到触发按钮。
+  const langMenuRef = useRef<HTMLDivElement>(null)
+  const langTriggerRef = useRef<HTMLButtonElement>(null)
+  const langOpenedViaKb = useRef(false)
+
+  useEffect(() => {
+    if (!langMenuOpen || !langOpenedViaKb.current) return
+    langOpenedViaKb.current = false
+    langMenuRef.current
+      ?.querySelector<HTMLButtonElement>('[role="menuitem"]')
+      ?.focus()
+  }, [langMenuOpen])
+
+  const focusLangItem = (dir: 1 | -1) => {
+    const items = Array.from(
+      langMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
+    )
+    if (items.length === 0) return
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement)
+    items[(idx + dir + items.length) % items.length].focus()
+  }
+
+  const onLangTriggerKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+    e.preventDefault()
+    if (!langMenuOpen) {
+      langOpenedViaKb.current = true
+      setLangMenuOpen(true)
+      return
+    }
+    focusLangItem(e.key === 'ArrowDown' ? 1 : -1)
+  }
+
+  const onLangMenuKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      focusLangItem(1)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      focusLangItem(-1)
+    } else if (e.key === 'Escape') {
+      e.stopPropagation()
+      setLangMenuOpen(false)
+      langTriggerRef.current?.focus()
+    } else if (e.key === 'Tab') {
+      setLangMenuOpen(false)
+    }
+  }
 
   const status = connecting ? 'connecting' : connected ? 'connected' : 'disconnected'
   const statusDot =
@@ -70,12 +119,13 @@ export function Sidebar({
           </div>
         </div>
         {onClose && (
-          <button
+          <IconButton
+            icon="close"
+            label={t('common.close')}
+            size="sm"
             onClick={onClose}
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted hover:bg-surface-2 hover:text-text lg:hidden"
-          >
-            <Icon name="close" size={18} />
-          </button>
+            className="text-muted lg:hidden"
+          />
         )}
       </div>
 
@@ -121,7 +171,8 @@ export function Sidebar({
         <NavAction icon="bar-chart" label={t('sidebar.stats')} onClick={() => { onOpenStats(); onClose?.() }} />
         <NavAction icon="layers" label={t('sidebar.browse')} onClick={() => { onOpenWorkspace(); onClose?.() }} />
         <NavAction icon="settings" label={t('sidebar.settings')} onClick={() => { onOpenSettings(); onClose?.() }} />
-        <NavAction icon="trash" label={t('sidebar.clear')} danger onClick={() => { clear(); onClose?.() }} />
+        {/* 清空不可逆：与删除会话对齐，先二次确认。 */}
+        <NavAction icon="trash" label={t('sidebar.clear')} danger onClick={() => setConfirmClear(true)} />
       </nav>
 
       {/* 外观：主题 / 语言 */}
@@ -137,7 +188,11 @@ export function Sidebar({
         {/* 语言切换快捷按钮 */}
         <div className="relative">
           <button
+            ref={langTriggerRef}
             onClick={() => setLangMenuOpen(!langMenuOpen)}
+            onKeyDown={onLangTriggerKeyDown}
+            aria-haspopup="menu"
+            aria-expanded={langMenuOpen}
             className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-text-2 transition-colors hover:bg-surface-2 hover:text-text"
           >
             <Icon name="globe" size={17} />
@@ -146,12 +201,20 @@ export function Sidebar({
           </button>
           {langMenuOpen && (
             <>
-              <div className="absolute bottom-full left-0 right-0 z-50 mb-1 overflow-hidden rounded-lg border border-border bg-surface shadow-lg">
+              <div
+                ref={langMenuRef}
+                role="menu"
+                aria-orientation="vertical"
+                onKeyDown={onLangMenuKeyDown}
+                className="absolute bottom-full left-0 right-0 z-dropdown mb-1 overflow-hidden rounded-lg border border-border bg-surface shadow-lg"
+              >
                 <div className="py-1">
                   <button
+                    role="menuitem"
+                    tabIndex={-1}
                     onClick={() => { setPreference('auto'); setLangMenuOpen(false) }}
                     className={cn(
-                      'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors',
+                      'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors focus-visible:bg-surface-2 focus-visible:text-text focus-visible:outline-none',
                       preference === 'auto' ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2 hover:text-text',
                     )}
                   >
@@ -161,9 +224,11 @@ export function Sidebar({
                   {SUPPORTED_LOCALES.map((code: LocaleCode) => (
                     <button
                       key={code}
+                      role="menuitem"
+                      tabIndex={-1}
                       onClick={() => { setPreference(code); setLangMenuOpen(false) }}
                       className={cn(
-                        'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors',
+                        'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors focus-visible:bg-surface-2 focus-visible:text-text focus-visible:outline-none',
                         preference === code ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2 hover:text-text',
                       )}
                     >
@@ -184,6 +249,18 @@ export function Sidebar({
           </span>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmClear}
+        onClose={() => setConfirmClear(false)}
+        onConfirm={() => {
+          clear()
+          onClose?.()
+        }}
+        title={t('sidebar.clear')}
+        body={t('shell.clear_confirm_body')}
+        confirmLabel={t('sidebar.clear')}
+      />
     </div>
   )
 }

@@ -20,6 +20,7 @@ const EXAMPLES = [
 /** Scrollable conversation transcript. */
 export function Transcript() {
   const { items, state, connected } = useAgentSession()
+  const { t } = useI18n()
   const scrollRef = useRef<HTMLDivElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const atBottom = useRef(true)
@@ -39,7 +40,15 @@ export function Transcript() {
   }
 
   return (
-    <div ref={scrollRef} onScroll={onScroll} className="no-scrollbar h-full overflow-y-auto">
+    // role="log"（隐含 aria-live=polite）：新消息对读屏用户可感知（WCAG 4.1.3 状态消息）。
+    <div
+      ref={scrollRef}
+      onScroll={onScroll}
+      role="log"
+      aria-live="polite"
+      aria-label={t('transcript.log_aria')}
+      className="no-scrollbar h-full overflow-y-auto"
+    >
       <div className="mx-auto w-full max-w-3xl space-y-5 px-4 py-6">
         {items.map((item) => (
           <ItemView key={item.id} item={item} />
@@ -109,7 +118,11 @@ const ItemView = memo(function ItemView({ item }: { item: TranscriptItem }) {
       return <AskCard ask={item.ask} resolved={item.resolved} answer={item.answer} />
     case 'error':
       return (
-        <div className="flex items-start gap-2.5 rounded-xl border border-danger/30 bg-danger/[0.06] px-3.5 py-2.5 text-sm text-danger">
+        // role="alert"：错误插入时立即播报，不等用户滚动到该条目。
+        <div
+          role="alert"
+          className="flex items-start gap-2.5 rounded-xl border border-danger/30 bg-danger/[0.06] px-3.5 py-2.5 text-sm text-danger"
+        >
           <Icon name="x-circle" size={16} className="mt-0.5 shrink-0" />
           <p className="whitespace-pre-wrap break-words">{item.message}</p>
         </div>
@@ -402,10 +415,18 @@ function AskCard({
   const { respond } = useAgentSession()
   const { t } = useI18n()
   const [text, setText] = useState('')
+  // 在途保护：审批/回复帧已发出但服务端 resolved 回执未达时，禁止二次提交。
+  const [sent, setSent] = useState(false)
   const isFollowup = typeof ask.kind === 'string' && ask.kind === 'followup'
 
+  const send = (response: Parameters<typeof respond>[1]) => {
+    if (sent || resolved) return
+    setSent(true)
+    respond(ask.id, response)
+  }
+
   return (
-    <div className="rounded-xl border border-primary/30 bg-primary/[0.04] p-3.5 shadow-soft">
+    <div role="alert" className="rounded-xl border border-primary/30 bg-primary/[0.04] p-3.5 shadow-soft">
       <div className="mb-2 flex items-center gap-2">
         <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/15 text-primary">
           <Icon name="shield" size={15} />
@@ -431,6 +452,7 @@ function AskCard({
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={1}
+            aria-label={t('transcript.reply_placeholder')}
             placeholder={t('transcript.reply_placeholder')}
             className="max-h-32 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-[13px] text-text placeholder:text-muted/60 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/15"
           />
@@ -438,18 +460,24 @@ function AskCard({
             variant="primary"
             size="md"
             leftIcon="arrow-right"
-            disabled={!text.trim()}
-            onClick={() => respond(ask.id, { text: text.trim() })}
+            disabled={!text.trim() || sent}
+            onClick={() => send({ text: text.trim() })}
           >
             {t('transcript.reply')}
           </Button>
         </div>
       ) : (
         <div className="flex gap-2">
-          <Button variant="primary" leftIcon="check" onClick={() => respond(ask.id, 'yes')}>
+          <Button variant="primary" leftIcon="check" disabled={sent} onClick={() => send('yes')}>
             {t('transcript.approve')}
           </Button>
-          <Button variant="outline" leftIcon="close" className="text-danger hover:bg-danger/10" onClick={() => respond(ask.id, 'no')}>
+          <Button
+            variant="outline"
+            leftIcon="close"
+            className="text-danger hover:bg-danger/10"
+            disabled={sent}
+            onClick={() => send('no')}
+          >
             {t('transcript.reject')}
           </Button>
         </div>
