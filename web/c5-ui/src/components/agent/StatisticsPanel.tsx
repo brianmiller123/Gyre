@@ -48,6 +48,14 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
     void load()
   }, [load])
 
+  // 全屏浮层：Esc 关闭（与 Modal 行为一致；onClose 缺省 = 由宿主控制显隐，不注册）。
+  useEffect(() => {
+    if (!onClose) return
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose?.()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   const usage = stats?.usage
   // 缓存命中率：命中读取占「输入侧总消耗」（非缓存输入 + 命中读取）的比例。
   const hitRate =

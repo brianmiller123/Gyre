@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Markdown } from '@/lib/agent/markdown'
 import { Icon } from '@/components/icons'
 import { Badge, Button } from '@/components/ui'
@@ -8,6 +8,7 @@ import type { AskMessage, TranscriptItem } from '@/lib/agent/types'
 import { useNotifications } from '@/lib/notifications'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
+import { copyText } from '@/lib/clipboard'
 
 const EXAMPLES = [
   { icon: 'layers', textKey: 'transcript.example.1' },
@@ -30,7 +31,7 @@ export function Transcript() {
   }
 
   useEffect(() => {
-    if (atBottom.current) endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    if (atBottom.current) endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
   }, [items])
 
   if (items.length === 0) {
@@ -63,7 +64,8 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
           <span className="gradient-text">{t('transcript.title_agent')}</span> {t('transcript.title_console')}
         </h1>
         <p className="mx-auto mt-2 max-w-md text-sm text-muted">
-          {t('transcript.subtitle')} {connected ? t('transcript.status_connected', { desc: meta.desc }) : t('transcript.connecting')}
+          {t('transcript.subtitle')}{' '}
+          {connected ? t('transcript.status_connected', { desc: t(meta.desc) }) : t('transcript.connecting')}
         </p>
 
         <div className="mt-8 grid grid-cols-1 gap-2.5 text-left sm:grid-cols-2">
@@ -83,14 +85,15 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
         </div>
 
         <p className="mt-6 text-[11px] text-muted">
-          提示：在设置中配置 <span className="font-mono">agent --serve</span> 的地址与 token
+          {t('transcript.hint_serve')}
         </p>
       </div>
     </div>
   )
 }
 
-function ItemView({ item }: { item: TranscriptItem }) {
+const ItemView = memo(function ItemView({ item }: { item: TranscriptItem }) {
+  const { t } = useI18n()
   switch (item.kind) {
     case 'user':
       return <UserMessage item={item} />
@@ -123,16 +126,16 @@ function ItemView({ item }: { item: TranscriptItem }) {
         >
           <Icon name={item.success ? 'check-circle' : 'alert'} size={16} className="shrink-0" />
           <span>
-            任务{item.success ? '完成' : '结束'} ·{' '}
-            <span className="tabular">{item.turns}</span> 轮 ·{' '}
-            <span className="tabular">{item.tool_calls}</span> 次工具调用
+            {t(item.success ? 'transcript.done_ok' : 'transcript.done_end')} ·{' '}
+            <span className="tabular">{item.turns}</span> {t('transcript.turns')} ·{' '}
+            <span className="tabular">{item.tool_calls}</span> {t('transcript.tool_calls')}
           </span>
         </div>
       )
     default:
       return null
   }
-}
+})
 
 function Avatar() {
   return (
@@ -225,15 +228,25 @@ function MessageDeleteButton({
  * 删除按钮绝对定位于气泡左侧（right-full），不占据布局空间，避免气泡位移。
  */
 function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }> }) {
+  const { t } = useI18n()
   return (
     <div className="group flex justify-end">
       <div className="relative max-w-[85%]">
-        <div className="absolute right-full top-0 mr-1 flex items-center opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
-          <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_user" />
-        </div>
+        {/* 纯图片占位项无对应历史行，无法定位删除目标，不渲染删除按钮。 */}
+        {!item.placeholder && (
+          <div className="absolute right-full top-0 mr-1 flex items-center opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+            <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_user" />
+          </div>
+        )}
         <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-white dark:text-[#06241f]">
           <p className="whitespace-pre-wrap break-words">{item.text}</p>
         </div>
+        {item.steered && (
+          <p className="mt-1 flex items-center justify-end gap-1 text-[11px] text-muted">
+            <Icon name="zap" size={11} />
+            {t('transcript.steered')}
+          </p>
+        )}
       </div>
     </div>
   )
@@ -251,15 +264,13 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'ass
   const [copied, setCopied] = useState(false)
   const hasText = item.text.trim().length > 0
 
-  const copy = () => {
+  const copy = async () => {
     if (!hasText) return
-    navigator.clipboard?.writeText(item.text).then(
-      () => {
-        setCopied(true)
-        window.setTimeout(() => setCopied(false), 1500)
-      },
-      () => {},
-    )
+    // copyText 兼容非安全上下文（http 部署）；仅在成功时反馈「已复制」，失败不假装成功。
+    if (await copyText(item.text)) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    }
   }
 
   return (
@@ -301,6 +312,7 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
     <div className="rounded-xl border border-border bg-surface-2/50">
       <button
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs font-medium text-muted"
       >
         <Icon name="activity" size={14} className={streaming ? 'animate-pulse text-primary' : ''} />
@@ -327,6 +339,7 @@ function ToolBlock({ name, command, output }: { name: string; command?: string; 
     <div className="rounded-xl border border-border bg-surface-2/50">
       <button
         onClick={() => (hasOutput || !!command) && setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs"
       >
         <span className="flex h-6 w-6 items-center justify-center rounded-md bg-primary/10 text-primary">
@@ -397,7 +410,7 @@ function AskCard({
         <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/15 text-primary">
           <Icon name="shield" size={15} />
         </span>
-        <Badge tone="info">{askKindLabel(ask.kind)}</Badge>
+        <Badge tone="info">{askKindLabel(ask.kind, t)}</Badge>
       </div>
       <p className="mb-3 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-text">{ask.prompt}</p>
 
@@ -428,16 +441,16 @@ function AskCard({
             disabled={!text.trim()}
             onClick={() => respond(ask.id, { text: text.trim() })}
           >
-            回复
+            {t('transcript.reply')}
           </Button>
         </div>
       ) : (
         <div className="flex gap-2">
           <Button variant="primary" leftIcon="check" onClick={() => respond(ask.id, 'yes')}>
-            批准
+            {t('transcript.approve')}
           </Button>
           <Button variant="outline" leftIcon="close" className="text-danger hover:bg-danger/10" onClick={() => respond(ask.id, 'no')}>
-            拒绝
+            {t('transcript.reject')}
           </Button>
         </div>
       )}

@@ -141,7 +141,7 @@ pub fn extract_prompt_text(params: Option<&Value>) -> String {
 /// - `image: true` —— 支持 `/paste` 粘贴图像（`UserContent::Image`）
 /// - `embeddedContext: false` —— 暂未实现 ACP 嵌入式上下文块
 /// - `mcp.stdio: true` —— `McpRegistry` 通过子进程 stdio 加载 MCP server
-/// - `mcp.http: false` —— 未实现 HTTP 传输的 MCP server
+/// - `mcp.http: true` —— `McpRegistry` 亦支持 Streamable HTTP 端点（`[mcp.servers.<name>].url`）
 fn handle_initialize(req: &crate::types::JsonRpcRequest) -> Value {
     // 记录客户端信息供诊断
     if let Some(params) = &req.params {
@@ -175,7 +175,7 @@ fn handle_initialize(req: &crate::types::JsonRpcRequest) -> Value {
                 "embeddedContext": false,
             },
             "mcpCapabilities": {
-                "http": false,
+                "http": true,
                 "stdio": true,
             },
         },

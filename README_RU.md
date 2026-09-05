@@ -30,7 +30,7 @@ Gyre — это **продакшен-фреймворк для AI-агента-�
 - **PTY псевдотерминал** (опционально): `run_pty_command`, поддержка интерактивных терминальных приложений (top / vim / REPL)
 - **Обработка изображений** (опционально): `read_image` / `image_gen` (DALL·E или совместимый API)
 - **Интеграция с GitHub** (опционально): запросы и операции с PR / Issues / Actions, а также GraphQL-запросы
-- **Протокол MCP**: реализует Model Context Protocol (транспорт stdio, initialize / tools/list / tools/call); можно подключать инструменты stdio MCP-серверов
+- **Протокол MCP**: реализует Model Context Protocol поверх stdio и Streamable HTTP (initialize / tools/list / tools/call / resources/*); можно подключать инструменты stdio- и HTTP MCP-серверов
 
 ### 🧠 Управление контекстом
 - **AppendOnlyLog**: сообщения доступны только для добавления; единственный легальный путь изменения — это `replaceTail` во время уплотнения
@@ -57,7 +57,7 @@ Gyre — это **продакшен-фреймворк для AI-агента-�
 - **Два режима транспорта**: `stdio` (редактор вызывает как подпроцесс, нулевое использование портов) / `http` (HTTP+SSE, мультиплексируется на том же порту, что и веб-фронтенд)
 - **Тройная эквивалентность**: ACP использует то же управление сессиями и механизм одобрения, что и CLI и веб-фронтенд — одну сессию могут одновременно отслеживать несколько клиентов
 - **Стандартный поток событий**: `session/update` отправляет стандартные события ACP, такие как `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update`
-- **Объявление возможностей**: рукопожатие `initialize` достоверно объявляет `promptCapabilities` (поддержка изображений) и `mcpCapabilities` (поддержка stdio), проходя строгую валидацию схемы клиентом
+- **Объявление возможностей**: рукопожатие `initialize` достоверно объявляет `promptCapabilities` (поддержка изображений) и `mcpCapabilities` (поддержка stdio + Streamable HTTP), проходя строгую валидацию схемы клиентом
 
 ### 🔄 Оркестрация мульти-агентов
 - **Делегирование под-агентов** (TaskTool): родительский агент может делегировать подзадачи под-агентам, с ограничителями конкурентности и независимыми бюджетами токенов
@@ -184,7 +184,7 @@ Gyre/
 │   ├── ast/                    # AST-манипуляция (tree-sitter + ast-grep)
 │   ├── search/                 # поиск по коду (grep/glob/fd/highlight/tokens)
 │   ├── ttsr/                   # потоковые правила «time-travel» (стражи стрима без системного промпта)
-│   ├── mcp/                    # клиент протокола MCP (stdio)
+│   ├── mcp/                    # клиент протокола MCP (stdio + Streamable HTTP)
 │   ├── lsp/                    # клиент языкового сервера LSP
 │   ├── dap/                    # клиент DAP-отладчика (инструмент `debug`)
 │   ├── browser/                # автоматизация headless-браузера (минимальный CDP-клиент)
@@ -393,7 +393,7 @@ CLI-флаг переопределяет конфиг во время выпо�
   "agentCapabilities": {
     "loadSession": true,
     "promptCapabilities": { "image": true, "embeddedContext": false },
-    "mcpCapabilities": { "http": false, "stdio": true }
+    "mcpCapabilities": { "http": true, "stdio": true }
   },
   "agentInfo": { "name": "Gyre", "version": "0.1.0" },
   "authMethods": []

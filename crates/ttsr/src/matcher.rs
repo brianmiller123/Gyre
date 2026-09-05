@@ -236,6 +236,7 @@ pub fn tool_calls_of(
                 id,
                 name,
                 arguments,
+                ..
             } => Some((id.clone(), name.clone(), arguments.clone())),
             _ => None,
         })

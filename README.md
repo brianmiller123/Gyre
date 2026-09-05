@@ -30,7 +30,7 @@ Gyre is a **production-grade AI coding agent framework** that provides a complet
 - **PTY pseudo-terminal** (optional): `run_pty_command`, supports interactive terminal apps (top / vim / REPL)
 - **Image processing** (optional): `read_image` / `image_gen` (DALL·E or a compatible API)
 - **GitHub integration** (optional): query and operate on PRs / Issues / Actions, plus GraphQL queries
-- **MCP protocol**: implements the Model Context Protocol over stdio (initialize / tools/list / tools/call); mount tools from any stdio MCP server
+- **MCP protocol**: implements the Model Context Protocol over stdio and Streamable HTTP (initialize / tools/list / tools/call / resources/*); mount tools from any stdio or HTTP MCP server
 
 ### 🧠 Context Management
 - **AppendOnlyLog**: messages are append-only; the only legal mutation path is `replaceTail` during compaction
@@ -57,7 +57,7 @@ Gyre is a **production-grade AI coding agent framework** that provides a complet
 - **Dual transport modes**: `stdio` (the editor invokes it as a subprocess, zero port usage) / `http` (HTTP+SSE, multiplexed on the same port as the Web front-end)
 - **Three-way equivalence**: ACP shares the same session management and approval mechanism as the CLI and Web front-ends; the same session can even be subscribed to by multiple clients simultaneously
 - **Standard event stream**: `session/update` pushes ACP-standard events such as `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update`
-- **Capability declaration**: the `initialize` handshake truthfully declares `promptCapabilities` (image support) and `mcpCapabilities` (stdio support), passing strict client schema validation
+- **Capability declaration**: the `initialize` handshake truthfully declares `promptCapabilities` (image support) and `mcpCapabilities` (stdio + Streamable HTTP support), passing strict client schema validation
 
 ### 🔄 Multi-Agent Orchestration
 - **Sub-agent delegation** (TaskTool): a parent agent can delegate subtasks to sub-agents, with concurrency guardrails and independent token budgets
@@ -184,7 +184,7 @@ Gyre/
 │   ├── ast/                    # AST manipulation (tree-sitter + ast-grep)
 │   ├── search/                 # code search (grep/glob/fd/highlight/tokens)
 │   ├── ttsr/                   # time-traveling stream rules (prompt-free streaming guardrails)
-│   ├── mcp/                    # MCP protocol client (stdio)
+│   ├── mcp/                    # MCP protocol client (stdio + Streamable HTTP)
 │   ├── lsp/                    # LSP language-server client
 │   ├── dap/                    # DAP debug-adapter client (`debug` tool)
 │   ├── browser/                # headless browser automation (minimal CDP client)
@@ -393,7 +393,7 @@ Standard ACP events pushed during `session/prompt` via SSE (HTTP mode) or stdout
   "agentCapabilities": {
     "loadSession": true,
     "promptCapabilities": { "image": true, "embeddedContext": false },
-    "mcpCapabilities": { "http": false, "stdio": true }
+    "mcpCapabilities": { "http": true, "stdio": true }
   },
   "agentInfo": { "name": "Gyre", "version": "0.1.0" },
   "authMethods": []

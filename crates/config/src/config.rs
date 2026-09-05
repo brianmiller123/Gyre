@@ -672,14 +672,38 @@ impl Default for MemoryConfig {
 /// MCP server 配置集合（对应 `[mcp.servers.<name>]`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct McpConfig {
-    /// 命名 server → stdio 启动配置。
+    /// 命名 server → 启动配置（stdio 或 Streamable HTTP）。
     #[serde(default)]
     pub servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
+/// 单个 MCP server 配置：stdio 子进程（`command`）或 Streamable HTTP 端点（`url`）。
+///
+/// 无标签 enum：按必填键区分——含 `command` 即 stdio（向后兼容既有配置），
+/// 含 `url` 即 HTTP；两者皆无时反序列化失败并提示需 `command` 或 `url`。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum McpServerConfig {
+    /// stdio 子进程传输（JSON-RPC 2.0 over stdin/stdout）。
+    Stdio(McpStdioConfig),
+    /// Streamable HTTP 传输（POST JSON-RPC + 可选 SSE 响应流）。
+    Http(McpHttpConfig),
+}
+
+impl McpServerConfig {
+    /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制）。
+    #[must_use]
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Stdio(c) => c.timeout_ms.unwrap_or(30_000),
+            Self::Http(c) => c.timeout_ms.unwrap_or(30_000),
+        }
+    }
+}
+
 /// 单个 MCP server 的 stdio 启动配置。
 #[derive(Debug, Clone, Deserialize)]
-pub struct McpServerConfig {
+pub struct McpStdioConfig {
     /// 可执行命令（如 `npx` / `node` / `uvx`）。
     pub command: String,
     /// 命令参数。
@@ -688,6 +712,22 @@ pub struct McpServerConfig {
     /// 额外环境变量。
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制）。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// 单个 MCP server 的 Streamable HTTP 配置（参考 oh-my-pi `MCPHttpServerConfig`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpHttpConfig {
+    /// server 端点 URL（如 `http://127.0.0.1:3000/mcp`）。
+    pub url: String,
+    /// 额外请求头（如 `Authorization`；`Mcp-Session-Id` / `MCP-Protocol-Version` 由传输层独占）。
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制；覆盖整个 POST + SSE 响应期）。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 const fn default_true() -> bool {
@@ -1665,5 +1705,62 @@ password = "${GYRE_TEST_SOCKS5_PASS}"
 
         // SAFETY: 同上，仅本测试函数使用该变量。
         unsafe { std::env::remove_var("GYRE_TEST_SOCKS5_PASS") };
+    }
+    // MCP server 配置：无标签 enum 双形态（stdio 向后兼容 / Streamable HTTP）。
+    #[test]
+    fn mcp_server_config_stdio_and_http_from_toml() {
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+[mcp.servers.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+[mcp.servers.fs.env]
+FOO = "bar"
+[mcp.servers.remote]
+url = "http://127.0.0.1:3000/mcp"
+timeout_ms = 5000
+[mcp.servers.remote.headers]
+Authorization = "Bearer tok"
+"#;
+        let cfg: Config = toml::from_str(src).expect("解析应成功");
+        let servers = &cfg.mcp.servers;
+        assert_eq!(servers.len(), 2);
+
+        // stdio：必填 command 命中 Stdio 变体（无 `type` 键的既有配置保持兼容）。
+        let McpServerConfig::Stdio(stdio) = &servers["fs"] else {
+            panic!("含 command 应解析为 Stdio");
+        };
+        assert_eq!(stdio.command, "npx");
+        assert_eq!(stdio.args.len(), 3);
+        assert_eq!(stdio.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(servers["fs"].timeout_ms(), 30_000, "缺省超时 30s");
+
+        // http：必填 url 命中 Http 变体。
+        let McpServerConfig::Http(http) = &servers["remote"] else {
+            panic!("含 url 应解析为 Http");
+        };
+        assert_eq!(http.url, "http://127.0.0.1:3000/mcp");
+        assert_eq!(
+            http.headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
+        assert_eq!(servers["remote"].timeout_ms(), 5_000);
+    }
+
+    #[test]
+    fn mcp_server_config_timeout_zero_disables() {
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[mcp.servers.a]\ncommand = \"x\"\ntimeout_ms = 0\n";
+        let cfg: Config = toml::from_str(src).expect("解析应成功");
+        assert_eq!(cfg.mcp.servers["a"].timeout_ms(), 0, "0 表示不限制");
+    }
+
+    #[test]
+    fn mcp_server_config_requires_command_or_url() {
+        // 两者皆无 → 反序列化失败（配置错误应尽早暴露）。
+        let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[mcp.servers.bad]\nargs = [\"x\"]\n";
+        assert!(toml::from_str::<Config>(src).is_err());
     }
 }

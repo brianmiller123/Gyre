@@ -27,11 +27,12 @@ impl OpenAiCompletionsAdapter {
     }
 }
 
-const SUPPORTED: &[Api] = &[
-    Api::OpenAiCompletions,
-    Api::OllamaChat,
-    Api::OpenAiResponses,
-];
+/// 本适配器实现的是 Chat Completions wire；`Api::OpenAiResponses`（/v1/responses）
+/// 尚无实现，**不得**列入——名义支持会把 Responses 请求静默降级为 chat wire，
+/// Responses 专属能力（reasoning items / encrypted replay / previous_response_id）
+/// 全失且报错误导排障（伪适配，docs/oh-my-pi-gap-analysis-2026-09-05.md H3'）。
+/// `OllamaChat` 经其 OpenAI 兼容端点（`{base}/v1/chat/completions`）同构，保留。
+const SUPPORTED: &[Api] = &[Api::OpenAiCompletions, Api::OllamaChat];
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompletionsAdapter {
@@ -497,6 +498,7 @@ fn build_message(
             id,
             name,
             arguments,
+            signature: None,
         });
     }
     // P2-P：content_filter → StopReason::Error + sensitive 详情（移植 replay-policy.ts）。
@@ -556,6 +558,17 @@ fn finalize_stream_interrupt(
 mod tests {
     use super::*;
     use agent_core::{ContentBlock, ProviderMessage, ToolSpec};
+
+    #[test]
+    fn supports_excludes_unimplemented_responses_wire() {
+        // 伪适配回归：Responses wire 未实现，SUPPORTED 不得名义包含——
+        // 否则 openai-responses 模型被静默降级为 chat wire（H3'）。
+        assert_eq!(
+            SUPPORTED,
+            &[Api::OpenAiCompletions, Api::OllamaChat],
+            "SUPPORTED 应恰为已实现的两种 wire"
+        );
+    }
 
     #[test]
     fn body_includes_system_and_user() {

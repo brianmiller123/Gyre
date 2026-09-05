@@ -576,6 +576,7 @@ fn build_deepseek_message(
             id,
             name,
             arguments,
+            signature: None,
         });
     }
     // P2-P：content_filter → Error + sensitive（DeepSeek OpenAI 兼容，含 content_filter）。
@@ -841,6 +842,7 @@ mod tests {
                             id: "call_1".into(),
                             name: "list_files".into(),
                             arguments: serde_json::json!({"path":"."}),
+                            signature: None,
                         },
                     ],
                 },

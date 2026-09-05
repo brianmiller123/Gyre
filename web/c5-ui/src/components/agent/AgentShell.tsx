@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Badge, Button, Dropdown, Modal } from '@/components/ui'
+import { Badge, Button } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { Sidebar } from '@/components/agent/Sidebar'
 import { Transcript } from '@/components/agent/Transcript'
@@ -23,7 +23,6 @@ export function AgentShell() {
   const [mobileNav, setMobileNav] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
-  const [confirmModel, setConfirmModel] = useState<string | null>(null)
   // 统计页：与 URL hash 同步（`#/stats` 直达 / 可刷新 / 可分享）。
   const [statsOpen, setStatsOpen] = useState(() => window.location.hash === STATS_ROUTE)
   useEffect(() => {
@@ -44,19 +43,10 @@ export function AgentShell() {
     }
   }
 
-  const { state, usage, error, running, stopping, clear, cancel, items, models, currentModel, switchModel } =
-    useAgentSession()
+  const { state, usage, error, running, stopping, clear, cancel } = useAgentSession()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
   const totalTokens = usage.input_tokens + usage.output_tokens
-
-  const requestSwitchModel = (alias: string | null) => {
-    if (items.length > 0 && alias !== (currentModel?.alias ?? null)) {
-      setConfirmModel(alias)
-    } else {
-      switchModel(alias)
-    }
-  }
 
   return (
     <div className="app-aurora relative flex h-screen overflow-hidden text-text">
@@ -87,16 +77,13 @@ export function AgentShell() {
       {/* Main column */}
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar
-          stateLabel={meta.label}
+          stateLabel={t(meta.label)}
           stateTone={meta.tone}
           stateDot={meta.dot}
           totalTokens={totalTokens}
           cost={usage.cost_usd}
           running={running}
           stopping={stopping}
-          models={models}
-          currentModel={currentModel}
-          onPickModel={requestSwitchModel}
           onMenu={() => setMobileNav(true)}
           onInspector={() => setInspectorOpen(true)}
           onClear={clear}
@@ -144,36 +131,6 @@ export function AgentShell() {
 
       {workspaceOpen && <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />}
 
-      <Modal
-        open={confirmModel !== null}
-        onClose={() => setConfirmModel(null)}
-        title={t('shell.switch_model')}
-        description={t('shell.switch_model_desc')}
-        icon="cube"
-        size="sm"
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => setConfirmModel(null)}>
-              {t('shell.cancel')}
-            </Button>
-            <Button
-              variant="primary"
-              leftIcon="check"
-              onClick={() => {
-                if (confirmModel !== null) switchModel(confirmModel)
-                setConfirmModel(null)
-              }}
-            >
-              {t('shell.switch_and_new')}
-            </Button>
-          </>
-        }
-      >
-        <p className="text-sm text-text-2">
-          {t('shell.switch_confirm_body', { model: confirmModel ?? t('shell.default') })}
-        </p>
-      </Modal>
-
       <Toaster />
     </div>
   )
@@ -187,9 +144,6 @@ function TopBar({
   cost,
   running,
   stopping,
-  models,
-  currentModel,
-  onPickModel,
   onMenu,
   onInspector,
   onClear,
@@ -202,9 +156,6 @@ function TopBar({
   cost: number
   running: boolean
   stopping: boolean
-  models: Array<{ alias: string; id: string }>
-  currentModel: { alias: string; id: string } | null
-  onPickModel: (alias: string | null) => void
   onMenu: () => void
   onInspector: () => void
   onClear: () => void
@@ -226,10 +177,6 @@ function TopBar({
       <Badge tone={stateTone} dot={stateDot} className="hidden sm:inline-flex">
         {stateLabel}
       </Badge>
-
-      {models.length > 0 && (
-        <ModelMenu models={models} currentModel={currentModel} onPick={onPickModel} />
-      )}
 
       <div className="flex-1" />
 
@@ -266,36 +213,5 @@ function TopBar({
         <Icon name="gauge" size={19} />
       </button>
     </header>
-  )
-}
-
-/** Compact model switcher. Index 0 is the server default (sent as model=null). */
-function ModelMenu({
-  models,
-  currentModel,
-  onPick,
-}: {
-  models: Array<{ alias: string; id: string }>
-  currentModel: { alias: string; id: string } | null
-  onPick: (alias: string | null) => void
-}) {
-  const { t } = useI18n()
-  return (
-    <Dropdown
-      align="left"
-      panelClassName="min-w-[15rem]"
-      trigger={
-        <button className="flex h-9 max-w-[180px] items-center gap-1.5 rounded-lg border border-border bg-surface-2/70 px-2.5 text-xs font-medium text-text-2 transition-colors hover:border-border-strong hover:text-text">
-          <Icon name="cube" size={15} className="shrink-0 text-primary" />
-          <span className="truncate">{currentModel?.alias ?? t('shell.default_model')}</span>
-          <Icon name="chevron-down" size={13} className="shrink-0 text-muted" />
-        </button>
-      }
-      items={models.map((m, i) => ({
-        label: `${m.alias}  ·  ${m.id}`,
-        active: currentModel?.alias === m.alias,
-        onClick: () => onPick(i === 0 ? null : m.alias),
-      }))}
-    />
   )
 }

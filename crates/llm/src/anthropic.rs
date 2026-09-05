@@ -109,13 +109,27 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
                             id,
                             name,
                             arguments,
+                            ..
                         } => serde_json::json!({
                             "type":"tool_use","id":id,"name":name,"input":arguments
                         }),
-                        ContentBlock::Thinking { text, .. } => {
-                            serde_json::json!({"type":"thinking","thinking":text})
+                        // 思考回放（对齐 omp anthropic.ts:4279-4320）：带签名 → 原样回传
+                        // thinking block；无签名 → 降级为裸文本（官方 API 对无签名 thinking
+                        // 回放报 400 Invalid signature；Anthropic 方言的降级禁用 <thinking>
+                        // 标签包裹，reasoning_extraction 会把包裹链当复制输出拒答）。
+                        ContentBlock::Thinking { text, signature } => {
+                            if text.trim().is_empty() {
+                                serde_json::Value::Null
+                            } else if signature.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                                serde_json::json!({
+                                    "type":"thinking","thinking":text,"signature":signature
+                                })
+                            } else {
+                                serde_json::json!({"type":"text","text":text})
+                            }
                         }
                     })
+                    .filter(|v| !v.is_null())
                     .collect();
                 messages.push(serde_json::json!({"role":"assistant","content":blocks}));
             }
@@ -207,7 +221,9 @@ fn anthropic_tool_choice(d: &ToolChoiceDirective) -> Option<serde_json::Value> {
 #[derive(Default)]
 struct BlockState {
     is_tool: bool,
+    is_thinking: bool,
     text: String,
+    signature: String,
     tool_id: Option<String>,
     tool_name: Option<String>,
     tool_args: String,
@@ -256,6 +272,9 @@ struct Delta {
     partial_json: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
+    /// `signature_delta` 增量（thinking 块签名，回放时必带）。
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -328,8 +347,10 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
                                 b.is_tool = true;
                                 b.tool_id = cb.id.clone();
                                 b.tool_name = cb.name.clone();
+                            } else if cb.t == "thinking" {
+                                b.is_thinking = true;
                             }
-                        }
+                    }
                     }
                     "content_block_delta" => {
                         if let (Some(idx), Some(delta)) = (ev.index, ev.delta) {
@@ -338,6 +359,17 @@ fn parse_stream(resp: reqwest::Response, model_id: String) -> AssistantEventStre
                             match delta.t.as_deref() {
                                 Some("text_delta") => {
                                     if let Some(t) = delta.text { b.text.push_str(&t); yield AssistantEvent::TextDelta(t); }
+                                }
+                                Some("thinking_delta") => {
+                                    if let Some(t) = delta.text {
+                                        b.text.push_str(&t);
+                                        yield AssistantEvent::ThinkingDelta(t);
+                                    }
+                                }
+                                Some("signature_delta") => {
+                                    if let Some(s) = delta.signature {
+                                        b.signature.push_str(&s);
+                                    }
                                 }
                                 Some("input_json_delta") => {
                                     if let Some(pj) = delta.partial_json {
@@ -405,7 +437,17 @@ fn build_message(
                 id: b.tool_id.clone().unwrap_or_else(|| "tool".into()),
                 name: b.tool_name.clone().unwrap_or_default(),
                 arguments: args,
+                signature: (!b.signature.is_empty()).then(|| b.signature.clone()),
             });
+        } else if b.is_thinking {
+            // thinking 块：text 由 thinking_delta 累积、签名由 signature_delta 累积；
+            // 空文本块丢弃（对齐 omp）。
+            if !b.text.is_empty() {
+                content.push(ContentBlock::Thinking {
+                    text: b.text.clone(),
+                    signature: (!b.signature.is_empty()).then(|| b.signature.clone()),
+                });
+            }
         } else if !b.text.is_empty() {
             content.push(ContentBlock::Text {
                 text: b.text.clone(),
@@ -460,5 +502,74 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "read_file");
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn body_replays_signed_thinking_and_demotes_unsigned() {
+        let req = CompletionRequest {
+            model: Model::with_defaults("claude-3", "anthropic", Api::AnthropicMessages),
+            system: vec![],
+            messages: vec![ProviderMessage::Assistant {
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "先推理".into(),
+                        signature: Some("sig123".into()),
+                    },
+                    ContentBlock::Thinking {
+                        text: "无签名".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Thinking {
+                        text: "  ".into(),
+                        signature: None,
+                    },
+                ],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: 16,
+            temperature: None,
+            thinking: None,
+            cache_key: None,
+            stable_prefix_len: 0,
+        };
+        let body = build_body(&req);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        // 空文本思考块被丢弃；带签名原样回传；无签名降级裸文本。
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "先推理");
+        assert_eq!(blocks[0]["signature"], "sig123");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "无签名");
+    }
+
+    #[test]
+    fn build_message_carries_thinking_and_signature() {
+        let b0 = BlockState {
+            is_thinking: true,
+            text: "思考".into(),
+            signature: "abc".into(),
+            ..Default::default()
+        };
+        let b1 = BlockState {
+            text: "答案".into(),
+            ..Default::default()
+        };
+        let msg = build_message("claude-3", &[b0, b1], &None, &Usage::default());
+        assert_eq!(msg.content.len(), 2);
+        assert_eq!(
+            msg.content[0],
+            ContentBlock::Thinking {
+                text: "思考".into(),
+                signature: Some("abc".into())
+            }
+        );
+        assert_eq!(
+            msg.content[1],
+            ContentBlock::Text {
+                text: "答案".into()
+            }
+        );
     }
 }

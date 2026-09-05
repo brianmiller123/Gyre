@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Select } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
+import { ModelSwitcher } from '@/components/agent/ModelSwitcher'
 import { useSettings } from '@/lib/settings'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
@@ -71,6 +72,8 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   // 待发送的图片内容块（多模态）。
   const [images, setImages] = useState<ContentInput[]>([])
   const taRef = useRef<HTMLTextAreaElement>(null)
+  // submit 在途互斥：expandMentions await 期间二次 Enter 会双发同一消息。
+  const sendingRef = useRef(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const serverOrigin = useMemo(() => {
@@ -106,7 +109,6 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   const menuOpen = isCommand && !dismissed
 
   const cmdExact = parsed ? allCommands.find((c) => c.name === parsed.name) : undefined
-  const expectArg = !!(cmdExact && (cmdExact.choices || cmdExact.choicesFromModels))
 
   // Phase 1: pick a command (no space yet) → filter by typed name.
   // Phase 2: command chosen, picking an argument → filter choices.
@@ -115,7 +117,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     if (!parsed.hasArg) {
       return allCommands
         .filter((c) => c.name.startsWith(parsed.name))
-        .map((c) => ({ label: c.name, desc: c.desc }))
+        .map((c) => ({ label: c.name, desc: t(c.descKey ?? c.desc, c.descArgs) }))
     }
     if (cmdExact) {
       return choicesFor(cmdExact, models)
@@ -123,7 +125,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
         .map((a) => ({ label: a, desc: a === models[0]?.alias ? t('composer.default_model') : '' }))
     }
     return []
-  }, [menuOpen, parsed, cmdExact, models, allCommands])
+  }, [menuOpen, parsed, cmdExact, models, allCommands, t])
 
   useEffect(() => {
     setActive(0)
@@ -156,6 +158,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
       fetchMcp,
       newCollabRoom,
       serverOrigin,
+      t,
     }),
     [
       clear,
@@ -183,6 +186,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
       fetchMcp,
       newCollabRoom,
       serverOrigin,
+      t,
     ],
   )
 
@@ -194,34 +198,40 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
 
   async function submit() {
     if (!connected) return
-    const t = text.trim()
-    if (!t && images.length === 0) return
-    if (isCommand) {
-      if (running) return // 斜杠命令运行中不响应；纯文本作 steering 插话（服务器忙时 steer）
-      // Execute a typed command directly (e.g. "/clear" or "/mode code").
-      const p = parseCommandLine(t)!
-      const cmd = allCommands.find((c) => c.name === p.name)
-      if (!cmd) {
-        say(`未知命令：/${p.name}（输入 /help 查看）`, 'warning')
-        setText('')
+    if (sendingRef.current) return
+    const raw = text.trim()
+    if (!raw && images.length === 0) return
+    sendingRef.current = true
+    try {
+      if (isCommand) {
+        if (running) return // 斜杠命令运行中不响应；纯文本作 steering 插话（服务器忙时 steer）
+        // Execute a typed command directly (e.g. "/clear" or "/mode code").
+        const p = parseCommandLine(raw)!
+        const cmd = allCommands.find((c) => c.name === p.name)
+        if (!cmd) {
+          say(t('composer.unknown_cmd', { name: p.name }), 'warning')
+          setText('')
+          return
+        }
+        runCommand(cmd, p.arg)
         return
       }
-      runCommand(cmd, p.arg)
-      return
+      // 非命令路径：若含 @file 提及，发送前展开为附加上下文块。
+      let body = raw
+      if (parseMentions(raw).length > 0) {
+        body = await expandMentions(raw, { apiGet, say })
+      }
+      // 多模态：有图片时走 sendContent（已展开的文本作为 caption）。
+      if (images.length > 0) {
+        sendContent(body, images)
+        setImages([])
+      } else {
+        send(body)
+      }
+      setText('')
+    } finally {
+      sendingRef.current = false
     }
-    // 非命令路径：若含 @file 提及，发送前展开为附加上下文块。
-    let body = t
-    if (parseMentions(t).length > 0) {
-      body = await expandMentions(t, { apiGet, say })
-    }
-    // 多模态：有图片时走 sendContent（已展开的文本作为 caption）。
-    if (images.length > 0) {
-      sendContent(body, images)
-      setImages([])
-    } else {
-      send(body)
-    }
-    setText('')
   }
 
 
@@ -253,7 +263,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     const arr = Array.from(files).filter((f) => IMAGE_MIMES.includes(f.type))
     for (const f of arr) {
       if (f.size > MAX_IMAGE_BYTES) {
-        say(`图片「${f.name || '未命名'}」超过 10 MiB 上限，已跳过`, 'warning')
+        say(t('composer.image_too_large', { name: f.name || '—' }), 'warning')
         continue
       }
       const reader = new FileReader()
@@ -278,6 +288,9 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   }
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // IME 组合中的 Enter/Escape/方向键属于输入法操作（确认候选词、取消组合、选词），
+    // 不应触发发送、停止或菜单导航；keyCode 229 兼容旧浏览器。
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (menuOpen && list.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
@@ -316,6 +329,10 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   return (
     <div className="relative border-t border-border bg-surface/70 backdrop-blur-xl">
       <div className="mx-auto w-full max-w-3xl px-3 py-3 sm:px-4">
+        {/* 输入区顶部工具栏：模型切换器 */}
+        <div className="mb-2 flex min-w-0 items-center">
+          <ModelSwitcher />
+        </div>
         {/* Slash-command menu */}
         {menuOpen && list.length > 0 && (
           <div className="absolute bottom-full left-3 right-3 z-30 mb-2 overflow-hidden rounded-xl border border-border bg-surface shadow-pop sm:left-4 sm:right-4">
@@ -326,9 +343,9 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                 <KbdMini>↑↓</KbdMini> {t('composer.hint_select')} <KbdMini>↵</KbdMini> {t('composer.hint_confirm')} <KbdMini>esc</KbdMini> {t('composer.hint_close')}
               </span>
             </div>
-            <ul className="max-h-64 overflow-y-auto py-1">
+            <ul id="slash-menu" role="listbox" aria-label={t('composer.menu')} className="max-h-64 overflow-y-auto py-1">
               {list.map((item, i) => (
-                <li key={item.label}>
+                <li key={item.label} id={`slash-opt-${i}`} role="option" aria-selected={i === active}>
                   <button
                     onMouseEnter={() => setActive(i)}
                     onClick={() => {
@@ -417,6 +434,9 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
             <textarea
               ref={taRef}
               rows={1}
+              aria-expanded={menuOpen && list.length > 0}
+              aria-controls="slash-menu"
+              aria-activedescendant={menuOpen && list.length > 0 ? `slash-opt-${active}` : undefined}
               value={text}
               onChange={(e) => {
                 setText(e.target.value)

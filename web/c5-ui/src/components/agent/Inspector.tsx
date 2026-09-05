@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useMemo } from 'react'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { SubAgentMonitor } from '@/components/agent/SubAgentMonitor'
 import { useSettings } from '@/lib/settings'
-import { Badge, Button, Modal, ProgressBar } from '@/components/ui'
+import { Badge, Button, ProgressBar } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact, formatNumber } from '@/lib/format'
@@ -24,28 +24,14 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
     agents,
     connect,
     newChat,
-    switchModel,
     compact: doCompact,
   } = useAgentSession()
   const { settings } = useSettings()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
-  const [pendingAlias, setPendingAlias] = useState<string | null>(null)
 
-  // Clicking a model: switch immediately, but confirm if a conversation exists.
-  const pickModel = (alias: string, isDefault: boolean) => {
-    const target = isDefault ? null : alias
-    if (target === (currentModel?.alias ?? null)) return
-    if (items.length > 0) setPendingAlias(isDefault ? '__default__' : alias)
-    else switchModel(target)
-  }
-  const confirmPending = () => {
-    if (pendingAlias === null) return
-    switchModel(pendingAlias === '__default__' ? null : pendingAlias)
-    setPendingAlias(null)
-  }
-
-  const lastDone = [...items].reverse().find((i) => i.kind === 'done')
+  // 流式期间 items 高频变化：记忆化避免每次渲染 O(n) 反转拷贝。
+  const lastDone = useMemo(() => [...items].reverse().find((i) => i.kind === 'done'), [items])
   const totalTokens = usage.input_tokens + usage.output_tokens
 
   return (
@@ -78,7 +64,8 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
             </span>
           </Row>
           <div className="flex gap-2 pt-1">
-            <Button size="sm" variant="outline" leftIcon="refresh" className="flex-1" onClick={() => connect()}>
+            {/* 断线重连必须 resume 当前会话：裸 connect() 会新建会话，导致本地 transcript 与服务端日志行号错位。 */}
+            <Button size="sm" variant="outline" leftIcon="refresh" className="flex-1" onClick={() => connect(sessionId)}>
               {t('inspector.reconnect')}
             </Button>
             <Button size="sm" variant="ghost" leftIcon="plus" className="flex-1" onClick={() => newChat()}>
@@ -92,10 +79,10 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           <div className="flex items-center justify-between rounded-lg border border-border bg-surface-2/60 px-3 py-2.5">
             <span className="text-xs text-muted">{t('inspector.current')}</span>
             <Badge tone={meta.tone} dot={meta.dot}>
-              {meta.label}
+              {t(meta.label)}
             </Badge>
           </div>
-          <p className="mt-1.5 text-[11px] text-muted">{meta.desc}</p>
+          <p className="mt-1.5 text-[11px] text-muted">{t(meta.desc)}</p>
         </Section>
 
         {/* Usage */}
@@ -160,7 +147,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           </Section>
         )}
 
-        {/* Models — click to switch (starts a new conversation) */}
+        {/* Models — 状态展示；切换入口在输入区上方工具栏 */}
         {models.length > 0 && (
           <Section title={t('inspector.models')} icon="cube">
             <ul className="space-y-1">
@@ -168,33 +155,22 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
                 const active = currentModel?.alias === m.alias
                 const isDefault = i === 0
                 return (
-                  <li key={m.alias}>
-                    <button
-                      onClick={() => pickModel(m.alias, isDefault)}
-                      disabled={active}
-                      className={cn(
-                        'flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors',
-                        active ? 'cursor-default bg-primary/10' : 'cursor-pointer hover:bg-surface-2',
+                  <li
+                    key={m.alias}
+                    className="flex items-center justify-between gap-2 rounded-md bg-surface-2/40 px-2 py-1.5 text-xs"
+                  >
+                    <span className={cn('flex min-w-0 items-center gap-1.5 font-medium', active ? 'text-primary' : 'text-text-2')}>
+                      {active && <Icon name="check" size={12} />}
+                      <span className="truncate">{m.alias}</span>
+                      {isDefault && (
+                        <span className="rounded bg-surface-3 px-1 py-0 text-[9px] text-muted">{t('inspector.default_badge')}</span>
                       )}
-                    >
-                      <span className={cn('flex min-w-0 items-center gap-1.5 font-medium', active ? 'text-primary' : 'text-text-2')}>
-                        {active ? (
-                          <Icon name="check" size={12} />
-                        ) : (
-                          <Icon name="arrow-right" size={12} className="text-muted opacity-0 group-hover:opacity-100" />
-                        )}
-                        <span className="truncate">{m.alias}</span>
-                        {isDefault && (
-                          <span className="rounded bg-surface-3 px-1 py-0 text-[9px] text-muted">{t('inspector.default_badge')}</span>
-                        )}
-                      </span>
-                      <span className="max-w-[110px] shrink-0 truncate font-mono text-[10px] text-muted">{m.id}</span>
-                    </button>
+                    </span>
+                    <span className="max-w-[110px] shrink-0 truncate font-mono text-[10px] text-muted">{m.id}</span>
                   </li>
                 )
               })}
             </ul>
-            <p className="pt-1 text-[10px] text-muted">{t('inspector.switch_hint')}</p>
           </Section>
         )}
 
@@ -217,29 +193,6 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           {t('inspector.tip_body')}
         </div>
       </div>
-
-      <Modal
-        open={pendingAlias !== null}
-        onClose={() => setPendingAlias(null)}
-        title={t('inspector.switch_model')}
-        description={t('inspector.switch_model_desc')}
-        icon="cube"
-        size="sm"
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => setPendingAlias(null)}>
-              {t('shell.cancel')}
-            </Button>
-            <Button variant="primary" leftIcon="check" onClick={confirmPending}>
-              {t('shell.switch_and_new')}
-            </Button>
-          </>
-        }
-      >
-        <p className="text-sm text-text-2">
-          {t('shell.switch_confirm_body', { model: pendingAlias === '__default__' ? t('inspector.default_model') : (pendingAlias ?? '') })}
-        </p>
-      </Modal>
     </aside>
   )
 }

@@ -745,12 +745,7 @@ async fn main() -> Result<()> {
             tool_registry = tool_registry
                 .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
                 .with(Box::new(agent_tools::MemoryRetainTool::new(Arc::clone(m))))
-                .with(Box::new(agent_tools::MemoryReflectTool::new(
-                    Arc::clone(m),
-                    Arc::clone(&provider),
-                    model.clone(),
-                    provider_ctx.clone(),
-                )))
+                .with(Box::new(agent_tools::MemoryReflectTool::new(Arc::clone(m))))
                 .with(Box::new(agent_tools::MemoryEditTool::new(Arc::clone(m))))
                 .with(Box::new(agent_tools::MemoryLearnTool::new(Arc::clone(m))));
         }
@@ -2585,6 +2580,7 @@ mod tests {
             id: "t1".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({ "path": "Cargo.toml" }),
+            signature: None,
         });
         hook.on_turn_end(&turn_ctx(&msg, false)).await;
         {

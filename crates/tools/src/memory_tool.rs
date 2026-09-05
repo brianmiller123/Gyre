@@ -12,12 +12,8 @@
 
 use std::sync::Arc;
 
-use agent_core::{
-    AssistantEvent, CapabilityTier, CompletionRequest, LlmProvider, MemoryStore, Model,
-    ProviderCallContext, ProviderMessage, ToolError, ToolResult, UserContent,
-};
+use agent_core::{CapabilityTier, MemoryStore, ToolError, ToolResult};
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde_json::json;
 
 use super::{Concurrency, Tool, ToolContext};
@@ -186,35 +182,22 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
-/// `reflect`：把会话中浮现的观察/思考提炼为心智模型（经 LLM 综合），
-/// 追加到项目 `mental_models.md`，下次会话注入 system prompt。
+/// `reflect`：基于长期记忆的综合问答（只读）——带一个问题与可选上下文，
+/// 检索记忆库并综合为回答，**不写入**任何内容。
 ///
-/// 移植 oh-my-pi `memory-reflect` 语义：reflect = 「LLM 提炼 + 心智模型落库」；
-/// 去重/合并由任务末的 `consolidate_mental_models` 统一完成（local 后端）。
-/// 与 `retain`（存结构化记录、recall 可检索）互补：reflect 面向**准则/偏好**，
-/// 注入可见而非检索命中。
+/// 对齐 oh-my-pi `tools/memory-reflect.ts`：reflect = 「recall 结果 → 综合回答」，
+/// approval=read、loadMode=discoverable。与 `recall`（返回带分数的原始命中列表）
+/// 互补：reflect 面向「基于记忆回答一个开放问题」。写入走 `retain` / `learn`
+///（mental_model）；任务末整合仍由 `consolidate_mental_models` 完成（local 后端）。
 pub struct MemoryReflectTool {
     memory: Arc<dyn MemoryStore>,
-    provider: Arc<dyn LlmProvider>,
-    model: Model,
-    provider_ctx: ProviderCallContext,
 }
 
 impl MemoryReflectTool {
-    /// 绑定记忆存储与 LLM（提炼用）。
+    /// 绑定记忆存储。
     #[must_use]
-    pub fn new(
-        memory: Arc<dyn MemoryStore>,
-        provider: Arc<dyn LlmProvider>,
-        model: Model,
-        provider_ctx: ProviderCallContext,
-    ) -> Self {
-        Self {
-            memory,
-            provider,
-            model,
-            provider_ctx,
-        }
+    pub fn new(memory: Arc<dyn MemoryStore>) -> Self {
+        Self { memory }
     }
 }
 
@@ -224,22 +207,25 @@ impl Tool for MemoryReflectTool {
         "reflect"
     }
     fn description(&self) -> &'static str {
-        "把会话中浮现的观察/思考提炼为心智模型（工程准则、用户偏好、项目约定）：\
-经 LLM 综合为精炼条目后写入长期记忆，下次会话自动注入 system prompt。\
-适合在任务收尾或发现规律时使用（如「用户偏好 X」「本项目约定 Y」）。"
+        "基于跨会话长期记忆综合回答一个开放问题（只读，不写入）：\
+检索记忆库中与问题相关的过往记忆并综合为回答。\
+适合「我们从过往会话中学到了什么」「关于 X 的既有结论/偏好是什么」类提问；\
+要保存新知识请改用 retain 或 learn。"
     }
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "content": { "type": "string",
-                             "description": "要提炼的原始观察/对话片段/思考（可长可短）" }
+                "query": { "type": "string",
+                           "description": "要回答的问题" },
+                "context": { "type": "string",
+                             "description": "可选补充上下文（帮助限定检索范围）" }
             },
-            "required": ["content"]
+            "required": ["query"]
         })
     }
     fn capability(&self) -> CapabilityTier {
-        // 只写记忆库、不触工作区；沿用 omp 对记忆工具的 read 级审批。
+        // 只读检索；沿用 omp 对 reflect 的 read 级审批。
         CapabilityTier::ReadOnly
     }
     fn concurrency(&self) -> Concurrency {
@@ -251,90 +237,46 @@ impl Tool for MemoryReflectTool {
         input: serde_json::Value,
         _ctx: &ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let content = input
-            .get("content")
+        let query = input
+            .get("query")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `content` 参数".into()))?;
-        let content = truncate_chars(content, 4000);
-
-        let req = CompletionRequest {
-            model: self.model.clone(),
-            system: vec![format!(
-                "你是记忆提炼助手。把用户的原始观察提炼为精炼、自包含、可直接复用的\
-工程准则或用户偏好陈述。只输出提炼结果：每条一行，不要编号、不要 markdown \
-列表前缀、不要解释或客套。"
-            )],
-            messages: vec![ProviderMessage::User {
-                content: vec![UserContent::Text {
-                    text: format!(
-                        "把以下内容提炼为 1-3 条精炼准则/偏好（每条一行，无编号无前缀）：\n\n{content}"
-                    ),
-                }],
-            }],
-            tools: vec![],
-            tool_choice: None,
-            max_tokens: 512,
-            temperature: Some(0.0),
-            thinking: None,
-            cache_key: None,
-            stable_prefix_len: 0,
+            .filter(|q| !q.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("缺少 `query` 参数".into()))?;
+        let context = input
+            .get("context")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        // omp：context 非空时并入检索查询（query\n\nAdditional context:\n{context}）。
+        let search = match context {
+            Some(c) => format!(
+                "{query}\n\nAdditional context:\n{}",
+                truncate_chars(c, 2000)
+            ),
+            None => query.to_string(),
         };
-        let mut stream = self
-            .provider
-            .stream(req, &self.provider_ctx)
-            .await
-            .map_err(|e| ToolError::Execution(format!("LLM 提炼失败: {e}")))?;
-        let mut output = String::new();
-        while let Some(ev) = stream.next().await {
-            if let AssistantEvent::TextDelta(d) = ev {
-                output.push_str(&d);
-            }
-        }
-        let models = distill_lines(&output);
-        if models.is_empty() {
-            return Err(ToolError::Execution(
-                "LLM 未提炼出有效条目（输出为空或全为无效行）".into(),
+        let hits = self.memory.recall(&search, 8).await;
+        if hits.is_empty() {
+            return Ok(ToolResult::text(
+                "No relevant information found to reflect on.",
             ));
         }
-        for m in &models {
-            self.memory
-                .add_mental_model(m)
-                .await
-                .map_err(|e| ToolError::Execution(format!("心智模型写入失败: {e}")))?;
-        }
-        let mut out = format!("已提炼 {} 条心智模型（下次会话自动注入）：", models.len());
-        for m in &models {
-            let _ = writeln!(out, "\n- {m}");
-        }
-        Ok(ToolResult::text(out))
+        let summary = hits
+            .iter()
+            .map(|h| {
+                format!(
+                    "- {}（相关度 {:.2}）",
+                    h.content.replace('\n', " "),
+                    h.score
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolResult::text(format!(
+            "Based on recalled memories:\n\n{summary}"
+        )))
     }
-}
-
-/// 把 LLM 输出拆成精炼条目：逐行剥离 markdown 列表/编号前缀，去空行、去重（保序）。
-fn distill_lines(output: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for raw in output.lines() {
-        let mut line = raw.trim();
-        // 剥 markdown 前缀：`- ` / `* ` / `# ` / `> ` / `1. ` / `1) `
-        while let Some(stripped) = line.strip_prefix(['-', '*', '#', '>', '•']) {
-            line = stripped.trim_start();
-        }
-        if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit()) {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix(['.', ')']) {
-                line = rest.trim_start();
-            }
-        }
-        if line.is_empty() || seen.contains(line) {
-            continue;
-        }
-        seen.insert(line.to_string());
-        out.push(line.to_string());
-    }
-    out
 }
 
 // ── memory_edit / learn：记忆管理面与主动学习入口 ─────────────────────────────
@@ -606,17 +548,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn distill_strips_markdown_and_dedups() {
-        let out = "- 准则一\n* 准则二\n1. 准则三\n2) 准则四\n\n准则一\n  - 缩进条目\n";
-        let lines = distill_lines(out);
-        assert_eq!(
-            lines,
-            vec!["准则一", "准则二", "准则三", "准则四", "缩进条目"]
-        );
-        assert_eq!(distill_lines("\n\n  \n"), Vec::<String>::new());
-    }
-
-    #[test]
     fn truncate_keeps_head_and_marks_tail() {
         let s = "中文内容".repeat(1000);
         let t = truncate_chars(&s, 10);
@@ -680,41 +611,9 @@ mod tests {
         }
     }
 
-    /// 固定输出的桩 Provider：忽略请求，吐出指定文本（reflect 提炼测试用）。
-    struct FixedProvider(&'static str);
-
-    #[async_trait]
-    impl agent_core::LlmProvider for FixedProvider {
-        fn id(&self) -> &'static str {
-            "fixed"
-        }
-        fn supports(&self) -> &[agent_core::Api] {
-            &[]
-        }
-        async fn stream(
-            &self,
-            _req: CompletionRequest,
-            _ctx: &ProviderCallContext,
-        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
-            let msg = agent_core::AssistantMessage {
-                content: vec![agent_core::ContentBlock::Text {
-                    text: self.0.to_string(),
-                }],
-                usage: agent_core::Usage::default(),
-                model: "fixed".into(),
-                stop_reason: Some(agent_core::StopReason::Stop),
-                stop_details: None,
-            };
-            Ok(Box::pin(futures::stream::iter(vec![
-                AssistantEvent::TextDelta(self.0.to_string()),
-                AssistantEvent::MessageEnd(msg),
-            ])))
-        }
-    }
-
-    // P0-1b：reflect 工具 = LLM 提炼 + 心智模型落库（注入可见，非检索命中）。
+    // 对齐 omp memory-reflect.ts：reflect = 检索 + 综合回答（只读，不写入）。
     #[tokio::test]
-    async fn reflect_distills_and_persists_mental_models() {
+    async fn reflect_answers_from_memory_without_writing() {
         let root = std::env::temp_dir().join(format!(
             "mem-tool-test-{}-{:#x}",
             std::process::id(),
@@ -725,47 +624,49 @@ mod tests {
         ));
         let store: std::sync::Arc<dyn MemoryStore> =
             std::sync::Arc::new(agent_memory::StructuredMemoryStore::with_root(root.clone()));
-        let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::new(FixedProvider(
-            "- 用户偏好 Bun 而非 Node\n* 部署用 systemd 单元\n1. 认证走 OAuth2\n- 用户偏好 Bun 而非 Node\n",
-        ));
-        let tool = MemoryReflectTool::new(
-            std::sync::Arc::clone(&store),
-            std::sync::Arc::clone(&provider),
-            Model::with_defaults("fixed", "fixed", agent_core::Api::OpenAiCompletions),
-            ProviderCallContext::default(),
+        let retain = MemoryRetainTool::new(std::sync::Arc::clone(&store));
+        let reflect = MemoryReflectTool::new(std::sync::Arc::clone(&store));
+
+        // 空库：固定空回答（omp 同文案）。
+        let empty = reflect
+            .execute(serde_json::json!({"query": "我们怎么部署服务？"}), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            text_of(&empty),
+            "No relevant information found to reflect on."
         );
 
-        let out = tool
+        // 写入一条事实（经 retain 工具走真实链路）。
+        retain
             .execute(
-                serde_json::json!({ "content": "用户表示喜欢 Bun；部署用 systemd；认证走 OAuth2" }),
+                serde_json::json!({"content": "本项目部署使用 systemd 单元"}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        // 有命中：综合回答，含来源内容，且不产生任何写入。
+        let out = reflect
+            .execute(
+                serde_json::json!({"query": "我们怎么部署服务？", "context": "部署流程"}),
                 &ctx(),
             )
             .await
             .unwrap();
         let text = text_of(&out);
-        assert!(text.contains("已提炼 3 条心智模型"), "{text}");
-        assert!(text.contains("用户偏好 Bun 而非 Node"));
-        assert!(!text.contains("1."), "编号前缀应剥离: {text}");
+        assert!(text.starts_with("Based on recalled memories:"), "{text}");
+        assert!(text.contains("systemd"), "{text}");
 
-        // 落库：mental_models.md 三行，格式 `- [ts] text`，重复行只落一次。
-        let mm = std::fs::read_to_string(root.join("mental_models.md")).unwrap();
-        let lines: Vec<&str> = mm.lines().collect();
-        assert_eq!(lines.len(), 3, "应含 3 条（去重后）：{mm}");
-        for line in &lines {
-            assert!(line.starts_with("- [20"), "时间戳格式: {line}");
-            assert!(
-                line.contains("用户偏好") || line.contains("systemd") || line.contains("OAuth2")
-            );
-        }
-
-        // 注入面：structured 未配置 mental_models_cfg 时 trait mental_models() 为 None
-        //（注入段由 engine 按配置组装，本测试只锁落库格式）。
-
-        // 空输入报错。
-        assert!(tool.execute(serde_json::json!({}), &ctx()).await.is_err());
+        // 缺 query 报错。
+        assert!(
+            reflect
+                .execute(serde_json::json!({}), &ctx())
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
-
     /// 最小 ToolContext（本测试工具不触碰工作区/审批）。
     fn ctx() -> ToolContext<'static> {
         use std::sync::OnceLock;

@@ -1078,6 +1078,7 @@ fn supersede_read_results(log: &[AgentMessage]) -> Vec<AgentMessage> {
                 id,
                 name,
                 arguments,
+                ..
             } = block
             {
                 if name == "read_file" {
@@ -1154,6 +1155,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 arguments: serde_json::json!({}),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),
@@ -1197,6 +1199,7 @@ mod tests {
                     id: id.into(),
                     name: "read_file".into(),
                     arguments: json!({ "path": "a.txt" }),
+                    signature: None,
                 }],
                 usage: Usage::default(),
                 model: "m".into(),
@@ -1233,6 +1236,7 @@ mod tests {
                 id: "call-1".into(),
                 name: "read_file".into(),
                 arguments: json!({ "path": "skill://pdf" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),
@@ -1264,6 +1268,7 @@ mod tests {
                 id: "call-1".into(),
                 name: "read_file".into(),
                 arguments: json!({ "path": "skill://pdf" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),
@@ -2009,6 +2014,7 @@ mod tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 arguments: json!({ "path": "a.txt" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),

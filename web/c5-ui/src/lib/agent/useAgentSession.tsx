@@ -32,6 +32,7 @@ import { bindWorkspaceContext } from '@/lib/agent/workspace'
 import { bindStatsContext } from '@/lib/agent/stats'
 import { useSettings } from '@/lib/settings'
 import { useI18n } from '@/lib/i18n'
+import { useNotifications } from '@/lib/notifications'
 import type { Mode } from '@/lib/settings'
 
 interface Stats {
@@ -124,8 +125,11 @@ interface AgentSessionValue {
   fetchMcp: () => Promise<McpToolInfo[]>
   /** 拉取指定会话的分支树（`/api/sessions/{id}/branches`）。 */
   fetchBranches: (sessionId: string) => Promise<BranchTree | null>
-  /** 切换活跃分支（活跃会话即时生效并重载 transcript；`handoff` 注入被离开分支的摘要）。 */
-  switchBranch: (leafId: string, handoff?: boolean) => Promise<SessionOpResult>
+  /** 拉取子 Agent 快照（REST 补全；WS sub_agents 是事件广播，迟加入客户端用它补齐初始状态）。 */
+  fetchAgents: (sessionId: string) => Promise<void>
+  /** 切换活跃分支（重连 resume 重载该会话 transcript；`handoff` 注入被离开分支的摘要；
+   *  `sid` 指定目标会话，缺省 = 当前活跃会话——分支树模态框浏览历史会话时必须传入）。 */
+  switchBranch: (leafId: string, handoff?: boolean, sid?: string) => Promise<SessionOpResult>
   /** 生成端到端加密协同房间（`/api/collab/room`）。 */
   newCollabRoom: () => Promise<CollabRoom | null>
   /** ✨ LLM 重写草稿（`POST /api/sessions/{id}/enhance`）。失败返回 null。 */
@@ -185,6 +189,9 @@ function resolveLineIndex(
   let hi = 0
   for (const it of items) {
     if (it.kind !== 'user' && it.kind !== 'assistant' && it.kind !== 'thinking') continue
+    // 纯图片消息的本地占位项不落盘（服务端历史不含它），必须跳过，
+    // 否则其后所有项的行号配对整体偏移一格，导致删除落错行。
+    if (it.kind === 'user' && it.placeholder) continue
     const h = history[hi++]
     if (it.id === itemId) return h?.line
   }
@@ -260,8 +267,11 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   // WebSocket 重连退避计数（连接成功后重置为 0）。
   const reconnectAttemptsRef = useRef(0)
   // 心跳看门狗定时器 id。
-  const heartbeatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const heartbeatTimerRef = useRef<NodeJS.Timeout | null>(null)
+  // 自动重连定时器：手动 connect / disconnect 时清除，避免与用户操作竞争。
+  const retryTimerRef = useRef<NodeJS.Timeout | null>(null)
 
+  const { toast } = useNotifications()
   const uid = () => `m${Date.now()}-${idCounter.current++}`
 
   const running = state === 'running' || state === 'streaming' || state === 'waiting_for_input'
@@ -293,7 +303,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
           {
             id: uid(),
             kind: 'say',
-            text: '⚠️ 检测到服务端超过 60 秒无响应，任务可能已异常终止，状态已自动重置',
+            text: tRef.current('session.heartbeat_stale'),
             level: 'warning',
             ts: Date.now(),
           } as TranscriptItem,
@@ -329,6 +339,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const appendDelta = useCallback((which: 'assistant' | 'thinking', delta: string) => {
     let id = openRef.current[which]
     if (!id) {
+      // 空 delta 且无打开项：不创建空气泡（后端 AgentEvent::Assistant 的防御性空帧、
+      // 以及未来可能的空增量，都不应留下永久「…」占位）。
+      if (!delta) return
       id = uid()
       openRef.current[which] = id
       setItems((prev) => [
@@ -381,7 +394,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  /** 拉取 SOCKS5 代理状态（服务端权威；同步本地乐观镜像）。连接建立时调用。 */
+  /** 拉取 SOCKS5 代理状态（服务端权威）。连接建立与设置面板打开时调用。 */
   const refreshSocks5Status = useCallback(async () => {
     const cfg = settingsRef.current
     const origin = cfg.serverUrl.replace(/\/$/, '')
@@ -391,63 +404,83 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       const r = await fetch(`${origin}/api/socks5${qs.toString() ? `?${qs}` : ''}`)
       if (!r.ok) return
       const d = (await r.json()) as Socks5Status
+      // 只写服务端权威状态，不回写 settings：本地镜像曾使 settings 身份每次刷新都变，
+      // 触发设置面板 effect 无限重取循环（详见 SettingsPanel 的 open 上升沿刷新）。
       setSocks5Status(d)
-      update({ socks5Enabled: d.enabled })
     } catch {
       /* 静默：状态拉取失败不影响主流程 */
     }
-  }, [update])
+  }, [])
 
   // 挂载即拉取一次 SOCKS5 状态（不依赖 WS 连接）：设置页开关在未连接时也能显示。
   useEffect(() => {
     void refreshSocks5Status()
   }, [refreshSocks5Status])
 
-  /** 拉取某会话的历史消息列表（含日志行索引 line）。 */
+  /** 拉取某会话的历史消息列表（含日志行索引 line）。
+   *  返回 null = 拉取失败（网络/鉴权/5xx）；[] = 空历史（成功）。二者语义不同，
+   *  调用方据此决定「显示空会话」还是「保留现状并报错」。 */
   const fetchHistoryList = useCallback(
-    async (id: string): Promise<SessionHistoryItem[]> => {
+    async (id: string): Promise<SessionHistoryItem[] | null> => {
       const cfg = settingsRef.current
       const origin = cfg.serverUrl.replace(/\/$/, '')
       const qs = new URLSearchParams()
       if (cfg.token) qs.set('token', cfg.token)
       try {
         const res = await fetch(`${origin}/api/sessions/${encodeURIComponent(id)}/history?${qs}`)
-        if (!res.ok) return []
+        if (!res.ok) return null
         const data = await res.json()
         return Array.isArray(data.items) ? (data.items as SessionHistoryItem[]) : []
       } catch {
-        return []
+        return null
       }
     },
     [],
   )
 
-  /** 拉取某会话的历史消息并填充到对话区（恢复展示用）。历史项携带日志行索引 `line`，
-   *  供前端定位删除目标。 */
-  const loadHistory = useCallback(
-    async (id: string) => {
-      const list = await fetchHistoryList(id)
-      const mapped: TranscriptItem[] = list.map((h) =>
-        h.kind === 'user'
-          ? { id: uid(), kind: 'user', text: h.text, ts: Date.now(), line: h.line }
-          : h.kind === 'thinking'
-            ? { id: uid(), kind: 'thinking', text: h.text, ts: Date.now(), line: h.line }
-            : { id: uid(), kind: 'assistant', text: h.text, ts: Date.now(), line: h.line },
-      )
-      setItems(mapped)
-    },
-    [fetchHistoryList],
-  )
-
+  /** 拉取子 Agent 快照（REST 补全端点 /api/sessions/{id}/agents）：WS 的 sub_agents
+   * 是事件驱动广播，迟加入/重连的客户端在下一个事件前收不到任何子 Agent——用该端点
+   * 补齐初始状态，之后仍由 WS 帧整体覆盖更新。 */
+  const fetchAgents = useCallback(async (sid: string) => {
+    const cfg = settingsRef.current
+    const origin = cfg.serverUrl.replace(/\/$/, '')
+    const qs = new URLSearchParams()
+    if (cfg.token) qs.set('token', cfg.token)
+    try {
+      const r = await fetch(`${origin}/api/sessions/${encodeURIComponent(sid)}/agents?${qs}`)
+      if (!r.ok) return
+      const d = (await r.json()) as { agents?: SubAgentStatus[] }
+      if (d && Array.isArray(d.agents)) setAgents(d.agents)
+    } catch {
+      /* 静默：REST 补全失败不阻塞主连接，后续 WS 帧会继续更新 */
+    }
+  }, [])
   const connect = useCallback(async (resume?: string | null, fork?: string | null) => {
     // 用 ref 作真值：newChat/重连的 setTimeout 即使捕获陈旧闭包，也能读到最新连接态。
     if (connectingRef.current || connectedRef.current) return
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
+    }
     connectingRef.current = true
     setConnecting(true)
     setError(null)
     intentionalClose.current = false
     // 连接代次：屏蔽被取代的旧 socket 的迟到回调，防止其污染新连接状态。
     const gen = ++genRef.current
+    // 自动重连调度（指数退避 1s→2s→…→30s）：WS 关闭与 HTTP 失败共用，
+    // 确保服务器重启窗口内第一次 create_session 失败后重连链不会永久终止。
+    const scheduleReconnect = () => {
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30_000)
+      reconnectAttemptsRef.current++
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null
+        if (!intentionalClose.current && !connectedRef.current && !connectingRef.current) {
+          void connect(sessionIdRef.current)
+        }
+      }, delay)
+    }
     try {
       const cfg = settingsRef.current
       const origin = cfg.serverUrl.replace(/\/$/, '')
@@ -486,10 +519,23 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         setState('no_task')
         setContextUsage(null)
         // best-effort metadata
-        fetch(`${origin}/api/models`).then((r) => r.json()).then(setModels).catch(() => {})
-        fetch(`${origin}/api/stats${tokenOnly}`).then((r) => r.json()).then(setStats).catch(() => {})
+        // 带 token（缺失时鉴权部署一律 401 → 模型列表永久为空），并校验响应形状：
+        // 非 2xx / 非 JSON / 非数组一律回落空列表，避免坏数据进入 state 使 find 抛错。
+        fetch(`${origin}/api/models${tokenOnly}`)
+          .then((r) => (r.ok ? r.json() : []))
+          .then((d: unknown) => setModels(Array.isArray(d) ? (d as ModelInfo[]) : []))
+          .catch(() => {})
+        fetch(`${origin}/api/stats${tokenOnly}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d: unknown) => {
+            // 校验形状：401/5xx 的错误 JSON 不得污染统计状态（Inspector 直接读其字段）。
+            if (d && typeof d === 'object' && 'active_sessions' in (d as object)) setStats(d as Stats)
+          })
+          .catch(() => {})
         void refreshSocks5Status()
         refreshSessions()
+        // REST 补全：连接/重连时同步一次子 Agent 快照（详见 fetchAgents 注释）。
+        void fetchAgents(sid)
       }
       ws.onclose = () => {
         if (!mine()) return // 旧 socket 迟到的 close：忽略，不破坏新连接
@@ -501,15 +547,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         closeOpen('thinking')
         if (!intentionalClose.current) {
           setError(tRef.current('session.disconnected'))
-          // 自动重连（指数退避：1s → 2s → 4s → … → 最大 30s）。
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30_000)
-          reconnectAttemptsRef.current++
-          setTimeout(() => {
-            // 仅当仍未主动关闭且未建立新连接时才重连
-            if (!intentionalClose.current && !connectedRef.current && !connectingRef.current) {
-              void connect(sessionIdRef.current)
-            }
-          }, delay)
+          scheduleReconnect()
         }
       }
       ws.onerror = () => {
@@ -545,14 +583,17 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
             pushItem({ kind: 'say', text: frame.text, level: frame.kind ?? 'info' })
             break
           case 'ask':
-            // 去重：seenAskIds 确保同一 ask.id 不会被重复添加（防止服务端偶发重复推送或 StrictMode 导致的双重渲染）。
             if (!seenAskIds.current.has(frame.ask.id)) {
+              // 上限保护：极端长会话下集合无界增长（内存泄漏），超限整体重置（去重窗口重启）。
+              if (seenAskIds.current.size >= 500) seenAskIds.current = new Set()
               seenAskIds.current.add(frame.ask.id)
               pushItem({ kind: 'ask', ask: frame.ask })
             }
             break
           case 'tool_execution_start':
             // 缓冲命令（含 shell 工具的 command），等待配对的 tool_exec 落到工具块上。
+            // 上限保护：exec 丢失（崩溃/断连）时 start 永不配对，防止缓冲无界增长。
+            if (pendingToolStarts.current.length >= 500) pendingToolStarts.current.length = 0
             pendingToolStarts.current.push({
               tool_call_id: frame.tool_call_id,
               command: deriveToolCommand(frame.args),
@@ -594,20 +635,41 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
           case 'context_usage':
             setContextUsage({ current: frame.current, limit: frame.limit })
             break
+          case 'steered':
+            // 运行中插话回执：把最近一条未标记的用户消息标记为 steering（服务端已把它
+            // 作为 steer 注入当前任务）。仅影响本地展示；无对应用户项时静默忽略。
+            setItems((prev) => {
+              for (let i = prev.length - 1; i >= 0; i--) {
+                const it = prev[i]
+                if (it.kind === 'user' && !it.steered) {
+                  const next = prev.slice()
+                  next[i] = { ...it, steered: true }
+                  return next
+                }
+              }
+              return prev
+            })
+            break
         }
       }
     } catch (err) {
       connectingRef.current = false
       setConnecting(false)
       setError(err instanceof Error ? err.message : String(err))
+      // HTTP 层失败（服务器重启/网络抖动）也要继续退避重试；此前重试仅在 ws.onclose
+      // 调度，一旦 create_session 失败重连链就永久终止，用户必须手动刷新。
+      scheduleReconnect()
     }
     // guard 已改用 ref，deps 仅保留实际用到的稳定回调；connect 不再随 connecting/connected 重建。
   }, [closeOpen, appendDelta, pushItem, refreshSessions, refreshSocks5Status])
 
-  const sendFrame = useCallback((frame: ClientFrame) => {
+  /** 发送 WS 帧；返回 false = 连接不可用（调用方应给出可见反馈而非静默丢弃）。 */
+  const sendFrame = useCallback((frame: ClientFrame): boolean => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(frame))
+      return true
     }
+    return false
   }, [])
 
   const send = useCallback(
@@ -629,7 +691,12 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
 
   const respond = useCallback(
     (askId: string, response: AskResponseValue) => {
-      sendFrame({ type: 'respond', ask_id: askId, response })
+      // 连接不可用时不标记 resolved：服务端审批 oneshot 还在等回执（直至超时），
+      // 假装已批准会让用户误以为任务已继续。给出可见失败提示，卡片保持可重试。
+      if (!sendFrame({ type: 'respond', ask_id: askId, response })) {
+        toast({ title: tRef.current('session.respond_failed'), severity: 'danger' })
+        return
+      }
       setItems((prev) =>
         prev.map((it) =>
           it.kind === 'ask' && it.ask.id === askId
@@ -648,11 +715,14 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const cancel = useCallback(() => {
     // 即时反馈：进入「停止中」过渡态并立即结束流式气泡（输入光标停止闪烁），再下发 cancel 帧。
     // 后端确认取消后会回传 done/error → state 翻为非 running → 上方 effect 自动复位 stopping。
-    // 这样即便存在网络延迟，UI 也能立刻响应「已停止」。
+    // 这样即便存在网络延迟，UI 也能立刻响应「已停止」；连接不可用则给出失败提示并复位。
     setStopping(true)
     closeOpen('assistant')
     closeOpen('thinking')
-    sendFrame({ type: 'cancel' })
+    if (!sendFrame({ type: 'cancel' })) {
+      setStopping(false)
+      toast({ title: tRef.current('session.cancel_failed'), severity: 'danger' })
+    }
   }, [sendFrame, closeOpen])
 
   const clear = useCallback(() => {
@@ -673,25 +743,41 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   )
 
   const newChat = useCallback(() => {
+    // 运行中先下发 cancel：否则旧任务在后端继续跑完（持续消耗 token），帧无人消费。
+    if (running) sendFrame({ type: 'cancel' })
     disconnect()
     clear()
     // reconnect on next tick so state flushes
     setTimeout(() => void connect(null), 50)
-  }, [disconnect, clear, connect])
+  }, [running, sendFrame, disconnect, clear, connect])
 
-  /** 恢复到指定历史会话：断开 → 拉历史填充 → 重连 resume=id。
+  /** 恢复到指定历史会话：先拉历史 → 断开清空 → 填充 → 重连 resume=id。
    *
    * 后端对「纯 resume 的活跃会话」直接复用（不重建），故切回一个正在运行的会话时
-   * 其任务不会被中断。这里先 await 历史拉取再重连，确保「历史覆盖」与「实时帧」
-   * 不会竞争——否则 loadHistory 迟到的 setItems 会把刚收到的实时增量回退掉。 */
+   * 其任务不会被中断。历史拉取先于断开/清空：失败（网络/鉴权/5xx）时保留当前会话
+   * 原状并提示，绝不把有历史的会话静默清空；成功则先 await 再重连，确保「历史覆盖」
+   * 与「实时帧」不会竞争——否则迟到的 setItems 会把刚收到的实时增量回退掉。 */
   const switchSession = useCallback(
     async (id: string) => {
+      const list = await fetchHistoryList(id)
+      if (list === null) {
+        say(tRef.current('session.history_failed'), 'warning')
+        return
+      }
       disconnect()
       clear()
-      await loadHistory(id)
+      setItems(
+        list.map((h) =>
+          h.kind === 'user'
+            ? { id: uid(), kind: 'user', text: h.text, ts: Date.now(), line: h.line }
+            : h.kind === 'thinking'
+              ? { id: uid(), kind: 'thinking', text: h.text, ts: Date.now(), line: h.line }
+              : { id: uid(), kind: 'assistant', text: h.text, ts: Date.now(), line: h.line },
+        ),
+      )
       void connect(id)
     },
-    [disconnect, clear, loadHistory, connect],
+    [fetchHistoryList, say, disconnect, clear, connect],
   )
 
   /** 删除指定历史会话：DELETE 后乐观移除；若删除的是当前会话则新建。 */
@@ -759,18 +845,19 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const deleteMessage = useCallback(
     async (item: TranscriptItem): Promise<SessionOpResult> => {
       if (item.kind !== 'user' && item.kind !== 'assistant') {
-        return { ok: false, error: '仅支持删除用户输入或助手响应' }
+        return { ok: false, error: tRef.current('msg.del_only') }
       }
       const sid = sessionIdRef.current
-      if (!sid) return { ok: false, error: '无活跃会话' }
+      if (!sid) return { ok: false, error: tRef.current('session.no_active') }
       // 解析日志行索引：已有则直接用，否则拉历史按顺序定位。
       let line = item.line
       if (line == null) {
         const hist = await fetchHistoryList(sid)
+        if (hist === null) return { ok: false, error: tRef.current('msg.del_history_failed') }
         line = resolveLineIndex(itemsRef.current, item.id, hist)
       }
       if (line == null) {
-        return { ok: false, error: '无法定位消息（可能仍在生成中）' }
+        return { ok: false, error: tRef.current('msg.del_not_found') }
       }
       const cfg = settingsRef.current
       const origin = cfg.serverUrl.replace(/\/$/, '')
@@ -783,7 +870,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
           { method: 'DELETE' },
         )
         if (res.status === 409) {
-          return { ok: false, error: '任务运行中，无法删除' }
+          return { ok: false, error: tRef.current('msg.del_busy') }
         }
         if (!res.ok) {
           const txt = await res.text().catch(() => '')
@@ -889,7 +976,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       closeOpen('thinking')
       setItems((prev) => [
         ...prev,
-        { id: uid(), kind: 'user', text: trimmed || '（图片）', ts: Date.now() },
+        // placeholder：纯图片消息的本地占位。服务端日志不持久化它（read_history 只收
+        // 非空文本），resolveLineIndex 据此跳过，保证其后消息的删除行号不错位。
+        { id: uid(), kind: 'user', text: trimmed || tRef.current('msg.image_placeholder'), ts: Date.now(), placeholder: !trimmed },
       ])
       setStopping(false)
       setState('running')
@@ -990,11 +1079,11 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         { enabled: on },
       )
       if (!d) return false
+      // 不回写 settings.socks5Enabled（镜像已随 P1-3 修复移除，见 refreshSocks5Status）。
       setSocks5Status((s) => (s ? { ...s, ...d } : d))
-      update({ socks5Enabled: d.enabled })
       return true
     },
-    [apiPost, update],
+    [apiPost],
   )
 
   /** 运行时切换审批模式：POST /api/approval-mode（实时生效 + 服务端持久化）。 */
@@ -1049,28 +1138,33 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [apiGet],
   )
 
-  /** 切换活跃分支：POST 后若为当前会话则重连 resume 重载 transcript。 */
+  /** 切换指定会话的活跃分支：POST 成功后重连 resume=目标会话，重载新分支的 transcript。
+   *
+   * `sid` 缺省 = 当前活跃会话；BranchTreeModal 浏览历史会话的分支树时必须显式传入，
+   * 否则会把切换错落到当前活跃会话上（树与操作目标不一致）。
+   * 鉴权：后端 switch_branch 只有 Path+Json 提取器，token 必须放 body（与其它端点的
+   * Query 鉴权不同，见 server/lib.rs switch_branch）；查询串仅为日志一致性保留。 */
   const switchBranch = useCallback(
-    async (leafId: string, handoff = false): Promise<SessionOpResult> => {
+    async (leafId: string, handoff = false, sid?: string): Promise<SessionOpResult> => {
       const cfg = settingsRef.current
       const origin = cfg.serverUrl.replace(/\/$/, '')
-      const sid = sessionIdRef.current
-      if (!sid) return { ok: false, error: '无活跃会话' }
+      const target = sid ?? sessionIdRef.current
+      if (!target) return { ok: false, error: tRef.current('session.no_active') }
       try {
         const res = await fetch(
-          `${origin}/api/sessions/${encodeURIComponent(sid)}/branches/switch`,
+          `${origin}/api/sessions/${encodeURIComponent(target)}/branches/switch`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ leaf_id: leafId, handoff, token: cfg.token ?? null }),
+            body: JSON.stringify({ leaf_id: leafId, handoff, token: cfg.token || undefined }),
           },
         )
         if (!res.ok) {
           const text = await res.text().catch(() => '')
           return { ok: false, error: text || `HTTP ${res.status}` }
         }
-        // 切换成功：重连 resume=当前会话 以重载新分支的 transcript。
-        switchSession(sid)
+        // 切换成功：重连 resume=目标会话 以重载新分支的 transcript。
+        switchSession(target)
         return { ok: true }
       } catch (e) {
         return { ok: false, error: String(e) }
@@ -1104,13 +1198,14 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
     [models, settings.model],
   )
 
-  // Auto-connect on mount (and when server identity changes while disconnected).
+  // 挂载时建立初始连接；断连状态下 serverUrl 变更（设置里换地址）时自动重连到新服务器。
+  // 已连接时不响应（不打断在跑任务）；连接字段的显式变更由 SettingsPanel save() 处理。
   useEffect(() => {
     if (!connected && !connecting && !sessionId) {
       void connect()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [settings.serverUrl])
 
   useEffect(() => () => disconnect(), [disconnect])
 
@@ -1156,6 +1251,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchSkillBody,
       fetchMcp,
       fetchBranches,
+      fetchAgents,
       switchBranch,
       newCollabRoom,
       enhancePrompt,
@@ -1208,6 +1304,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       fetchSkillBody,
       fetchMcp,
       fetchBranches,
+      fetchAgents,
       switchBranch,
       newCollabRoom,
       enhancePrompt,
@@ -1215,6 +1312,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       socks5Status,
       refreshSocks5Status,
       setSocks5Enabled,
+      approvalModeStatus,
+      refreshApprovalModeStatus,
+      setApprovalMode,
     ],
   )
 

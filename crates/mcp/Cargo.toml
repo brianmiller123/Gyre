@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "MCP (Model Context Protocol) stdio client + tool bridge"
+description = "MCP (Model Context Protocol) client: stdio + Streamable HTTP transports + tool bridge"
 
 [dependencies]
 agent-core   = { workspace = true }
@@ -15,6 +15,13 @@ serde_json   = { workspace = true }
 async-trait  = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
+reqwest           = { workspace = true }
+eventsource-stream = { workspace = true }
+futures           = { workspace = true }
+parking_lot       = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
 
 [lints]
 workspace = true

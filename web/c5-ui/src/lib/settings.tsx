@@ -12,21 +12,24 @@ export interface Settings {
   mode: Mode
   /** Selected model alias (applied when creating a session). null = server default. */
   model: string | null
-  /** SOCKS5 代理开关的本地镜像（权威状态在服务端 /api/socks5；此值用于刷新前乐观显示）。 */
-  socks5Enabled: boolean
 }
 
 const STORAGE_KEY = 'agent-ui-settings'
 
 function defaults(): Settings {
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
-  return { serverUrl: origin, token: '', mode: 'code', model: null, socks5Enabled: false }
+  return { serverUrl: origin, token: '', mode: 'code', model: null }
 }
 
 function load(): Settings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) return { ...defaults(), ...JSON.parse(raw) }
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Settings> & Record<string, unknown>
+      // 旧版本可能存有已废弃的 socks5Enabled 镜像：剔除，避免死状态永久回流。
+      delete parsed.socks5Enabled
+      return { ...defaults(), ...parsed }
+    }
   } catch {
     /* ignore */
   }

@@ -46,6 +46,13 @@ export function Sidebar({
       : status === 'connecting'
         ? t('sidebar.connecting')
         : t('sidebar.disconnected')
+  // 安全解析主机名：serverUrl 可能是用户手输的任意字符串，渲染期抛异常会白屏。
+  let serverHost = '—'
+  try {
+    serverHost = settings.serverUrl ? new URL(settings.serverUrl).host : '—'
+  } catch {
+    /* 非法地址保持占位符，交由设置面板校验与错误横幅提示 */
+  }
 
   return (
     <div className="flex h-full w-60 flex-col border-r border-border bg-surface/80 backdrop-blur-xl">
@@ -99,7 +106,7 @@ export function Sidebar({
           </span>
         </div>
         <p className="mt-1.5 truncate font-mono text-[10px] text-muted">
-          {settings.serverUrl ? new URL(settings.serverUrl).host : '—'}
+          {serverHost}
         </p>
         {sessionId && (
           <p className="mt-0.5 truncate font-mono text-[10px] text-muted">
@@ -171,15 +178,10 @@ export function Sidebar({
           )}
         </div>
         <div className="mt-1 flex items-center justify-between px-2.5 py-1 text-[10px] text-muted">
-          <span>v1.0 · WebUI</span>
-          <a
-            href="https://github.com"
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 hover:text-text"
-          >
+          <span>v{__APP_VERSION__} · WebUI</span>
+          <span className="inline-flex items-center gap-1">
             <Icon name="github" size={12} /> {t('sidebar.source')}
-          </a>
+          </span>
         </div>
       </div>
     </div>

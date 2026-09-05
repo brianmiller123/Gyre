@@ -32,6 +32,7 @@ pub(crate) fn skill_read_call_ids(log: &[AgentMessage]) -> HashSet<String> {
                 id,
                 name,
                 arguments,
+                ..
             } = block
             {
                 if name == "read_file"
@@ -128,6 +129,7 @@ mod tests {
                 id: id.into(),
                 name: "read_file".into(),
                 arguments: json!({ "path": "a.txt" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),
@@ -144,6 +146,7 @@ mod tests {
                     id: id.into(),
                     name: "read_file".into(),
                     arguments: json!({ "path": "a.txt" }),
+                    signature: None,
                 },
             ],
             usage: Usage::default(),
@@ -160,11 +163,13 @@ mod tests {
                     id: id1.into(),
                     name: "read_file".into(),
                     arguments: json!({ "path": "a.txt" }),
+                    signature: None,
                 },
                 ContentBlock::ToolCall {
                     id: id2.into(),
                     name: "read_file".into(),
                     arguments: json!({ "path": "b.txt" }),
+                    signature: None,
                 },
             ],
             usage: Usage::default(),
@@ -270,6 +275,7 @@ mod tests {
                 id: "s1".into(),
                 name: "read_file".into(),
                 arguments: json!({ "path": "skill://pdf" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "m".into(),

@@ -336,6 +336,7 @@ pub fn recover_tool_call(
         id,
         name,
         arguments,
+        signature,
     } = block
     else {
         return None;
@@ -357,6 +358,7 @@ pub fn recover_tool_call(
         id: id.clone(),
         name: name.clone(),
         arguments: new_args,
+        signature: signature.clone(),
     };
     let mut clean_message = message.clone();
     clean_message.content = vec![clean_block];
@@ -764,6 +766,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "edit".into(),
                 arguments: serde_json::json!({ "input": input }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "gpt-5".into(),
@@ -802,6 +805,7 @@ mod tests {
                 id: "c".into(),
                 name: "edit".into(),
                 arguments: serde_json::json!({ "input": input }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "gpt-5".into(),

@@ -1,4 +1,6 @@
 [toolchain]
-channel    = "stable"
+# 固定 stable 版本：CI/本地工具链不漂移（对齐 omp 的 pin 策略；omp 用 nightly pin）。
+# 升级时同步更新 Cargo.lock 的 rust-version 相关校验并重跑 CI。
+channel    = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile    = "minimal"

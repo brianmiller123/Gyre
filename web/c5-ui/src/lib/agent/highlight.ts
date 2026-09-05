@@ -79,5 +79,7 @@ export function highlight(code: string, lang: string): string {
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
+  // 字符 → HTML 实体。此前实现误把实体写成原字符（空操作）：未转义内容经 innerHTML
+  // 注入会执行（XSS），此路径在 hljs 抛异常时兜底使用。
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }

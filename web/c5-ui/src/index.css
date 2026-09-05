@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* ==========================================================================
-   C5 · Cloud Control Console — Design System ("Nebula Command")
+ * Agent Console Design System
 
    All color is expressed as RGB triplets so Tailwind opacity modifiers work
    (e.g. `bg-primary/20`). Toggling `.dark` on <html> re-skins the whole UI.

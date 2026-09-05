@@ -1,6 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import './index.css'
 
 // Bundled fonts (no network at runtime): Sora (display) + Plus Jakarta Sans
@@ -23,6 +24,8 @@ import '@fontsource/jetbrains-mono/600.css'
 // Theme is applied pre-paint in index.html to avoid a flash of the wrong theme.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 )

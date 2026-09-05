@@ -9,6 +9,7 @@ import {
 import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
+import { copyText } from '@/lib/clipboard'
 import { highlight } from '@/lib/agent/highlight'
 
 /**
@@ -47,11 +48,16 @@ function inline(text: string, keyPrefix: string): ReactNode[] {
       nodes.push(<em key={`${keyPrefix}-i${i}`}>{tok.slice(1, -1)}</em>)
     } else if (tok.startsWith('[')) {
       const mm = /\[([^\]]+)\]\(([^)]+)\)/.exec(tok)!
-      nodes.push(
-        <a key={`${keyPrefix}-l${i}`} href={mm[2]} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2 hover:opacity-80">
-          {mm[1]}
-        </a>,
-      )
+      // 仅放行安全协议：assistant 输出可被仓库内容注入，javascript:/data: 链接是 XSS 载体。
+      if (/^(https?:|mailto:)/i.test(mm[2])) {
+        nodes.push(
+          <a key={`${keyPrefix}-l${i}`} href={mm[2]} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2 hover:opacity-80">
+            {mm[1]}
+          </a>,
+        )
+      } else {
+        nodes.push(<span key={`${keyPrefix}-l${i}`} className="text-primary">{mm[1]}</span>)
+      }
     }
     last = m.index + tok.length
     i++
@@ -327,10 +333,12 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const html = useMemo(() => highlight(deferred, lang), [deferred, lang])
   const { t } = useI18n()
   const [copied, setCopied] = useState(false)
-  const copy = () => {
-    navigator.clipboard?.writeText(code).catch(() => {})
-    setCopied(true)
-    window.setTimeout(() => setCopied(false), 1500)
+  const copy = async () => {
+    // copyText 兼容非安全上下文；仅在写入成功时反馈「已复制」，失败不假装成功。
+    if (await copyText(code)) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    }
   }
   return (
     <div className="group relative overflow-hidden rounded-xl border border-border text-[13px]">

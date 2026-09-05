@@ -15,7 +15,7 @@
 pub struct KeywordDetect {
     /// 是否命中 `ultrathink`（思考预算拉满）。
     pub ultrathink: bool,
-    /// 命中关键词对应的隐藏通知文本（按检测顺序，先于用户消息注入）。
+    /// 命中关键词对应的隐藏通知文本（按检测顺序，后于用户消息注入）。
     pub notices: Vec<String>,
 }
 

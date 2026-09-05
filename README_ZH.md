@@ -30,7 +30,7 @@ Gyre 是一个**生产级 AI 编程智能体框架**，提供完整的「感知�
 - **PTY 伪终端**（可选）：`run_pty_command`，支持交互式终端应用（top / vim / REPL）
 - **图像处理**（可选）：`read_image` / `image_gen`（DALL·E 或兼容 API）
 - **GitHub 集成**（可选）：PR / Issue / Actions 查询与操作，GraphQL 查询
-- **MCP 协议**：实现 Model Context Protocol（stdio 传输，initialize / tools/list / tools/call），可挂载 stdio MCP server 的工具
+- **MCP 协议**：实现 Model Context Protocol（stdio + Streamable HTTP 传输，initialize / tools/list / tools/call / resources/*），可挂载 stdio / HTTP MCP server 的工具
 
 ### 🧠 上下文管理
 - **AppendOnlyLog**：消息只追加，唯一变异路径是压缩时合法 `replaceTail`
@@ -57,7 +57,7 @@ Gyre 是一个**生产级 AI 编程智能体框架**，提供完整的「感知�
 - **双传输模式**：`stdio`（编辑器作为子进程调用，零端口占用）/ `http`（HTTP+SSE，与 Web 前端同端口复用）
 - **三端等价**：ACP 与 CLI、Web 前端共享同一份会话管理与审批机制，同一会话可被多客户端同时订阅
 - **标准事件流**：`session/update` 推送 `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update` 等 ACP 标准事件
-- **能力声明**：`initialize` 握手时如实声明 `promptCapabilities`（image 支持）与 `mcpCapabilities`（stdio 支持），严格客户端 schema 校验通过
+- **能力声明**：`initialize` 握手时如实声明 `promptCapabilities`（image 支持）与 `mcpCapabilities`（stdio + Streamable HTTP 支持），严格客户端 schema 校验通过
 
 ### 🔄 多 Agent 编排
 - **子 Agent 委派**（TaskTool）：父 Agent 可委派子任务给子 Agent，支持并发护栏与独立 Token 预算
@@ -184,7 +184,7 @@ Gyre/
 │   ├── ast/                    # AST 操控（tree-sitter + ast-grep）
 │   ├── search/                 # 代码搜索（grep/glob/fd/highlight/tokens）
 │   ├── ttsr/                   # 时间旅行流规则（不占 system prompt 的流式护栏）
-│   ├── mcp/                    # MCP 协议客户端（stdio）
+│   ├── mcp/                    # MCP 协议客户端（stdio + Streamable HTTP）
 │   ├── lsp/                    # LSP 语言服务器客户端
 │   ├── dap/                    # DAP 调试适配器客户端（`debug` 工具）
 │   ├── browser/                # headless 浏览器自动化（最小 CDP 客户端）
@@ -393,7 +393,7 @@ CLI flag 可运行时覆盖配置：`--acp` 单独使用为纯 stdio 模式（�
   "agentCapabilities": {
     "loadSession": true,
     "promptCapabilities": { "image": true, "embeddedContext": false },
-    "mcpCapabilities": { "http": false, "stdio": true }
+    "mcpCapabilities": { "http": true, "stdio": true }
   },
   "agentInfo": { "name": "Gyre", "version": "0.1.0" },
   "authMethods": []

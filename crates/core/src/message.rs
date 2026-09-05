@@ -166,6 +166,13 @@ pub enum ContentBlock {
         name: String,
         /// 参数（JSON）。
         arguments: serde_json::Value,
+        /// 供应商思考签名（Gemini `thoughtSignature`，附在 functionCall part 上）。
+        ///
+        /// Gemini 3 起强校验：回放含 functionCall 的历史时，functionCall part 必须携带
+        /// 原始 `thoughtSignature`，缺失/篡改会被 400 拒绝。对齐 omp
+        /// `catalog/src/types.ts` ToolCallBlock.thoughtSignature。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 }
 
@@ -208,6 +215,7 @@ impl AssistantMessage {
                     id,
                     name,
                     arguments,
+                    ..
                 } => Some((id.as_str(), name.as_str(), arguments)),
                 _ => None,
             })

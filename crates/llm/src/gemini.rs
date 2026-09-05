@@ -166,11 +166,44 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
                             Some(serde_json::json!({ "text": text }))
                         }
                         // 工具调用 → functionCall part（args 为完整 JSON 对象直传）。
-                        ContentBlock::ToolCall { name, arguments, .. } => {
-                            Some(serde_json::json!({ "functionCall": { "name": name, "args": arguments } }))
+                        // Gemini 3 起强校验：回放历史中的 functionCall 必须带原始
+                        // thoughtSignature（缺失/篡改 → 400）。签名仅在同模型产出时有效；
+                        // Gyre 消息模型未记录产出 provider，base64 校验通过即回放
+                        //（omp 另有同 provider+model 门，见 google-shared.ts:222-260）。
+                        ContentBlock::ToolCall {
+                            name,
+                            arguments,
+                            signature,
+                            ..
+                        } => {
+                            let mut part =
+                                serde_json::json!({ "functionCall": { "name": name, "args": arguments } });
+                            if let Some(s) =
+                                signature.as_deref().filter(|s| is_valid_thought_signature(s))
+                            {
+                                part["thoughtSignature"] = serde_json::json!(s);
+                            }
+                            Some(part)
                         }
-                        // thinking 块跳过：Gemini 无 preserveReasoning 等价物，回传会被拒。
-                        ContentBlock::Thinking { .. } => None,
+                        // thinking 块：带有效签名 → `thought` part 原样回放（保思考上下文）；
+                        // 无签名 → 降级为普通 text part（Gemini 对无签名 thought part
+                        // schema 接受但静默丢弃，见 omp dialect/demotion.ts 文档）。
+                        ContentBlock::Thinking { text, signature } => {
+                            if text.trim().is_empty() {
+                                None
+                            } else if signature
+                                .as_deref()
+                                .is_some_and(is_valid_thought_signature)
+                            {
+                                Some(serde_json::json!({
+                                    "thought": true,
+                                    "text": text,
+                                    "thoughtSignature": signature,
+                                }))
+                            } else {
+                                Some(serde_json::json!({ "text": text }))
+                            }
+                        }
                         ContentBlock::Text { .. } => None,
                     })
                     .collect();
@@ -276,6 +309,10 @@ struct GeminiPart {
     /// true 表示该 text part 为思考摘要（includeThoughts 开启时出现）。
     #[serde(default)]
     thought: Option<bool>,
+    /// 思考签名（TYPE_BYTES/base64）：保思考上下文的加密载体，可出现在任意 part 上；
+    /// 回放时 functionCall part 必带（Gemini 3 强校验）。对齐 omp google-shared.ts。
+    #[serde(default, rename = "thoughtSignature", alias = "thought_signature")]
+    thought_signature: Option<String>,
     #[serde(default, rename = "functionCall", alias = "function_call")]
     function_call: Option<GeminiFunctionCall>,
 }
@@ -328,6 +365,8 @@ struct ToolCallAccum {
     id: Option<String>,
     name: Option<String>,
     args: serde_json::Value,
+    /// functionCall part 携带的 thoughtSignature（回放时必须原样带回）。
+    sig: Option<String>,
 }
 
 /// 单条流的累积状态（供 [`parse_gemini_stream`] 与 fixture 测试复用）。
@@ -335,6 +374,7 @@ struct GeminiStreamState {
     model_id: String,
     text_buf: String,
     thought_buf: String,
+    thought_sig: Option<String>,
     tool_calls: Vec<ToolCallAccum>,
     finish: Option<String>,
     usage: Usage,
@@ -346,6 +386,7 @@ impl GeminiStreamState {
             model_id,
             text_buf: String::new(),
             thought_buf: String::new(),
+            thought_sig: None,
             tool_calls: Vec::new(),
             finish: None,
             usage: Usage::default(),
@@ -392,6 +433,7 @@ impl GeminiStreamState {
                             id: Some(id.clone()),
                             name: Some(fc.name.clone()),
                             args: args.clone(),
+                            sig: part.thought_signature.clone().filter(|s| !s.is_empty()),
                         });
                         events.push(AssistantEvent::ToolCallStart {
                             id: id.clone(),
@@ -407,6 +449,15 @@ impl GeminiStreamState {
                     } else if let Some(text) = part.text.as_deref().filter(|t| !t.is_empty()) {
                         if part.thought == Some(true) {
                             self.thought_buf.push_str(text);
+                            // 保留最近一个非空签名（部分后端只在首 delta 带签名，
+                            // 对齐 omp retainThoughtSignature）。
+                            if part
+                                .thought_signature
+                                .as_deref()
+                                .is_some_and(|s| !s.is_empty())
+                            {
+                                self.thought_sig = part.thought_signature.clone();
+                            }
                             events.push(AssistantEvent::ThinkingDelta(text.to_string()));
                         } else {
                             self.text_buf.push_str(text);
@@ -437,7 +488,7 @@ impl GeminiStreamState {
         if !self.thought_buf.is_empty() {
             content.push(ContentBlock::Thinking {
                 text: self.thought_buf.clone(),
-                signature: None,
+                signature: self.thought_sig.clone(),
             });
         }
         if !self.text_buf.is_empty() {
@@ -450,6 +501,7 @@ impl GeminiStreamState {
                 id: tc.id.clone().unwrap_or_default(),
                 name: tc.name.clone().unwrap_or_default(),
                 arguments: tc.args.clone(),
+                signature: tc.sig.clone(),
             });
         }
         let (stop_reason, stop_details) =
@@ -464,6 +516,16 @@ impl GeminiStreamState {
     }
 }
 
+/// thoughtSignature 合法性校验：Google API 要求 TYPE_BYTES/base64
+///（对齐 omp `isValidThoughtSignature`：非空、4 的倍数长、base64 字符集）。
+/// 不合法的签名回放会被 Google 端 400 拒绝，宁可丢弃降级。
+fn is_valid_thought_signature(signature: &str) -> bool {
+    !signature.is_empty()
+        && signature.len() % 4 == 0
+        && signature
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
 /// finishReason → (`StopReason`, `StopDetails`)。
 ///
 /// 模型发起函数调用时 Gemini 的 finishReason 通常仍为 `STOP`——有工具调用即判
@@ -763,6 +825,7 @@ mod tests {
                         id: "call_0".into(),
                         name: "read_file".into(),
                         arguments: serde_json::json!({"path":"a.rs"}),
+                        signature: None,
                     },
                 ],
             },
@@ -774,18 +837,20 @@ mod tests {
             },
         ];
         let body = build_body(&r);
-        // assistant 轮：thinking 跳过，仅 functionCall part。
+        // assistant 轮：无签名 thinking 降级为普通 text part + functionCall part。
         assert_eq!(body["contents"][0]["role"], "model");
         assert_eq!(
             body["contents"][0]["parts"].as_array().map(Vec::len),
-            Some(1)
+            Some(2)
         );
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "先分析");
+        assert!(body["contents"][0]["parts"][0].get("thought").is_none());
         assert_eq!(
-            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            body["contents"][0]["parts"][1]["functionCall"]["name"],
             "read_file"
         );
         assert_eq!(
-            body["contents"][0]["parts"][0]["functionCall"]["args"]["path"],
+            body["contents"][0]["parts"][1]["functionCall"]["args"]["path"],
             "a.rs"
         );
         // tool 结果轮：functionResponse 的 name 经历史回查（call_0 → read_file）。
@@ -887,6 +952,74 @@ mod tests {
         assert!(!id.is_empty(), "合成调用 id 不应为空");
     }
 
+    #[test]
+    fn sse_captures_thought_signatures() {
+        // thought part 与 functionCall part 均可携带 thoughtSignature；
+        // 流式侧按 retain 语义保留最近非空值。
+        let (events, msg) = run_fixture(
+            "gemini-3-pro",
+            &[
+                r#"{"candidates":[{"content":{"parts":[{"text":"推理","thought":true,"thoughtSignature":"QUJDRA=="}]}}]}"#,
+                r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}},"thoughtSignature":"Rm9v"}]}}]}"#,
+                r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":8}}"#,
+            ],
+        );
+        assert!(matches!(&events[0], AssistantEvent::ThinkingDelta(t) if t == "推理"));
+        assert!(matches!(&msg.content[0],
+            ContentBlock::Thinking { text, signature: Some(sig) }
+                if text == "推理" && sig == "QUJDRA=="
+        ));
+        assert!(matches!(&msg.content[1],
+            ContentBlock::ToolCall { name, signature: Some(sig), .. }
+                if name == "read_file" && sig == "Rm9v"
+        ));
+    }
+
+    #[test]
+    fn body_replays_thought_signatures_and_demotes_unsigned() {
+        let req = CompletionRequest {
+            model: Model::with_defaults("gemini-3-pro", "google", Api::GoogleGenerativeAi),
+            system: vec![],
+            messages: vec![ProviderMessage::Assistant {
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "推理".into(),
+                        signature: Some("QUJDRA==".into()),
+                    },
+                    ContentBlock::Thinking {
+                        text: "无签名".into(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_0".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "a.rs"}),
+                        signature: Some("Rm9v".into()),
+                    },
+                ],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: 16,
+            temperature: None,
+            thinking: None,
+            cache_key: None,
+            stable_prefix_len: 0,
+        };
+        let body = build_body(&req);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        // 带签名 thinking → thought part 原样回放。
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], "推理");
+        assert_eq!(parts[0]["thoughtSignature"], "QUJDRA==");
+        // 无签名 thinking → 降级普通 text（无 thought 标记）。
+        assert_eq!(parts[1]["text"], "无签名");
+        assert!(parts[1].get("thought").is_none());
+        // functionCall 必带签名回放。
+        assert_eq!(parts[2]["functionCall"]["name"], "read_file");
+        assert_eq!(parts[2]["thoughtSignature"], "Rm9v");
+    }
     #[test]
     fn sse_finish_reason_mapping() {
         let (_, msg) = run_fixture(

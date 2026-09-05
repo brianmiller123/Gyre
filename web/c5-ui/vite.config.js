@@ -1,15 +1,21 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 // Vite configuration for the Agent WebUI.
 // - base './' so the built bundle can be served from any sub-path (incl. by
 //   `agent --serve`, which serves ./web as static files).
 // - '@' alias → ./src for clean, decoupled imports.
 // - dev proxy forwards /api and /ws to the Rust agent server (default
 //   127.0.0.1:8080) so `npm run dev` (:5173) talks to `agent --serve` (:8080).
+// 注入 package.json 版本号（Sidebar 页脚展示），避免源码里硬编码 v1.0 漂移。
+var pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'));
 export default defineConfig({
     base: './',
     plugins: [react()],
+    define: {
+        __APP_VERSION__: JSON.stringify(pkg.version),
+    },
     resolve: {
         alias: {
             '@': path.resolve(__dirname, 'src'),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   fetchFile,
@@ -16,6 +16,7 @@ import { Badge, Button, Spinner } from '@/components/ui'
 import { compact } from '@/lib/format'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
+import { useNotifications } from '@/lib/notifications'
 
 type WsMode = 'left' | 'floating' | 'right'
 
@@ -368,6 +369,7 @@ function DockBtn({
 function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number) => void }) {
   const { theme } = useTheme()
   const { t } = useI18n()
+  const { toast } = useNotifications()
   const hlReady = useHighlighter(theme)
   const [info, setInfo] = useState<WorkspaceInfo | null>(null)
   const [tree, setTree] = useState<TreeNode[]>([])
@@ -417,6 +419,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
             )
           } catch {
             setTree((prev) => updateNode(prev, node.path, { loading: false }))
+            toast({ title: t('workspace.list_failed'), body: node.path, severity: 'warning' })
           }
         }
       }
@@ -457,7 +460,14 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
   }, [])
 
   const lang = activePath ? languageOf(activePath) : 'plaintext'
-  const html = file?.content ? highlight(file.content, lang) : ''
+  // 全文高亮较贵：memoize，避免拖拽分割条（treeW state）等无关重渲染反复重算。
+  // 超大文本（>256KiB）直接跳过高亮（尤其 highlightAuto 的多语言探测是主线程秒级阻塞），
+  // 由 CodeView 走 escapeHtml 纯文本路径。
+  const skipHl = (file?.content?.length ?? 0) > 256 * 1024
+  const html = useMemo(
+    () => (file?.content && !skipHl ? highlight(file.content, lang) : ''),
+    [file?.content, lang, skipHl],
+  )
 
   return (
     <div className="flex h-full flex-col">
@@ -538,7 +548,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
                   </div>
                 ) : null}
                 {file?.content != null && !fileLoading && (
-                  <CodeView html={html} language={lang} ready={hlReady} raw={file.content} />
+                  <CodeView html={html} language={lang} ready={hlReady && !skipHl} raw={file.content} />
                 )}
               </div>
             </>
@@ -639,15 +649,16 @@ function CodeView({
 }) {
   const body = ready ? html : escapeHtml(raw)
   const lines = raw.split('\n')
+  // 超大文件（数万行）：行号池改为单个文本节点（换行分隔），避免每行一个 <div>
+  // 产生数万 DOM 节点导致渲染冻结。行不换行（pre），两列按行号天然对齐。
+  const gutter = lines.length > 5000 ? lines.map((_, i) => i + 1).join('\n') : null
   return (
     <div className="flex min-w-full">
       <pre
         aria-hidden
         className="select-none border-r border-white/5 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-white/25"
       >
-        {lines.map((_, i) => (
-          <div key={i}>{i + 1}</div>
-        ))}
+        {gutter ?? lines.map((_, i) => <div key={i}>{i + 1}</div>)}
       </pre>
       <pre className="flex-1 overflow-x-auto px-3 py-3">
         <code
@@ -702,5 +713,7 @@ function fileIcon(name: string): string {
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
+  // 字符 → HTML 实体。此前实现误把实体写成原字符（空操作）：未 ready 首帧渲染的
+  // raw 文件内容经 dangerouslySetInnerHTML 注入会执行（XSS）。
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }

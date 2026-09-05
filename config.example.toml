@@ -141,10 +141,19 @@ enable_commands = false
 # ignored = []   # 排除 glob，作用于 skill 名
 # included = []  # 包含 glob，空 = 全部
 
-# MCP server（stdio JSON-RPC 2.0）。每个 server 暴露的工具自动注册为 agent 工具。
+# MCP server。每个 server 暴露的工具自动注册为 agent 工具。
+# 两种传输形态（按必填键区分）：
+# - stdio：子进程 JSON-RPC 2.0（含 command 即 stdio，向后兼容）
+# - http：Streamable HTTP（含 url 即 http；POST JSON-RPC + 可选 SSE 响应流）
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.remote]
+url = "http://127.0.0.1:3000/mcp"
+timeout_ms = 30000   # 单请求超时（毫秒）；0 = 不限制，缺省 30000
+[mcp.servers.remote.headers]
+Authorization = "Bearer ${MCP_TOKEN}"
 
 # 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + 后端按需合并）
 [memory]

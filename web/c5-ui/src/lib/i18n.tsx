@@ -87,7 +87,7 @@ export interface I18nContextValue {
   /** 设置语言偏好（`'auto'` 跟随系统）；持久化到 localStorage。 */
   setPreference: (pref: LocaleCode | 'auto') => void
   /** 取词并完成 `{name}` 命名插值；缺失回退英文，再缺失返回 key 本身。 */
-  t: (key: string, args?: Record<string, string | number>) => string
+  t: (key: string, args?: Record<string, unknown>) => string
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null)
@@ -130,7 +130,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const t = useCallback(
-    (key: string, args?: Record<string, string | number>) => {
+    (key: string, args?: Record<string, unknown>) => {
       const dict = locales[locale] ?? locales[DEFAULT_LOCALE]
       let raw = dict[key] ?? locales[DEFAULT_LOCALE][key] ?? key
       if (args && raw.includes('{')) {

@@ -1277,6 +1277,7 @@ mod tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": "a.txt" }),
+                signature: None,
             }],
             usage: Usage::default(),
             model: "stub".into(),
@@ -1365,6 +1366,7 @@ mod tests {
                     id: "c1".into(),
                     name: "probe".into(),
                     arguments: serde_json::json!({}),
+                    signature: None,
                 }],
                 usage: Usage::default(),
                 model: "loop".into(),
@@ -1787,6 +1789,7 @@ mod tests {
                         id: "trunc1".into(),
                         name: "probe".into(),
                         arguments: serde_json::json!({"incomplete": true}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "trunc-tool".into(),
@@ -1907,6 +1910,7 @@ mod tests {
                     id: "err1".into(),
                     name: "probe".into(),
                     arguments: serde_json::json!({}),
+                    signature: None,
                 }],
                 usage: Usage::default(),
                 model: "err-tool".into(),
@@ -2015,6 +2019,7 @@ mod tests {
                         id: "tc1".into(),
                         name: "probe".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "transient".into(),
@@ -2300,6 +2305,7 @@ mod tests {
                     id: "detour1".into(),
                     name: "other".into(),
                     arguments: serde_json::json!({}),
+                    signature: None,
                 }],
                 usage: Usage::default(),
                 model: "detour".into(),
@@ -2471,6 +2477,7 @@ mod tests {
                         id: "b1".into(),
                         name: "block".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "block-call".into(),
@@ -2929,6 +2936,7 @@ mod tests {
                         id: "c1".into(),
                         name: "probe".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "two-turn".into(),
@@ -3146,6 +3154,7 @@ mod tests {
                         id: "c1".into(),
                         name: "probe".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "aside-midwork".into(),
@@ -3258,6 +3267,7 @@ mod tests {
                         id: "c1".into(),
                         name: "probe".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "recording".into(),
@@ -3830,6 +3840,7 @@ mod tests {
                         id: "c1".into(),
                         name: "streaming".into(),
                         arguments: serde_json::json!({}),
+                        signature: None,
                     }],
                     usage: Usage::default(),
                     model: "streaming-prov".into(),
@@ -4226,11 +4237,18 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // 顺序契约：通知在用户原话**之后**（对齐 omp agent-session.ts:5797-5801）。
+        let prompt_idx = texts
+            .iter()
+            .position(|t| t.contains("请 orchestrate 这些任务"))
+            .expect("用户原话应在上下文中");
+        let notice_idx = texts
+            .iter()
+            .position(|t| t.contains("[magic-keyword:orchestrate]"))
+            .expect("orchestrate 命中应注入隐藏通知");
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("[magic-keyword:orchestrate]")),
-            "orchestrate 命中应注入隐藏通知"
+            notice_idx > prompt_idx,
+            "通知应后于用户消息：prompt@{prompt_idx}, notice@{notice_idx}"
         );
     }
 
@@ -4441,6 +4459,7 @@ mod tests {
                         id: format!("call-{n}"),
                         name: self.tool.into(),
                         arguments: self.args.clone(),
+                        signature: None,
                     }],
                     usage: agent_core::Usage::default(),
                     model: "ttsr-tool".into(),
@@ -5006,6 +5025,7 @@ mod tests {
                     id: format!("c{n}"),
                     name: "no_such_tool".into(),
                     arguments: serde_json::json!({}),
+                    signature: None,
                 }]
             } else {
                 vec![ContentBlock::Text {

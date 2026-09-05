@@ -99,6 +99,7 @@ export type Frame =
   | { type: 'error'; message: string }
   | { type: 'sub_agents'; agents: SubAgentStatus[] }
   | { type: 'context_usage'; current: number; limit: number }
+  | { type: 'steered'; text: string }
 
 /** Normalize a raw JSON message into a typed Frame (tolerant of serde quirks). */
 export function parseFrame(raw: unknown): Frame | null {
@@ -175,6 +176,8 @@ export function parseFrame(raw: unknown): Frame | null {
         current: typeof r.current === 'number' ? r.current : 0,
         limit: typeof r.limit === 'number' ? r.limit : 0,
       }
+    case 'steered':
+      return { type: 'steered', text: r.text ?? r.steered ?? '' }
     default:
       return null
   }
@@ -227,7 +230,17 @@ export function deriveToolCommand(args: unknown): string | undefined {
 
 /* ------------------------------- UI models -------------------------------- */
 export type TranscriptItem =
-  | { id: string; kind: 'user'; text: string; ts: number; line?: number }
+  | {
+      id: string
+      kind: 'user'
+      text: string
+      ts: number
+      line?: number
+      /** 运行中作为 steer 插话注入（服务端 steered 帧回执标记）。 */
+      steered?: boolean
+      /** 纯图片消息的本地占位（服务端日志不持久化，无对应历史行）。 */
+      placeholder?: boolean
+    }
   | { id: string; kind: 'assistant'; text: string; ts: number; streaming?: boolean; line?: number }
   | { id: string; kind: 'thinking'; text: string; ts: number; streaming?: boolean; line?: number }
   | { id: string; kind: 'tool'; name: string; command?: string; output: string; ts: number }
@@ -321,5 +334,7 @@ export interface McpToolInfo {
 export interface CollabRoom {
   room_id: string
   key: string
+  /** 可写令牌（可写分享链接 ?wt= 用；只读 view 链接不携带）。 */
+  write_token: string
   ws_url: string
 }

@@ -12,6 +12,7 @@ import { createPortal } from 'react-dom'
 import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { clamp } from '@/lib/format'
+import { useI18n } from '@/lib/i18n'
 
 /**
  * Reusable UI primitives for the C5 console.
@@ -20,7 +21,7 @@ import { clamp } from '@/lib/format'
  */
 
 /* ------------------------------- tiny hooks ------------------------------- */
-export function useClickOutside<T extends HTMLElement>(
+function useClickOutside<T extends HTMLElement>(
   ref: React.RefObject<T>,
   handler: () => void,
 ) {
@@ -108,58 +109,6 @@ export function Button({
   )
 }
 
-/* ---------------------------------- Card ---------------------------------- */
-export function Card({
-  className,
-  children,
-  ...rest
-}: React.HTMLAttributes<HTMLDivElement>) {
-  return (
-    <div className={cn('card', className)} {...rest}>
-      {children}
-    </div>
-  )
-}
-
-export function CardHeader({
-  title,
-  subtitle,
-  icon,
-  action,
-  className,
-}: {
-  title: ReactNode
-  subtitle?: ReactNode
-  icon?: string
-  action?: ReactNode
-  className?: string
-}) {
-  return (
-    <div
-      className={cn(
-        'flex items-start justify-between gap-4 border-b border-border px-5 py-4',
-        className,
-      )}
-    >
-      <div className="flex items-start gap-3">
-        {icon && (
-          <span className="mt-0.5 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <Icon name={icon} size={18} />
-          </span>
-        )}
-        <div>
-          <h3 className="font-display text-[15px] font-semibold leading-tight text-text">
-            {title}
-          </h3>
-          {subtitle && (
-            <p className="mt-0.5 text-xs text-muted">{subtitle}</p>
-          )}
-        </div>
-      </div>
-      {action && <div className="shrink-0">{action}</div>}
-    </div>
-  )
-}
 
 /* --------------------------------- Badge ---------------------------------- */
 export type Tone =
@@ -227,37 +176,6 @@ export function Badge({
       {children}
     </span>
   )
-}
-
-/* ------------------------------ status meta ------------------------------- */
-// `label` 字段存 i18n key（见 lib/locales.ts），消费方用 useI18n().t(meta.label) 取本地化文案。
-export const runStatusMeta: Record<string, { label: string; tone: Tone; pulse?: boolean }> = {
-  running: { label: 'ui.status.running', tone: 'success', pulse: true },
-  pending: { label: 'ui.status.pending', tone: 'warning', pulse: true },
-  failed: { label: 'ui.status.failed', tone: 'danger' },
-  stopped: { label: 'ui.status.stopped', tone: 'neutral' },
-}
-export const healthMeta: Record<string, { label: string; tone: Tone }> = {
-  healthy: { label: 'ui.health.healthy', tone: 'success' },
-  degraded: { label: 'ui.health.degraded', tone: 'warning' },
-  down: { label: 'ui.health.down', tone: 'danger' },
-}
-export const deployMeta: Record<string, { label: string; tone: Tone; pulse?: boolean }> = {
-  success: { label: 'ui.status.success', tone: 'success' },
-  running: { label: 'ui.status.in_progress', tone: 'info', pulse: true },
-  failed: { label: 'ui.status.failed', tone: 'danger' },
-  cancelled: { label: 'ui.status.cancelled', tone: 'neutral' },
-}
-export const memberStatusMeta: Record<string, { label: string; tone: Tone }> = {
-  active: { label: 'ui.member.active', tone: 'success' },
-  invited: { label: 'ui.member.invited', tone: 'warning' },
-  suspended: { label: 'ui.member.suspended', tone: 'neutral' },
-}
-export const providerMeta: Record<string, { label: string; tone: Tone }> = {
-  aws: { label: 'AWS', tone: 'warning' },
-  gcp: { label: 'GCP', tone: 'info' },
-  azure: { label: 'Azure', tone: 'success' },
-  onprem: { label: 'ui.provider.onprem', tone: 'neutral' },
 }
 
 /* --------------------------------- Field ---------------------------------- */
@@ -341,26 +259,6 @@ export function Input({
   )
 }
 
-export function Textarea({
-  className,
-  invalid,
-  ...rest
-}: React.TextareaHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }) {
-  return (
-    <textarea
-      className={cn(
-        inputBase,
-        'min-h-[88px] resize-y px-3 py-2.5',
-        invalid
-          ? 'border-danger focus:border-danger focus:ring-danger/20'
-          : 'border-border focus:border-primary',
-        className,
-      )}
-      {...rest}
-    />
-  )
-}
-
 export function Select({
   className,
   invalid,
@@ -429,71 +327,6 @@ export function Switch({
   )
 }
 
-export function Checkbox({
-  checked,
-  onChange,
-  indeterminate = false,
-  'aria-label': ariaLabel,
-}: {
-  checked: boolean
-  onChange: (v: boolean) => void
-  indeterminate?: boolean
-  'aria-label'?: string
-}) {
-  return (
-    <button
-      type="button"
-      role="checkbox"
-      aria-checked={indeterminate ? 'mixed' : checked}
-      aria-label={ariaLabel}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[6px] border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
-        checked || indeterminate
-          ? 'border-primary bg-primary'
-          : 'border-border-strong bg-surface-2 hover:border-primary/60',
-      )}
-    >
-      <Icon
-        name={indeterminate ? 'minus' : 'check'}
-        size={13}
-        className="text-white dark:text-[#06241f]"
-        strokeWidth={3}
-      />
-    </button>
-  )
-}
-
-/* --------------------------------- Avatar --------------------------------- */
-export function Avatar({
-  name,
-  hue = 200,
-  size = 36,
-  className,
-}: {
-  name: string
-  hue?: number
-  size?: number
-  className?: string
-}) {
-  return (
-    <span
-      className={cn(
-        'inline-flex shrink-0 items-center justify-center rounded-full font-semibold text-white',
-        className,
-      )}
-      style={{
-        width: size,
-        height: size,
-        fontSize: size * 0.4,
-        background: `linear-gradient(135deg, hsl(${hue} 68% 46%), hsl(${(hue + 42) % 360} 70% 38%))`,
-      }}
-      title={name}
-    >
-      {name.trim().slice(0, 1)}
-    </span>
-  )
-}
 
 /* ------------------------------- ProgressBar ------------------------------ */
 export function ProgressBar({
@@ -531,44 +364,6 @@ export function ProgressBar({
   )
 }
 
-/* -------------------------------- Segmented ------------------------------- */
-export function Segmented<T extends string>({
-  options,
-  value,
-  onChange,
-  className,
-}: {
-  options: Array<{ value: T; label: string; icon?: string }>
-  value: T
-  onChange: (v: T) => void
-  className?: string
-}) {
-  return (
-    <div
-      className={cn(
-        'inline-flex items-center gap-1 rounded-xl border border-border bg-surface-2 p-1',
-        className,
-      )}
-    >
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          onClick={() => onChange(o.value)}
-          className={cn(
-            'inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-all',
-            value === o.value
-              ? 'bg-surface text-text shadow-soft'
-              : 'text-muted hover:text-text',
-          )}
-        >
-          {o.icon && <Icon name={o.icon} size={15} />}
-          {o.label}
-        </button>
-      ))}
-    </div>
-  )
-}
 
 /* ---------------------------------- Modal --------------------------------- */
 const modalSizes = {
@@ -597,7 +392,36 @@ export function Modal({
   footer?: ReactNode
   size?: keyof typeof modalSizes
 }) {
+  const { t } = useI18n()
+  const titleId = useId()
+  const dialogRef = useRef<HTMLDivElement>(null)
   useLockBody(open)
+  // 焦点管理：打开时移入对话框（键盘/读屏用户可直接 Tab 操作），关闭时归还给触发元素。
+  useEffect(() => {
+    if (!open) return
+    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    dialogRef.current?.focus()
+    return () => prev?.focus()
+  }, [open])
+  // 简易焦点陷阱：Tab 循环限制在对话框内，防止焦点落到背景内容上。
+  const trapTab = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Tab') return
+    const root = dialogRef.current
+    if (!root) return
+    const focusables = root.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )
+    if (focusables.length === 0) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault()
+      last.focus()
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault()
+      first.focus()
+    }
+  }
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -613,10 +437,14 @@ export function Modal({
         onClick={onClose}
       />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        tabIndex={-1}
+        onKeyDown={trapTab}
         className={cn(
-          'relative z-10 flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border bg-surface shadow-pop animate-scale-in sm:rounded-2xl',
+          'relative z-10 flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border bg-surface shadow-pop animate-scale-in outline-none sm:rounded-2xl',
           modalSizes[size],
         )}
       >
@@ -629,14 +457,14 @@ export function Modal({
             )}
             <div className="min-w-0 flex-1">
               {title && (
-                <h2 className="font-display text-base font-semibold text-text">{title}</h2>
+                <h2 id={titleId} className="font-display text-base font-semibold text-text">{title}</h2>
               )}
               {description && <p className="mt-0.5 text-xs text-muted">{description}</p>}
             </div>
             <button
               onClick={onClose}
               className="-mr-1 flex h-8 w-8 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface-2 hover:text-text"
-              aria-label="关闭"
+              aria-label={t('common.close')}
             >
               <Icon name="close" size={18} />
             </button>
@@ -669,11 +497,14 @@ export function Dropdown({
   trigger,
   items,
   align = 'right',
+  direction = 'down',
   panelClassName,
 }: {
   trigger: React.ReactElement
   items: MenuItem[]
   align?: 'left' | 'right'
+  /** Panel placement relative to the trigger: `up` for bottom-anchored toolbars. */
+  direction?: 'down' | 'up'
   panelClassName?: string
 }) {
   const [open, setOpen] = useState(false)
@@ -703,7 +534,8 @@ export function Dropdown({
         <div
           role="menu"
           className={cn(
-            'absolute z-50 mt-2 min-w-[12rem] origin-top rounded-xl border border-border bg-surface p-1.5 shadow-pop animate-scale-in',
+            'absolute z-50 min-w-[12rem] rounded-xl border border-border bg-surface p-1.5 shadow-pop animate-scale-in',
+            direction === 'up' ? 'bottom-full mb-2 origin-bottom' : 'mt-2 origin-top',
             align === 'right' ? 'right-0' : 'left-0',
             panelClassName,
           )}
@@ -798,83 +630,8 @@ export function EmptyState({
   )
 }
 
-export function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd className="inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded border border-border bg-surface-2 px-1.5 font-mono text-[11px] text-muted">
-      {children}
-    </kbd>
-  )
-}
-
-export function Tooltip({
-  label,
-  children,
-  side = 'top',
-}: {
-  label: string
-  children: ReactNode
-  side?: 'top' | 'bottom'
-}) {
-  return (
-    <span className="group/tt relative inline-flex">
-      {children}
-      <span
-        className={cn(
-          'pointer-events-none absolute left-1/2 z-50 -translate-x-1/2 whitespace-nowrap rounded-md border border-border bg-surface px-2 py-1 text-xs text-text shadow-pop transition-all duration-150 opacity-0 group-hover/tt:opacity-100',
-          side === 'top' ? 'bottom-full mb-1.5' : 'top-full mt-1.5',
-        )}
-      >
-        {label}
-      </span>
-    </span>
-  )
-}
 
 export function Divider({ className }: { className?: string }) {
   return <hr className={cn('border-border', className)} />
 }
 
-export function SegmentedTabs<T extends string>({
-  tabs,
-  value,
-  onChange,
-  className,
-}: {
-  tabs: Array<{ value: T; label: string; count?: number }>
-  value: T
-  onChange: (v: T) => void
-  className?: string
-}) {
-  return (
-    <div className={cn('flex items-center gap-1 overflow-x-auto no-scrollbar', className)}>
-      {tabs.map((t) => (
-        <button
-          key={t.value}
-          onClick={() => onChange(t.value)}
-          className={cn(
-            'relative whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-            value === t.value ? 'text-primary' : 'text-muted hover:text-text',
-          )}
-        >
-          {t.label}
-          {typeof t.count === 'number' && (
-            <span
-              className={cn(
-                'ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular',
-                value === t.value ? 'bg-primary/15 text-primary' : 'bg-surface-3 text-muted',
-              )}
-            >
-              {t.count}
-            </span>
-          )}
-          {value === t.value && (
-            <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-primary" />
-          )}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-// re-export useId consumers can import if needed
-export { useId }

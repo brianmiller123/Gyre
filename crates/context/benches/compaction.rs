@@ -52,6 +52,7 @@ fn tool_call(id: &str, name: &str) -> AgentMessage {
             id: id.into(),
             name: name.into(),
             arguments: serde_json::json!({}),
+            signature: None,
         }],
         usage: Usage::default(),
         model: "bench-model".into(),

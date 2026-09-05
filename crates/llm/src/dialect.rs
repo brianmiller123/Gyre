@@ -98,6 +98,7 @@ pub(crate) fn parse_tool_call_json(inner: &str, idx: usize) -> Option<ContentBlo
         id: format!("inband_{idx}"),
         name,
         arguments,
+        signature: None,
     })
 }
 
@@ -203,6 +204,7 @@ mod tests {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 assert!(id.starts_with("inband_"), "id 应为 inband 前缀: {id}");
                 assert_eq!(name, "read_file");

@@ -23,7 +23,7 @@ const accents = [
 /** Connection + appearance settings modal. */
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { settings, update } = useSettings()
-  const { disconnect, connect, clear, socks5Status, refreshSocks5Status, setSocks5Enabled, approvalModeStatus, refreshApprovalModeStatus, setApprovalMode } =
+  const { disconnect, connect, clear, sessionId, socks5Status, refreshSocks5Status, setSocks5Enabled, approvalModeStatus, refreshApprovalModeStatus, setApprovalMode } =
     useAgentSession()
   const { theme, setTheme } = useTheme()
   const { toast } = useNotifications()
@@ -44,7 +44,10 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
       void refreshSocks5Status()
       void refreshApprovalModeStatus()
     }
-  }, [open, settings, refreshSocks5Status, refreshApprovalModeStatus])
+    // 仅依赖 open 上升沿：面板打开期间 settings 的身份变化（如刷新回写）不得重置草稿
+    // 或触发重取——曾因把 settings 放进依赖造成无限刷新循环 + 用户输入被周期性回滚。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
 
   useEffect(() => {
     const saved = localStorage.getItem('agent-accent') || 'Teal'
@@ -82,10 +85,27 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   }
 
   function save() {
-    update(draft)
+    // 校验并归一服务地址：非法值绝不入库（曾因 Sidebar 渲染期 new URL() 抛异常导致全屏白屏）。
+    const raw = draft.serverUrl.trim()
+    if (raw) {
+      try {
+        // eslint-disable-next-line no-new
+        new URL(raw)
+      } catch {
+        toast({ title: t('settings.invalid_url'), body: raw, severity: 'danger' })
+        return
+      }
+    }
+    const next = raw ? raw : window.location.origin
+    // 同源保存时保留当前会话（resume 重建连接，model/mode 覆盖随查询串生效）；
+    // 跨服务器保存则开新会话（旧会话 id 在新服务器上不存在）。
+    const sameOrigin =
+      settings.serverUrl.replace(/\/$/, '') === next.replace(/\/$/, '')
+    const resume = sameOrigin ? (sessionId ?? undefined) : undefined
+    update({ ...draft, serverUrl: next })
     toast({ title: t('settings.saved'), severity: 'success' })
     disconnect()
-    setTimeout(() => void connect(), 60)
+    setTimeout(() => void connect(resume), 60)
     onClose()
   }
 

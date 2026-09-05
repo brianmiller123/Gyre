@@ -17,9 +17,9 @@ pub use approval::ApprovalModeController;
 pub use config::{
     AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config,
     EditToolsConfig, EvalConfig, GithubConfig, GoalsConfig, InterceptorConfig, McpConfig,
-    McpServerConfig, MemoryBackend, MemoryConfig, MinimizerConfig, ModelProfile, ServerConfig,
-    SkillsConfig, Socks5Config, SubagentConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig,
-    TtsrConfig, parse_compaction_backend, wildcard_match,
+    McpHttpConfig, McpServerConfig, McpStdioConfig, MemoryBackend, MemoryConfig, MinimizerConfig,
+    ModelProfile, ServerConfig, SkillsConfig, Socks5Config, SubagentConfig, ToolApproval,
+    ToolsConfig, ToolsSwitchConfig, TtsrConfig, parse_compaction_backend, wildcard_match,
 };
 pub use config::{CustomCommand, discover_commands, discover_context_files};
 pub use env::expand_env;

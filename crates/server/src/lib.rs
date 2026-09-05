@@ -1177,12 +1177,7 @@ async fn build_agent(
         tool_registry = tool_registry
             .with(Box::new(agent_tools::MemoryRecallTool::new(Arc::clone(m))))
             .with(Box::new(agent_tools::MemoryRetainTool::new(Arc::clone(m))))
-            .with(Box::new(agent_tools::MemoryReflectTool::new(
-                Arc::clone(m),
-                Arc::clone(&provider),
-                model.clone(),
-                provider_ctx.clone(),
-            )))
+            .with(Box::new(agent_tools::MemoryReflectTool::new(Arc::clone(m))))
             .with(Box::new(agent_tools::MemoryEditTool::new(Arc::clone(m))))
             .with(Box::new(agent_tools::MemoryLearnTool::new(Arc::clone(m))));
     }
@@ -3255,9 +3250,10 @@ async fn collab_ws_handler(
     State(state): State<SessionManager>,
     axum::extract::Query(auth): axum::extract::Query<SessionParams>,
 ) -> Response {
-    if let Err(resp) = check_auth(&state, &auth.token) {
-        return resp;
-    }
+    // 此处有意不做全局 check_auth：分享链接的访问控制 = 不可猜 room_id + E2E 房间密钥
+    // （# 片段，不发给服务器）+ 可写 wt。全局 auth token 是 host 的凭证，guest 不应
+    // 持有（否则等于交出完整 API 权限），此前在此校验会把所有 guest 挡成 401，
+    // 协同分享在鉴权部署下完全不可用。房间创建端点 GET /api/collab/room 仍要求鉴权。
     // 非 WS 请求（浏览器 GET，无 Upgrade 头）→ 渲染 guest 页面；否则升级为 WS 桥。
     let Some(ws) = ws.0 else {
         return (
@@ -3569,6 +3565,7 @@ mod tests {
                             id: "t1".into(),
                             name: "read_file".into(),
                             arguments: serde_json::json!({"path": "src/lib.rs"}),
+                            signature: None,
                         },
                     ],
                     usage: Usage::default(),
@@ -3897,11 +3894,13 @@ mod tests {
                     id: "t1".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "path": "a.rs" }),
+                    signature: None,
                 },
                 ContentBlock::ToolCall {
                     id: "t2".into(),
                     name: "run_command".into(),
                     arguments: serde_json::json!({ "cmd": "ls" }),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "done".into(),
@@ -3940,6 +3939,7 @@ mod tests {
                     id: "t3".into(),
                     name: "write_file".into(),
                     arguments: serde_json::json!({}),
+                    signature: None,
                 }],
                 usage: Usage {
                     input_tokens: 10,

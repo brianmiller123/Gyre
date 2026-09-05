@@ -148,16 +148,18 @@ pub fn run_loop(
             }
         }
         context.set_system(system, &specs0).await;
-        // Magic keywords：散文词命中 → 隐藏通知先于用户消息注入；`ultrathink` 额外拉满
-        // 思考预算（见下方 thinking 解析）。`workflowz` 需要 task 工具在场。
+        // Magic keywords：散文词命中 → 隐藏系统通知**后于**用户消息注入（对齐 omp
+        // agent-session.ts:5797-5801：通知追加在用户消息之后，模型先读用户原话再看
+        // steering 提示）；`ultrathink` 额外拉满思考预算（见下方 thinking 解析）。
+        // `workflowz` 需要 task 工具在场。
         let has_task_tool = specs0.iter().any(|s| s.name == "task");
         let keyword_detect = keywords::detect(&prompt_text, has_task_tool);
+        context.append(agent_core::AgentMessage::User(user_msg)).await;
         for notice in &keyword_detect.notices {
             context
                 .append(agent_core::AgentMessage::user_text(notice.clone()))
                 .await;
         }
-        context.append(agent_core::AgentMessage::User(user_msg)).await;
         yield AgentEvent::StateChanged(AgentState::Running);
 
         // TTSR：恢复会话中已注入的规则抑制状态（扫描 `[ttsr-injection:…]` 标记消息）。
@@ -836,7 +838,7 @@ pub fn run_loop(
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolCall { id, name, arguments } => {
+                    ContentBlock::ToolCall { id, name, arguments, .. } => {
                         Some((id.clone(), name.clone(), arguments.clone()))
                     }
                     _ => None,

@@ -626,6 +626,7 @@ fn build_glm_message(
             id,
             name,
             arguments,
+            signature: None,
         });
     }
     // P2-P：content_filter → Error + sensitive（GLM/Z.ai OpenAI 兼容，含 content_filter）。
@@ -863,6 +864,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path":"a.rs"}),
+                    signature: None,
                 },
             ],
         }];
@@ -884,6 +886,7 @@ mod tests {
                     id: "c1".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path":"x"}),
+                    signature: None,
                 }],
             },
             ProviderMessage::Tool {

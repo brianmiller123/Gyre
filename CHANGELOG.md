@@ -18,6 +18,10 @@
 - `.config/nextest.toml`：`retries = 0`（flaky 是 bug，不是遮羞布）、fail-fast 关闭、慢测试 60s 预警。
 - `run_command` 工具参数：`cwd`（相对工作区根解析、须为已存在目录）、`env`（键名合法性校验）、
   `timeout`（1–3600s，`0` = 不限时，默认 120s）。
+- MCP Streamable HTTP 传输：`[mcp.servers.<name>]` 支持 `url` + `headers`（值经 `${ENV}` 展开）
+  双形态配置（含 `command` 即 stdio 向后兼容 / 含 `url` 即 http）；JSON 与 SSE 两种响应、
+  `Mcp-Session-Id` 会话保持、`MCP-Protocol-Version` 握手后携带、`close` 发 DELETE 终止会话；
+  `mcpCapabilities.http` 能力声明改为 `true`，README 三语与 `config.example.toml` 同步。
 - 危险命令硬拦截清单：移植上游 `CRITICAL_BASH_PATTERNS` 21 条（`rm -rf /`、`--no-preserve-root`、
   fork 炸弹、dd/mkfs/shred、`> /etc/passwd`、`curl | sh` 及进程替换/eval 变体、关机、`nc -e` 等），
   命中即拒并附原因提示。
@@ -55,6 +59,9 @@
   宿主大小写变体键再写入。
 - 超限输出从「一刀切截断尾部」改为 head+tail 中段省略（头部 60% + 尾部 25%，UTF-8 边界与行首
   对齐，附省略字节数提示）。
+- WebUI 模型切换器迁移：从顶栏移至消息输入框正上方的工具栏（`ModelSwitcher` 组件，向上展开的下拉
+  菜单，醒目显示当前模型）；重复点击当前模型不再误开新会话；运行面板（Inspector）模型列表改为
+  只读状态展示，全站唯一切换入口（工具栏 + `/model` 命令），四语文案同步清理。
 - 移除 29 个 crate `lib.rs` 中与 workspace lints 冲突的 `#![warn(clippy::pedantic)]` /
   `#![warn(missing_docs)]` 属性墙（属性级别高于 Cargo.toml 配置，会架空整份 allow 名单）；
   lint 政策收敛到根 `Cargo.toml` 单一事实源。`core` 的 `missing_docs` 门禁经核实零告警，保留。

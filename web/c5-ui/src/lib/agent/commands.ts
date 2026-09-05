@@ -13,10 +13,13 @@ import { formatNumber } from '@/lib/format'
 
 /**
  * Slash-command registry for the composer. The agent server accepts
- * `new_task` / `respond` / `cancel` / `compact`, so these are client-side actions that
- * mutate UI/session state (clear, switch model/mode, open panels, …) or issue REST
- * fetches (skills / mcp / collab). They mirror the CLI REPL commands where it makes sense.
+ * free-form text; slash commands are intercepted client-side and mapped to
+ * context actions (or skill/command bodies sent as tasks).
+ *
+ * 所有用户可见文案必须经 `ctx.t()`（locales `cmd.*` 键）——desc 存原文兜底，
+ * 内置命令同时给 descKey 供菜单本地化渲染。
  */
+
 export interface CommandContext {
   clear: () => void
   newChat: () => void
@@ -56,11 +59,18 @@ export interface CommandContext {
   usage: Usage
   /** 上下文窗口 token 占比（/status 展示用）。 */
   contextUsage: { current: number; limit: number } | null
+  /** 本地化函数：命令输出一律走它，禁止硬编码文案。 */
+  t: (key: string, args?: Record<string, unknown>) => string
 }
 
 export interface Command {
   name: string
+  /** 兜底原文（服务端自定义命令的描述，语言不可控）。 */
   desc: string
+  /** 内置命令的 locales 键，菜单渲染优先于 desc。 */
+  descKey?: string
+  /** descKey 的插值参数。 */
+  descArgs?: Record<string, unknown>
   /** Fixed argument choices (e.g. modes). */
   choices?: string[]
   /** Whether arguments come from the model list. */
@@ -75,65 +85,77 @@ const MODES: Mode[] = ['code', 'architect', 'ask', 'debug']
 export const commands: Command[] = [
   {
     name: 'help',
-    desc: '显示可用命令',
-    run: (c) =>
-      c.say(
-        '可用命令：/status /clear /new /cancel /mode /model /compact /skills /skill /mcp /collab /fork /files /settings /help — 输入 `/` 触发菜单',
-        'info',
-      ),
+    desc: 'Show available commands',
+    descKey: 'cmd.help.desc',
+    run: (c) => c.say(c.t('cmd.help.body'), 'info'),
   },
   {
     name: 'status',
-    desc: '查看会话状态与用量',
+    desc: 'Show session status and usage',
+    descKey: 'cmd.status.desc',
     run: (c) => c.say(renderStatus(c), 'info'),
   },
-  { name: 'clear', desc: '清空当前对话', run: (c) => { c.clear(); c.say('对话已清空', 'success') } },
-  { name: 'new', desc: '新建会话', run: (c) => c.newChat() },
-  { name: 'cancel', desc: '停止当前任务', run: (c) => c.cancel() },
-  { name: 'files', desc: '打开文件浏览', run: (c) => c.openWorkspace() },
-  { name: 'settings', desc: '打开设置', run: (c) => c.openSettings() },
+  {
+    name: 'clear',
+    desc: 'Clear the conversation',
+    descKey: 'cmd.clear.desc',
+    run: (c) => {
+      c.clear()
+      c.say(c.t('cmd.clear.done'), 'success')
+    },
+  },
+  { name: 'new', desc: 'New session', descKey: 'cmd.new.desc', run: (c) => c.newChat() },
+  { name: 'cancel', desc: 'Stop the current task', descKey: 'cmd.cancel.desc', run: (c) => c.cancel() },
+  { name: 'files', desc: 'Open file browser', descKey: 'cmd.files.desc', run: (c) => c.openWorkspace() },
+  { name: 'settings', desc: 'Open settings', descKey: 'cmd.settings.desc', run: (c) => c.openSettings() },
   {
     name: 'compact',
-    desc: '压缩上下文（shake + summarize + prune）',
+    desc: 'Compact context (shake + summarize + prune)',
+    descKey: 'cmd.compact.desc',
     run: (c) => {
       c.compact()
-      c.say('正在压缩上下文…', 'info')
+      c.say(c.t('cmd.compact.started'), 'info')
     },
   },
   {
     name: 'fork',
-    desc: '复制当前会话为新会话',
+    desc: 'Fork the current session',
+    descKey: 'cmd.fork.desc',
     run: (c) => {
       c.forkSession()
-      c.say('已 fork 当前会话', 'success')
+      c.say(c.t('cmd.fork.done'), 'success')
     },
   },
   {
     name: 'skills',
-    desc: '列出已加载 skill',
+    desc: 'List loaded skills',
+    descKey: 'cmd.skills.desc',
     run: async (c) => {
       const list = await c.fetchSkills()
       if (!list.length) {
-        c.say('（未加载 skill）', 'info')
+        c.say(c.t('cmd.skills.empty'), 'info')
         return
       }
       c.say(
-        'Skills：\n' + list.map((s) => `- ${s.name} [${s.level}] ${s.description}`).join('\n'),
+        c.t('cmd.skills.list', {
+          list: list.map((s) => `- ${s.name} [${s.level}] ${s.description}`).join('\n'),
+        }),
         'info',
       )
     },
   },
   {
     name: 'skill',
-    desc: '注入指定 skill 正文（/skill <名称>）',
+    desc: 'Inject a skill body (/skill <name>)',
+    descKey: 'cmd.skill.desc',
     run: async (c, arg) => {
       if (!arg) {
-        c.say('用法：/skill <名称>（/skills 查看列表）', 'warning')
+        c.say(c.t('cmd.skill.usage'), 'warning')
         return
       }
       const body = await c.fetchSkillBody(arg)
       if (body == null) {
-        c.say(`未知 skill：${arg}`, 'warning')
+        c.say(c.t('cmd.skill.unknown', { name: arg }), 'warning')
         return
       }
       c.send(body)
@@ -141,82 +163,89 @@ export const commands: Command[] = [
   },
   {
     name: 'mcp',
-    desc: '列出已加载 MCP 工具',
+    desc: 'List loaded MCP tools',
+    descKey: 'cmd.mcp.desc',
     run: async (c) => {
       const list = await c.fetchMcp()
       if (!list.length) {
-        c.say('（未加载 MCP server）', 'info')
-        return
-      }
-      c.say('MCP 工具：\n' + list.map((t) => `- ${t.name}  ${t.description}`).join('\n'), 'info')
-    },
-  },
-  {
-    name: 'collab',
-    desc: '生成端到端加密协同房间',
-    run: async (c) => {
-      const r = await c.newCollabRoom()
-      if (!r) {
-        c.say('生成协同房间失败', 'danger')
+        c.say(c.t('cmd.mcp.empty'), 'info')
         return
       }
       c.say(
-        `协同房间（AES-256-GCM）\n房间 id：${r.room_id}\n密钥：${r.key}\n分享链接：${c.serverOrigin}/#${r.key}`,
-        'success',
+        c.t('cmd.mcp.list', { list: list.map((tl) => `- ${tl.name}  ${tl.description}`).join('\n') }),
+        'info',
       )
     },
   },
   {
+    name: 'collab',
+    desc: 'Create an end-to-end encrypted collab room',
+    descKey: 'cmd.collab.desc',
+    run: async (c) => {
+      const r = await c.newCollabRoom()
+      if (!r) {
+        c.say(c.t('cmd.collab.failed'), 'danger')
+        return
+      }
+      // guest 页在后端 /collab/{room_id}：路径带房间 id，?wt= 决定可写，# 片段携带
+      // E2E 房间密钥（不发给服务器）。此前生成的 /#key 链接无人消费，guest 无法加入。
+      const share = `${c.serverOrigin}/collab/${r.room_id}?wt=${r.write_token}#${r.key}`
+      c.say(c.t('cmd.collab.room', { id: r.room_id, key: r.key, url: share }), 'success')
+    },
+  },
+  {
     name: 'mode',
-    desc: '切换模式（code / architect / ask / debug）',
+    desc: 'Switch mode (code / architect / ask / debug)',
+    descKey: 'cmd.mode.desc',
     choices: MODES,
     run: (c, arg) => {
       const m = (MODES as string[]).includes(arg) ? (arg as Mode) : c.mode
       c.switchMode(m)
-      c.say(`模式已设为 ${m}（重连会话以应用）`, 'success')
+      c.say(c.t('cmd.mode.set', { mode: m }), 'success')
     },
   },
   {
     name: 'model',
-    desc: '切换模型（开始新对话）',
+    desc: 'Switch model (starts a new conversation)',
+    descKey: 'cmd.model.desc',
     choicesFromModels: true,
     run: (c, arg) => {
       const aliases = c.models.map((m) => m.alias)
       if (!arg || !aliases.includes(arg)) {
-        c.say(`用法：/model <${aliases.join(' | ')}>`, 'warning')
+        c.say(c.t('cmd.model.usage', { aliases: aliases.join(' | ') }), 'warning')
         return
       }
       c.switchModel(arg === aliases[0] ? null : arg)
-      c.say(`已切换模型：${arg}`, 'success')
+      c.say(c.t('cmd.model.switched', { name: arg }), 'success')
     },
   },
 ]
 
 /** 渲染 `/status` 文本快照（模型 / 模式 / 会话 / 上下文窗口 / token 用量 / 花费）。 */
 function renderStatus(c: CommandContext): string {
-  const lines: string[] = ['📊 状态概览']
-  lines.push(`模型：${c.currentModel?.id ?? '—'}`)
-  lines.push(`模式：${c.mode}`)
-  lines.push(`会话：${c.sessionId ?? '—'}`)
-  lines.push(`状态：${c.state}`)
+  const lines: string[] = [c.t('cmd.status.title')]
+  lines.push(c.t('cmd.status.model', { v: c.currentModel?.id ?? '—' }))
+  lines.push(c.t('cmd.status.mode', { v: c.mode }))
+  lines.push(c.t('cmd.status.session', { v: c.sessionId ?? '—' }))
+  lines.push(c.t('cmd.status.state', { v: String(c.state) }))
   if (c.contextUsage && c.contextUsage.limit > 0) {
     const { current, limit } = c.contextUsage
     const pct = (current / limit) * 100
     lines.push('')
     lines.push(
-      `上下文窗口：${formatNumber(current)} / ${formatNumber(limit)}（${pct.toFixed(1)}%）`,
+      c.t('cmd.status.ctx', { cur: formatNumber(current), limit: formatNumber(limit), pct: pct.toFixed(1) }),
     )
     lines.push(renderBar(pct, 24))
   }
   const u = c.usage
   lines.push('')
-  lines.push('Token 用量')
-  lines.push(`  输入：${formatNumber(u.input_tokens)}`)
-  lines.push(`  输出：${formatNumber(u.output_tokens)}`)
-  lines.push(`  缓存读：${formatNumber(u.cache_read_tokens)}`)
-  lines.push(`  缓存写：${formatNumber(u.cache_write_tokens)}`)
+  lines.push(c.t('cmd.status.usage'))
+  lines.push(c.t('cmd.status.input', { v: formatNumber(u.input_tokens) }))
+  lines.push(c.t('cmd.status.output', { v: formatNumber(u.output_tokens) }))
+  lines.push(c.t('cmd.status.cache_read', { v: formatNumber(u.cache_read_tokens) }))
+  lines.push(c.t('cmd.status.cache_write', { v: formatNumber(u.cache_write_tokens) }))
   if (u.cost_usd > 0) {
-    lines.push(`累计花费：$${u.cost_usd.toFixed(6)}`)
+    lines.push(c.t('cmd.status.cost', { v: u.cost_usd.toFixed(6) }))
   }
   return lines.join('\n')
 }
@@ -234,7 +263,9 @@ function renderBar(pct: number, width: number): string {
 export function customCommandsToCommands(custom: CustomCommandInfo[]): Command[] {
   return custom.map((cc) => ({
     name: cc.name,
-    desc: cc.description || `自定义命令 /${cc.name}`,
+    ...(cc.description
+      ? { desc: cc.description }
+      : { desc: '', descKey: 'cmd.custom.desc', descArgs: { name: cc.name } }),
     run: (c, arg) => {
       c.send(arg ? `${cc.body}\n\n# 命令参数\n${arg}` : cc.body)
     },

@@ -1,9 +1,10 @@
 import { createPortal } from 'react-dom'
-import type { Severity } from '@/types'
+import type { Severity } from '@/lib/agent/types'
 import { Icon } from '@/components/icons'
 import { useNotifications, type Toast } from '@/lib/notifications'
 import { cn } from '@/lib/cn'
 
+import { useI18n } from '@/lib/i18n'
 const toastMeta: Record<Severity, { icon: string; ring: string; text: string }> = {
   success: { icon: 'check-circle', ring: 'bg-success', text: 'text-success' },
   info: { icon: 'info', ring: 'bg-info', text: 'text-info' },
@@ -26,6 +27,7 @@ export function Toaster() {
 }
 
 function ToastCard({ toast, onClose }: { toast: Toast; onClose: () => void }) {
+  const { t } = useI18n()
   const meta = toastMeta[toast.severity]
   return (
     <div
@@ -43,7 +45,7 @@ function ToastCard({ toast, onClose }: { toast: Toast; onClose: () => void }) {
       <button
         onClick={onClose}
         className="absolute right-2 top-2.5 flex h-6 w-6 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-text"
-        aria-label="关闭"
+        aria-label={t('common.close')}
       >
         <Icon name="close" size={15} />
       </button>

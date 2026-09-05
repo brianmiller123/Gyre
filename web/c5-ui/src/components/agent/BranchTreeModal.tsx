@@ -82,7 +82,9 @@ export function BranchTreeModal({
 
   const onSwitch = async (leafId: string) => {
     setBusyLeaf(leafId)
-    const res = await switchBranch(leafId, handoff)
+    // 显式传目标会话：模态框浏览的是 sessionId 的分支树，切换必须作用于同一会话，
+    // 否则会把续写点错落到当前活跃会话上。
+    const res = await switchBranch(leafId, handoff, sessionId)
     setBusyLeaf(null)
     if (res.ok) {
       toast({ title: t('branches.switched'), severity: 'success' })
@@ -173,7 +175,7 @@ function BranchNodeView({
   leafSet: Set<string>
   busyLeaf: string | null
   onSwitch: (leafId: string) => void
-  t: (key: string, args?: Record<string, string | number>) => string
+  t: (key: string, args?: Record<string, unknown>) => string
 }) {
   const kids = childrenOf.get(node.id) ?? []
   const isActive = node.id === activeId
@@ -216,7 +218,7 @@ function BranchNodeView({
             {node.preview || t('branches.no_preview')}
           </span>
           <span className="text-[9px] uppercase tracking-wide text-muted/70">
-            {roleLabel(node.role)}
+            {roleLabel(node.role, t)}
             {isLeaf && kids.length === 0 ? '' : ''}
           </span>
         </span>
@@ -262,19 +264,22 @@ function BranchNodeView({
   )
 }
 
-/** 角色的人类可读标签。 */
-function roleLabel(role: string): string {
+/** 角色的人类可读标签（t 由组件注入）。 */
+function roleLabel(
+  role: string,
+  t: (key: string, args?: Record<string, unknown>) => string,
+): string {
   switch (role) {
     case 'user':
-      return '用户'
+      return t('branches.role.user')
     case 'assistant':
-      return '助手'
+      return t('branches.role.assistant')
     case 'tool':
-      return '工具'
+      return t('branches.role.tool')
     case 'status':
-      return '状态'
+      return t('branches.role.status')
     case 'ask':
-      return '询问'
+      return t('branches.role.ask')
     default:
       return role
   }
