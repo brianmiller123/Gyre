@@ -13,6 +13,7 @@
 //! - [`platform`] —— 跨平台路径与编译守卫
 //! - [`skill`] —— file-backed skill 端口（[`SkillProvider`](skill::SkillProvider) / [`SkillResolver`](skill::SkillResolver)）
 //! - [`resource`] —— 外部资源读取端口（[`ResourceResolver`](resource::ResourceResolver)，`mcp://` 路由用）
+//! - [`secrets`] —— 管线级密钥双向脱敏（[`SecretsObfuscator`](secrets::SecretsObfuscator)）
 //!
 //! 解耦保证：本 crate 不依赖 `reqwest`/`tokio`/`tree-sitter` 等任何具体实现。
 
@@ -27,8 +28,11 @@ pub mod llm;
 pub mod memory;
 pub mod message;
 pub mod model;
+pub mod oauth_callback;
 pub mod platform;
+pub mod prompt_sections;
 pub mod resource;
+pub mod secrets;
 pub mod skill;
 pub mod tool;
 pub mod workspace;
@@ -52,7 +56,11 @@ pub use message::{
 };
 pub use model::{Api, Model};
 pub use platform::{config_dir, forced_utf8_locale};
+pub use prompt_sections::{
+    DELEGATION_SECTION, DELIVERY_SECTION, TOOL_POLICY_SECTION, WORKFLOW_SECTION,
+};
 pub use resource::{ResourceEntry, ResourceError, ResourceResolver};
+pub use secrets::SecretsObfuscator;
 pub use skill::{
     Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillResolver, SkillSource,
 };

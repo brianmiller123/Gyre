@@ -4,11 +4,12 @@ use super::{
     Agent, AgentEvent, AgentMessage, AgentRunSummary, AgentState, ApprovalDecision, Arc, AskKind,
     AskMessage, AskResponse, AssistantEvent, AssistantMessage, CancellationToken,
     CompactionStrategy, CompletionRequest, Concurrency, ContentBlock, ContextManager, Hook,
-    HookEvent, Instrument, InterruptMode, MAX_HARMONY_ABORT_RETRY, MAX_HARMONY_TRUNCATE_RESUME,
-    MAX_PAUSED_CONTINUATIONS, MAX_SOFT_TOOL_ESCALATIONS, SoftToolRequirement, StatusKind,
-    StatusMessage, StopReason, StreamExt, ThinkingConfig, ToolChoice, ToolChoiceDirective,
-    ToolContext, ToolRegistry, ToolResult, ToolResultMessage, Usage, approval_prompt,
-    fire_on_turn_end, harmony, keywords, prepend_reminder, render_skills_section,
+    HookEvent, Instrument, InterruptMode, MAX_EMPTY_STOP_RETRIES, MAX_HARMONY_ABORT_RETRY,
+    MAX_HARMONY_TRUNCATE_RESUME, MAX_PAUSED_CONTINUATIONS, MAX_SOFT_TOOL_ESCALATIONS,
+    SoftToolRequirement, StatusKind, StatusMessage, StopReason, StreamExt, ThinkingConfig,
+    ToolChoice, ToolChoiceDirective, ToolContext, ToolRegistry, ToolResult, ToolResultMessage,
+    Usage, approval_prompt, fire_on_turn_end, harmony, keywords, prepend_reminder,
+    render_skills_section,
 };
 
 /// 首轮查询驱动召回的上限（对齐 mnemopi `recallLimit` 默认 8）。
@@ -77,10 +78,13 @@ pub fn run_loop(
     // 合并冲突注册表（`read_file :conflicts` 注册 / `write_file conflict://N` 解决）。
     let conflicts = Arc::clone(&agent.conflicts);
     let pending_rewrites = Arc::clone(&agent.pending_rewrites);
+    // 会话级文本快照存储（可选；Arc clone 廉价，工具批执行时注入 ToolContext::snapshots）。
+    let snapshot_store = agent.snapshot_store.clone();
     // P2：模型 fallback 链 + key 轮换环（Arc clone 廉价；stream! 内每轮尝试链/取 key）。
     let fallbacks = agent.fallbacks.clone();
     let key_rings = Arc::clone(&agent.key_rings);
-
+    // 密钥脱敏器（可选；会话级映射表随 Agent 生命周期，跨 run 复用同一实例）。
+    let secrets = agent.secrets.clone();
     async_stream::stream! {
         // P1-D：GenAI invoke_agent span（OTel 语义规范）——agent run 的逻辑根 span。
         // async_stream! 内 yield 不能放入嵌套 async block（无法 Instrument 覆盖含 yield 的整段），
@@ -198,6 +202,8 @@ pub fn run_loop(
         let mut mistakes: usize = 0;
         // pause_turn 连续重采样计数（见 MAX_PAUSED_CONTINUATIONS）。
         let mut paused_continuations: usize = 0;
+        // 空回复有界重试计数（见 MAX_EMPTY_STOP_RETRIES；非空轮次重置）。
+        let mut empty_stop_retries: usize = 0;
         // P0-C：Harmony 泄漏双计数器（truncate-resume / abort-retry，各自独立上限）。
         let mut harmony_truncate_resume: usize = 0;
         let mut harmony_retry: usize = 0;
@@ -428,7 +434,14 @@ pub fn run_loop(
             let req = CompletionRequest {
                 model: model.clone(),
                 system: built.system.clone(),
-                messages: built.messages,
+                // 密钥出向脱敏（provider 边界；omp `obfuscateProviderContext` 同语义）：
+                // 会话上下文始终存明文（transcript/压缩/显示不受影响），仅请求出进程前
+                // 将命中密钥替换为 `<secret:N>` HMAC 占位符——User 文本 / Tool 结果 /
+                // Assistant 重放（文本+参数）统一覆盖，`None`（off）时直通。
+                messages: match &secrets {
+                    Some(s) => s.obfuscate_provider_messages(built.messages),
+                    None => built.messages,
+                },
                 tools: specs.clone(),
                 tool_choice: soft_tool_choice.clone(),
                 max_tokens,
@@ -715,6 +728,12 @@ pub fn run_loop(
             // 移植 oh-my-pi `transformAssistantMessage`：host 闭包原地改写 text / tool_call
             // args（宏展开、脱敏、归一化）。单一真相源——下游 context/UI/tools 都看改写后。
             let mut assistant = assistant;
+            // 密钥入向还原（须在持久化与工具分发**前**——放在 P1-M transform 之前的单一
+            // 真相源点位）：模型回显的 `<secret:N>` 还原为明文，context 持久化、MessageEnd、
+            // 工具参数分发全部看到真实字节；下一轮重放时出向 transform 再统一脱敏（闭环）。
+            if let Some(s) = &secrets {
+                s.restore_assistant_message(&mut assistant);
+            }
             if let Some(tf) = &transform_assistant {
                 tf(&mut assistant);
             }
@@ -870,6 +889,52 @@ pub fn run_loop(
                 }
             }
 
+            // P0：空回复有界重试（移植 oh-my-pi turn-recovery 的 empty-stop retry，
+            // EMPTY_STOP_MAX_RETRIES=3）。普通停止（`Stop`/孤立 `ToolUse`）却无任何可交付
+            // 内容（无文本、无工具调用）时：不持久化空 assistant（对齐 omp
+            // dropAssistantTurn——避免重试后上下文堆积空消息）、注入 user 角色续跑提醒后
+            // 重采样。cancel / deadline 时不重试（保持中止语义）；连续超限则按现状完成
+            //（落到下方正常收尾路径）。
+            let deadline_exceeded_now =
+                deadline_at.is_some_and(|d| std::time::Instant::now() >= d);
+            if is_empty_assistant_stop(&assistant)
+                && tool_calls.is_empty()
+                && !cancel.is_cancelled()
+                && !deadline_exceeded_now
+            {
+                if empty_stop_retries < MAX_EMPTY_STOP_RETRIES {
+                    empty_stop_retries += 1;
+                    yield AgentEvent::Say(StatusMessage {
+                        text: format!(
+                            "检测到空回复，重试 {empty_stop_retries}/{MAX_EMPTY_STOP_RETRIES}"
+                        ),
+                        kind: StatusKind::Warning,
+                    });
+                    context
+                        .append(agent_core::AgentMessage::user_text(format!(
+                            "<system-injection>\n\
+                             上一轮未产出任何可交付内容（无文本、无工具调用）即停止，任务尚未完成。\
+                             请继续：给出用户可见的最终回答，或发起下一个必需的工具调用。\
+                             （Attempt #{empty_stop_retries}/{MAX_EMPTY_STOP_RETRIES}）\n\
+                             </system-injection>"
+                        )))
+                        .await;
+                    // P1-E：空回复重试，turn 结束 → 继续（本轮 assistant 未入 context）。
+                    yield AgentEvent::TurnEnd {
+                        message: assistant.clone(),
+                        tool_results: std::mem::take(&mut turn_tool_results),
+                        will_continue: true,
+                    };
+                    continue;
+                }
+                yield AgentEvent::Say(StatusMessage {
+                    text: format!("空回复重试达上限（{MAX_EMPTY_STOP_RETRIES}），按完成停止"),
+                    kind: StatusKind::Warning,
+                });
+            } else {
+                // 非空轮次重置计数（对齐 omp `#emptyStopRetryCount = 0`）。
+                empty_stop_retries = 0;
+            }
             context
                 .append(agent_core::AgentMessage::Assistant(assistant.clone()))
                 .await;
@@ -1374,8 +1439,9 @@ pub fn run_loop(
                 conflicts: Some(&conflicts),
                 pending_rewrites: Some(&pending_rewrites),
                 context: Some(context.as_ref()),
+                snapshots: snapshot_store.as_ref(),
+                tool_call_id: None,
             };
-            // 调度执行（Shared 并发 / Exclusive 屏障串行），结果按原始顺序返回。
             // Immediate 模式 + batch 含 interruptible 工具时，边执行边轮询 steering 队列，
             // 命中即 batch_token.cancel() 中断在途工具（移植 oh-my-pi `watchSteeringWhileRunning`）。
             // 用 async 块统一两分支的 future 类型，便于下方 select! 边等边 drain partial。
@@ -1561,7 +1627,25 @@ pub async fn run_pending_task(
     }
     // P1-D：catch_unwind 防 `tool.execute` panic（第三方工具/MCP 的 unwrap None、越界等失控）
     // 传播终止整个 agent run。panic 归一化为不可恢复 Error result（不污染会话文件、不悬空）。
-    let outcome = std::panic::AssertUnwindSafe(tool.execute(task.args.clone(), tcx))
+    // 契约#2：按工具调用派生上下文——`tool_call_id` 绑定单次调用，工具发 partial 时据此
+    // 与 ToolExecutionStart/End 配对；其余字段照抄批次级引用（全为 Copy 引用，构造廉价）。
+    // cancel 语义不变：仍指向批次级 token（run 级取消 / steering 中断对批内工具共享生效）。
+    let call_tcx = ToolContext {
+        workspace: tcx.workspace,
+        approval: tcx.approval,
+        cancel: tcx.cancel,
+        skills: tcx.skills,
+        memory: tcx.memory,
+        resources: tcx.resources,
+        write_effect: tcx.write_effect,
+        update_tx: tcx.update_tx,
+        conflicts: tcx.conflicts,
+        pending_rewrites: tcx.pending_rewrites,
+        context: tcx.context,
+        snapshots: tcx.snapshots,
+        tool_call_id: Some(&task.id),
+    };
+    let outcome = std::panic::AssertUnwindSafe(tool.execute(task.args.clone(), &call_tcx))
         .catch_unwind()
         .await;
     let (mut result, mistake_inc) = match outcome {
@@ -1656,6 +1740,26 @@ pub async fn run_batch(
         (t.order, t.id.clone(), t.name.clone(), result, mistake_inc)
     });
     futures::future::join_all(futs).await
+}
+
+/// 空停止判定（移植 oh-my-pi `isEmptyAssistantStop`）：`Stop` / 孤立 `ToolUse` 停止却无
+/// 任何可交付内容——文本块全空白、thinking 无签名（不可回放），且无工具调用。其余停止
+/// 原因不算空停止：Length 截断 / 流中断有专属续写路径，Error / Aborted / Pause 各有分支。
+fn is_empty_assistant_stop(msg: &AssistantMessage) -> bool {
+    if !matches!(
+        msg.stop_reason,
+        Some(StopReason::Stop | StopReason::ToolUse)
+    ) {
+        return false;
+    }
+    !msg.content.iter().any(|b| match b {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        // thinking 仅在携带签名（可回放校验）时算可交付内容（对齐 omp isActionableContent）。
+        ContentBlock::Thinking { signature, .. } => {
+            signature.as_deref().is_some_and(|s| !s.trim().is_empty())
+        }
+        ContentBlock::ToolCall { .. } => true,
+    })
 }
 
 /// Immediate 模式下轮询 steering 队列的间隔（移植 oh-my-pi `STEERING_INTERRUPT_POLL_MS`）。

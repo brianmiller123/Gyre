@@ -1,4 +1,3 @@
-import { useMemo } from 'react'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { SubAgentMonitor } from '@/components/agent/SubAgentMonitor'
 import { useSettings } from '@/lib/settings'
@@ -20,7 +19,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
     models,
     currentModel,
     stats,
-    items,
+    lastDone,
     agents,
     connect,
     newChat,
@@ -30,8 +29,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
 
-  // 流式期间 items 高频变化：记忆化避免每次渲染 O(n) 反转拷贝。
-  const lastDone = useMemo(() => [...items].reverse().find((i) => i.kind === 'done'), [items])
+  // lastDone 由 provider 记忆化（done 边界才换身份）：本组件流式期间不再随 items 重渲染。
   const totalTokens = usage.input_tokens + usage.output_tokens
 
   return (
@@ -54,12 +52,12 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
             </Badge>
           </Row>
           <Row label={t('inspector.server')}>
-            <span className="max-w-[150px] truncate font-mono text-[11px] text-text-2">
+            <span className="max-w-[150px] truncate font-mono text-2xs text-text-2">
               {settings.serverUrl || '—'}
             </span>
           </Row>
           <Row label={t('inspector.session')}>
-            <span className="max-w-[150px] truncate font-mono text-[11px] text-text-2">
+            <span className="max-w-[150px] truncate font-mono text-2xs text-text-2">
               {sessionId ? sessionId.slice(0, 13) + '…' : '—'}
             </span>
           </Row>
@@ -82,7 +80,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
               {t(meta.label)}
             </Badge>
           </div>
-          <p className="mt-1.5 text-[11px] text-muted">{t(meta.desc)}</p>
+          <p className="mt-1.5 text-2xs text-muted">{t(meta.desc)}</p>
         </Section>
 
         {/* Usage */}
@@ -163,10 +161,10 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
                       {active && <Icon name="check" size={12} />}
                       <span className="truncate">{m.alias}</span>
                       {isDefault && (
-                        <span className="rounded bg-surface-3 px-1 py-0 text-[9px] text-muted">{t('inspector.default_badge')}</span>
+                        <span className="rounded bg-surface-3 px-1 py-0 text-2xs text-muted">{t('inspector.default_badge')}</span>
                       )}
                     </span>
-                    <span className="max-w-[110px] shrink-0 truncate font-mono text-[10px] text-muted">{m.id}</span>
+                    <span className="max-w-[110px] shrink-0 truncate font-mono text-2xs text-muted">{m.id}</span>
                   </li>
                 )
               })}
@@ -186,7 +184,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           </Section>
         )}
 
-        <div className="rounded-lg border border-border bg-surface-2/50 p-3 text-[11px] leading-relaxed text-muted">
+        <div className="rounded-lg border border-border bg-surface-2/50 p-3 text-2xs leading-relaxed text-muted">
           <p className="mb-1 flex items-center gap-1.5 font-medium text-text-2">
             <Icon name="sparkles" size={13} className="text-primary" /> {t('inspector.tip_title')}
           </p>
@@ -200,7 +198,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
 function Section({ title, icon, children }: { title: string; icon: string; children: React.ReactNode }) {
   return (
     <div>
-      <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted">
+      <p className="mb-2 flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-muted">
         <Icon name={icon} size={13} /> {title}
       </p>
       <div className="space-y-1.5">{children}</div>
@@ -221,11 +219,11 @@ function UsageBar({ label, value, total, color }: { label: string; value: number
   const pct = total > 0 ? (value / total) * 100 : 0
   return (
     <div className="flex items-center gap-2 py-0.5">
-      <span className="w-14 shrink-0 text-[11px] text-muted">{label}</span>
+      <span className="w-14 shrink-0 text-2xs text-muted">{label}</span>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-3">
         <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: color }} />
       </div>
-      <span className="tabular w-12 shrink-0 text-right text-[11px] text-text-2">{formatNumber(value)}</span>
+      <span className="tabular w-12 shrink-0 text-right text-2xs text-text-2">{formatNumber(value)}</span>
     </div>
   )
 }
@@ -234,7 +232,7 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border bg-surface-2/60 px-2 py-1.5">
       <div className="tabular text-sm font-semibold text-text">{value}</div>
-      <div className="text-[10px] text-muted">{label}</div>
+      <div className="text-2xs text-muted">{label}</div>
     </div>
   )
 }

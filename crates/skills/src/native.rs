@@ -2,12 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_core::{
-    Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillSource, config_dir,
-};
+use agent_core::{Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, config_dir};
 use async_trait::async_trait;
 
-use crate::frontmatter::parse_skill_file;
+use crate::scan::scan_dir;
 
 const PROVIDER_ID: &str = "native";
 
@@ -43,84 +41,22 @@ impl SkillProvider for NativeSkillProvider {
         let mut out = Vec::new();
         // user: <config_dir>/skills
         if let Some(cfg) = config_dir() {
-            out.extend(scan_dir(&cfg.join("skills"), SkillLevel::User)?);
+            out.extend(scan_dir(
+                &cfg.join("skills"),
+                SkillLevel::User,
+                PROVIDER_ID,
+            )?);
         }
         // project: 自 cwd 向上 walkup 的 .agent/skills
         for dir in project_skill_dirs(&self.cwd) {
-            out.extend(scan_dir(&dir, SkillLevel::Project)?);
+            out.extend(scan_dir(&dir, SkillLevel::Project, PROVIDER_ID)?);
         }
         // 自定义目录（视作 user）
         for dir in &opts.custom_directories {
-            out.extend(scan_dir(dir, SkillLevel::User)?);
+            out.extend(scan_dir(dir, SkillLevel::User, PROVIDER_ID)?);
         }
         Ok(out)
     }
-}
-
-/// 扫描一个 skills 根目录下的 `<name>/SKILL.md`（非递归）。
-fn scan_dir(dir: &Path, level: SkillLevel) -> Result<Vec<Skill>, SkillError> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(SkillError::Io(e)),
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if fname.starts_with('.') || !path.is_dir() {
-            continue;
-        }
-        let skill_md = path.join("SKILL.md");
-        if !skill_md.is_file() {
-            continue;
-        }
-        match load_skill_file(&skill_md, level) {
-            Ok(skill) => out.push(skill),
-            Err(e) => {
-                tracing::warn!(
-                    target: "agent_skills",
-                    path = %skill_md.display(),
-                    error = %e,
-                    "failed to load skill file"
-                );
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// 加载单个 SKILL.md 为 [`Skill`]。
-fn load_skill_file(skill_md: &Path, level: SkillLevel) -> Result<Skill, SkillError> {
-    let content = std::fs::read_to_string(skill_md)?;
-    let fm = parse_skill_file(&content).frontmatter;
-    let dir_name = skill_md
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("skill");
-    let name = fm
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| dir_name.to_string(), str::to_string);
-    let base_dir = skill_md.parent().map(Path::to_path_buf).unwrap_or_default();
-    Ok(Skill {
-        name,
-        description: fm.description.unwrap_or_default(),
-        file_path: skill_md.to_path_buf(),
-        base_dir,
-        source: SkillSource {
-            provider: PROVIDER_ID.to_string(),
-            level,
-        },
-        hide: fm.hide,
-        modes: fm.modes,
-    })
 }
 
 /// 自 cwd 向上枚举 `.agent/skills` 候选，止于 home 目录。
@@ -139,7 +75,6 @@ fn project_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     }
     out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

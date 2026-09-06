@@ -181,6 +181,7 @@ async fn connect_test_client(url: &str) -> McpClient {
         url: url.to_string(),
         headers,
         timeout_ms: None,
+        oauth: None,
     });
     McpClient::connect(&cfg).await.expect("connect")
 }
@@ -234,12 +235,24 @@ async fn http_sse_response_extracts_matching_id() {
     let client = connect_test_client(&url).await;
     client.initialize().await.expect("initialize");
 
+    // SSE 流内夹带的 server 通知（notifications/changed）应转发给注册的处理器。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_on_notification(Arc::new(move |n| {
+        let _ = tx.send(n.method.clone());
+    }));
+
     // SSE 响应流：夹带通知 + 匹配 id 的 result → 文本拼接。
     let out = client
         .call_tool("echo", json!({}))
         .await
         .expect("call_tool");
     assert_eq!(out, "line1\nline2");
+
+    let method = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("通知未到达")
+        .expect("信道关闭");
+    assert_eq!(method, "notifications/changed");
 }
 
 #[tokio::test]
@@ -275,6 +288,7 @@ async fn http_non_2xx_maps_to_http_error() {
         url: format!("{url}nope"),
         headers: HashMap::new(),
         timeout_ms: None,
+        oauth: None,
     });
     let client = McpClient::connect(&cfg).await.expect("connect");
     let err = client.list_tools().await.expect_err("应 404");

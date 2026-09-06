@@ -27,6 +27,9 @@ use tokio::io::AsyncBufReadExt;
 /// i18n 取词宏（编译期内嵌 locale 目录，运行期按系统/配置语言激活）。
 use agent_i18n::t;
 
+/// 管理子命令面（models / auth / config）：路由识别与执行在 `agent_cli::manage`。
+use agent_cli::manage::{ManageCmd, Route};
+
 use repl::{
     CommandContext, CommandOutcome, ReplHelper, all_command_names, handle_command, model_choices,
     session_history_lines,
@@ -41,7 +44,11 @@ use repl::{
 )]
 struct Cli {
     /// Task text (reads one line from stdin if omitted).
-    task: Option<String>,
+    ///
+    /// 收集首参数起的全部剩余词（对齐 oh-my-pi：`agent list all my files` 整句作 prompt；
+    /// flag 须置于任务文本之前）。配合保留顶层词防误注入 gate（reserved_top_level_word_hint）。
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+    task: Vec<String>,
     /// Model alias (matches `[[models]] alias` in config).
     #[arg(long)]
     model: Option<String>,
@@ -74,6 +81,11 @@ struct Cli {
     /// Mutually exclusive with --serve / --acp (stdout is the protocol channel).
     #[arg(long)]
     rpc: bool,
+    /// Forward approvals/followup questions to the RPC host as `request` frames
+    /// (host answers with `response` frames). Default off: approvals are auto-denied
+    /// (compat with existing embedders).
+    #[arg(long)]
+    rpc_forward_ask: bool,
     /// Resume a historical session (session id; list with --list-sessions).
     #[arg(long)]
     resume: Option<String>,
@@ -214,6 +226,31 @@ fn print_approval_status(cfg: &agent_config::Config) {
     eprintln!("{}", agent_i18n::t!("approval.status", mode = mode));
 }
 
+/// ACP `session/available_commands` 清单：与 REPL 内置斜杠命令对齐（名称 + 简述）。
+/// 描述面向编辑器命令菜单；新增 REPL 命令时同步此表。
+fn acp_command_catalog() -> Vec<(String, String)> {
+    [
+        ("/model", "切换或查看模型（/model <别名|角色>）"),
+        ("/mode", "切换模式（code / architect / …）"),
+        ("/compact", "手动压缩上下文"),
+        ("/tree", "查看会话树；/tree <节点id> 切换分叉点"),
+        ("/branch", "从指定节点分叉新分支（摘要交接）"),
+        ("/models", "列出当前 provider 可用模型"),
+        ("/mcp", "查看 MCP 服务器与工具状态"),
+        ("/skills", "查看/注入技能"),
+        ("/todo", "查看当前任务清单"),
+        ("/goal", "查看目标预算"),
+        ("/diff", "查看 git 差异"),
+        ("/status", "查看会话状态"),
+        ("/agents", "打开子 Agent 仪表盘"),
+        ("/sessions", "列出历史会话"),
+        ("/resume", "恢复历史会话"),
+    ]
+    .into_iter()
+    .map(|(n, d)| (n.to_string(), d.to_string()))
+    .collect()
+}
+
 /// 启动 Web 服务。`acp` 为 true（或配置启用）时合并 ACP HTTP+SSE 路由。
 async fn run_server(
     cfg: agent_config::Config,
@@ -237,6 +274,8 @@ async fn run_server(
     })
     .context(t!("error.build_http"))?;
     let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::from(cwd), socks5);
+    // ACP `session/available_commands` 数据源：REPL 斜杠命令清单（名称 + 简述）。
+    state.set_available_commands(acp_command_catalog()).await;
     // ACP 路由在组装层合并（agent-acp 依赖 agent-server，故不能在 server crate 内 merge，
     // 否则循环依赖）。
     let app = if acp_enabled {
@@ -276,10 +315,120 @@ async fn run_acp_stdio(
     })
     .context(t!("error.build_http"))?;
     let state = agent_server::SessionManager::new(Arc::new(cfg), http, Arc::from(cwd), socks5);
+    state.set_available_commands(acp_command_catalog()).await;
     agent_acp::run_stdio(state)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// 用户级配置目录（`platform::config_dir()`；不可得时退当前目录，与 auth 链一致）。
+fn manage_config_dir() -> PathBuf {
+    agent_core::platform::config_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 执行管理子命令（语法识别在 [`agent_cli::manage::route`]；此处只装配 IO 与退出码）。
+///
+/// 返回进程退出码：0 成功；1 运行错（经 `Err` 亦以 1 退出）；2 用法错（路由层已拦截）。
+/// 依赖配置的命令在此处自行 `Config::load`——路由位于 main 的启动装载之前，
+/// config.toml 损坏/缺失时 `config check` / `auth save` 等仍须可用。
+async fn run_manage_cmd(cmd: ManageCmd, cwd: &std::path::Path) -> Result<i32> {
+    use std::io::Read as _;
+    let config_dir = manage_config_dir();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match cmd {
+        ManageCmd::ModelsList => {
+            let cfg = agent_config::Config::load(cwd).context(t!("error.load_config"))?;
+            agent_cli::manage::models_list(&cfg, &mut out)?;
+            Ok(0)
+        }
+        ManageCmd::AuthList => {
+            let cfg = agent_config::Config::load(cwd).context(t!("error.load_config"))?;
+            agent_cli::manage::auth_list(&cfg, &config_dir, &mut out)?;
+            Ok(0)
+        }
+        ManageCmd::AuthSave { provider } => {
+            // 密钥只经 stdin 读入（--stdin 已在路由层强制）；不回显、不落日志。
+            let mut key = String::new();
+            std::io::stdin()
+                .read_to_string(&mut key)
+                .context(t!("manage.auth.stdin_read_failed"))?;
+            let path = agent_cli::manage::auth_save(&config_dir, &provider, &key)?;
+            eprintln!(
+                "{}",
+                t!(
+                    "manage.auth.saved",
+                    provider = provider,
+                    path = path.display().to_string()
+                )
+            );
+            Ok(0)
+        }
+        ManageCmd::AuthRemove { provider } => {
+            agent_cli::manage::auth_remove(&config_dir, &provider)?;
+            eprintln!(
+                "{}",
+                t!(
+                    "manage.auth.removed",
+                    provider = provider,
+                    path = agent_config::auth_path(&config_dir).display().to_string()
+                )
+            );
+            Ok(0)
+        }
+        ManageCmd::AuthLogin { id } => {
+            agent_cli::manage::auth_login(&id, &config_dir).await?;
+            Ok(0)
+        }
+        ManageCmd::AuthLogout { provider } => {
+            let outcome = agent_cli::manage::auth_logout(&config_dir, &provider)?;
+            if outcome.oauth_removed {
+                eprintln!(
+                    "{}",
+                    t!(
+                        "manage.auth.logout.oauth_removed",
+                        provider = provider,
+                        path = agent_config::oauth_path(&config_dir).display().to_string()
+                    )
+                );
+            }
+            if outcome.api_key_removed {
+                eprintln!(
+                    "{}",
+                    t!(
+                        "manage.auth.logout.key_removed",
+                        provider = provider,
+                        path = agent_config::auth_path(&config_dir).display().to_string()
+                    )
+                );
+            }
+            Ok(0)
+        }
+        ManageCmd::McpLogin { server } => {
+            agent_cli::manage::mcp_login(&server, &config_dir).await?;
+            Ok(0)
+        }
+        ManageCmd::McpLogout { server } => {
+            agent_cli::manage::mcp_logout(&server, &config_dir)?;
+            Ok(0)
+        }
+        ManageCmd::ConfigPath => {
+            agent_cli::manage::config_path(&config_dir, &mut out)?;
+            Ok(0)
+        }
+        ManageCmd::ConfigCheck => match agent_config::Config::load(cwd) {
+            Ok(cfg) => {
+                agent_cli::manage::config_check_summary(&cfg, &mut out)?;
+                Ok(0)
+            }
+            // 校验失败：打印错误并以非零码（运行错 1）退出。
+            Err(err) => {
+                eprintln!("{}", agent_cli::manage::config_check_error(&err));
+                Ok(1)
+            }
+        },
+    }
 }
 
 #[tokio::main]
@@ -294,6 +443,29 @@ async fn main() -> Result<()> {
     let cwd = cli
         .cwd
         .unwrap_or_else(|| std::env::current_dir().expect("无法获取当前目录"));
+
+    // 管理子命令路由（对齐 oh-my-pi cli-commands.ts 的显式注册表语义）：
+    // 识别成功即执行并退出；语法不匹配（裸保留词 / 未知子动作 / 真实多词 prompt）
+    // 一律回落原路径——下方 prompt 路径上的 reserved 顶层词提示（#4845 防误注入）
+    // 与 prompt 行为完全不变。
+    // 路由必须位于 Config::load 之前：config.toml 损坏/缺失时 config check 与
+    // auth save 等管理命令仍须可用（启动装载在下方会先 bail）。
+    // i18n 先按 --lang 激活（管理命令输出跟随 --lang；config 语言在装载后才可得）。
+    agent_i18n::init(cli.lang.as_deref());
+    match agent_cli::manage::route(&cli.task) {
+        Route::Fallthrough => {}
+        Route::Usage(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2); // 用法错误
+        }
+        Route::Run(cmd) => {
+            let code = run_manage_cmd(cmd, &cwd).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+    }
 
     // 1. 加载配置（分层 TOML）
     let mut cfg = agent_config::Config::load(&cwd).context(t!("error.load_config"))?;
@@ -348,7 +520,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("--rpc 与 --serve / --acp 互斥，不能同时指定");
     }
     if cli.rpc {
-        return rpc::run_rpc(cfg, cwd, socks_cli_override).await;
+        return rpc::run_rpc(cfg, cwd, socks_cli_override, cli.rpc_forward_ask).await;
     }
 
     // 纯 stdio ACP 模式（--acp 且未指定 --serve）：编辑器作为子进程调用，不启动 HTTP。
@@ -426,14 +598,6 @@ async fn main() -> Result<()> {
         .resolve_chain(cli.model.as_deref())
         .context(t!("error.resolve_model"))?;
     let profile = chain[0];
-    let api_key: String = profile.resolve_api_key().expose_secret().to_string();
-    let model = profile.to_model();
-    let fallback_models: Vec<agent_core::Model> =
-        chain.iter().skip(1).map(|p| p.to_model()).collect();
-    // P2：API key 轮换环（`api_keys` 多 key 列表；空 = 单 key 不轮换）。
-    let key_rings: std::collections::HashMap<String, Vec<String>> =
-        chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
-
     // 3. 装配 Provider（registry + OpenAI Chat Completions 适配器）
     // SOCKS5 代理控制器（仅影响后端出站请求；开关经 --socks / 配置 / sidecar）。
     let socks5 = build_socks5_controller(&cfg, &cwd, socks_cli_override);
@@ -442,11 +606,31 @@ async fn main() -> Result<()> {
     // 共享 HTTP 客户端：仅设连接超时 + keepalive，不设整条请求总超时——该客户端专供流式
     // LLM 调用，总超时会切断仍在正常输出的慢速长流（收不到终止帧而误判「未收到结束标记」）；
     // 真正的「上游挂起」由各 SSE 适配器的按 chunk 空闲读超时（STREAM_IDLE_TIMEOUT）兜底。
+    // （构建顺序前移：OAuth「先刷后用」解析需要该客户端。）
     let client = agent_proxy::build_http_client(socks5, cfg.user_agent.as_deref(), |b| {
         b.tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
     })
     .context(t!("error.build_http"))?;
+    let oauth_client = client.clone(); // collect_providers 会移动 client；热切换解析复用。
+    // 认证链分层（config 值含 ${ENV} 展开 → oauth.toml 有效/先刷后用 → auth.toml
+    // → GYRE_<PROVIDER>_API_KEY env）。注意：load 期望「配置目录」（内部自拼
+    // auth.toml），误传文件路径会永远读空。
+    let config_dir = agent_core::platform::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let api_key: String = agent_llm::oauth::resolve_runtime_api_key(
+        &client,
+        &config_dir,
+        profile.api.as_str(),
+        profile.api_key.expose_secret().is_empty(),
+        profile.resolve_api_key().expose_secret(),
+    );
+    let model = profile.to_model();
+    let fallback_models: Vec<agent_core::Model> =
+        chain.iter().skip(1).map(|p| p.to_model()).collect();
+    // P2：API key 轮换环（`api_keys` 多 key 列表；空 = 单 key 不轮换）。
+    let key_rings: std::collections::HashMap<String, Vec<String>> =
+        chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
+
     let mut registry = agent_llm::ProviderRegistry::new();
     for p in agent_llm::collect_providers(client) {
         registry.register(p);
@@ -526,6 +710,20 @@ async fn main() -> Result<()> {
     let workspace = Arc::new(agent_core::Workspace::new(cwd.clone()));
     // MCP 注册表（多 server 工具；包 Arc 供 build_agent 与 /mcp 共享）
     let mcp: Arc<agent_mcp::McpRegistry> = Arc::new(agent_mcp::McpRegistry::load(&cfg.mcp).await);
+    // MCP 工具清单磁盘缓存：启动快照落盘 + 未连上 server 的 stale 回填告警。
+    // （刷新时机为每次启动 load 之后；运行期变更不落盘——最小实现。）
+    let mcp_cache_dir = agent_core::platform::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    agent_mcp::store_tools(&mcp_cache_dir, &mcp.tools());
+    for name in cfg.mcp.servers.keys() {
+        if let Some(cached) = agent_mcp::hydrate_from_cache(&mcp_cache_dir, &mcp, name) {
+            tracing::warn!(
+                server = %name,
+                tools = cached.tools.len(),
+                cached_at_ms = cached.cached_at_ms,
+                "MCP server 未连上，工具元信息来自磁盘缓存快照（不可执行）"
+            );
+        }
+    }
     // 可选工具开关运行时快照：初值取自配置 [tools].enabled（覆盖各组默认 false）。
     // 后续可由 `/tools <key> on|off` 动态切换；切换后重建 Agent 以反映新工具集与提示词。
     let mut optional: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
@@ -543,6 +741,12 @@ async fn main() -> Result<()> {
     // P2：SSH / browser 可选组（[tools.enabled] ssh / browser）。
     optional.insert("ssh".to_string(), cfg.tools.effective("ssh", false));
     optional.insert("browser".to_string(), cfg.tools.effective("browser", false));
+    // 会话级文本快照存储：read_file（经 engine 的 ToolContext::snapshots 记录）与
+    // apply_hashline（HashlineTool::with_snapshots 写前自存）共享同一 Arc——read 侧版本
+    // 对 stale-hash 恢复可见。跨 Agent 重建（/model、/mode 热切换）保持，会话级单例。
+    let snapshot_store = Arc::new(std::sync::RwLock::new(
+        agent_hashline::InMemorySnapshotStore::new(),
+    ));
     // 子 Agent 工具集（按启用态装配的可选工具 + MCP，不含 task 以防递归；与模型无关，构建一次）
     let (mut sub_reg, _) = assemble_builtin_tools(
         &optional,
@@ -550,6 +754,7 @@ async fn main() -> Result<()> {
         cfg.github.allow_write,
         cfg.agent.commands.interceptor.enabled,
         compiled_minimizer(&cfg),
+        Some(Arc::clone(&snapshot_store)),
     );
     for t in mcp.tools() {
         sub_reg = sub_reg.with(Box::new(t.clone()));
@@ -576,11 +781,35 @@ async fn main() -> Result<()> {
             t!("context.foreign_loaded", count = foreign_sections.len())
         );
     }
-    // 外来配置追加进上下文约定（与 AGENTS.md 同通道注入 system）。
-    let mut base_context_files = agent_config::discover_context_files(&cwd);
+    // 上下文基座：行为杠杆四段（移植 oh-my-pi system-prompt：§ Tool Policy / # Delegation /
+    // § Workflow / § Delivery + § Critical 收尾）在最前，项目上下文（AGENTS.md/外来配置/
+    // MCP 指引/长期记忆）在其后——对应 omp「systemPrompt 主体在前、projectPrompt 在后」。
+    let mut base_context_files = vec![
+        agent_core::prompt_sections::TOOL_POLICY_SECTION.to_string(),
+        agent_core::prompt_sections::DELEGATION_SECTION.to_string(),
+        agent_core::prompt_sections::WORKFLOW_SECTION.to_string(),
+        agent_core::prompt_sections::DELIVERY_SECTION.to_string(),
+    ];
+    base_context_files.extend(agent_config::discover_context_files(&cwd));
     base_context_files.extend(foreign_sections);
     // Phase 0：security_scan 恒开注册 → 使用指引恒注入（与工具注册面一致）。
     base_context_files.push(agent_tools::SECURITY_SCAN_PROMPT_SECTION.to_string());
+    // MCP server instructions：initialize 握手返回的使用指引注入 system prompt
+    // （移植 oh-my-pi getServerInstructions；多 server 按配置顺序分节；工具行为以其 schema 为准）。
+    let mcp_instructions = mcp.server_instructions();
+    if !mcp_instructions.is_empty() {
+        let mut section = String::from(
+            "<mcp-server-instructions>\n已连接 MCP server 随握手返回的使用指引（冲突时以工具 schema 为准）：\n",
+        );
+        for (server, text) in &mcp_instructions {
+            section.push_str(&format!(
+                "\n<server name=\"{server}\">\n{}\n</server>\n",
+                text.trim()
+            ));
+        }
+        section.push_str("\n</mcp-server-instructions>");
+        base_context_files.push(section);
+    }
     let commands = agent_config::discover_commands(&cwd);
     if !commands.is_empty() {
         eprintln!("{}", t!("commands.loaded", count = commands.len()));
@@ -636,7 +865,7 @@ async fn main() -> Result<()> {
     // Agent 构造闭包：参数化 mode/model/provider_ctx/max_output，热切换后可重建。
     // task 工具内嵌 model/provider_ctx，故随模型/模式一起重建。
     // 子 Agent 监控总线：与 TaskTool / /agents 仪表盘共享同一份进程内状态。
-    let supervisor = agent_supervisor::Supervisor::new();
+    let supervisor = Arc::new(agent_supervisor::Supervisor::new());
 
     // P0-3：goals 目标预算共享状态（跨 Agent 重建保持；`/goal` 查看/调整）。
     // 预算为空（两者均为 0）时不注入，行为与未配置完全一致。
@@ -710,15 +939,18 @@ async fn main() -> Result<()> {
             github_allow_write,
             cfg.agent.commands.interceptor.enabled,
             compiled_minimizer(&cfg),
+            Some(Arc::clone(&snapshot_store)),
         );
         for t in mcp.tools() {
             tool_registry = tool_registry.with(Box::new(t.clone()));
         }
         // P1：hub 消息总线（以 "main" 入册；子 Agent 不含——其消费面留待 task 集成）。
-        tool_registry = tool_registry.with(Box::new(agent_tools::HubTool::register(
-            Arc::clone(&hub),
-            "main",
-        )));
+        let processes = Arc::new(agent_supervisor::ProcessManager::new());
+        tool_registry = tool_registry.with(Box::new(
+            agent_tools::HubTool::register(Arc::clone(&hub), "main")
+                .with_supervision(supervisor.clone())
+                .with_processes(processes),
+        ));
         // Phase 0：todo / ask / checkpoint / rewind 接线（修复 CLI 前端工具面缺失——
         // 此前仅 server 装配，双前端工具面不一致；状态取闭包外共享句柄，跨 Agent
         // 重建存活）。ask 经 ApprovalPolicy::prompt 通道走 CLI 的 stdin resolver
@@ -766,7 +998,7 @@ async fn main() -> Result<()> {
                 sub_thinking,
                 subagent_max_concurrent,
             )
-            .with_supervisor(supervisor.clone())
+            .with_supervisor(Arc::clone(&supervisor))
             .with_approval(Arc::clone(&approval));
             tool_registry = tool_registry.with(Box::new(task_tool));
         }
@@ -856,6 +1088,8 @@ async fn main() -> Result<()> {
                 optional,
                 github_enabled,
             ))
+            // 与 HashlineTool 共享会话快照存储（见上方 snapshot_store 单例）。
+            .snapshot_store(Some(Arc::clone(&snapshot_store)))
             .resources(Arc::clone(&mcp) as Arc<dyn agent_core::ResourceResolver>);
         // P2：压缩后端——snapcompact 要求视觉模型（[compaction].vision_models 通配匹配，
         // 空列表 = 任何模型启用）；不匹配回退 summarize（每次重建按当前 model 判断）。
@@ -941,6 +1175,8 @@ async fn main() -> Result<()> {
                 }));
             }
         }
+        // 文件式 hook（[[hooks]]）：shell 命令钩子（before_tool 可 deny/allow；其余通知型）。
+        hooks.extend(agent_cli::hooks_cfg::shell_hooks_from_config(&cfg));
         let builder = if hooks.is_empty() {
             builder
         } else {
@@ -991,7 +1227,13 @@ async fn main() -> Result<()> {
         Arc::new(std::sync::Mutex::new(Usage::default()));
 
     // 8. 单次任务（非交互）：执行后退出
-    if let Some(task) = cli.task.clone() {
+    if !cli.task.is_empty() {
+        let task = cli.task.join(" ");
+        // 保留顶层词防误注入（移植 oh-my-pi cli-commands.ts #4845 语义）：
+        // 裸管理动词/插件语法不作为 prompt 发给 LLM 计费。
+        if let Some(hint) = reserved_top_level_word_hint(&task) {
+            anyhow::bail!("{hint}");
+        }
         run_turn(&agent, &task, &accumulated).await?;
         return Ok(());
     }
@@ -1068,6 +1310,8 @@ async fn main() -> Result<()> {
                     if apply_model_switch(
                         &alias,
                         &cfg,
+                        &oauth_client,
+                        &config_dir,
                         &mut current_api_key,
                         &mut current_base_url,
                         &mut current_max_output,
@@ -1281,6 +1525,107 @@ async fn main() -> Result<()> {
                 CommandOutcome::Agents => {
                     if let Err(e) = agents_view::run_dashboard(&supervisor).await {
                         eprintln!("{}", t!("agents.dashboard_error", e = e));
+                    }
+                    (String::new(), true)
+                }
+                CommandOutcome::ShowTree => {
+                    let nodes = context.snapshot_nodes().await;
+                    let active = context.active_leaf().await;
+                    eprintln!("{}", t!("tree.title"));
+                    eprintln!(
+                        "{}",
+                        agent_cli::tree_ui::render_tree(&nodes, active.as_deref())
+                    );
+                    (String::new(), true)
+                }
+                CommandOutcome::SwitchBranch { node, handoff } => {
+                    let nodes = context.snapshot_nodes().await;
+                    match agent_cli::tree_ui::parse_node_target(&node, &nodes) {
+                        None => {
+                            eprintln!(
+                                "{}",
+                                t!(
+                                    "tree.switch_failed",
+                                    reason = format!("节点不存在或前缀歧义: {node}")
+                                )
+                            );
+                        }
+                        Some(target) if handoff => match context
+                            .switch_branch_with_handoff(&target)
+                            .await
+                        {
+                            Ok(true) => {
+                                eprintln!("{}", t!("tree.switched", node = target));
+                            }
+                            Ok(false) => {
+                                eprintln!(
+                                    "{}",
+                                    t!(
+                                        "tree.switch_failed",
+                                        reason = "handoff 不可用（该上下文无摘要器）".to_string()
+                                    )
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("{}", t!("tree.switch_failed", reason = e.to_string()));
+                            }
+                        },
+                        Some(target) => {
+                            if context.set_active_leaf(&target).await {
+                                eprintln!("{}", t!("tree.switched", node = target));
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    t!(
+                                        "tree.switch_failed",
+                                        reason = format!("节点不存在: {target}")
+                                    )
+                                );
+                            }
+                        }
+                    }
+                    (String::new(), true)
+                }
+                CommandOutcome::ListModels => {
+                    let http = reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .unwrap_or_default();
+                    match agent_llm::list_models(
+                        current_model.api,
+                        &current_base_url,
+                        &current_api_key,
+                        http,
+                    )
+                    .await
+                    {
+                        Ok(list) if list.is_empty() => {
+                            eprintln!("{}", t!("models.empty"));
+                        }
+                        Ok(list) => {
+                            eprintln!(
+                                "{}",
+                                t!(
+                                    "models.title",
+                                    source = format!(
+                                        "{} @ {}",
+                                        current_model.api.as_str(),
+                                        current_base_url
+                                    )
+                                )
+                            );
+                            for dm in &list {
+                                let owner = dm
+                                    .owned_by
+                                    .as_deref()
+                                    .map(|o| format!("  ({o})"))
+                                    .unwrap_or_default();
+                                eprintln!("  {}{owner}", dm.id);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{}", t!("models.failed", reason = e.to_string()));
+                        }
                     }
                     (String::new(), true)
                 }
@@ -1513,6 +1858,78 @@ fn optional_context_files(
     files
 }
 
+/// 保留顶层词（移植 oh-my-pi `cli-commands.ts` 的 `RESERVED_TOP_LEVEL_WORDS`，并按
+/// Gyre 子命令路线图扩充）：这些词规划为未来 CLI 子命令（models/config/usage/…
+/// 与插件动词族）。裸用作任务首词时，用户意图极可能是「调管理命令」而非「发这句
+/// prompt」——按 omp #4845 防误注入语义拦截并提示，避免整句被发给 LLM 误计费。
+const RESERVED_TOP_LEVEL_WORDS: &[&str] = &[
+    "models",
+    "config",
+    "usage",
+    "stats",
+    "plugin",
+    "marketplace",
+    "extensions",
+    "mcp",
+    "auth",
+    "login",
+    "logout",
+    "update",
+    "upgrade",
+    "doctor",
+    "completions",
+    "gc",
+    "install",
+    "uninstall",
+    "enable",
+    "disable",
+    "list",
+    "remove",
+    "discover",
+];
+
+/// 插件/市场管理语法子动作（对齐 omp `MARKETPLACE_SUBCOMMANDS`）：
+/// `agent marketplace add x` / `agent plugin remove y` 视为管理命令语法。
+const MARKETPLACE_SUBCOMMANDS: &[&str] = &["add", "remove", "rm", "update", "list"];
+
+/// 保留顶层词提示（移植 oh-my-pi `reservedTopLevelWordMessage` 的触发语法）：
+///
+/// - 首词带 `-` / `@` 前缀 → 非管理命令（flag / @file 语法），放行。
+/// - 非保留词首词 → 放行。
+/// - 裸保留词（`agent models`）→ 提示。
+/// - `marketplace|plugin <子动作> …` → 提示。
+/// - 后续任一参数含 `@`（`name@marketplace` 插件 id 语法，如 `agent uninstall foo@bar`）→ 提示。
+/// - 其余多词形态（如 `list all my files`、`upgrade the deps`）→ 放行为正常 prompt。
+#[must_use]
+fn reserved_top_level_word_hint(task: &str) -> Option<String> {
+    let mut tokens = task.split_whitespace();
+    let first = tokens.next()?;
+    if first.starts_with('-') || first.starts_with('@') {
+        return None;
+    }
+    if !RESERVED_TOP_LEVEL_WORDS.contains(&first) {
+        return None;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    let management_grammar = match rest.first() {
+        // 裸保留词。
+        None => true,
+        Some(second) => {
+            ((first == "marketplace" || first == "plugin")
+                && MARKETPLACE_SUBCOMMANDS.contains(second))
+                || rest.iter().any(|a| !a.starts_with('-') && a.contains('@'))
+        }
+    };
+    management_grammar.then(|| {
+        format!(
+            "「agent {first}」是保留的管理命令字（该词已按 oh-my-pi #4845 防误注入语义\
+             拦截，不作为任务发送，避免被误计费）。可用子命令：`agent models list`、\
+             `agent auth list|save|remove`、`agent config path|check`。若确要以此文本\
+             作为任务，请调整首词措辞，或在交互 REPL 中直接输入。"
+        )
+    })
+}
+
 /// 装配内置工具集：核心工具（始终启用）+ 按启用态追加的可选组（ast/lsp/image/hashline/pty/github）。
 ///
 /// 与 [`optional_context_files`] 配对：同一开关同时决定「工具是否注册」与「提示词是否注入」，
@@ -1624,6 +2041,7 @@ fn assemble_builtin_tools(
     github_allow_write: bool,
     interceptor_enabled: bool,
     minimizer: agent_tools::Minimizer,
+    snapshots: Option<std::sync::Arc<std::sync::RwLock<agent_hashline::InMemorySnapshotStore>>>,
 ) -> (
     agent_tools::DefaultToolRegistry,
     Option<agent_tools::LspPool>,
@@ -1648,7 +2066,13 @@ fn assemble_builtin_tools(
         reg = reg.with(Box::new(lsp));
     }
     if *optional.get("hashline").unwrap_or(&false) {
-        reg = reg.with(Box::new(agent_hashline::HashlineTool::new()));
+        // 共享会话快照存储（与 engine 的 ToolContext::snapshots 同一实例——read 侧记录
+        // 的版本对本工具 stale-hash 恢复可见）。None（如测试）时自建，行为不变。
+        let hashline = match snapshots {
+            Some(store) => agent_hashline::HashlineTool::with_snapshots(store),
+            None => agent_hashline::HashlineTool::new(),
+        };
+        reg = reg.with(Box::new(hashline));
     }
     if *optional.get("pty").unwrap_or(&false) {
         reg = reg.with(Box::new(agent_pty::RunPtyTool));
@@ -1696,44 +2120,68 @@ fn is_known_optional_key(key: &str) -> bool {
     OPTIONAL_TOOL_KEYS.contains(&key)
 }
 
-/// `/model <alias>` 热切换：解析 profile 并更新运行时模型状态。成功返回 true。
+/// `/model <alias|role>` 热切换：解析 profile（先 alias/id，未命中再查 `[models.roles]`
+/// 角色）并更新运行时模型状态；密钥走认证链分层（config → auth.toml → env）。
+/// 成功返回 true。
+#[allow(clippy::too_many_arguments)] // 模型热切换状态注入面，同 run_swarm 先例。
 fn apply_model_switch(
     alias: &str,
     cfg: &agent_config::Config,
+    oauth_client: &reqwest::Client,
+    config_dir: &std::path::Path,
     current_api_key: &mut String,
     current_base_url: &mut String,
     current_max_output: &mut usize,
     current_model: &mut agent_core::Model,
     current_provider_ctx: &mut agent_core::ProviderCallContext,
 ) -> bool {
-    match cfg.resolve_model(Some(alias)) {
-        Ok(profile) => {
-            *current_api_key = profile.resolve_api_key().expose_secret().to_string();
-            *current_base_url = profile.base_url.clone();
-            *current_max_output = profile.max_output_tokens.unwrap_or(4096);
-            *current_model = agent_core::Model {
-                id: profile.id.clone(),
-                provider: "openai-compatible".into(),
-                api: profile.api,
-                max_input_tokens: profile.effective_max_input_tokens(),
-                max_output_tokens: *current_max_output,
-                supports_tools: true,
-                supports_streaming: true,
-                supports_thinking: false,
-                extra_body: profile.extra_body.clone(),
-            };
-            *current_provider_ctx = agent_core::ProviderCallContext {
-                api_key: Some(current_api_key.clone()),
-                base_url: Some(current_base_url.clone()),
-                max_in_flight: None,
-            };
-            true
-        }
-        Err(e) => {
-            eprintln!("{}", t!("model.switch_failed", e = e));
-            false
-        }
-    }
+    let resolved = cfg
+        .resolve_model(Some(alias))
+        .ok()
+        .or_else(|| cfg.resolve_role(alias));
+    let Some(profile) = resolved else {
+        eprintln!(
+            "{}",
+            t!(
+                "model.switch_failed",
+                e = agent_core::ConfigError::ModelNotFound(alias.to_string())
+            )
+        );
+        return false;
+    };
+    // 密钥链解析：config 值非空优先，否则 oauth.toml（有效/先刷后用）→
+    // auth.toml → 环境变量回退；全空回落 profile 内联值（历史行为兜底）。
+    let key = agent_llm::oauth::resolve_runtime_api_key(
+        oauth_client,
+        config_dir,
+        profile.api.as_str(),
+        profile.api_key.expose_secret().is_empty(),
+        profile.resolve_api_key().expose_secret(),
+    );
+    *current_api_key = if key.is_empty() {
+        profile.resolve_api_key().expose_secret().to_string()
+    } else {
+        key
+    };
+    *current_base_url = profile.base_url.clone();
+    *current_max_output = profile.max_output_tokens.unwrap_or(4096);
+    *current_model = agent_core::Model {
+        id: profile.id.clone(),
+        provider: "openai-compatible".into(),
+        api: profile.api,
+        max_input_tokens: profile.effective_max_input_tokens(),
+        max_output_tokens: *current_max_output,
+        supports_tools: true,
+        supports_streaming: true,
+        supports_thinking: false,
+        extra_body: profile.extra_body.clone(),
+    };
+    *current_provider_ctx = agent_core::ProviderCallContext {
+        api_key: Some(current_api_key.clone()),
+        base_url: Some(current_base_url.clone()),
+        max_in_flight: None,
+    };
+    true
 }
 
 /// `/compact` 手动压缩：shake → summarize → prune（与循环内自动压缩一致）。
@@ -2092,9 +2540,12 @@ async fn load_skill_catalog(
     if !opts.enabled {
         return agent_skills::SkillCatalog::default();
     }
-    match agent_skills::SkillRegistry::native(cwd.to_path_buf())
-        .load(&opts)
-        .await
+    match agent_skills::SkillRegistry::cross_tool(
+        cwd.to_path_buf(),
+        &cfg.skills.to_provider_toggles(),
+    )
+    .load(&opts)
+    .await
     {
         Ok(cat) => {
             if !cat.warnings.is_empty() {
@@ -2314,14 +2765,19 @@ mod tests {
     #[test]
     fn assemble_defaults_to_core_only() {
         let optional = std::collections::HashMap::new();
-        let (reg, _) =
-            assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
+        let (reg, _) = assemble_builtin_tools(
+            &optional,
+            false,
+            false,
+            false,
+            agent_tools::disabled(),
+            None,
+        );
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"run_command"));
         for opt in [
-            "replace_block",
             "ast_search",
             "read_image",
             "image_gen",
@@ -2338,8 +2794,14 @@ mod tests {
     fn assemble_enables_ast_group() {
         let mut optional = std::collections::HashMap::new();
         optional.insert("ast".to_string(), true);
-        let (reg, _) =
-            assemble_builtin_tools(&optional, false, false, false, agent_tools::disabled());
+        let (reg, _) = assemble_builtin_tools(
+            &optional,
+            false,
+            false,
+            false,
+            agent_tools::disabled(),
+            None,
+        );
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"replace_block"));
@@ -2353,7 +2815,7 @@ mod tests {
     fn assemble_github_independent_of_optional_map() {
         let optional = std::collections::HashMap::new();
         let (reg, _) =
-            assemble_builtin_tools(&optional, true, true, false, agent_tools::disabled());
+            assemble_builtin_tools(&optional, true, true, false, agent_tools::disabled(), None);
         let specs = reg.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(
@@ -2598,5 +3060,61 @@ mod tests {
         let m8 = assistant_with_text("收尾总结");
         hook.on_turn_end(&turn_ctx(&m8, false)).await;
         assert_eq!(notes.lock().len(), 2);
+    }
+
+    #[test]
+    fn reserved_word_bare_verb_hints() {
+        assert!(reserved_top_level_word_hint("models").is_some());
+        assert!(reserved_top_level_word_hint("list").is_some());
+        assert!(reserved_top_level_word_hint("config").is_some());
+    }
+
+    #[test]
+    fn reserved_word_multiword_prompt_falls_through() {
+        // omp #4845 的原始案例：真实 prompt 恰好以保留词开头仍应放行。
+        assert!(reserved_top_level_word_hint("list all my files").is_none());
+        assert!(reserved_top_level_word_hint("upgrade the deps").is_none());
+        assert!(reserved_top_level_word_hint("explain models of thinking").is_none());
+        // 非保留词首词 / flag、@file 前缀一律放行。
+        assert!(reserved_top_level_word_hint("explain models").is_none());
+        assert!(reserved_top_level_word_hint("-models").is_none());
+        assert!(reserved_top_level_word_hint("@file models").is_none());
+    }
+
+    #[test]
+    fn reserved_word_plugin_grammar_hints() {
+        // 管理语法形态：marketplace/plugin + 子动作、插件 id 含 @。
+        assert!(reserved_top_level_word_hint("marketplace add x").is_some());
+        assert!(reserved_top_level_word_hint("plugin rm x").is_some());
+        assert!(reserved_top_level_word_hint("uninstall foo@bar").is_some());
+        assert!(reserved_top_level_word_hint("enable foo@bar").is_some());
+        // 含 - 开头的参数不算 id 语法。
+        assert!(reserved_top_level_word_hint("enable -x").is_none());
+    }
+
+    #[test]
+    fn manage_route_fallthrough_keeps_reserved_hints() {
+        use agent_cli::manage::Route;
+        // 裸保留词不由管理路由接管：回落原路径并继续命中既有 reserved 提示
+        // （#4845 语义不变）。
+        for word in ["models", "auth", "config", "list", "usage"] {
+            assert!(
+                matches!(
+                    agent_cli::manage::route(&[word.to_string()]),
+                    Route::Fallthrough
+                ),
+                "裸保留词 {word} 应回落"
+            );
+            assert!(
+                reserved_top_level_word_hint(word).is_some(),
+                "{word} 应提示"
+            );
+        }
+        // 真实多词 prompt 两关都放行。
+        assert!(matches!(
+            agent_cli::manage::route(&["explain".to_string(), "models".to_string()]),
+            Route::Fallthrough
+        ));
+        assert!(reserved_top_level_word_hint("explain models").is_none());
     }
 }

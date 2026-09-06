@@ -11,6 +11,7 @@ agent-core   = { workspace = true }
 agent-shell  = { workspace = true }
 agent-search = { workspace = true }
 agent-lsp    = { workspace = true }
+agent-supervisor = { workspace = true }
 reqwest      = { workspace = true }
 agent-ast    = { workspace = true }
 futures      = { workspace = true }

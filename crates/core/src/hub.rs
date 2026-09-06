@@ -6,8 +6,9 @@
 //! - [`Hub::peers`]：列出全部在册 id（供模型发现可通信对象）。
 //! - [`Hub::unregister`]：注销（drop 收件箱）。
 //!
-//! v1 边界（文档化）：仅进程内、无持久化、无广播、无后台任务句柄面
-//! （后台任务/复活语义由 supervisor + task 体系承载，见 `agent-supervisor`）。
+//! v1 边界（文档化）：仅进程内、无持久化、无广播；子任务生命周期由 supervisor +
+//! task 体系承载（见 `agent-supervisor`），总线侧经 [`HubSupervision`] 端口暴露其
+//! 只读快照与取消委托（真实实现由装配层注入；进程托管 op 仍待 async job manager）。
 //! 与 omp `irc/bus.ts` 的差距：跨进程 IPC、回执（ACK）、唤醒/复活协议留待后续。
 
 use std::collections::HashMap;
@@ -137,6 +138,45 @@ impl Default for Hub {
     }
 }
 
+/// 单个被监督子任务的快照（hub 工具 `jobs` 面的最小字段集）。
+///
+/// 字段由监督体系以自有词汇填充：`status` 原样透传（如 `running`/`done`），不做
+/// omp `running|idle|parked` 三态转译；监督体系给不出的字段填 `None`，由 hub 工具
+/// 如实标 `unknown`，不编造。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HubJobSnapshot {
+    /// 子任务 id（hub 工具 `cancel` 的 `ids` 键）。
+    pub id: String,
+    /// 任务标签（名称）。
+    pub label: String,
+    /// 生命周期阶段（监督体系自有词汇，原样透传）。
+    pub status: String,
+    /// 是否在途（未达终态）。
+    pub in_flight: bool,
+    /// 已完成轮次（未知为 `None`）。
+    pub turns: Option<u64>,
+    /// 进度 0.0–1.0（未知为 `None`）。
+    pub progress: Option<f32>,
+}
+
+/// hub 监督句柄：hub 工具 `jobs`/`cancel` 的数据源与执行端（进程内子任务面）。
+///
+/// 总线本体只有「注册表 + 邮箱」；子任务生命周期由监督体系（`agent-supervisor` +
+/// 任务框架）承载。装配层把真实监督句柄桥接为本 trait 后注入 hub 工具：
+/// - 未接入：`jobs` 各字段如实标 `unknown`；`cancel` 明确报错（拒绝而非静默 no-op）。
+/// - 已接入：`jobs` 展示快照与在途计数；`cancel` 委托句柄（下达取消，不保证已终止）。
+#[async_trait::async_trait]
+pub trait HubSupervision: Send + Sync {
+    /// 全量子任务快照。
+    async fn jobs(&self) -> Vec<HubJobSnapshot>;
+
+    /// 请求取消一个子任务；`Ok(())` 表示取消已下达（不保证目标已终止）。
+    ///
+    /// # Errors
+    /// 目标不存在、已终结或监督体系无取消通道时，返回描述性错误文本。
+    async fn cancel(&self, id: &str) -> Result<(), String>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +234,37 @@ mod tests {
             Err(HubError::RecipientGone(id)) => assert_eq!(id, "t"),
             other => panic!("期望 RecipientGone，得到 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn supervision_port_dispatches() {
+        struct Fake;
+        #[async_trait::async_trait]
+        impl HubSupervision for Fake {
+            async fn jobs(&self) -> Vec<HubJobSnapshot> {
+                vec![HubJobSnapshot {
+                    id: "sub-1".into(),
+                    label: "Demo".into(),
+                    status: "running".into(),
+                    in_flight: true,
+                    turns: Some(2),
+                    progress: Some(0.5),
+                }]
+            }
+            async fn cancel(&self, id: &str) -> Result<(), String> {
+                if id == "sub-1" {
+                    Ok(())
+                } else {
+                    Err(format!("{id} 不存在"))
+                }
+            }
+        }
+        let s: Arc<dyn HubSupervision> = Arc::new(Fake);
+        let jobs = s.jobs().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "running");
+        assert!(jobs[0].in_flight);
+        assert!(s.cancel("sub-1").await.is_ok());
+        assert!(s.cancel("nope").await.is_err());
     }
 }

@@ -2,13 +2,13 @@
 //! 用法（在项目根）：cargo run -p agent-skills --example `verify_skills`
 
 use agent_core::{SkillLoadOptions, SkillResolver};
-use agent_skills::SkillRegistry;
+use agent_skills::{ProviderToggles, SkillRegistry};
 
 #[tokio::main]
 async fn main() {
     let cwd = std::env::current_dir().expect("无法获取 cwd");
     let opts = SkillLoadOptions::default();
-    let cat = SkillRegistry::native(cwd.clone())
+    let cat = SkillRegistry::cross_tool(cwd.clone(), &ProviderToggles::default())
         .load(&opts)
         .await
         .expect("加载失败");

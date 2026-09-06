@@ -1,0 +1,38 @@
+{{!
+  THIRD-PARTY-NOTICES 生成模板（cargo-about）。
+  数据模型（cargo-about 文档）：
+    overview  - LicenseSet 列表：count / name / id
+    licenses  - License 列表：name / id / text / source_path / used_by
+    used_by[] - { crate: {name, version, ...}, path }
+  生成命令见 about.toml 头部注释。
+}}
+# Third-party notices
+
+This application incorporates third-party software, listed below with the
+full text of each applicable license. The licenses shown are the branches
+selected per the priority order in `about.toml`.
+
+## License overview
+
+{{#each overview}}
+- {{name}} ({{id}}) — {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+## {{name}} ({{id}})
+
+Used by:
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{#if source_path}}
+License text source: {{source_path}}
+{{/if}}
+
+```
+{{{text}}}
+```
+
+{{/each}}

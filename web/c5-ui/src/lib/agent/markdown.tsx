@@ -9,7 +9,7 @@ import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
 import { copyText } from '@/lib/clipboard'
-import { useHighlightedCode } from '@/lib/agent/highlight'
+import { useHighlightedCode, useHljsTheme } from '@/lib/agent/highlight'
 
 /**
  * Compact, dependency-light Markdown renderer tuned for assistant output.
@@ -221,6 +221,8 @@ export const Markdown = memo(function Markdown({
   className?: string
 }) {
   const blocks = useMemo(() => parse(children), [children])
+  // 代码块底色随明暗模式切换（github / github-dark 主题 + --c-code-* 令牌）。
+  useHljsTheme()
   return (
     <div className={cn('space-y-3 text-[14px] leading-relaxed text-text-2', className)}>
       {blocks.map((b, idx) => {
@@ -342,16 +344,17 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   }
   return (
     <div className="group relative overflow-hidden rounded-xl border border-border text-[13px]">
-      <div className="flex items-center justify-between border-b border-white/5 bg-black/20 px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-white/60">{lang || 'code'}</span>
+      {/* 头部条用主题中立的 surface 配色：浅色模式不再压在深色代码底上。 */}
+      <div className="flex items-center justify-between border-b border-border bg-surface-2/70 px-3 py-1.5">
+        <span className="font-mono text-2xs uppercase tracking-wide text-muted">{lang || 'code'}</span>
         <button
           onClick={copy}
-          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-white/65 transition-colors hover:bg-white/10 hover:text-white"
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-surface-3 hover:text-text-2"
         >
           <Icon name={copied ? 'check' : 'copy'} size={12} /> {copied ? t('common.copied') : t('common.copy')}
         </button>
       </div>
-      <pre className="hljs overflow-x-auto p-3">
+      <pre className="hljs overflow-x-auto bg-code-bg p-3 text-code-fg">
         <code className="font-mono leading-relaxed" dangerouslySetInnerHTML={{ __html: html }} />
       </pre>
     </div>

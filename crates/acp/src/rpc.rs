@@ -7,6 +7,7 @@
 //! - `session/cancel`（通知）— 取消当前 turn
 //! - `session/load`（请求）— 恢复历史会话
 //! - `session/close`（请求）— 关闭会话
+//! - `session/available_commands`（请求）— 返回注入的可用命令清单（斜杠命令菜单）
 //! - `session/request_permission`（服务端→客户端请求）— turn 中的审批/追问经此发给
 //!   ACP 客户端，客户端以同 id 的 JSON-RPC 响应回答（构造/登记/回执解析见下方模块）
 //!
@@ -21,7 +22,7 @@ use agent_server::{ClientFrame, ServerFrame, SessionManager};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::types::RpcError;
+use crate::types::{CommandInfo, RpcError};
 
 /// ACP 协议版本（客户端 `initialize` 时协商）。
 ///
@@ -50,6 +51,7 @@ pub async fn dispatch_rpc(
         "session/load" => handle_session_load(state, req).await,
         "session/close" => handle_session_close(state, req).await,
         "session/set_mode" => handle_set_mode(state, req).await,
+        "session/available_commands" => handle_available_commands(state, req).await,
         "authenticate" => Ok(json!({})),
         "logout" => Ok(json!({})),
         // session/prompt 需传输层特殊处理（阻塞推送通知）。
@@ -288,6 +290,31 @@ async fn handle_set_mode(
         .await
         .map_err(|e| rpc_error(INTERNAL_ERROR, e))?;
     Ok(json!({ "sessionId": new_sid }))
+}
+
+/// `session/available_commands`：返回可用命令清单（`{"commands":[...]}`）。
+///
+/// 清单来源为 [`SessionManager`] 的共享可写存储（装配层经
+/// `set_available_commands` 注入）；未注入时返回空列表。与同族方法一致：
+/// 要求 `sessionId` 且会话必须存在（未知会话按 Invalid params 拒绝）。
+async fn handle_available_commands(
+    state: &SessionManager,
+    req: &crate::types::JsonRpcRequest,
+) -> Result<Value, RpcError> {
+    let sid = param_str(req.params.as_ref(), "sessionId")
+        .or_else(|| param_str(req.params.as_ref(), "session_id")) // 兼容旧格式
+        .ok_or_else(|| rpc_error(INVALID_PARAMS, "缺少必填参数 sessionId"))?;
+    state
+        .get(sid)
+        .await
+        .ok_or_else(|| rpc_error(INVALID_PARAMS, format!("会话不存在: {sid}")))?;
+    let commands: Vec<CommandInfo> = state
+        .available_commands()
+        .await
+        .into_iter()
+        .map(|(name, description)| CommandInfo { name, description })
+        .collect();
+    Ok(json!({ "commands": commands }))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -561,6 +588,7 @@ mod tests {
     use super::*;
     use crate::types::{JsonRpcId, JsonRpcRequest};
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn initialize_returns_standard_acp_envelope() {
@@ -897,5 +925,90 @@ mod tests {
         assert_eq!(id_to_string(Some(&json!("abc"))), Some("abc".into()));
         assert_eq!(id_to_string(None), None);
         assert_eq!(id_to_string(Some(&json!(null))), None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // session/available_commands
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// 测试辅助：以示例配置构造 SessionManager（cwd 指定，便于临时目录隔离）。
+    fn test_manager(cwd: &std::path::Path) -> SessionManager {
+        let cfg: agent_config::Config =
+            toml::from_str(include_str!("../../../config.example.toml"))
+                .expect("示例配置应可解析为 Config");
+        SessionManager::new(Arc::new(cfg), reqwest::Client::new(), Arc::from(cwd), None)
+    }
+
+    /// 测试辅助：构造管理器 + 一个活跃会话（`create_session` 仅本地装配，无网络请求）。
+    async fn manager_with_session(tag: &str) -> (SessionManager, String) {
+        let cwd = std::env::temp_dir().join(format!("gyre-acp-cmds-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("临时 cwd 应可创建");
+        let mgr = test_manager(&cwd);
+        let sid = mgr
+            .create_session(None, None, None, None, None)
+            .await
+            .expect("测试会话应可创建");
+        (mgr, sid)
+    }
+
+    /// 测试辅助：构造 `session/available_commands` 请求。
+    fn available_commands_request(session_id: Option<&str>) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(JsonRpcId::Str("cmd-1".into())),
+            method: "session/available_commands".into(),
+            params: session_id.map(|sid| json!({ "sessionId": sid })),
+        }
+    }
+
+    #[tokio::test]
+    async fn available_commands_returns_injected_list() {
+        let (mgr, sid) = manager_with_session("injected").await;
+        mgr.set_available_commands(vec![
+            ("review".into(), "代码评审".into()),
+            ("compact".into(), "压缩会话上下文".into()),
+        ])
+        .await;
+
+        let result = dispatch_rpc(&mgr, &available_commands_request(Some(&sid)))
+            .await
+            .expect("已注入时应成功");
+        // 顶层仅 commands 键；条目为 name/description 形状（camelCase，单词形锁定键名）。
+        assert_eq!(result.as_object().map(|o| o.len()), Some(1));
+        let commands = result["commands"].as_array().expect("commands 应为数组");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["name"], "review");
+        assert_eq!(commands[0]["description"], "代码评审");
+        assert_eq!(commands[1]["name"], "compact");
+        assert_eq!(commands[1]["description"], "压缩会话上下文");
+    }
+
+    #[tokio::test]
+    async fn available_commands_empty_when_not_injected() {
+        let (mgr, sid) = manager_with_session("empty").await;
+        let result = dispatch_rpc(&mgr, &available_commands_request(Some(&sid)))
+            .await
+            .expect("未注入也应成功（空列表）");
+        assert_eq!(result["commands"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn available_commands_unknown_session_is_invalid_params() {
+        let mgr = test_manager(std::path::Path::new("."));
+        let err = dispatch_rpc(&mgr, &available_commands_request(Some("no-such-session")))
+            .await
+            .expect_err("未知会话应报错");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("会话不存在"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn available_commands_missing_session_id_is_invalid_params() {
+        let mgr = test_manager(std::path::Path::new("."));
+        let err = dispatch_rpc(&mgr, &available_commands_request(None))
+            .await
+            .expect_err("缺少 sessionId 应报错");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("sessionId"), "{err:?}");
     }
 }

@@ -366,7 +366,7 @@ pub struct Session {
     /// 待审批回执表（驱动任务用以解析 Respond）。
     pub pending: PendingMap,
     /// 子 Agent 监控总线（TaskTool 与转发器共享同一份状态）。
-    pub supervisor: Supervisor,
+    pub supervisor: Arc<Supervisor>,
     /// 驱动任务句柄（[`Session::shutdown`] 时 abort，防长时运行会话任务泄漏）。
     pub driver_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// 子 Agent 监控转发任务句柄（[`Session::shutdown`] 时 abort）。
@@ -427,6 +427,10 @@ pub struct SessionManager {
     /// 审批模式运行时控制器（共享单例；`/api/approval-mode` 路由驱动，实时生效并
     /// 持久化到 `.gyre/approval-mode.state`）。恒存在——默认档 always-ask 始终可用。
     approval: Arc<agent_config::ApprovalModeController>,
+    /// 可用命令清单（`session/available_commands` 共享可写存储）：装配层启动后注入，
+    /// ACP 分发层读取。以 `(name, description)` 二元组存储——线协议类型 `CommandInfo`
+    /// 定义在 agent-acp（依赖方向 acp → server，不能反向引用），此处保持中性对偶。
+    available_commands: Arc<tokio::sync::RwLock<Vec<(String, String)>>>,
 }
 
 impl SessionManager {
@@ -453,6 +457,7 @@ impl SessionManager {
             approval: Arc::new(agent_config::ApprovalModeController::new(Some(
                 approval_path,
             ))),
+            available_commands: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -490,6 +495,19 @@ impl SessionManager {
     #[must_use]
     pub const fn pause_gate(&self) -> &Arc<PauseGate> {
         &self.pause_gate
+    }
+
+    /// 注入可用命令清单（`session/available_commands` 数据源；装配层调用，覆盖式更新）。
+    ///
+    /// 元组为 `(name, description)`；注入 `vec![]` 即清空。未注入（初始态）读取得到空列表。
+    pub async fn set_available_commands(&self, commands: Vec<(String, String)>) {
+        *self.available_commands.write().await = commands;
+    }
+
+    /// 读取可用命令清单（未注入时为空列表）。
+    #[must_use]
+    pub async fn available_commands(&self) -> Vec<(String, String)> {
+        self.available_commands.read().await.clone()
     }
 
     /// 创建/恢复/fork 会话。
@@ -568,7 +586,7 @@ impl SessionManager {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<ClientFrame>();
 
-        let supervisor = Supervisor::new();
+        let supervisor = Arc::new(Supervisor::new());
         // Skill 目录 + MCP 注册表：每个会话加载一次，供 build_agent 与只读端点（/skills /mcp）共享。
         let skill_opts = self.config.skills.to_load_options();
         let skill_catalog: Arc<agent_skills::SkillCatalog> = if skill_opts.enabled {
@@ -942,7 +960,7 @@ async fn build_agent(
     cwd: &std::path::Path,
     pending: &PendingMap,
     broadcast_tx: &broadcast::Sender<ServerFrame>,
-    supervisor: &Supervisor,
+    supervisor: &Arc<Supervisor>,
     // 会话 id（决定持久化路径 `<cwd>/.agent/sessions/<id>.jsonl`；resume 时复用历史）。
     session_id: &str,
     alias: Option<&str>,
@@ -961,7 +979,17 @@ async fn build_agent(
     let chain = config.resolve_chain(alias).map_err(|e| e.to_string())?;
     let profile = chain[0];
     use secrecy::ExposeSecret;
-    let api_key: String = profile.resolve_api_key().expose_secret().to_string();
+    // 认证链分层（config 值 → oauth.toml 有效/先刷后用 → auth.toml → env）。
+    // 同步封装内部 block_in_place：须 multi-thread runtime（server 入口满足）。
+    let config_dir =
+        agent_core::platform::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let api_key: String = agent_llm::oauth::resolve_runtime_api_key(
+        &http,
+        &config_dir,
+        profile.api.as_str(),
+        profile.api_key.expose_secret().is_empty(),
+        profile.resolve_api_key().expose_secret(),
+    );
     let model = agent_core::Model {
         id: profile.id.clone(),
         provider: "openai-compatible".into(),
@@ -1142,11 +1170,15 @@ async fn build_agent(
     tool_registry = tool_registry.with(Box::new(agent_tools::SecurityScanTool::new(
         agent_tools::SecurityScanState::new().shared(),
     )));
-    // P1：hub 消息总线（每会话以 "main" 入册）。
-    tool_registry = tool_registry.with(Box::new(agent_tools::HubTool::register(
-        agent_core::hub::Hub::new().shared(),
-        "main",
-    )));
+    // P1：hub 消息总线（每会话以 "main" 入册）+ 进程托管 op（start/ps/logs/stop/restart/
+    // describe 与带 name 的 send/wait；进程内实现，随服务进程存续）。
+    let hub_supervision: Arc<dyn agent_core::hub::HubSupervision> = supervisor.clone();
+    let processes = Arc::new(agent_supervisor::ProcessManager::new());
+    tool_registry = tool_registry.with(Box::new(
+        agent_tools::HubTool::register(agent_core::hub::Hub::new().shared(), "main")
+            .with_supervision(hub_supervision)
+            .with_processes(processes),
+    ));
     if config.subagent.enabled {
         let task_tool = agent::TaskTool::new(
             Arc::clone(&provider),
@@ -2122,7 +2154,7 @@ async fn list_commands(
 ///
 /// 采用「dirty 标记 + 125ms 节拍」：事件仅置位，节拍到期才下发最新快照，
 /// 突发不补帧、带宽友好（≈8fps），且天然幂等（前端整体替换）。
-async fn supervisor_forwarder(sup: Supervisor, tx: broadcast::Sender<ServerFrame>) {
+async fn supervisor_forwarder(sup: Arc<Supervisor>, tx: broadcast::Sender<ServerFrame>) {
     let mut rx = sup.subscribe();
     let mut dirty = false;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(125));
@@ -2411,8 +2443,14 @@ fn is_safe_session_id(id: &str) -> bool {
 /// 解析一行会话 JSONL：优先按 [`agent_core::SessionNode`]（新会话树格式）解析取其
 /// `message`；失败则回退为裸 [`agent_core::AgentMessage`]（旧线性日志格式）。
 ///
-/// 使历史读取对新旧两种持久化格式都兼容。
+/// 使历史读取对新旧两种持久化格式都兼容；会话 header 记录（v1+ 首行）返回 `None`
+/// （调用方按「无法解析的行」跳过，不计入消息）。
 fn parse_history_line(line: &str) -> Option<agent_core::AgentMessage> {
+    // 会话文件 header 记录（v1+ 首行）不是消息：明确跳过（read_first_user /
+    // read_history / 统计聚合 / transcript 渲染共用本入口，一处跳过处处生效）。
+    if agent_context::is_session_header_line(line) {
+        return None;
+    }
     if let Ok(node) = serde_json::from_str::<agent_core::SessionNode>(line) {
         return Some(node.message);
     }
@@ -2690,12 +2728,18 @@ async fn list_sessions(
                 .mtime
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
+            let created_at_ms = s.created_at.as_ref().map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+            });
             serde_json::json!({
                 "id": s.id,
                 "preview": preview,
                 "title": title,
                 "mtime_ms": mtime_ms,
                 "bytes": s.bytes,
+                // 会话创建时间（header 记录；legacy 无 header 的旧会话为 null）。
+                "created_at_ms": created_at_ms,
             })
         })
         .collect();
@@ -2826,6 +2870,10 @@ fn read_branch_tree(path: &std::path::Path) -> serde_json::Value {
         for line in std::io::BufReader::new(file).lines().filter_map(Result::ok) {
             let t = line.trim();
             if t.is_empty() {
+                continue;
+            }
+            // 会话 header 记录（v1+ 首行）不是树节点：跳过。
+            if agent_context::is_session_header_line(t) {
                 continue;
             }
             if let Ok(n) = serde_json::from_str::<agent_core::SessionNode>(t) {
@@ -3732,6 +3780,58 @@ mod tests {
         assert_eq!(tree["active_leaf"].as_str(), Some("c1"));
         assert_eq!(tree["nodes"].as_array().unwrap().len(), 4);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v1+ 会话文件（首行 header 记录）：read_history / read_first_user /
+    /// read_branch_tree 均跳过 header 行，正常解析后续节点条目。
+    #[test]
+    fn readers_skip_session_header_line() {
+        use agent_context::{CURRENT_SESSION_VERSION, SessionHeader, SessionRecord};
+        use agent_core::{AgentMessage, SessionNode};
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "agent_hdr_test_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let header = SessionHeader {
+            version: CURRENT_SESSION_VERSION,
+            created_at_unix: 1_700_000_000,
+            agent: "gyre".into(),
+        };
+        let node = SessionNode::root("u1".into(), AgentMessage::user_text("header 后的用户消息"));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&SessionRecord::Header(header)).unwrap()
+            )
+            .unwrap();
+            writeln!(f, "{}", serde_json::to_string(&node).unwrap()).unwrap();
+        }
+        // read_history：只有 1 条用户消息（header 不计）。
+        let items = read_history(&path);
+        assert_eq!(items.len(), 1, "header 行不得计入历史");
+        assert_eq!(items[0]["kind"].as_str(), Some("user"));
+        assert_eq!(
+            items[0]["line"].as_i64(),
+            Some(0),
+            "消息索引不受 header 影响"
+        );
+        // read_first_user：预览取自 header 之后的用户消息。
+        assert_eq!(
+            read_first_user(&path),
+            Some("header 后的用户消息".to_string())
+        );
+        // read_branch_tree：只有 1 个树节点（header 不计）。
+        let tree = read_branch_tree(&path);
+        assert_eq!(tree["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["active_leaf"].as_str(), Some("u1"));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -57,10 +57,18 @@ impl LlmProvider for AnthropicMessagesAdapter {
         let body = build_body(&request);
         let model_id = request.model.id.clone();
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", ctx.api_key.as_deref().unwrap_or_default())
+        // Claude OAuth 访问令牌（`sk-ant-oat…`）必须走 Bearer + oauth beta 头
+        // （x-api-key 是 console API key 专用——omp 同语义）；静态 key 维持原样。
+        let api_key = ctx.api_key.as_deref().unwrap_or_default();
+        let oauth = api_key.starts_with("sk-ant-oat");
+        let mut req = self.client.post(&url);
+        req = if oauth {
+            req.bearer_auth(api_key)
+                .header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            req.header("x-api-key", api_key)
+        };
+        let resp = req
             .header("anthropic-version", "2023-06-01")
             .json(&body)
             .send()

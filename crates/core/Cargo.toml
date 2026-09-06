@@ -17,11 +17,18 @@ futures     = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }
 dirs        = { workspace = true }
+regex       = { workspace = true }
+sha2        = { workspace = true }
+base64      = { workspace = true }
+hmac        = { workspace = true }
+rand        = { workspace = true }
 
 [dev-dependencies]
+reqwest    = { workspace = true }
 # 基准门：tiktoken 计数基准（benches/tokenize.rs）。真实实现位于 agent-context
 # （crates/context/src/token.rs）；core→context 的 dev 依赖边为 Cargo 允许的
 # dev-dependency 环（context 正常依赖 core，dev 边不参与常规依赖图）。
+tempfile    = { workspace = true }
 agent-context = { workspace = true }
 criterion = { workspace = true }
 

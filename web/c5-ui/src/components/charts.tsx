@@ -73,7 +73,8 @@ export function BarChart({
 
   const groupW = innerW / data.length
   const barGap = 2
-  const barW = has2 ? groupW * 0.32 : groupW * 0.5
+  // 单柱限宽：数据点很少（如只有 1 天）时柱子不会涨满整格。
+  const barW = Math.min(has2 ? groupW * 0.32 : groupW * 0.5, 32)
 
   const ticks = Array.from({ length: 5 }, (_, i) => (max / 4) * i)
 

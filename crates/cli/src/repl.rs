@@ -42,6 +42,17 @@ pub enum CommandOutcome {
     Swarm(String),
     /// 打开子 Agent 监控仪表盘（终端备用屏，自动刷新，Enter 返回）。
     Agents,
+    /// `/tree`（无参）：渲染会话树（活跃叶子标记；主循环异步快照后打印）。
+    ShowTree,
+    /// `/tree <id>` / `/branch <id>`：切换活跃叶子（handoff = 摘要交接分叉）。
+    SwitchBranch {
+        /// 目标节点（完整 id 或 ≥4 字符前缀）。
+        node: String,
+        /// true → `switch_branch_with_handoff`（离支摘要注入）。
+        handoff: bool,
+    },
+    /// `/models`：运行时模型发现（当前 provider 的 /models 端点）。
+    ListModels,
     /// 粘贴图像（剪贴板或本地文件）作为多模态用户消息发送。
     Paste {
         /// 附带的文本提示（可为空）。
@@ -161,6 +172,9 @@ pub const fn builtin_commands() -> &'static [&'static str] {
         "/suggest",
         "/review",
         "/compact",
+        "/tree",
+        "/branch",
+        "/models",
         "/mcp",
         "/skill",
         "/skills",
@@ -192,6 +206,9 @@ const HELP_KEYS: &[&str] = &[
     "help.model",
     "help.mode",
     "help.plan",
+    "help.tree",
+    "help.branch",
+    "help.models",
     "help.paste",
     "help.enhance",
     "help.suggest",
@@ -295,6 +312,24 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             print_help(ctx);
             CommandOutcome::Handled
         }
+        "/tree" => match input.split_whitespace().nth(1) {
+            Some(id) if !id.is_empty() => CommandOutcome::SwitchBranch {
+                node: id.to_string(),
+                handoff: false,
+            },
+            _ => CommandOutcome::ShowTree,
+        },
+        "/branch" => match input.split_whitespace().nth(1) {
+            Some(id) if !id.is_empty() => CommandOutcome::SwitchBranch {
+                node: id.to_string(),
+                handoff: true,
+            },
+            _ => {
+                eprintln!("{}", t!("tree.usage"));
+                CommandOutcome::Handled
+            }
+        },
+        "/models" => CommandOutcome::ListModels,
         "/status" => {
             print_status(ctx);
             CommandOutcome::Handled
@@ -948,6 +983,10 @@ fn first_user_message_text(path: &Path) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
+        // v1+ 会话文件首行为 header 记录：跳过（非消息）。
+        if agent_context::is_session_header_line(trimmed) {
+            continue;
+        }
         let Ok(msg) = serde_json::from_str::<agent_core::AgentMessage>(trimmed) else {
             continue;
         };
@@ -1519,6 +1558,37 @@ mod tests {
     }
 
     #[test]
+    fn first_user_message_skips_session_header() {
+        use agent_context::{CURRENT_SESSION_VERSION, SessionHeader};
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("agent-sess-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!("{n}.jsonl"));
+        let header = SessionHeader {
+            version: CURRENT_SESSION_VERSION,
+            created_at_unix: 1_700_000_000,
+            agent: "gyre".into(),
+        };
+        let header_line =
+            serde_json::to_string(&agent_context::SessionRecord::Header(header)).unwrap();
+        let msg = agent_core::AgentMessage::user_text("header 之后的用户消息");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{header_line}").unwrap();
+            writeln!(f, "{}", serde_json::to_string(&msg).unwrap()).unwrap();
+        }
+        assert_eq!(
+            first_user_message_text(&path),
+            Some("header 之后的用户消息".to_string())
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn session_history_renders_user_and_assistant() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("agent-hist-{}", std::process::id()));
@@ -1765,6 +1835,8 @@ mod tests {
                 compaction: agent_config::CompactionConfig::default(),
                 socks5: agent_config::Socks5Config::default(),
                 user_agent: None,
+                hooks: Vec::new(),
+                models_roles: None,
             };
             Self {
                 model: agent_core::Model::with_defaults(

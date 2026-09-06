@@ -2,7 +2,12 @@ import { useEffect, useState } from 'react'
 import { useDeferredValue } from 'react'
 // highlight.js core + languages are bundled locally (no CDN at runtime).
 import hljs from 'highlight.js/lib/core'
-import 'highlight.js/styles/github-dark.min.css'
+// 两套主题以字符串内联打进主包（各 ~2KB），运行时按应用明暗模式挂载其一：
+// 浅色代码块配 github 亮色令牌，深色配 github-dark，避免全局静态单主题
+// 在另一模式下底色/字色不可读。
+import githubDarkCss from 'highlight.js/styles/github-dark.min.css?inline'
+import githubLightCss from 'highlight.js/styles/github.min.css?inline'
+import { useTheme } from '@/lib/theme'
 
 /**
  * 语言模块按需加载：只静态打包 core（很小），29 种语言各自成为独立 chunk，
@@ -43,6 +48,24 @@ const LANGUAGE_LOADERS: Record<string, () => Promise<{ default: any }>> = {
 let registered = false
 let registering: Promise<void> | null = null
 
+let hljsStyleEl: HTMLStyleElement | null = null
+
+/** 把 highlight.js 主题（github / github-dark）挂到文档级 <style> 上（幂等）。 */
+export function applyHljsTheme(theme: 'light' | 'dark'): void {
+  if (typeof document === 'undefined') return
+  hljsStyleEl ??= Object.assign(document.createElement('style'), { id: 'hljs-theme' })
+  if (!hljsStyleEl.isConnected) document.head.appendChild(hljsStyleEl)
+  hljsStyleEl.textContent = theme === 'dark' ? githubDarkCss : githubLightCss
+}
+
+/** 组件侧入口：跟随 ThemeProvider 切换 highlight.js 主题。 */
+export function useHljsTheme(): void {
+  const { theme } = useTheme()
+  useEffect(() => {
+    applyHljsTheme(theme)
+  }, [theme])
+}
+
 /** 注册全部支持的语言（幂等；首次调用并行拉取语言 chunk）。 */
 export function ensureLanguages(): Promise<void> {
   if (registered) return Promise.resolve()
@@ -60,11 +83,14 @@ export function ensureLanguages(): Promise<void> {
  * The hook keeps a `ready` flag (true once language chunks are registered) so
  * callers can defer the first paint imperceptibly; no network is involved.
  *
- * The github-dark theme is imported statically and styles `.hljs`. The code
- * viewer always renders on a dark background, so a single theme suits both
- * light and dark app modes — no runtime theme swap needed.
+ * Also keeps the highlight.js theme in sync with the app theme: the light
+ * app mode renders code on the light `--c-code-bg`, so the github light theme
+ * must be mounted there (see `applyHljsTheme`).
  */
-export function useHighlighter(_theme: 'light' | 'dark'): boolean {
+export function useHighlighter(theme: 'light' | 'dark'): boolean {
+  useEffect(() => {
+    applyHljsTheme(theme)
+  }, [theme])
   const [ready, setReady] = useState(registered)
   useEffect(() => {
     if (registered) return

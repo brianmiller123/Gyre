@@ -4,6 +4,7 @@ import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { useNotifications } from '@/lib/notifications'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/cn'
+import { treeIndent } from '@/lib/tree'
 import { Icon } from '@/components/icons'
 import { Button, Modal, Skeleton } from '@/components/ui'
 
@@ -102,7 +103,7 @@ export function BranchTreeModal({
     <Modal open={open} onClose={onClose} title={t('branches.title')} size="md">
       <div className="mb-2 flex items-center justify-between gap-2">
         <p className="text-xs text-muted">{t('branches.desc')}</p>
-        <label className="flex shrink-0 cursor-pointer select-none items-center gap-1.5 text-[11px] text-text-2">
+        <label className="flex shrink-0 cursor-pointer select-none items-center gap-1.5 text-2xs text-text-2">
           <input
             type="checkbox"
             checked={handoff}
@@ -127,7 +128,7 @@ export function BranchTreeModal({
             <Icon name="alert" size={20} className="text-danger" />
             <p className="text-xs font-medium text-text-2">{t('branches.load_failed')}</p>
             {error && (
-              <p className="max-w-xs break-all text-[11px] leading-relaxed text-muted">{error}</p>
+              <p className="max-w-xs break-all text-2xs leading-relaxed text-muted">{error}</p>
             )}
             <Button size="sm" variant="outline" leftIcon="refresh" onClick={() => void load()}>
               {t('common.retry')}
@@ -162,7 +163,7 @@ export function BranchTreeModal({
       </div>
 
       {tree && !multiBranch && !loading && (
-        <p className="mt-2 text-[11px] text-muted">{t('branches.single_hint')}</p>
+        <p className="mt-2 text-2xs text-muted">{t('branches.single_hint')}</p>
       )}
     </Modal>
   )
@@ -203,7 +204,7 @@ function BranchNodeView({
           'group flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors',
           isActive ? 'bg-primary/15' : 'hover:bg-surface-2',
         )}
-        style={{ paddingLeft: `${depth * 14 + 6}px` }}
+        style={{ paddingLeft: `${treeIndent(depth)}px` }}
       >
         {/* 分支节点圆点：活跃叶子为实心主色，路径上为半透明，其余淡灰。 */}
         <span
@@ -231,7 +232,7 @@ function BranchNodeView({
           >
             {node.preview || t('branches.no_preview')}
           </span>
-          <span className="text-[9px] uppercase tracking-wide text-muted/70">
+          <span className="text-2xs uppercase tracking-wide text-muted/70">
             {roleLabel(node.role, t)}
             {isLeaf && kids.length === 0 ? '' : ''}
           </span>
@@ -242,7 +243,7 @@ function BranchNodeView({
             disabled={busyLeaf !== null}
             onClick={() => onSwitch(node.id)}
             className={cn(
-              'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+              'shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium transition-colors',
               'bg-surface-3 text-text-2 hover:bg-primary hover:text-white',
               'disabled:cursor-not-allowed disabled:opacity-50',
             )}

@@ -8,18 +8,28 @@
 #![deny(unsafe_code)]
 
 mod approval;
+mod auth;
 mod config;
 mod env;
+mod oauth_store;
 mod rules;
 
 pub use approval::ApprovalModeController;
 
+pub use auth::{AuthStore, auth_path, env_var_name, load, resolve, save};
+
+pub use oauth_store::{
+    OAuthCredentials, OAuthStore, load as load_oauth, oauth_path, remove as remove_oauth,
+    save as save_oauth,
+};
+
 pub use config::{
     AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config,
-    EditToolsConfig, EvalConfig, GithubConfig, GoalsConfig, InterceptorConfig, McpConfig,
-    McpHttpConfig, McpServerConfig, McpStdioConfig, MemoryBackend, MemoryConfig, MinimizerConfig,
-    ModelProfile, ServerConfig, SkillsConfig, Socks5Config, SubagentConfig, ToolApproval,
-    ToolsConfig, ToolsSwitchConfig, TtsrConfig, parse_compaction_backend, wildcard_match,
+    EditToolsConfig, EvalConfig, GithubConfig, GoalsConfig, HookEventKind, HookRule,
+    InterceptorConfig, McpConfig, McpHttpConfig, McpOAuthConfig, McpServerConfig, McpStdioConfig,
+    MemoryBackend, MemoryConfig, MinimizerConfig, ModelProfile, RolesCfg, ServerConfig,
+    SkillsConfig, Socks5Config, SubagentConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig,
+    TtsrConfig, parse_compaction_backend, wildcard_match,
 };
 pub use config::{CustomCommand, discover_commands, discover_context_files};
 pub use env::expand_env;

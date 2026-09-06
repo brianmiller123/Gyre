@@ -19,8 +19,10 @@ pub mod token;
 mod tool_protection;
 pub mod tree;
 
+pub use persistence::CURRENT_SESSION_VERSION;
 pub use persistence::delete_message_in_file;
-pub use persistence::{SessionInfo, SessionStore};
+pub use persistence::{SessionHeader, SessionInfo, SessionRecord, SessionStore};
+pub use persistence::{is_session_header_line, read_session_header};
 pub use tree::{
     branch_messages, branch_path_ids, branch_path_nodes, children_of,
     collect_entries_for_branch_summary, common_ancestor, leaves, new_node_id, node_index,

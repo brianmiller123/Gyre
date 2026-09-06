@@ -15,6 +15,11 @@ pub struct Config {
     /// 额外模型 profile（运行时 `--model <alias>` 切换）。
     #[serde(default)]
     pub models: Vec<ModelProfile>,
+    /// 模型角色映射（TOML `[models.roles]`：role → alias/id）。
+    /// 加载管线把 `[models.roles]` 段提升为本字段（见 [`hoist_models_roles`]）；
+    /// 直接顶层键 `models_roles` 亦可。内置角色约定 default/plan/quick 仅文档层。
+    #[serde(default)]
+    pub models_roles: Option<RolesCfg>,
     /// Agent 行为配置。
     #[serde(default)]
     pub agent: AgentConfig,
@@ -64,6 +69,9 @@ pub struct Config {
     /// `pi/<version> (<platform> <release>; <arch>)`（见 `agent_core::platform::default_llm_user_agent`）。
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Shell 钩子规则（TOML `[[hooks]]` 数组表；装配层经 `shell_hooks_from_config` 转为 `ShellHook`）。
+    #[serde(default)]
+    pub hooks: Vec<HookRule>,
 }
 
 impl Config {
@@ -109,6 +117,16 @@ impl Config {
             )));
         };
 
+        let cfg = Self::from_merged(&merged)?;
+        Ok(cfg)
+    }
+
+    /// 从合并后的 `toml::Value` 构建 Config：`[models.roles]` 段提升为顶层
+    /// `models_roles`（[`hoist_models_roles`]）→ round-trip 反序列化 → 校验。
+    /// `load` 与测试共用此管线，保证行为一致。
+    fn from_merged(merged: &toml::Value) -> Result<Self, ConfigError> {
+        let mut merged = merged.clone();
+        hoist_models_roles(&mut merged);
         // round-trip 通过字符串完成 toml::Value → Config（加载时一次性，开销可忽略）。
         let merged_str = toml::to_string(&merged)
             .map_err(|e| ConfigError::Parse(format!("合并配置序列化失败: {e}")))?;
@@ -133,12 +151,35 @@ impl Config {
                 "subagent.max_concurrent 必须 ≥ 1".into(),
             ));
         }
+        // [[hooks]]：command 非空 + timeout 区间检查（`None` 视为默认 10，无需校验）。
+        for h in &self.hooks {
+            if h.command.trim().is_empty() {
+                return Err(ConfigError::Invalid("hooks.command 不能为空".into()));
+            }
+            let t = h.effective_timeout_secs();
+            if !(1..=600).contains(&t) {
+                return Err(ConfigError::Invalid(format!(
+                    "hooks.timeout_secs 必须在 1..=600 区间（当前 {t}）"
+                )));
+            }
+        }
         for m in std::iter::once(&self.default_model).chain(&self.models) {
             if matches!(m.max_input_tokens, Some(0)) {
                 return Err(ConfigError::Invalid("max_input_tokens 必须 > 0".into()));
             }
             // P2：fallback 引用存在性 + 防环（配置错误尽早暴露，而非运行时静默跳过）。
             self.resolve_chain(m.alias.as_deref().or(Some(m.id.as_str())))?;
+        }
+        // [models.roles]：每个角色值必须命中既有 profile（alias 或 id，含默认）。
+        // 配置错误尽早暴露，而非运行时 resolve_role 静默返回 None。
+        if let Some(roles) = &self.models_roles {
+            for (role, target) in &roles.roles {
+                if self.find_profile(target).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "models.roles.{role} 引用的模型不存在: {target}（须为 [[models]] 的 alias/id 或默认 profile）"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -170,6 +211,16 @@ impl Config {
         let mut seen = std::collections::HashSet::from([primary.id.clone()]);
         self.expand_fallbacks(primary, &mut chain, &mut seen)?;
         Ok(chain)
+    }
+
+    /// 按角色名解析模型 profile（`[models.roles]`：role → alias/id → profile）。
+    ///
+    /// 角色名任意（`default` / `plan` / `quick` 为内置约定，仅文档层）；未配置
+    /// `[models.roles]`、角色不存在或引用未命中时返回 `None`。
+    #[must_use]
+    pub fn resolve_role(&self, role: &str) -> Option<&ModelProfile> {
+        let target = self.models_roles.as_ref()?.roles.get(role)?;
+        self.find_profile(target)
     }
 
     /// 按 alias 或 id 查找 profile（含默认 profile）。
@@ -219,6 +270,54 @@ fn merge_value(base: &mut toml::Value, overlay: &toml::Value) {
         }
         (slot, overlay) => *slot = overlay.clone(),
     }
+}
+
+/// `[models.roles]` 提升为顶层 `models_roles`。
+///
+/// TOML 规范：array-of-tables 的子表归属**最后一个元素**——`[[models]]` 之后的
+/// `[models.roles]` 会被解析进最后一个模型条目；而仅写 `[models.roles]`（无
+/// `[[models]]`）时 `models` 本身是 `{ roles = {…} }` 表，无法反序列化为模型数组。
+/// 此处把两种形态统一提升：`roles` 表移动到顶层键 `models_roles`（已存在则保留
+/// 原值），`models` 恢复为纯模型数组（提升后为空则整体移除）。
+fn hoist_models_roles(value: &mut toml::Value) {
+    let Some(root) = value.as_table_mut() else {
+        return;
+    };
+    let (models_emptied, roles) = match root.get_mut("models") {
+        // 形态一：`[[models]]` 存在 —— roles 挂在最后一个条目内。
+        Some(toml::Value::Array(entries)) => (
+            false,
+            entries
+                .last_mut()
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|last| last.remove("roles")),
+        ),
+        // 形态二：仅 `[models.roles]` —— `models` 是 `{ roles = {…} }` 表。
+        Some(toml::Value::Table(models)) => {
+            let roles = models.remove("roles");
+            (models.is_empty(), roles)
+        }
+        // 无 models 键 / 非法形态：交由后续反序列化自然报错。
+        _ => return,
+    };
+    if models_emptied {
+        root.remove("models");
+    }
+    if let Some(roles) = roles {
+        root.entry("models_roles").or_insert(roles);
+    }
+}
+
+/// 模型角色映射（TOML `[models.roles]`）。
+///
+/// 键为任意自定义角色名（`default` / `plan` / `quick` 为内置约定，仅文档层），
+/// 值为目标模型的 `alias` 或 `id`。加载时由 [`Config::load`] 经
+/// [`hoist_models_roles`] 从 `[models.roles]` 段提升到顶层 `models_roles`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RolesCfg {
+    /// role → alias / 模型 id（flatten：段内每个键即一个角色）。
+    #[serde(flatten)]
+    pub roles: std::collections::HashMap<String, String>,
 }
 
 /// 模型 profile（对应 TOML `[default_model]` / `[[models]]`）。
@@ -578,9 +677,6 @@ pub struct SkillsConfig {
     /// 总开关；`false` 则不发现、不注入、`skill://` 一律失败。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 注册 `/skill:<name>` slash command（远期，当前未实现）。
-    #[serde(default)]
-    pub enable_commands: bool,
     /// 自定义扫描目录（`~` 展开；非递归 `*/SKILL.md`）。
     #[serde(default)]
     pub custom_directories: Vec<String>,
@@ -590,16 +686,19 @@ pub struct SkillsConfig {
     /// 包含 glob（空 = 全部）。
     #[serde(default)]
     pub included: Vec<String>,
+    /// 跨工具 skill 发现 provider 开关。
+    #[serde(default)]
+    pub providers: SkillsProviders,
 }
 
 impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            enable_commands: false,
             custom_directories: Vec::new(),
             ignored: Vec::new(),
             included: Vec::new(),
+            providers: SkillsProviders::default(),
         }
     }
 }
@@ -617,6 +716,62 @@ impl SkillsConfig {
                 .collect(),
             ignored: self.ignored.clone(),
             included: self.included.clone(),
+        }
+    }
+
+    /// 转 agent-skills 装配开关（native 恒开，不经过此表）。
+    #[must_use]
+    pub fn to_provider_toggles(&self) -> agent_skills::ProviderToggles {
+        self.providers.to_toggles()
+    }
+}
+
+/// 跨工具 skill 发现 provider 开关（对应 TOML `[skills.providers]`；缺省全开）。
+///
+/// 路径语义对齐 oh-my-pi `discovery/{claude,codex,opencode,github}.ts`：
+/// - `claude`：`~/.claude/skills`（尊重 `CLAUDE_CONFIG_DIR`）+ 项目 `.claude/skills` walkup，priority 80
+/// - `codex`：`~/.codex/skills` + 项目 `.codex/skills`，priority 70
+/// - `opencode`：`~/.config/opencode/skills` + 项目 `.opencode/skills`，priority 55
+/// - `github`：仅项目 `.github/skills`，priority 30
+///
+/// native（`<config_dir>/skills` + `.agent/skills`，priority 100）恒开，不在表内；
+/// 同名 skill 按 priority first-wins 去重。
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SkillsProviders {
+    /// Claude Code（`.claude/skills`）。
+    #[serde(default = "default_true")]
+    pub claude: bool,
+    /// OpenAI Codex（`.codex/skills`）。
+    #[serde(default = "default_true")]
+    pub codex: bool,
+    /// OpenCode（`.opencode/skills` / `~/.config/opencode/skills`）。
+    #[serde(default = "default_true")]
+    pub opencode: bool,
+    /// GitHub Copilot（`.github/skills`）。
+    #[serde(default = "default_true")]
+    pub github: bool,
+}
+
+impl Default for SkillsProviders {
+    fn default() -> Self {
+        Self {
+            claude: true,
+            codex: true,
+            opencode: true,
+            github: true,
+        }
+    }
+}
+
+impl SkillsProviders {
+    /// 转 agent-skills 装配开关。
+    #[must_use]
+    pub fn to_toggles(self) -> agent_skills::ProviderToggles {
+        agent_skills::ProviderToggles {
+            claude: self.claude,
+            codex: self.codex,
+            opencode: self.opencode,
+            github: self.github,
         }
     }
 }
@@ -717,6 +872,38 @@ pub struct McpStdioConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// MCP OAuth 子配置（对齐 oh-my-pi `MCPServerConfigBase.oauth`）。
+///
+/// 全部可选：缺省时走 RFC 9728/8414 自动发现 + RFC 7591 动态客户端注册；
+/// 显式 `client_id` 供不开放 DCR 的服务商（如 Figma MCP Catalog 白名单制）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpOAuthConfig {
+    /// 手工指定的 OAuth client id（跳过 DCR）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// 手工指定的 client secret（机密客户端）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// 授权 scope（空格分隔）；缺省用发现结果的 scope。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// 精确 redirect URI（覆盖回环默认 `http://127.0.0.1:<port>/callback`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    /// 回调端口（缺省 3000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+    /// 回调路径（缺省 `/callback`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_path: Option<String>,
+    /// 授权请求 `prompt` 参数；缺省仅 `offline_access` 时补 `consent`（OIDC 要求），`""` 强制省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// RFC 8707 资源指示；缺省从受保护资源/AS 元数据发现，兜底 server URL。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
 /// 单个 MCP server 的 Streamable HTTP 配置（参考 oh-my-pi `MCPHttpServerConfig`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpHttpConfig {
@@ -728,6 +915,9 @@ pub struct McpHttpConfig {
     /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制；覆盖整个 POST + SSE 响应期）。
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// OAuth 授权配置（Remote MCP 授权；缺省不发授权请求）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 const fn default_true() -> bool {
@@ -1205,6 +1395,56 @@ pub fn parse_compaction_backend(raw: &str) -> agent_core::CompactionBackend {
             tracing::warn!("未知压缩后端 '{raw}'，回退 summarize");
         }
         agent_core::CompactionBackend::Summarize
+    }
+}
+
+/// Shell 钩子超时缺省值（秒）。
+const HOOK_DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// 钩子事件类型（TOML 小写蛇形字符串：`before_tool` / `after_tool` / `stop`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEventKind {
+    /// 工具执行前（可经 `before_tool_intercept` 通道拦截）。
+    BeforeTool,
+    /// 工具执行后（通知型：触发命令但不解析决定）。
+    AfterTool,
+    /// 任务结束（通知型：触发命令但不解析决定）。
+    Stop,
+}
+
+/// 单条 shell 钩子规则（对应 TOML `[[hooks]]` 数组表）。
+///
+/// ```toml
+/// [[hooks]]
+/// event = "before_tool"            # before_tool / after_tool / stop
+/// tool = "shell"                   # 可选；缺省匹配所有工具（stop 忽略此项）
+/// command = "/usr/local/bin/gate"  # `sh -c`（Windows `cmd /C`）执行
+/// timeout_secs = 5                 # 可选；1..=600，缺省 10
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookRule {
+    /// 触发事件。
+    pub event: HookEventKind,
+    /// 可选工具名过滤；`None` = 匹配所有工具。
+    pub tool: Option<String>,
+    /// shell 命令；stdin 收到事件 JSON，stdout 首行 JSON 决定拦截与否（仅 `before_tool` 解析）。
+    pub command: String,
+    /// 超时秒数（1..=600；缺省 10）。超时 kill 子进程并按放行处理。
+    pub timeout_secs: Option<u64>,
+}
+
+impl HookRule {
+    /// 生效超时秒数：未配置时取 [`HOOK_DEFAULT_TIMEOUT_SECS`]。
+    #[must_use]
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(HOOK_DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// 工具名过滤器是否命中（`None` 过滤器匹配一切）。
+    #[must_use]
+    pub fn matches_tool(&self, tool: &str) -> bool {
+        self.tool.as_deref().is_none_or(|t| t == tool)
     }
 }
 
@@ -1762,5 +2002,257 @@ Authorization = "Bearer tok"
         // 两者皆无 → 反序列化失败（配置错误应尽早暴露）。
         let src = "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n[mcp.servers.bad]\nargs = [\"x\"]\n";
         assert!(toml::from_str::<Config>(src).is_err());
+    }
+
+    // P2：[skills.providers] 跨工具 skill provider 开关。
+    #[test]
+    fn skills_providers_defaults_and_parse() {
+        // 缺省：全开（向后兼容，无 [skills.providers] 段也可解析）。
+        let cfg: SkillsConfig = toml::from_str("").unwrap();
+        assert!(
+            cfg.providers.claude
+                && cfg.providers.codex
+                && cfg.providers.opencode
+                && cfg.providers.github
+        );
+
+        // 显式关闭单项；其它保持默认开。
+        let cfg: SkillsConfig =
+            toml::from_str("[providers]\nclaude = false\ngithub = false\n").unwrap();
+        assert!(!cfg.providers.claude);
+        assert!(cfg.providers.codex);
+        assert!(cfg.providers.opencode);
+        assert!(!cfg.providers.github);
+
+        // 转 agent-skills 装配开关字段一一对应。
+        let t = cfg.to_provider_toggles();
+        assert!(!t.claude && t.codex && t.opencode && !t.github);
+    }
+
+    // ── [[hooks]]：解析 + 校验 ────────────────────────────────────────────────
+
+    /// 合法 `[[hooks]]`：小写蛇形 event、可选字段缺省、timeout 生效值与工具过滤。
+    #[test]
+    fn hooks_parse_from_toml() {
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+
+[[hooks]]
+event = "before_tool"
+tool = "shell"
+command = "/bin/gate"
+timeout_secs = 5
+
+[[hooks]]
+event = "stop"
+command = "/bin/notify"
+"#;
+        let cfg: Config = toml::from_str(src).expect("解析应成功");
+        assert_eq!(cfg.hooks.len(), 2);
+        let h0 = &cfg.hooks[0];
+        assert_eq!(h0.event, HookEventKind::BeforeTool);
+        assert_eq!(h0.tool.as_deref(), Some("shell"));
+        assert_eq!(h0.command, "/bin/gate");
+        assert_eq!(h0.timeout_secs, Some(5));
+        assert_eq!(h0.effective_timeout_secs(), 5);
+        assert!(h0.matches_tool("shell") && !h0.matches_tool("read"));
+
+        let h1 = &cfg.hooks[1];
+        assert_eq!(h1.event, HookEventKind::Stop);
+        assert!(h1.tool.is_none(), "缺省无工具过滤");
+        assert_eq!(h1.timeout_secs, None);
+        assert_eq!(h1.effective_timeout_secs(), 10, "缺省超时 10");
+        assert!(h1.matches_tool("任意"), "None 过滤器匹配一切");
+    }
+
+    /// 非法 event 字符串 → 解析失败（serde 枚举小写蛇形）。
+    #[test]
+    fn hooks_reject_unknown_event() {
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "x"
+
+[[hooks]]
+event = "before"
+command = "/bin/x"
+"#;
+        assert!(toml::from_str::<Config>(src).is_err());
+    }
+
+    /// validate：空 command 与 timeout 越界（0 / 601）拒绝；边界值（1 / 600 / 缺省）通过。
+    #[test]
+    fn hooks_validate_rejects_empty_command_and_bad_timeout() {
+        let mk = |hooks: &str| {
+            format!("[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n{hooks}")
+        };
+
+        let empty_cmd = mk("[[hooks]]\nevent = \"stop\"\ncommand = \"  \"\n");
+        let cfg: Config = toml::from_str(&empty_cmd).unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(super::ConfigError::Invalid(_))
+        ));
+
+        for bad in ["0", "601"] {
+            let src = mk(&format!(
+                "[[hooks]]\nevent = \"stop\"\ncommand = \"/bin/x\"\ntimeout_secs = {bad}\n"
+            ));
+            let cfg: Config = toml::from_str(&src).unwrap();
+            assert!(
+                matches!(cfg.validate(), Err(super::ConfigError::Invalid(_))),
+                "timeout {bad} 应被拒绝"
+            );
+        }
+
+        for ok in ["1", "600", ""] {
+            let extra = if ok.is_empty() {
+                String::new()
+            } else {
+                format!("timeout_secs = {ok}\n")
+            };
+            let src = mk(&format!(
+                "[[hooks]]\nevent = \"stop\"\ncommand = \"/bin/x\"\n{extra}"
+            ));
+            let cfg: Config = toml::from_str(&src).unwrap();
+            assert!(cfg.validate().is_ok(), "timeout '{ok}' 应通过");
+        }
+    }
+
+    // ── [models.roles]：角色映射 ──────────────────────────────────────────────
+
+    /// 顶层直接键 `models_roles`（不经 load 提升的裸反序列化路径）+ resolve_role。
+    #[test]
+    fn models_roles_direct_key_parse_and_resolve() {
+        let src = r#"
+[default_model]
+id = "sonnet"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[[models]]
+id = "kimi"
+alias = "k2"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[models_roles]
+plan = "k2"
+quick = "sonnet"
+"#;
+        let cfg: Config = toml::from_str(src).expect("解析应成功");
+        assert_eq!(cfg.models_roles.as_ref().map(|r| r.roles.len()), Some(2));
+        assert_eq!(
+            cfg.resolve_role("plan").map(|m| m.id.as_str()),
+            Some("kimi"),
+            "角色值可为 [[models]] 的 alias"
+        );
+        assert_eq!(
+            cfg.resolve_role("quick").map(|m| m.id.as_str()),
+            Some("sonnet"),
+            "角色值可为默认 profile 的 id"
+        );
+        assert!(
+            cfg.resolve_role("default").is_none(),
+            "未配置的角色返回 None"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// `[models.roles]` 段经 load 管线提升（两种形态：随 `[[models]]` / 独立段）。
+    #[test]
+    fn models_roles_section_hoisted_via_load_pipeline() {
+        // 形态一：`[[models]]` 存在 —— TOML 规范下 roles 挂在最后一个条目内，提升后恢复。
+        let with_models = r#"
+[default_model]
+id = "sonnet"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[[models]]
+id = "kimi"
+alias = "k2"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[[models]]
+id = "glm-5"
+alias = "glm"
+api = "zai"
+base_url = "https://api.z.ai/api/paas/v4"
+
+[models.roles]
+plan = "k2"
+quick = "glm"
+"#;
+        let value: toml::Value = toml::from_str(with_models).unwrap();
+        let cfg = Config::from_merged(&value).expect("提升 + 解析应成功");
+        assert_eq!(cfg.models.len(), 2, "提升后 models 恢复为纯模型数组");
+        let roles = &cfg.models_roles.as_ref().expect("roles 应被提升").roles;
+        assert_eq!(roles.get("plan").map(String::as_str), Some("k2"));
+        assert_eq!(roles.get("quick").map(String::as_str), Some("glm"));
+        assert_eq!(
+            cfg.resolve_role("plan").map(|m| m.id.as_str()),
+            Some("kimi")
+        );
+        assert_eq!(
+            cfg.resolve_role("quick").map(|m| m.id.as_str()),
+            Some("glm-5")
+        );
+    }
+
+    /// 形态二：仅 `[models.roles]`（无 `[[models]]`）—— models 表整体提升后移除。
+    #[test]
+    fn models_roles_only_section_hoisted() {
+        let roles_only = r#"
+[default_model]
+id = "sonnet"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[models.roles]
+plan = "sonnet"
+"#;
+        let value: toml::Value = toml::from_str(roles_only).unwrap();
+        let cfg = Config::from_merged(&value).expect("提升 + 解析应成功");
+        assert!(cfg.models.is_empty(), "提升后为空的 models 表应被移除");
+        assert_eq!(
+            cfg.resolve_role("plan").map(|m| m.id.as_str()),
+            Some("sonnet")
+        );
+    }
+
+    /// validate：roles 引用不存在的 alias/id → Invalid。
+    #[test]
+    fn models_roles_validate_rejects_unknown_target() {
+        let src = r#"
+[default_model]
+id = "sonnet"
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+
+[models_roles]
+plan = "nope"
+"#;
+        let cfg: Config = toml::from_str(src).unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    /// 缺省：无 roles 段 → None，resolve_role 一律 None。
+    #[test]
+    fn models_roles_absent_defaults_to_none() {
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "x"
+"#;
+        let cfg: Config = toml::from_str(src).unwrap();
+        assert!(cfg.models_roles.is_none());
+        assert!(cfg.resolve_role("default").is_none());
     }
 }

@@ -21,3 +21,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# 仅测试用：构造 ToolContext 所需的取消令牌。
+tokio-util = { workspace = true }

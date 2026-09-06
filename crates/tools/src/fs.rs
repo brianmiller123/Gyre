@@ -9,6 +9,7 @@ use agent_core::{CapabilityTier, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::compute_file_hash;
 use crate::{ConflictBlock, PendingRewrite, Tool, ToolContext, write_with_effects};
 
 /// 读取文件（带行号）。
@@ -20,14 +21,14 @@ impl Tool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "读取工作区内文件内容并附行号。仅限只读，不修改文件。"
+        "读取工作区内文件内容并附行号。仅限只读，不修改文件。路径可带行选择器（`:N`、`:N-M`、`:N+K`、`:N-`、逗号多区间、`:raw`）精确取段；普通文本读取首行输出 `[相对路径#哈希]` 段头（哈希为全文指纹），编辑（apply_hashline）必须引用最新段头与行号锚定。"
     }
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、artifact://<id>（shake 归档内容回读）、http(s)://（抓取网页）、pr://<owner>/<repo>[/<N>]（GitHub PR，文件缓存）、issue://<owner>/<repo>[/<N>]（GitHub issue）" },
-                "summary": { "type": "boolean", "description": "可选：对支持语言的代码文件做结构摘要——折叠大体块、保留签名，行号与原文一致。适合快速浏览大文件；需逐行编辑时仍用真实行号。" }
+                "path": { "type": "string", "description": "文件路径（相对工作区根或绝对路径），或内部协议：skill://<name>[/<rel>]（skill 内容）、memory://[summary|full]（跨会话记忆）、mcp://<server>/<uri>（MCP 资源）、local://<rel>（显式工作区相对）、artifact://<id>（shake 归档内容回读）、http(s)://（抓取网页）、pr://<owner>/<repo>[/<N>]（GitHub PR，文件缓存）、issue://<owner>/<repo>[/<N>]（GitHub issue）。本地路径可带行选择器后缀（1 基绝对行号）：`:N` / `:N-`（第 N 行到文件尾）、`:N-M`（闭区间）、`:N+K`（第 N 行起 K 行）、`:a-b,c-d`（逗号多区间，升序合并）、`:raw`（原样输出，无行号）、`:raw:N-M` 或 `:N-M:raw`（原文切片）。普通文本读取首行输出 `[相对路径#哈希]` 段头（哈希为全文指纹）；后续 apply_hashline 编辑必须引用最新段头与行号。raw / 协议 / 归档 / SQLite / notebook 读取无段头。" },
+                "summary": { "type": "boolean", "description": "可选：对支持语言的代码文件做结构摘要——折叠大体块、保留签名，行号与原文一致。适合快速浏览大文件；需逐行编辑时仍用真实行号。与行选择器互斥（带选择器时忽略）。" }
             },
             "required": ["path"]
         })
@@ -55,20 +56,19 @@ impl Tool for ReadFileTool {
             let out = summarize_conflicts(rest.trim(), &text, ctx)?;
             return Ok(ToolResult::text(out));
         }
-        // 内部协议路由：skill:// memory:// mcp:// local:// http(s):// 或裸本地路径。
-        let text = resolve_path(path, ctx).await?;
         // 可选摘要：对支持语言的代码文件做结构折叠，保留签名、行号保真。
         let want_summary = input
             .get("summary")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let out = if want_summary {
-            match SupportLang::from_path(Path::new(path)) {
-                Some(lang) => render_summary(&text, lang),
-                None => render_numbered(&text),
-            }
+        // 内部协议路径：路由解析 + 摘要/逐行渲染（无段头、无行选择器，行为与既往一致）。
+        // 裸路径 / `local://`：行选择器 + hashline 段头/快照管线。
+        let out = if is_protocol_path(path) {
+            let text = resolve_path(path, ctx).await?;
+            finish_text(&text, want_summary, path)
         } else {
-            render_numbered(&text)
+            let rel = path.strip_prefix("local://").unwrap_or(path);
+            read_local_rendered(rel, want_summary, ctx).await?
         };
         Ok(ToolResult::text(out))
     }
@@ -123,6 +123,411 @@ fn render_summary(text: &str, lang: SupportLang) -> String {
         }
     }
     out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 行选择器与本地读取管线（移植 omp read-selector.ts / read.ts 的选择器语义）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 1 基闭区间行区间；`end = None` 表示开区间（从 `start` 到文件尾）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineRange {
+    start: usize,
+    end: Option<usize>,
+}
+
+/// 行选择器解析结果（纯函数，便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineSelector {
+    /// 无选择器：全量读取。
+    None,
+    /// `:raw` / `:raw:N-M` / `:N-M:raw`：原样输出（无行号、无段头、不记快照）；
+    /// `ranges` 为伴随区间（可空）。
+    Raw { ranges: Vec<LineRange> },
+    /// 行区间选择器：1 基绝对行号，区间已升序合并。
+    Ranges(Vec<LineRange>),
+}
+
+/// 非法选择器错误：列出全部合法形式（枚举风格对齐 omp `read.ts` 的选择器错误）。
+fn invalid_selector(sel: &str) -> ToolError {
+    ToolError::Execution(format!(
+        "非法选择器 ':{sel}'。合法形式：:N（第 N 行到文件尾）、:N-M（闭区间）、:N+K（第 N 行起 K 行）、\
+:N-（N 到文件尾）、逗号多区间如 :5-16,960-973、:raw（原样输出）、:raw:N-M 或 :N-M:raw（原文切片）。\
+行号为 1 基绝对行号。`:img` 不支持——读图片请用 read_image 工具。"
+    ))
+}
+
+/// 解析 `path` 的行选择器后缀（[`split_path_selector`] 拆出的 sel 串）。
+///
+/// 支持（1 基绝对行号，含端）：
+/// - `:N` / `:N-`：从第 N 行到文件尾（裸 `N` 与 `N-` 同义，对齐 omp 语义）
+/// - `:N-M`：闭区间；`:N+K`：第 N 行起 K 行（K ≥ 1）
+/// - 逗号多区间 `:a-b,c-d`（升序合并重叠/相邻区间）
+/// - `:raw`：原样输出；`:raw:N-M` / `:N-M:raw`：原文切片（两种顺序均接受）
+///
+/// 解析失败返回错误并列出全部合法形式——归档/SQLite/notebook 的自有冒号语义已在
+/// [`read_binary_format`] 消费，`:conflicts` 已在 execute 前置分支消费，走到这里说明
+/// 选择器确实是写给文本读取的，未识别即报错而非静默整读（`:img` SVG 栅格化明确不移植，
+/// Gyre 用独立的 read_image 工具读图片）。
+fn parse_line_selector(sel: Option<&str>) -> Result<LineSelector, ToolError> {
+    let Some(sel) = sel.filter(|s| !s.is_empty()) else {
+        return Ok(LineSelector::None);
+    };
+    if let Some((a, b)) = sel.split_once(':') {
+        // 恰一侧为 `raw`（大小写不敏感），另一侧为区间列表。
+        let (_, range_chunk) = if a.eq_ignore_ascii_case("raw") {
+            (a, b)
+        } else if b.eq_ignore_ascii_case("raw") {
+            (b, a)
+        } else {
+            return Err(invalid_selector(sel));
+        };
+        return match parse_range_list(range_chunk)? {
+            Some(ranges) => Ok(LineSelector::Raw { ranges }),
+            None => Err(invalid_selector(sel)),
+        };
+    }
+    if sel.eq_ignore_ascii_case("raw") {
+        return Ok(LineSelector::Raw { ranges: Vec::new() });
+    }
+    match parse_range_list(sel)? {
+        Some(ranges) => Ok(LineSelector::Ranges(ranges)),
+        None => Err(invalid_selector(sel)),
+    }
+}
+
+/// 解析逗号分隔的区间列表；任一段不是区间形态返回 `Ok(None)`（由调用方决定回退/报错）。
+fn parse_range_list(chunk: &str) -> Result<Option<Vec<LineRange>>, ToolError> {
+    let mut ranges = Vec::new();
+    for c in chunk.split(',') {
+        match parse_range_chunk(c)? {
+            Some(r) => ranges.push(r),
+            None => return Ok(None),
+        }
+    }
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(merge_ranges(ranges)))
+}
+
+/// 解析单个区间段：`N` / `N-M` / `N-` / `N+K`。`..` 为 `-` 的宽容别名（`N..M` == `N-M`、
+/// `N..` == `N-`），`L` 前缀宽容剥除（`L50` == `50`），语义对齐 omp `LINE_RANGE_CHUNK_RE`。
+///
+/// 非区间形态返回 `Ok(None)`；形态是区间但越界（行号 0、end < start、K < 1）返回具体错误。
+fn parse_range_chunk(chunk: &str) -> Result<Option<LineRange>, ToolError> {
+    let chunk = chunk.trim();
+    let chunk = chunk.strip_prefix(['L', 'l']).unwrap_or(chunk);
+    let (start_s, rest) = split_digits(chunk);
+    // 空串 / 非数字开头 / 数字溢出：解析失败即非区间形态（最终统一报非法选择器）。
+    let Some(start) = start_s.parse::<usize>().ok() else {
+        return Ok(None);
+    };
+    if start == 0 {
+        return Err(ToolError::Execution(
+            "行号选择器 0 无效：行号从 1 开始（1 基）。用 :1 表示首行。".into(),
+        ));
+    }
+    if rest.is_empty() {
+        // 裸 `N`：从第 N 行到文件尾（与 `N-` 同义）。
+        return Ok(Some(LineRange { start, end: None }));
+    }
+    if let Some(tail) = rest.strip_prefix('-').or_else(|| rest.strip_prefix("..")) {
+        if tail.is_empty() {
+            return Ok(Some(LineRange { start, end: None }));
+        }
+        let tail = tail.strip_prefix(['L', 'l']).unwrap_or(tail);
+        let Some(end) = parse_line_no(tail) else {
+            return Ok(None);
+        };
+        if end < start {
+            return Err(ToolError::Execution(format!(
+                "区间 {start}-{end} 无效：end 必须 >= start（行号为 1 基）。"
+            )));
+        }
+        return Ok(Some(LineRange {
+            start,
+            end: Some(end),
+        }));
+    }
+    if let Some(tail) = rest.strip_prefix('+') {
+        let count = parse_line_no(tail).unwrap_or(0);
+        if count == 0 {
+            return Err(ToolError::Execution(format!(
+                "区间 {start}+{tail} 无效：行数 K 必须 >= 1。"
+            )));
+        }
+        return Ok(Some(LineRange {
+            start,
+            end: Some(start.saturating_add(count - 1)),
+        }));
+    }
+    Ok(None)
+}
+
+/// 解析非负十进制行号（空串 / 溢出返回 `None`）。
+fn parse_line_no(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// 拆出前导十进制数字串与其余部分。
+fn split_digits(s: &str) -> (&str, &str) {
+    let i = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s.split_at(i)
+}
+
+/// 区间升序排序，重叠/相邻（下一区间起点 ≤ 上一区间 end+1）合并；开区间吞并其后全部。
+fn merge_ranges(mut ranges: Vec<LineRange>) -> Vec<LineRange> {
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<LineRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if last.end.is_none_or(|e| r.start <= e.saturating_add(1)) => {
+                if r.end.is_none() || last.end.is_some_and(|e| r.end.unwrap_or(e) > e) {
+                    last.end = r.end;
+                }
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// 是否内部协议路径（skill/memory/mcp/artifact/pr/issue/conflict/xd/http(s)）。
+/// 协议路径不经本地行选择器管线（无段头、无快照、选择器语法不适用）。
+fn is_protocol_path(path: &str) -> bool {
+    [
+        "skill://",
+        "memory://",
+        "mcp://",
+        "artifact://",
+        "pr://",
+        "issue://",
+        "conflict://",
+        "xd://",
+        "http://",
+        "https://",
+    ]
+    .iter()
+    .any(|p| path.starts_with(p))
+}
+
+/// 协议路径文本收口：按需结构摘要，否则逐行带行号（与既往行为一致）。
+fn finish_text(text: &str, want_summary: bool, path: &str) -> String {
+    if want_summary {
+        match SupportLang::from_path(Path::new(path)) {
+            Some(lang) => render_summary(text, lang),
+            None => render_numbered(text),
+        }
+    } else {
+        render_numbered(text)
+    }
+}
+
+/// 本地读取产物。
+enum LocalRead {
+    /// 归档/SQLite/notebook 等二进制格式的成品输出（自带格式；不加段头、不走行选择器）。
+    Formatted(String),
+    /// 普通文本正文 + 工作区相对显示路径（供段头/快照/行选择器渲染）。
+    /// `literal` 为真表示走了字面路径命中——整读，不得再解析选择器。
+    Text {
+        text: String,
+        display: String,
+        literal: bool,
+    },
+}
+
+/// 本地文件读取核心（裸路径与 `local://` 共用）：
+///
+/// 1. **字面优先**：路径含 `:` 时先探测完整路径（含冒号部分）是否真实存在为文件——
+///    真实文件名长得像「路径:选择器」时字面获胜，整读、不解析选择器
+///    （移植 omp `read.ts` 的 `splitPathAndSelPreferringLiteral` 字面优先语义）；
+/// 2. 按扩展名分派二进制格式（归档/SQLite/notebook，selector 语义归各自读取器）；
+/// 3. 其余按普通文本读取（字节上限 [`MAX_READ_BYTES`]）。
+async fn read_local(rel: &str, ctx: &ToolContext<'_>) -> Result<LocalRead, ToolError> {
+    if rel.contains(':') {
+        let lit = ctx.workspace.resolve(Path::new(rel));
+        if tokio::fs::metadata(&lit).await.is_ok_and(|m| m.is_file()) {
+            return Ok(LocalRead::Text {
+                text: read_bounded(&lit).await?,
+                display: display_path(&lit, ctx),
+                literal: true,
+            });
+        }
+    }
+    let (pure, sel) = split_path_selector(rel);
+    let full = ctx.workspace.resolve(Path::new(pure));
+    if let Some(out) = read_binary_format(&full, sel).await? {
+        return Ok(LocalRead::Formatted(out));
+    }
+    Ok(LocalRead::Text {
+        text: read_bounded(&full).await?,
+        display: display_path(&full, ctx),
+        literal: false,
+    })
+}
+
+/// 本地路径完整读取管线（裸路径与 `local://` 共用）：核心读取 → 行选择器解析 →
+/// hashline 段头/快照 → 渲染。
+///
+/// - `raw` 选择器：原样输出（无行号、无段头、不记快照）；
+/// - 其余普通文本读取：首行输出 `[<相对路径>#<HASH>]` 段头（HASH 为全文指纹），
+///   并把**全文**快照 record 进 `ctx.snapshots`（若有；传全文而非选中切片——
+///   stale-hash 恢复需按指纹回放整版正文），供 apply_hashline 锚定与恢复；
+/// - 归档/SQLite/notebook 读取保持格式化输出，不加段头；
+/// - `summary` 与行选择器互斥，选择器优先。
+async fn read_local_rendered(
+    rel: &str,
+    want_summary: bool,
+    ctx: &ToolContext<'_>,
+) -> Result<String, ToolError> {
+    match read_local(rel, ctx).await? {
+        LocalRead::Formatted(out) => Ok(out),
+        LocalRead::Text {
+            text,
+            display,
+            literal,
+        } => {
+            // 字面命中：整读，不解析选择器。
+            let sel = if literal {
+                None
+            } else {
+                split_path_selector(rel).1
+            };
+            match parse_line_selector(sel)? {
+                LineSelector::Raw { ranges } => Ok(elide_middle(
+                    render_raw_slice(&text, &ranges),
+                    MAX_RANGE_OUTPUT,
+                )),
+                LineSelector::None => {
+                    let head = file_header(&display, &text, ctx);
+                    let body = if want_summary {
+                        match SupportLang::from_path(Path::new(&display)) {
+                            Some(lang) => render_summary(&text, lang),
+                            None => render_numbered(&text),
+                        }
+                    } else {
+                        render_numbered(&text)
+                    };
+                    Ok(format!("{head}\n{body}"))
+                }
+                LineSelector::Ranges(ranges) => {
+                    let head = file_header(&display, &text, ctx);
+                    let body = elide_middle(render_ranges(&text, &ranges), MAX_RANGE_OUTPUT);
+                    Ok(format!("{head}\n{body}"))
+                }
+            }
+        }
+    }
+}
+
+/// hashline 段头 `[<相对路径>#<HASH>]`：HASH 为全文指纹（[`compute_file_hash`]）。
+/// 有快照存储时经 `record` 取指纹（同一规范化），顺带记录全文版本供 stale-hash 恢复。
+fn file_header(display: &str, full_text: &str, ctx: &ToolContext<'_>) -> String {
+    let hash = match ctx.snapshots {
+        Some(store) => store
+            .write()
+            .expect("snapshot 锁中毒")
+            .record(display, full_text),
+        None => compute_file_hash(full_text),
+    };
+    format!("[{display}#{hash}]")
+}
+
+/// 工作区相对显示路径（段头/快照键）：剥去工作区根前缀、分隔符统一为 `/`；
+/// 不在根下（沙箱重映射后的怪路径）则原样返回。
+fn display_path(full: &Path, ctx: &ToolContext<'_>) -> String {
+    let rel = full.strip_prefix(ctx.workspace.root()).unwrap_or(full);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// 按行区间渲染（1 基绝对行号，`{n:>5}\t` 风格）；多区间一次输出，区间间空行分隔。
+/// 端点越界收敛到文件尾；整个区间落在文件外时输出范围提示（避免模型误读为空文件）。
+fn render_ranges(text: &str, ranges: &[LineRange]) -> String {
+    use std::fmt::Write as _;
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let mut out = String::new();
+    for (i, r) in ranges.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let start_idx = r.start.saturating_sub(1);
+        let end_idx = r.end.map_or(total, |e| e.min(total));
+        if start_idx >= total {
+            let label = match r.end {
+                Some(e) => format!("{}-{e}", r.start),
+                None => format!("{}-", r.start),
+            };
+            let _ = writeln!(out, "（区间 {label} 超出文件范围：文件共 {total} 行）");
+            continue;
+        }
+        for (idx, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
+            let _ = writeln!(out, "{:>5}\t{line}", idx + 1);
+        }
+    }
+    out
+}
+
+/// raw 输出：原样正文（无行号、无段头）。带区间时按 1 基区间切片，多区间间空一行。
+fn render_raw_slice(text: &str, ranges: &[LineRange]) -> String {
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let mut out = String::new();
+    for (i, r) in ranges.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let start_idx = r.start.saturating_sub(1);
+        let end_idx = r.end.map_or(total, |e| e.min(total));
+        for line in lines.iter().take(end_idx).skip(start_idx) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// 区间渲染输出上限：与全量读取的字节上限同源（选中行数超大时按 head+tail 折叠）。
+const MAX_RANGE_OUTPUT: usize = MAX_READ_BYTES;
+
+/// 超限输出 head+tail 中段省略（策略对齐 shell.rs `elide_middle`）：保留前 60% 与后 25%
+/// 字节（各自回退 UTF-8 边界并对齐行首），中段以提示行替代——截断不再吃掉尾部。
+fn elide_middle(out: String, max: usize) -> String {
+    if out.len() <= max {
+        return out;
+    }
+    // 回退 UTF-8 边界并向上对齐到行首（i 落在行首字符上）。
+    let align = |i: usize| -> usize {
+        let mut i = i.min(out.len());
+        while i > 0 && !out.is_char_boundary(i) {
+            i -= 1;
+        }
+        while i > 0 && out.as_bytes()[i - 1] != b'\n' {
+            i -= 1;
+        }
+        i
+    };
+    let head_cut = align(out.len() * 3 / 5);
+    let tail_start = align(out.len() - out.len() / 4);
+    if tail_start <= head_cut {
+        // 切点交叉（超长单行等极端情形）：退化为纯头部截断。
+        let mut s = out[..head_cut].to_string();
+        s.push_str("\n...(输出过长，已截断)");
+        return s;
+    }
+    let omitted = out[head_cut..tail_start].len();
+    let mut s = String::with_capacity(head_cut + (out.len() - tail_start) + 96);
+    s.push_str(&out[..head_cut]);
+    s.push_str(&format!("\n[... 已省略中间输出约 {omitted} 字节 ...]\n"));
+    s.push_str(&out[tail_start..]);
+    s
 }
 
 /// 解析 `read_file` 的 `path`：内部协议路由 + 裸本地路径，返回原始文本。
@@ -194,21 +599,19 @@ async fn resolve_path(path: &str, ctx: &ToolContext<'_>) -> Result<String, ToolE
     } else if let Some(id) = path.strip_prefix("artifact://") {
         resolve_artifact(id, ctx).await
     } else if let Some(rel) = path.strip_prefix("local://") {
-        let (pure, sel) = split_path_selector(rel);
-        let full = ctx.workspace.resolve(Path::new(pure));
-        if let Some(out) = read_binary_format(&full, sel).await? {
-            return Ok(out);
+        // `local://` 等价裸路径：核心读取，返回原始正文（渲染由 execute 的本地管线负责，
+        // `:conflicts` 等内部消费方需要未渲染文本）。
+        match read_local(rel, ctx).await? {
+            LocalRead::Formatted(out) => Ok(out),
+            LocalRead::Text { text, .. } => Ok(text),
         }
-        Ok(read_bounded(&full).await?)
     } else if path.starts_with("http://") || path.starts_with("https://") {
         fetch_http(path).await
     } else {
-        let (pure, sel) = split_path_selector(path);
-        let full = ctx.workspace.resolve(Path::new(pure));
-        if let Some(out) = read_binary_format(&full, sel).await? {
-            return Ok(out);
+        match read_local(path, ctx).await? {
+            LocalRead::Formatted(out) => Ok(out),
+            LocalRead::Text { text, .. } => Ok(text),
         }
-        Ok(read_bounded(&full).await?)
     }
 }
 
@@ -1400,6 +1803,7 @@ impl Tool for WriteFileTool {
 mod tests {
     use super::*;
     use crate::ConflictHistory;
+    use crate::InMemorySnapshotStore;
     use crate::Tool;
     use agent_core::{ApprovalMode, ApprovalRequest, CapabilityTier, Workspace};
 
@@ -1412,7 +1816,7 @@ mod tests {
         ws: &'a Workspace,
         history: Option<&'a std::sync::Arc<std::sync::Mutex<ConflictHistory>>>,
     ) -> ToolContext<'a> {
-        dummy_ctx_hq(ws, history, None)
+        dummy_ctx_full(ws, history, None, None)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1420,14 +1824,15 @@ mod tests {
         ws: &'a Workspace,
         queue: Option<&'a std::sync::Arc<std::sync::Mutex<Vec<PendingRewrite>>>>,
     ) -> ToolContext<'a> {
-        dummy_ctx_hq(ws, None, queue)
+        dummy_ctx_full(ws, None, queue, None)
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn dummy_ctx_hq<'a>(
+    fn dummy_ctx_full<'a>(
         ws: &'a Workspace,
         history: Option<&'a std::sync::Arc<std::sync::Mutex<ConflictHistory>>>,
         queue: Option<&'a std::sync::Arc<std::sync::Mutex<Vec<PendingRewrite>>>>,
+        snapshots: Option<&'a std::sync::Arc<std::sync::RwLock<crate::InMemorySnapshotStore>>>,
     ) -> ToolContext<'a> {
         use agent_core::ApprovalDecision;
         struct AutoApprove;
@@ -1460,6 +1865,8 @@ mod tests {
             conflicts: history,
             pending_rewrites: queue,
             context: None,
+            snapshots,
+            tool_call_id: None,
         }
     }
 
@@ -2145,5 +2552,367 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("out: hi"), "{text}");
+    }
+
+    // ── 行选择器（解析 / 渲染 / raw / 段头 / 快照）──────────────────────────────
+
+    /// 构造单个区间（测试辅助）。
+    fn lr(start: usize, end: Option<usize>) -> LineRange {
+        LineRange { start, end }
+    }
+
+    /// 构造区间列表（测试辅助）。
+    fn lrs(v: &[(usize, Option<usize>)]) -> Vec<LineRange> {
+        v.iter().map(|&(s, e)| lr(s, e)).collect()
+    }
+
+    #[test]
+    fn selector_none_and_raw_forms() {
+        assert_eq!(parse_line_selector(None).unwrap(), LineSelector::None);
+        assert_eq!(parse_line_selector(Some("")).unwrap(), LineSelector::None);
+        assert_eq!(
+            parse_line_selector(Some("raw")).unwrap(),
+            LineSelector::Raw { ranges: vec![] }
+        );
+        // 大小写不敏感
+        assert_eq!(
+            parse_line_selector(Some("RAW")).unwrap(),
+            LineSelector::Raw { ranges: vec![] }
+        );
+    }
+
+    #[test]
+    fn selector_range_forms() {
+        // 裸 N 与 N- 同义：从 N 到文件尾（omp 语义）
+        assert_eq!(
+            parse_line_selector(Some("50")).unwrap(),
+            LineSelector::Ranges(lrs(&[(50, None)]))
+        );
+        assert_eq!(
+            parse_line_selector(Some("50-")).unwrap(),
+            LineSelector::Ranges(lrs(&[(50, None)]))
+        );
+        assert_eq!(
+            parse_line_selector(Some("5-10")).unwrap(),
+            LineSelector::Ranges(lrs(&[(5, Some(10))]))
+        );
+        assert_eq!(
+            parse_line_selector(Some("20+5")).unwrap(),
+            LineSelector::Ranges(lrs(&[(20, Some(24))]))
+        );
+        // `..` 别名与 `L` 前缀宽容
+        assert_eq!(
+            parse_line_selector(Some("3..5")).unwrap(),
+            LineSelector::Ranges(lrs(&[(3, Some(5))]))
+        );
+        assert_eq!(
+            parse_line_selector(Some("3..")).unwrap(),
+            LineSelector::Ranges(lrs(&[(3, None)]))
+        );
+        assert_eq!(
+            parse_line_selector(Some("L5-6")).unwrap(),
+            LineSelector::Ranges(lrs(&[(5, Some(6))]))
+        );
+    }
+
+    #[test]
+    fn selector_multi_range_sorted_and_merged() {
+        // 乱序输入 → 升序
+        assert_eq!(
+            parse_line_selector(Some("960-973,5-16")).unwrap(),
+            LineSelector::Ranges(lrs(&[(5, Some(16)), (960, Some(973))]))
+        );
+        // 重叠合并
+        assert_eq!(
+            parse_line_selector(Some("10-20,5-12")).unwrap(),
+            LineSelector::Ranges(lrs(&[(5, Some(20))]))
+        );
+        // 相邻（end+1）合并
+        assert_eq!(
+            parse_line_selector(Some("1-5,6-9")).unwrap(),
+            LineSelector::Ranges(lrs(&[(1, Some(9))]))
+        );
+        // 开区间吞并其后全部（排序后开区间居首）
+        assert_eq!(
+            parse_line_selector(Some("1-,3-4,7-")).unwrap(),
+            LineSelector::Ranges(lrs(&[(1, None)]))
+        );
+        // 有间隙的保留分立
+        assert_eq!(
+            parse_line_selector(Some("5-16,960-973")).unwrap(),
+            LineSelector::Ranges(lrs(&[(5, Some(16)), (960, Some(973))]))
+        );
+    }
+
+    #[test]
+    fn selector_raw_compound_both_orders() {
+        assert_eq!(
+            parse_line_selector(Some("raw:50-100")).unwrap(),
+            LineSelector::Raw {
+                ranges: lrs(&[(50, Some(100))])
+            }
+        );
+        assert_eq!(
+            parse_line_selector(Some("50-100:raw")).unwrap(),
+            LineSelector::Raw {
+                ranges: lrs(&[(50, Some(100))])
+            }
+        );
+        // raw + 多区间
+        assert_eq!(
+            parse_line_selector(Some("raw:5-10,20-30")).unwrap(),
+            LineSelector::Raw {
+                ranges: lrs(&[(5, Some(10)), (20, Some(30))])
+            }
+        );
+    }
+
+    #[test]
+    fn selector_invalid_forms_error_with_syntax_list() {
+        for bad in [
+            "abc",
+            "-5",
+            "1-5,",
+            ",1-5",
+            "raw:raw",
+            "raw:x",
+            "1:2:3",
+            "img",
+            "99999999999999999999999",
+        ] {
+            let err = parse_line_selector(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("合法形式"), "{bad} → {err}");
+        }
+    }
+
+    #[test]
+    fn selector_bound_errors_are_specific() {
+        // 行号 0
+        let err = parse_line_selector(Some("0")).unwrap_err().to_string();
+        assert!(err.contains("1 基"), "{err}");
+        // end < start
+        let err = parse_line_selector(Some("5-2")).unwrap_err().to_string();
+        assert!(err.contains("end 必须 >= start"), "{err}");
+        // K < 1
+        let err = parse_line_selector(Some("5+0")).unwrap_err().to_string();
+        assert!(err.contains("K 必须 >= 1"), "{err}");
+    }
+
+    #[test]
+    fn render_ranges_absolute_line_numbers() {
+        let text = "a\nb\nc\nd\ne\n";
+        assert_eq!(
+            render_ranges(text, &[lr(2, Some(4))]),
+            "    2\tb\n    3\tc\n    4\td\n"
+        );
+        // 多区间：区间间空行
+        assert_eq!(
+            render_ranges(text, &[lr(1, Some(2)), lr(4, Some(5))]),
+            "    1\ta\n    2\tb\n\n    4\td\n    5\te\n"
+        );
+        // 开区间到文件尾
+        assert_eq!(render_ranges(text, &[lr(4, None)]), "    4\td\n    5\te\n");
+        // 端点越界收敛到文件尾
+        assert_eq!(
+            render_ranges(text, &[lr(4, Some(99))]),
+            "    4\td\n    5\te\n"
+        );
+        // 整段落在文件外 → 范围提示
+        let out = render_ranges(text, &[lr(9, Some(10))]);
+        assert!(out.contains("超出文件范围"), "{out}");
+    }
+
+    #[test]
+    fn render_raw_slice_verbatim_without_numbers() {
+        let text = "a\nb\nc\n";
+        // 无区间：整篇原样
+        assert_eq!(render_raw_slice(text, &[]), text);
+        // 切片：无行号、保留原文
+        assert_eq!(render_raw_slice(text, &[lr(2, Some(3))]), "b\nc\n");
+        // 多区间空行分隔
+        assert_eq!(
+            render_raw_slice(text, &[lr(1, Some(1)), lr(3, None)]),
+            "a\n\nc\n"
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_head_and_tail() {
+        let small = String::from("short");
+        assert_eq!(elide_middle(small.clone(), 100), small);
+        let lines: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        let out = elide_middle(lines, 2_000);
+        assert!(out.contains("已省略中间输出"), "{out}");
+        assert!(out.contains("line 1\n"), "头部保留: {out}");
+        assert!(out.contains("line 1000\n"), "尾部保留: {out}");
+        assert!(out.len() < 8_900, "折叠后应显著短于原文: {}", out.len());
+    }
+
+    #[test]
+    fn protocol_paths_routed_away_from_local_pipeline() {
+        for p in [
+            "skill://x",
+            "memory://summary",
+            "mcp://s/u",
+            "artifact://ab12",
+            "pr://o/r",
+            "issue://o/r/1",
+            "conflict://1",
+            "xd://pending",
+            "http://e.com",
+            "https://e.com/a",
+        ] {
+            assert!(is_protocol_path(p), "{p}");
+        }
+        assert!(!is_protocol_path("src/a.rs"));
+        assert!(!is_protocol_path("local://src/a.rs"));
+        assert!(!is_protocol_path("a.rs:1-5"));
+    }
+
+    #[tokio::test]
+    async fn read_file_plain_emits_hashline_header_and_snapshot() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        let body = "fn a() {}\nfn b() {}\n";
+        std::fs::write(tmp.join("a.rs"), body).unwrap();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(InMemorySnapshotStore::new()));
+        let ctx = dummy_ctx_full(&ws, None, None, Some(&store));
+
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "a.rs" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        let hash = compute_file_hash(body);
+        // 段头为首行：[相对路径#HASH]
+        assert!(
+            text.starts_with(&format!("[a.rs#{hash}]\n")),
+            "实际输出: {text}"
+        );
+        // 全文快照已记录（含正文与指纹）
+        {
+            let s = store.read().expect("snapshot 锁");
+            assert!(s.recognizes("a.rs", &hash));
+            assert_eq!(s.head("a.rs").unwrap().text, body);
+        }
+        // 再次读取：hash 稳定（同内容同指纹）
+        let again = ReadFileTool
+            .execute(serde_json::json!({ "path": "a.rs" }), &ctx)
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(again.starts_with(&format!("[a.rs#{hash}]\n")));
+    }
+
+    #[tokio::test]
+    async fn read_file_selector_slice_records_full_text_snapshot() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        let body = "l1\nl2\nl3\nl4\n";
+        std::fs::write(tmp.join("m.txt"), body).unwrap();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(InMemorySnapshotStore::new()));
+        let ctx = dummy_ctx_full(&ws, None, None, Some(&store));
+
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "m.txt:2-3" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        // 段头 + 1 基绝对行号切片
+        let hash = compute_file_hash(body);
+        assert!(text.starts_with(&format!("[m.txt#{hash}]\n")), "{text}");
+        assert!(text.contains("    2\tl2\n"), "{text}");
+        assert!(text.contains("    3\tl3\n"), "{text}");
+        assert!(!text.contains("    1\tl1"), "{text}");
+        // 快照记录的是全文而非选中切片
+        let s = store.read().expect("snapshot 锁");
+        assert_eq!(s.head("m.txt").unwrap().text, body);
+    }
+
+    #[tokio::test]
+    async fn read_file_raw_has_no_header_and_no_snapshot() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        let body = "l1\nl2\nl3\n";
+        std::fs::write(tmp.join("r.txt"), body).unwrap();
+        let store = std::sync::Arc::new(std::sync::RwLock::new(InMemorySnapshotStore::new()));
+        let ctx = dummy_ctx_full(&ws, None, None, Some(&store));
+
+        // 整篇 raw：原样输出
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "r.txt:raw" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.to_llm_text(), body);
+        // raw 切片
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "r.txt:raw:2-3" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.to_llm_text(), "l2\nl3\n");
+        // 无段头无快照
+        assert!(store.read().expect("snapshot 锁").head("r.txt").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_file_literal_path_wins_over_selector() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        // 字面文件名长得像「路径:选择器」
+        std::fs::write(tmp.join("w:1-2.txt"), "literal\n").unwrap();
+        let ctx = dummy_ctx(&ws);
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "w:1-2.txt" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        // 整读字面文件（含段头），未把 "1-2" 当选择器解析
+        assert!(text.starts_with('['), "{text}");
+        assert!(text.contains("literal"), "{text}");
+        // 对照：无字面文件时选择器生效
+        std::fs::write(tmp.join("s.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "s.txt:2-3" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(
+            text.contains("    2\tb") && text.contains("    3\tc"),
+            "{text}"
+        );
+        assert!(!text.contains("    4\td"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_file_invalid_selector_errors() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        std::fs::write(tmp.join("x.txt"), "a\nb\n").unwrap();
+        let ctx = dummy_ctx(&ws);
+        let err = ReadFileTool
+            .execute(serde_json::json!({ "path": "x.txt:abc" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("合法形式"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn archive_read_has_no_hashline_header() {
+        let tmp = tempfile_dir();
+        let ws = Workspace::new(&tmp);
+        let f = std::fs::File::create(tmp.join("x.zip")).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("m.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, b"hello zip").unwrap();
+        zw.finish().unwrap();
+        let ctx = dummy_ctx(&ws);
+        let out = ReadFileTool
+            .execute(serde_json::json!({ "path": "x.zip" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(!text.starts_with('['), "归档读取不加段头: {text}");
+        assert!(text.contains("m.txt"), "{text}");
     }
 }

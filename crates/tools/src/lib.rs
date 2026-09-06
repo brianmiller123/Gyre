@@ -25,6 +25,7 @@ pub mod minimizer;
 mod search;
 mod security_scan;
 mod shell;
+pub mod snapshot;
 mod ssh;
 mod todo;
 mod web_search;
@@ -56,11 +57,12 @@ pub use minimizer::{Minimized, Minimizer, OutputFilter, default_filters, disable
 pub use search::{GlobTool, GrepTool};
 pub use security_scan::{SECURITY_SCAN_PROMPT_SECTION, SecurityScanState, SecurityScanTool};
 pub use shell::RunCommandTool;
+pub use snapshot::{InMemorySnapshotStore, Snapshot, compute_file_hash};
 pub use ssh::{SSH_PROMPT_SECTION, SshTool};
 pub use todo::{TodoPhase, TodoState, TodoTool};
 pub use web_search::{
-    DuckDuckGoHtml, Searxng, SitePage, WebResult, WebSearchChain, WebSearchProvider, WebSearchTool,
-    extract_site,
+    Brave, DuckDuckGoHtml, Recency, Searxng, SitePage, Tavily, WebResult, WebSearchChain,
+    WebSearchProvider, WebSearchTool, extract_site,
 };
 pub use write::{NoopWriteEffect, WriteReport, render_diagnostics, write_with_effects};
 
@@ -106,6 +108,17 @@ pub struct ToolContext<'a> {
     /// 会话上下文管理器（可选；checkpoint/rewind 等会话状态工具经此读活跃叶子/回卷分支）。
     /// `None` 时相关工具报「会话上下文不可用」。
     pub context: Option<&'a dyn agent_core::ContextManager>,
+    /// 会话级文本快照存储（可选）。`read_file` 读取真实工作区文本时把全文 record 进此
+    /// store，与 `apply_hashline` 写前自存的快照共享同一实例——stale hash 恢复因此可见
+    /// read 侧版本。类型实体在 [`crate::snapshot`]（`agent-hashline` 依赖本 crate，反向
+    /// 会成环；`agent_hashline::InMemorySnapshotStore` 为同一类型的再导出）。
+    /// `None` 时不记录（默认）。
+    pub snapshots:
+        Option<&'a std::sync::Arc<std::sync::RwLock<crate::snapshot::InMemorySnapshotStore>>>,
+    /// 当前工具调用的 LLM 侧 id（可选）。批次级上下文为 `None`（默认）；engine 调度执行时
+    /// 按调用派生为 `Some(id)`，工具发 partial 时经 [`ToolContext::update_tx`] 回填，
+    /// 与 `ToolExecutionStart` / `ToolExecutionEnd` 事件配对。
+    pub tool_call_id: Option<&'a str>,
 }
 
 /// 工具并发模式（决定同一轮多工具调用的调度）。

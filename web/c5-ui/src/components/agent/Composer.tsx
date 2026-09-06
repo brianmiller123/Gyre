@@ -3,6 +3,7 @@ import { Button, IconButton, Select } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { ModelSwitcher } from '@/components/agent/ModelSwitcher'
+import { ApprovalModeSwitcher } from '@/components/agent/ApprovalModeSwitcher'
 import { useNotifications } from '@/lib/notifications'
 import { useSettings } from '@/lib/settings'
 import { cn } from '@/lib/cn'
@@ -348,14 +349,10 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   return (
     <div className="relative border-t border-border bg-surface/70 backdrop-blur-xl">
       <div className="mx-auto w-full max-w-3xl px-3 py-3 sm:px-4">
-        {/* 输入区顶部工具栏：模型切换器 */}
-        <div className="mb-2 flex min-w-0 items-center">
-          <ModelSwitcher />
-        </div>
         {/* Slash-command menu */}
         {menuOpen && list.length > 0 && (
           <div className="absolute bottom-full left-3 right-3 z-30 mb-2 overflow-hidden rounded-xl border border-border bg-surface shadow-pop sm:left-4 sm:right-4">
-            <div className="flex items-center gap-1.5 border-b border-border bg-surface-2/70 px-3 py-1.5 text-[11px] text-muted">
+            <div className="flex items-center gap-1.5 border-b border-border bg-surface-2/70 px-3 py-1.5 text-2xs text-muted">
               <Icon name="command" size={13} className="text-primary" />
               {parsed!.hasArg ? `/${parsed!.name} ${t('composer.slash_args')}` : t('composer.slash_command')}
               <span className="ml-auto flex items-center gap-1">
@@ -382,7 +379,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                       <span className="font-mono text-[13px] text-primary">/{item.label}</span>
                     )}
                     {parsed!.hasArg && <span className="font-medium">{item.label}</span>}
-                    <span className="ml-auto truncate text-[11px] text-muted">{item.desc}</span>
+                    <span className="ml-auto truncate text-2xs text-muted">{item.desc}</span>
                   </button>
                 </li>
               ))}
@@ -390,6 +387,13 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
           </div>
         )}
 
+        {/* 模型 / 审批模式切换行：输入框上方独立行，两者未就绪前各自隐藏。 */}
+        <div className="mb-1.5 flex items-center gap-1.5 px-1">
+          <ModelSwitcher />
+          <ApprovalModeSwitcher />
+        </div>
+
+        {/* 单胶囊输入框：文本区在上，模式/发送收进框内底部工具行。 */}
         <div
           className={cn(
             'rounded-2xl border bg-surface-2 p-2 transition-colors',
@@ -420,7 +424,34 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
             </div>
           )}
 
-          <div className="flex items-end gap-2">
+          <textarea
+            ref={taRef}
+            rows={1}
+            role="combobox"
+            aria-autocomplete="list"
+            aria-label={t('composer.input_aria')}
+            aria-expanded={menuOpen && list.length > 0}
+            aria-controls="slash-menu"
+            aria-activedescendant={menuOpen && list.length > 0 ? `slash-opt-${active}` : undefined}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value)
+              if (dismissed && e.target.value.startsWith('/')) setDismissed(false)
+            }}
+            onPaste={onPaste}
+            onKeyDown={onKeyDown}
+            disabled={!connected}
+            placeholder={
+              connected
+                ? running
+                  ? t('composer.placeholder.running')
+                  : t('composer.placeholder.idle')
+                : t('composer.placeholder.connecting')
+            }
+            className="max-h-[220px] w-full resize-none bg-transparent px-2 py-1.5 text-[14px] text-text placeholder:text-muted/70 focus:outline-none disabled:cursor-not-allowed"
+          />
+
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
             {/* 图片上传 */}
             <input
               ref={fileRef}
@@ -434,6 +465,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
               }}
             />
             <IconButton
+              size="sm"
               icon="image"
               label={t('composer.upload_image')}
               onClick={() => fileRef.current?.click()}
@@ -448,88 +480,50 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
               say={say}
               t={t}
             />
-
-            <textarea
-              ref={taRef}
-              rows={1}
-              role="combobox"
-              aria-autocomplete="list"
-              aria-label={t('composer.input_aria')}
-              aria-expanded={menuOpen && list.length > 0}
-              aria-controls="slash-menu"
-              aria-activedescendant={menuOpen && list.length > 0 ? `slash-opt-${active}` : undefined}
-              value={text}
+            <span className="min-w-2 flex-1" />
+            <Select
+              value={settings.mode}
               onChange={(e) => {
-                setText(e.target.value)
-                if (dismissed && e.target.value.startsWith('/')) setDismissed(false)
+                const m = e.target.value as any
+                update({ mode: m })
+                switchMode(m)
               }}
-              onPaste={onPaste}
-              onKeyDown={onKeyDown}
-              disabled={!connected}
-              placeholder={
-                connected
-                  ? running
-                    ? t('composer.placeholder.running')
-                    : t('composer.placeholder.idle')
-                  : t('composer.placeholder.connecting')
-              }
-              className="max-h-[220px] flex-1 resize-none bg-transparent px-2 py-2 text-[14px] text-text placeholder:text-muted/70 focus:outline-none disabled:cursor-not-allowed"
-            />
-            <div className="flex items-center gap-2">
-              <Select
-                value={settings.mode}
-                onChange={(e) => {
-                  const m = e.target.value as any
-                  update({ mode: m })
-                  switchMode(m)
-                }}
-                className="h-9 w-auto py-0 text-xs"
-                aria-label={t('composer.mode_aria')}
+              className="h-8 w-auto py-0 text-xs"
+              aria-label={t('composer.mode_aria')}
+            >
+              {MODE_OPTIONS.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </Select>
+            {running ? (
+              <Button
+                size="sm"
+                variant="danger"
+                leftIcon={stopping ? undefined : 'square'}
+                loading={stopping}
+                onClick={cancel}
+                title={t('composer.stop')}
               >
-                {MODE_OPTIONS.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </Select>
-              {running ? (
-                <Button
-                  variant="danger"
-                  leftIcon={stopping ? undefined : 'square'}
-                  loading={stopping}
-                  onClick={cancel}
-                  title={t('composer.stop')}
-                >
-                  {stopping ? t('composer.stopping') : t('composer.stop')}
-                </Button>
-              ) : (
-                <Button
-                  variant="primary"
-                  leftIcon="arrow-right"
-                  onClick={submit}
-                  disabled={!connected || (!text.trim() && images.length === 0)}
-                >
-                  {t('composer.send')}
-                </Button>
-              )}
-            </div>
+                {stopping ? t('composer.stopping') : t('composer.stop')}
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="primary"
+                leftIcon="arrow-right"
+                onClick={submit}
+                disabled={!connected || (!text.trim() && images.length === 0)}
+              >
+                {t('composer.send')}
+              </Button>
+            )}
           </div>
         </div>
-        <div className="mt-1.5 flex items-center justify-between px-1 text-[11px] text-muted">
-          <span className="truncate">
-            {connected ? (
-              <>
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-success" /> {t('sidebar.connected')} ·{' '}
-                <span className="font-mono">{sessionId ? sessionId.slice(0, 8) : '—'}</span>
-              </>
-            ) : (
-              <>
-                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warning" />{' '}
-                {t('sidebar.disconnected')}
-              </>
-            )}
-          </span>
-          <span className="hidden items-center gap-1 sm:flex">
+        {/* 页脚只保留快捷键提示；连接状态与 session id 由侧栏连接卡唯一承载。 */}
+        <div className="mt-1.5 flex items-center justify-end px-1 text-2xs text-muted">
+          <span className="flex items-center gap-1">
             <Icon name="command" size={12} /> <span className="font-mono">/</span> {t('composer.footer_cmd')} ·{' '}
             <Icon name="image" size={12} /> {t('composer.footer_paste')} · {t('composer.footer_enter')}
             {running && (
@@ -546,7 +540,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
 
 function KbdMini({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="mx-0.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-border bg-surface px-1 font-mono text-[10px] text-muted">
+    <kbd className="mx-0.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-border bg-surface px-1 font-mono text-2xs text-muted">
       {children}
     </kbd>
   )
@@ -586,7 +580,7 @@ function EnhanceButton({
       onClick={run}
       disabled={disabled || empty || loading}
       title={t('composer.enhance')}
-      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface hover:text-text disabled:cursor-not-allowed"
+      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface hover:text-text disabled:cursor-not-allowed"
     >
       <Icon name="sparkles" size={18} className={loading ? 'animate-pulse text-primary' : ''} />
     </button>

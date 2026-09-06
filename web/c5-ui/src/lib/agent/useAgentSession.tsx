@@ -64,7 +64,10 @@ export interface ApprovalModeStatus {
 }
 
 interface AgentSessionValue {
-  items: TranscriptItem[]
+  /** transcript 是否非空（低频派生值：流式期间恒定，避免消费方随 delta 重渲染）。 */
+  hasTranscript: boolean
+  /** 最后一个 done 项（低频派生值，Inspector 用；流式期间身份稳定）。 */
+  lastDone: TranscriptItem | null
   state: AgentStateName | string
   usage: Usage
   /** 上下文窗口 token 占比（current / limit），来自 ServerFrame::ContextUsage。 */
@@ -154,6 +157,13 @@ interface AgentSessionValue {
 }
 
 const AgentSessionContext = createContext<AgentSessionValue | null>(null)
+
+/**
+ * transcript 高频状态独立通道：items 每个流式 flush 都会换身份，单独成 context
+ * 后只有 Transcript 订阅它；主 context（actions + 低频状态）在流式期间值身份稳定，
+ * Sidebar/Composer/Inspector 等消费方不再随 delta 重渲染。
+ */
+const TranscriptItemsContext = createContext<TranscriptItem[] | null>(null)
 
 type NewTranscriptItem = {
   [K in TranscriptItem['kind']]: Omit<Extract<TranscriptItem, { kind: K }>, 'id' | 'ts'>
@@ -301,6 +311,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       const elapsed = Date.now() - lastActivityRef.current
       if (elapsed >= STALE_THRESHOLD) {
         // 后端静默终止：注入提示并重置状态
+        flushPendingDelta()
         setItems((prev) => [
           ...prev,
           {
@@ -330,37 +341,96 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   connectingRef.current = connecting
   connectedRef.current = connected
 
+  // ── 流式增量合并缓冲 ──
+  // text/thinking delta 每秒可达数十次：按 rAF 合并成至多每帧一次 setItems，
+  // 配合 items 独立 context，把流式渲染压力限制在 Transcript 子树、且不超过显示帧率。
+  const pendingDeltaRef = useRef<{ id: string; kind: 'assistant' | 'thinking'; text: string } | null>(null)
+  const deltaRafRef = useRef<number | null>(null)
+
+  /** 立即落盘缓冲中的增量。任何非 delta 的 items 变更前必须先调用，保证帧序不被交错。 */
+  const flushPendingDelta = useCallback(() => {
+    if (deltaRafRef.current !== null) {
+      cancelAnimationFrame(deltaRafRef.current)
+      deltaRafRef.current = null
+    }
+    const p = pendingDeltaRef.current
+    if (!p) return
+    pendingDeltaRef.current = null
+    setItems((prev) => {
+      const idx = prev.findIndex((it) => it.id === p.id)
+      // 缓冲目标是已存在的打开项；缺失只可能发生在 clear 之后（clear 会丢弃缓冲），
+      // 防御性兜底直接丢弃，不复活幽灵气泡。
+      if (idx === -1) return prev
+      const it = prev[idx]
+      if (!('text' in it)) return prev
+      const next = prev.slice()
+      next[idx] = { ...it, text: it.text + p.text }
+      return next
+    })
+  }, [])
+
+  // 卸载时取消挂着的 rAF，避免对已卸载 provider 的迟到 setState。
+  useEffect(
+    () => () => {
+      if (deltaRafRef.current !== null) cancelAnimationFrame(deltaRafRef.current)
+    },
+    [],
+  )
+
   const closeOpen = useCallback((which: 'assistant' | 'thinking') => {
+    flushPendingDelta()
     const id = openRef.current[which]
     if (!id) return
     openRef.current[which] = undefined
     setItems((prev) =>
       prev.map((it) => (it.id === id && 'streaming' in it ? { ...it, streaming: false } : it)),
     )
-  }, [])
+  }, [flushPendingDelta])
 
-  const appendDelta = useCallback((which: 'assistant' | 'thinking', delta: string) => {
-    let id = openRef.current[which]
-    if (!id) {
-      // 空 delta 且无打开项：不创建空气泡（后端 AgentEvent::Assistant 的防御性空帧、
-      // 以及未来可能的空增量，都不应留下永久「…」占位）。
+  const appendDelta = useCallback(
+    (which: 'assistant' | 'thinking', delta: string) => {
+      let id = openRef.current[which]
+      if (!id) {
+        // 空 delta 且无打开项：不创建空气泡（后端 AgentEvent::Assistant 的防御性空帧、
+        // 以及未来可能的空增量，都不应留下永久「…」占位）。
+        if (!delta) return
+        id = uid()
+        openRef.current[which] = id
+        // 首个增量立即建气泡（低频：每个气泡一次）——延迟创建会与 flush 的
+        // 「找不到项即丢弃」守卫竞态，中间夹着的 say/tool 帧会把整条消息吞掉。
+        flushPendingDelta()
+        setItems((prev) => [
+          ...prev,
+          { id, kind: which, text: delta, ts: Date.now(), streaming: true } as TranscriptItem,
+        ])
+        return
+      }
       if (!delta) return
-      id = uid()
-      openRef.current[which] = id
-      setItems((prev) => [
-        ...prev,
-        { id, kind: which, text: delta, ts: Date.now(), streaming: true } as TranscriptItem,
-      ])
-    } else {
-      setItems((prev) =>
-        prev.map((it) => (it.id === id && 'text' in it ? { ...it, text: it.text + delta } : it)),
-      )
-    }
-  }, [])
+      // 同一打开项的后续增量（热路径）并进缓冲，rAF 帧率合并渲染。
+      const p = pendingDeltaRef.current
+      if (p && p.id === id) {
+        p.text += delta
+      } else {
+        flushPendingDelta()
+        pendingDeltaRef.current = { id, kind: which, text: delta }
+      }
+      if (deltaRafRef.current === null) {
+        deltaRafRef.current = requestAnimationFrame(() => {
+          deltaRafRef.current = null
+          flushPendingDelta()
+        })
+      }
+    },
+    [flushPendingDelta],
+  )
 
-  const pushItem = useCallback((item: NewTranscriptItem) => {
-    setItems((prev) => [...prev, { ...item, id: uid(), ts: Date.now() } as TranscriptItem])
-  }, [])
+  const pushItem = useCallback(
+    (item: NewTranscriptItem) => {
+      flushPendingDelta()
+      setItems((prev) => [...prev, { ...item, id: uid(), ts: Date.now() } as TranscriptItem])
+    },
+    [flushPendingDelta],
+  )
 
   const disconnect = useCallback(() => {
     intentionalClose.current = true
@@ -644,6 +714,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
           case 'steered':
             // 运行中插话回执：把最近一条未标记的用户消息标记为 steering（服务端已把它
             // 作为 steer 注入当前任务）。仅影响本地展示；无对应用户项时静默忽略。
+            flushPendingDelta()
             setItems((prev) => {
               for (let i = prev.length - 1; i >= 0; i--) {
                 const it = prev[i]
@@ -667,7 +738,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       scheduleReconnect()
     }
     // guard 已改用 ref，deps 仅保留实际用到的稳定回调；connect 不再随 connecting/connected 重建。
-  }, [closeOpen, appendDelta, pushItem, refreshSessions, refreshSocks5Status])
+  }, [closeOpen, appendDelta, pushItem, flushPendingDelta, refreshSessions, refreshSocks5Status])
 
   /** 发送 WS 帧；返回 false = 连接不可用（调用方应给出可见反馈而非静默丢弃）。 */
   const sendFrame = useCallback((frame: ClientFrame): boolean => {
@@ -703,6 +774,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         toast({ title: tRef.current('session.respond_failed'), severity: 'danger' })
         return
       }
+      flushPendingDelta()
       setItems((prev) =>
         prev.map((it) =>
           it.kind === 'ask' && it.ask.id === askId
@@ -715,7 +787,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
         ),
       )
     },
-    [sendFrame],
+    [sendFrame, flushPendingDelta],
   )
 
   const cancel = useCallback(() => {
@@ -732,6 +804,12 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   }, [sendFrame, closeOpen])
 
   const clear = useCallback(() => {
+    // 丢弃未落盘的流式增量（而非 flush）：clear 之后旧增量不得复活成幽灵气泡。
+    if (deltaRafRef.current !== null) {
+      cancelAnimationFrame(deltaRafRef.current)
+      deltaRafRef.current = null
+    }
+    pendingDeltaRef.current = null
     setItems([])
     setAgents([])
     setUsage(EMPTY_USAGE)
@@ -889,6 +967,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       }
       // 本地就地更新：移除目标项（+ assistant 的同索引 thinking），后续 line 下移。
       const deletedLine = line
+      flushPendingDelta()
       setItems((prev) => {
         const idx = prev.findIndex((it) => it.id === item.id)
         if (idx === -1) return prev
@@ -914,7 +993,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       })
       return { ok: true }
     },
-    [fetchHistoryList],
+    [fetchHistoryList, flushPendingDelta],
   )
 
   /** Switch the active model by starting a fresh session with the given alias. */
@@ -1232,9 +1311,20 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => () => disconnect(), [disconnect])
 
+  // items 的低频派生值：hasTranscript 是原始布尔、lastDone 身份仅在 done 边界变化。
+  // 二者进主 context deps（而非 items 本身），流式 delta 期间主 context 值身份保持稳定。
+  const hasTranscript = items.length > 0
+  const lastDone = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].kind === 'done') return items[i]
+    }
+    return null
+  }, [items])
+
   const value = useMemo<AgentSessionValue>(
     () => ({
-      items,
+      hasTranscript,
+      lastDone,
       state,
       usage,
       contextUsage,
@@ -1287,7 +1377,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       setApprovalMode,
     }),
     [
-      items,
+      hasTranscript,
+      lastDone,
       state,
       usage,
       contextUsage,
@@ -1342,12 +1433,22 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   )
 
   return (
-    <AgentSessionContext.Provider value={value}>{children}</AgentSessionContext.Provider>
+    <AgentSessionContext.Provider value={value}>
+      <TranscriptItemsContext.Provider value={items}>{children}</TranscriptItemsContext.Provider>
+    </AgentSessionContext.Provider>
   )
 }
 
 export function useAgentSession(): AgentSessionValue {
   const ctx = useContext(AgentSessionContext)
   if (!ctx) throw new Error('useAgentSession must be used within AgentSessionProvider')
+  return ctx
+}
+
+/** transcript 高频订阅：仅 Transcript 这类必须随流式渲染的消费方使用；
+ *  其余组件一律走 useAgentSession()（低频值 + 稳定 actions），避免随 delta 重渲染。 */
+export function useTranscriptItems(): TranscriptItem[] {
+  const ctx = useContext(TranscriptItemsContext)
+  if (ctx === null) throw new Error('useTranscriptItems must be used within AgentSessionProvider')
   return ctx
 }

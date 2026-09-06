@@ -12,13 +12,17 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::client::{McpError, McpTransport, resolve_timeout};
+use crate::client::{McpError, McpTransport, NotificationHandler, resolve_timeout};
 
 /// MCP stdout 单行最大字节数：超过即丢弃缓冲（防无换行的超长行 OOM）。
 const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-/// MCP stdio 传输：持有子进程，后台读 task 按 id 分发响应。
+/// MCP stdio 传输：持有子进程，后台读 task 按 id 分发响应、把 server→client
 pub(crate) struct StdioTransport {
+    /// server→client 通知处理器槽（读 task 与 `set_on_notification` 共享）。
+    notifications: Arc<parking_lot::Mutex<Option<NotificationHandler>>>,
+    /// 异常断连处理器槽（读 task 退出时触发；主动 `close` 前由 [`McpClient`] 摘除）。
+    on_close: Arc<parking_lot::Mutex<Option<crate::client::CloseHandler>>>,
     write: Mutex<ChildStdin>,
     child: Mutex<Child>,
     next_id: AtomicU64,
@@ -54,10 +58,16 @@ impl StdioTransport {
             });
         }
 
+        let notifications: Arc<parking_lot::Mutex<Option<NotificationHandler>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         // 后台读 task：逐行解析 JSON-RPC，按 id 分发响应；stdout 关闭时清空 pending（rx 报错）。
         let pending_clone = Arc::clone(&pending);
+        let notifications_clone = Arc::clone(&notifications);
+        let on_close: Arc<parking_lot::Mutex<Option<crate::client::CloseHandler>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let on_close_clone = Arc::clone(&on_close);
         tokio::spawn(async move {
             // 手动有界行读：按 `\n` 切分并对单行设 [`MAX_MCP_LINE_BYTES`] 上限，
             // 杜绝 server 发送无换行的超长行导致内存无界增长。
@@ -86,6 +96,19 @@ impl StdioTransport {
                                 if let Some(tx) = p.remove(&id) {
                                     let _ = tx.send(val);
                                 }
+                            } else if val.get("id").is_none() {
+                                // server→client 通知：转发给注册的处理器；未注册仅记 debug。
+                                if let Some(method) = val.get("method").and_then(Value::as_str) {
+                                    let params = val.get("params").cloned().unwrap_or(Value::Null);
+                                    match notifications_clone.lock().clone() {
+                                        Some(h) => h(method, &params),
+                                        None => tracing::debug!(
+                                            target: "mcp::client",
+                                            method,
+                                            "忽略 server 通知（未注册处理器）"
+                                        ),
+                                    }
+                                }
                             }
                         }
                         if buf.len() > MAX_MCP_LINE_BYTES {
@@ -109,6 +132,11 @@ impl StdioTransport {
                 }
             }
             pending_clone.lock().await.clear();
+            // 读循环退出即视为异常断连（EOF / IO 错误）：触发重连监督。主动 close
+            // 的回收路径会先经 [`McpClient::install_transport`] 摘除处理器，不自触发。
+            if let Some(h) = on_close_clone.lock().clone() {
+                h();
+            }
         });
 
         Ok(Self {
@@ -116,6 +144,8 @@ impl StdioTransport {
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
             pending,
+            notifications,
+            on_close,
             timeout: resolve_timeout(cfg.timeout_ms),
         })
     }
@@ -176,6 +206,14 @@ impl McpTransport for StdioTransport {
         Ok(())
     }
 
+    fn set_on_notification(&self, handler: NotificationHandler) {
+        *self.notifications.lock() = Some(handler);
+    }
+
+    fn set_on_close(&self, handler: crate::client::CloseHandler) {
+        *self.on_close.lock() = Some(handler);
+    }
+
     async fn close(&self) {
         let mut c = self.child.lock().await;
         let _ = c.kill().await;
@@ -185,3 +223,56 @@ impl McpTransport for StdioTransport {
 
 // 注：子进程回收依赖 `spawn` 时设置的 `kill_on_drop(true)`——`StdioTransport` drop 时
 // 其拥有的 `Child` 一同 drop，自动 kill，杜绝孤儿进程。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn notification_frames_forward_to_handler_and_responses_do_not() {
+        // 子进程先发一条通知帧、再发一条响应帧（id=1 无 pending，应被静默忽略），随后挂住。
+        let script = concat!(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'"#,
+            r#" '{"jsonrpc":"2.0","id":1,"result":{}}'; sleep 5"#
+        );
+        let cfg = McpStdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            timeout_ms: None,
+        };
+        let t = StdioTransport::spawn(&cfg).await.expect("spawn");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        t.set_on_notification(Arc::new(move |method, _params| {
+            let _ = tx.send(method.to_string());
+        }));
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("通知未到达")
+            .expect("信道关闭");
+        assert_eq!(first, "notifications/tools/list_changed");
+        // 响应帧不得被误路由为通知（通道内不应再有消息）。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "响应帧被误路由为通知");
+    }
+
+    #[tokio::test]
+    async fn transport_close_fires_on_close_handler() {
+        // 子进程静默退出 → stdout EOF → 读循环结束 → 触发断连处理器。
+        let cfg = McpStdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 0.2".to_string()],
+            env: HashMap::new(),
+            timeout_ms: None,
+        };
+        let t = StdioTransport::spawn(&cfg).await.expect("spawn");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        t.set_on_close(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("断连未触发 on_close")
+            .expect("信道关闭");
+    }
+}

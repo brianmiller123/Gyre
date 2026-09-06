@@ -379,10 +379,17 @@ pub struct Agent {
     conflicts: Arc<std::sync::Mutex<agent_tools::ConflictHistory>>,
     /// 会话级 ast-rewrite 暂存队列（`ast_rewrite preview:true` → `xd://resolve/reject`）。
     pending_rewrites: Arc<std::sync::Mutex<Vec<agent_tools::PendingRewrite>>>,
+    /// 会话级文本快照存储（可选；与 `HashlineTool::with_snapshots` 共享同一 `Arc`——
+    /// `read_file` 记录的版本对 `apply_hashline` stale-hash 恢复可见）。`None` 时
+    /// `ToolContext::snapshots = None`（read 不记录）。
+    snapshot_store: Option<std::sync::Arc<std::sync::RwLock<agent_tools::InMemorySnapshotStore>>>,
     /// P2：模型 fallback 链（主模型失败且错误可重试时依序尝试的备用模型）。
     fallbacks: Vec<agent_core::Model>,
     /// P2：API key 轮换环（model id → key 环；`runtime_overrides` 命中时优先，跳过轮换）。
     key_rings: Arc<std::collections::HashMap<String, KeyRing>>,
+    /// 会话级密钥脱敏器（`None` = 关闭）。engine 在 provider 边界出向脱敏、
+    /// assistant 最终化后入向还原（见 `engine::run_loop` 接线点注释）。
+    secrets: Option<Arc<agent_core::SecretsObfuscator>>,
 }
 
 impl Agent {
@@ -430,6 +437,8 @@ impl Agent {
             goals: None,
             compaction_backend: agent_core::CompactionBackend::Summarize,
             compaction_max_frames: agent_snapcompact::DEFAULT_MAX_FRAMES,
+            snapshot_store: None,
+            secrets: None,
         }
     }
 
@@ -580,6 +589,13 @@ pub struct AgentBuilder {
     compaction_backend: agent_core::CompactionBackend,
     /// P2：snapcompact 帧数预算。
     compaction_max_frames: usize,
+    /// 会话级文本快照存储（可选；read_file 记录 / apply_hashline stale-hash 恢复）。
+    snapshot_store: Option<std::sync::Arc<std::sync::RwLock<agent_tools::InMemorySnapshotStore>>>,
+    /// 密钥脱敏装配：`None`（未设置）= 默认装配（env `GYRE_SECRETS=off` 门控的
+    /// per-install key）；`Some(None)` = 显式关闭；`Some(Some(arc))` = 注入自定义实例。
+    /// 三态语义有意为之（区分「未设置走默认」与「显式关闭」），定向豁免 option_option。
+    #[allow(clippy::option_option)]
+    secrets: Option<Option<Arc<agent_core::SecretsObfuscator>>>,
 }
 
 impl AgentBuilder {
@@ -592,6 +608,17 @@ impl AgentBuilder {
     /// 注入写入效果（编辑后 LSP format/diagnostics 钩子）。
     pub fn write_effect(mut self, effect: Arc<dyn WriteEffect>) -> Self {
         self.write_effect = Some(effect);
+        self
+    }
+
+    /// 注入会话级文本快照存储（`None` 禁用）。与装配层 `HashlineTool::with_snapshots`
+    /// 共享同一 `Arc`：`read_file` 把读取过的全文 record 进 store，`apply_hashline`
+    /// stale-hash 恢复即可回放 read 侧版本。
+    pub fn snapshot_store(
+        mut self,
+        store: Option<std::sync::Arc<std::sync::RwLock<agent_tools::InMemorySnapshotStore>>>,
+    ) -> Self {
+        self.snapshot_store = store;
         self
     }
 
@@ -641,6 +668,13 @@ impl AgentBuilder {
     /// 温度等，而**无需重建 Agent**。后续可按需扩展 `api_key` / `base_url` / `cwd` 等。
     pub fn runtime_overrides(mut self, overrides: Arc<dyn RuntimeOverrides>) -> Self {
         self.runtime_overrides = Some(overrides);
+        self
+    }
+    /// 注入密钥脱敏器（覆盖默认装配）。传 `None` 显式关闭（等价 env `GYRE_SECRETS=off`
+    /// 但不经 env——host 已自行判定时用）；传 `Some(_)` 注入自定义实例（测试 / host 定制）。
+    /// 默认（不调用）：[`agent_core::SecretsObfuscator::load_default`]（env 门控 per-install key）。
+    pub fn secrets(mut self, secrets: Option<Arc<agent_core::SecretsObfuscator>>) -> Self {
+        self.secrets = Some(secrets);
         self
     }
 
@@ -886,6 +920,7 @@ impl AgentBuilder {
             goal_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conflicts: Arc::new(std::sync::Mutex::new(agent_tools::ConflictHistory::new())),
             pending_rewrites: Arc::new(std::sync::Mutex::new(Vec::new())),
+            snapshot_store: self.snapshot_store,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
             steer_tx: self.steer_tx,
@@ -900,6 +935,10 @@ impl AgentBuilder {
                     .map(|(id, keys)| (id, KeyRing::new(keys)))
                     .collect(),
             ),
+            secrets: match self.secrets {
+                Some(explicit) => explicit,
+                None => agent_core::SecretsObfuscator::load_default().map(Arc::new),
+            },
         }
     }
 }
@@ -932,6 +971,11 @@ fn approval_prompt(tool: &str, args: &serde_json::Value) -> String {
         _ => format!("批准执行工具 `{tool}`？（参数: {args}）"),
     }
 }
+
+/// 空回复有界重试上限：普通停止（`StopReason::Stop`/孤立 `ToolUse`）却无任何可交付内容
+///（无文本、无工具调用）时注入续跑提醒重采样，连续超限则按现状完成。移植 oh-my-pi
+/// turn-recovery 的 `EMPTY_STOP_MAX_RETRIES`。
+pub const MAX_EMPTY_STOP_RETRIES: usize = 3;
 
 /// 非终止停顿（`StopReason::Pause`）的连续重采样上限：防止一个永不真正结束的 backend
 /// 把循环转成无限次模型请求。任一携带工具调用的轮次都会重置该计数（移植 oh-my-pi）。
@@ -1084,6 +1128,8 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         }
     }
 
@@ -3804,7 +3850,7 @@ mod tests {
             for partial in ["chunk-1", "chunk-2", "chunk-3"] {
                 if let Some(tx) = ctx.update_tx {
                     let _ = tx.send(agent_tools::ToolUpdate {
-                        tool_call_id: "c1".into(),
+                        tool_call_id: ctx.tool_call_id.unwrap_or("").to_string(),
                         name: "streaming".into(),
                         partial: partial.into(),
                     });
@@ -3890,20 +3936,358 @@ mod tests {
             .workspace(Arc::new(Workspace::new(".")))
             .build();
 
-        let mut updates: Vec<String> = Vec::new();
+        let mut updates: Vec<(String, String)> = Vec::new();
         let stream = agent.run("go");
         tokio::pin!(stream);
         while let Some(ev) = stream.next().await {
-            if let AgentEvent::ToolExecutionUpdate { partial, .. } = ev {
-                updates.push(partial);
+            if let AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+                ..
+            } = ev
+            {
+                updates.push((tool_call_id, partial));
             }
         }
         assert_eq!(
             updates,
-            vec!["chunk-1".to_string(), "chunk-2".into(), "chunk-3".into()],
-            "应按序收到 3 条流式 partial（select! 边执行边 drain + 兜底 drain 保证不丢失）"
+            vec![
+                ("c1".to_string(), "chunk-1".to_string()),
+                ("c1".into(), "chunk-2".into()),
+                ("c1".into(), "chunk-3".into()),
+            ],
+            "应按序收到 3 条流式 partial，且 tool_call_id 经 per-call ctx 绑定为 c1\
+            （select! 边执行边 drain + 兜底 drain 保证不丢失）"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2, "应正好 2 轮模型调用");
+    }
+
+    /// 第二个流式探针（独立工具名；同批执行时各自 partial 携带各自 tool_call_id）。
+    struct StreamingToolB;
+    #[async_trait]
+    impl Tool for StreamingToolB {
+        fn name(&self) -> &str {
+            "streaming_b"
+        }
+        fn description(&self) -> &str {
+            "streaming-b"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability(&self) -> CapabilityTier {
+            CapabilityTier::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            if let Some(tx) = ctx.update_tx {
+                let _ = tx.send(agent_tools::ToolUpdate {
+                    tool_call_id: ctx.tool_call_id.unwrap_or("").to_string(),
+                    name: "streaming_b".into(),
+                    partial: "b-chunk".into(),
+                });
+            }
+            Ok(ToolResult::text("final-b"))
+        }
+    }
+
+    /// 两轮 Provider：第 1 轮同批两个工具调用（c1=streaming / c2=streaming_b），第 2 轮纯文本。
+    struct TwoToolProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for TwoToolProvider {
+        fn id(&self) -> &'static str {
+            "two-tool-prov"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let msg = if n == 1 {
+                AssistantMessage {
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "streaming".into(),
+                            arguments: serde_json::json!({}),
+                            signature: None,
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c2".into(),
+                            name: "streaming_b".into(),
+                            arguments: serde_json::json!({}),
+                            signature: None,
+                        },
+                    ],
+                    usage: Usage::default(),
+                    model: "two-tool-prov".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    usage: Usage::default(),
+                    model: "two-tool-prov".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 同批两个工具各自 send partial：ToolExecutionUpdate 经 per-call 派生上下文携带
+    /// 各自正确的 tool_call_id（契约#2/#3 的核心回归）。
+    #[tokio::test]
+    async fn batch_tools_partial_updates_carry_respective_call_ids() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(StreamingTool));
+        reg.register(Box::new(StreamingToolB));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model = agent_core::Model::with_defaults(
+            "two-tool-prov",
+            "two-tool-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TwoToolProvider {
+                calls: calls.clone(),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build();
+
+        // (tool_call_id, partial) 收集：id 必须与发源的调用配对，不得串号。
+        let mut by_id: Vec<(String, String)> = Vec::new();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+                ..
+            } = ev
+            {
+                by_id.push((tool_call_id, partial));
+            }
+        }
+        let c1: Vec<&String> = by_id
+            .iter()
+            .filter(|(id, _)| id == "c1")
+            .map(|(_, p)| p)
+            .collect();
+        let c2: Vec<&String> = by_id
+            .iter()
+            .filter(|(id, _)| id == "c2")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            c1,
+            vec![&"chunk-1".to_string(), &"chunk-2".into(), &"chunk-3".into()],
+            "c1（streaming）的 partial 应带 c1"
+        );
+        assert_eq!(
+            c2,
+            vec![&"b-chunk".to_string()],
+            "c2（streaming_b）的 partial 应带 c2"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ── 空回复有界重试（P0：移植 oh-my-pi turn-recovery 的 empty-stop retry）──────
+
+    /// 可编程 Provider：按序吐出 script 中的消息，耗尽后重复最后一条。
+    struct ScriptedProvider {
+        script: Vec<AssistantMessage>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl agent_core::LlmProvider for ScriptedProvider {
+        fn id(&self) -> &'static str {
+            "scripted-prov"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let msg = match self.script.get(n) {
+                Some(m) => m.clone(),
+                None => self.script.last().cloned().expect("script 不应为空"),
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    /// 空停止消息：无任何内容块、自然停止（模型「什么都没说就停了」）。
+    fn empty_stop_msg() -> AssistantMessage {
+        AssistantMessage {
+            content: vec![],
+            usage: Usage::default(),
+            model: "scripted-prov".into(),
+            stop_reason: Some(StopReason::Stop),
+            stop_details: None,
+        }
+    }
+
+    fn text_stop_msg(text: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: Usage::default(),
+            model: "scripted-prov".into(),
+            stop_reason: Some(StopReason::Stop),
+            stop_details: None,
+        }
+    }
+
+    fn scripted_agent(
+        script: Vec<AssistantMessage>,
+        calls: Arc<AtomicUsize>,
+        ctx: Arc<dyn ContextManager>,
+    ) -> Agent {
+        let mut model = agent_core::Model::with_defaults(
+            "scripted-prov",
+            "scripted-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        Agent::builder(model)
+            .provider(Arc::new(ScriptedProvider { script, calls }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .build()
+    }
+
+    /// 第 1 轮空回复、第 2 轮正常回答：注入一次续跑提醒后会话完成、回答在；
+    /// 空 assistant 不入 context（避免重试后上下文堆积空消息）。
+    #[tokio::test]
+    async fn empty_stop_retries_once_then_completes_with_answer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let agent = scripted_agent(
+            vec![empty_stop_msg(), text_stop_msg("最终回答")],
+            calls.clone(),
+            Arc::clone(&ctx),
+        );
+
+        let mut retry_says = 0usize;
+        let mut final_text: Option<String> = None;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Say(s) if s.text.contains("检测到空回复") => retry_says += 1,
+                AgentEvent::TurnEnd {
+                    message,
+                    will_continue: false,
+                    ..
+                } => final_text = Some(message.text()),
+                _ => {}
+            }
+        }
+
+        assert_eq!(retry_says, 1, "应恰好注入 1 次空回复重试提醒");
+        assert_eq!(
+            final_text.as_deref(),
+            Some("最终回答"),
+            "重试后应拿到正常回答并按完成收尾"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "空回复后应重采样一轮");
+
+        // context 只含 1 条 assistant（第 2 轮）；空 assistant 未被持久化，
+        // 仅多一条 user 角色的续跑提醒。
+        let snapshot: Vec<agent_core::AgentMessage> = ctx
+            .snapshot_nodes()
+            .await
+            .into_iter()
+            .map(|n| n.message)
+            .collect();
+        let assistants: Vec<&agent_core::AgentMessage> = snapshot
+            .iter()
+            .filter(|m| matches!(m, agent_core::AgentMessage::Assistant(_)))
+            .collect();
+        assert_eq!(assistants.len(), 1, "空 assistant 不应入 context");
+        let reminders = snapshot
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    agent_core::AgentMessage::User(u)
+                        if u.content.iter().any(|c| matches!(
+                            c,
+                            agent_core::UserContent::Text { text }
+                                if text.contains("Attempt #1/3")
+                        ))
+                )
+            })
+            .count();
+        assert_eq!(reminders, 1, "应恰好注入 1 条 user 角色续跑提醒");
+    }
+
+    /// 连续 4 轮空回复：恰好重试 3 次后按现状完成（有界，不无限自旋）。
+    #[tokio::test]
+    async fn empty_stop_retry_is_bounded_at_three() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let agent = scripted_agent(vec![empty_stop_msg()], calls.clone(), Arc::clone(&ctx));
+
+        let mut retry_says = 0usize;
+        let mut cap_says = 0usize;
+        let mut completed = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Say(s) if s.text.contains("检测到空回复") => retry_says += 1,
+                AgentEvent::Say(s) if s.text.contains("空回复重试达上限") => cap_says += 1,
+                AgentEvent::TurnEnd {
+                    will_continue: false,
+                    ..
+                } => completed = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(retry_says, 3, "应恰好重试 3 次（MAX_EMPTY_STOP_RETRIES）");
+        assert_eq!(cap_says, 1, "超限后应发一次达上限提示并按完成收尾");
+        assert!(completed, "超限后按现状完成（正常停止边界）");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "1 次原始采样 + 3 次重试 = 4 轮模型调用"
+        );
     }
 
     // ── transform_assistant（P1-M：最终化后改写钩子）─────────────────────────
@@ -5143,5 +5527,293 @@ mod tests {
         assert!(!injected, "硬模式不注入提醒");
         assert!(done, "硬模式正常结束");
         assert_eq!(calls.load(Ordering::SeqCst), 3, "硬模式不续跑（3 次调用）");
+    }
+    // ── 密钥双向脱敏接线（engine 级：出向脱敏 → 入向还原 roundtrip / off 直通）────
+
+    /// 从文本中抓取首个 `<secret:hex16>` 占位符（测试桩用）。
+    fn extract_placeholder(text: &str) -> Option<String> {
+        let start = text.find("<secret:")?;
+        let end = start + text[start..].find('>')?;
+        Some(text[start..=end].to_string())
+    }
+
+    /// 捕获工具：记录收到的 arguments（观察入向 restore 是否还原明文），并回显进结果。
+    struct ArgsCaptureTool {
+        seen: parking_lot::Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl Tool for ArgsCaptureTool {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn description(&self) -> &str {
+            "capture"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability(&self) -> CapabilityTier {
+            CapabilityTier::ReadOnly
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _: &ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.seen.lock().push(args.clone());
+            Ok(ToolResult::text(format!(
+                "got:{}",
+                args["q"].as_str().unwrap_or("")
+            )))
+        }
+    }
+    /// 注册表包装：registry 持 `Box<dyn Tool>`，测试另持同一实例的 `Arc` 观测 `seen`。
+    struct CaptureShare(Arc<ArgsCaptureTool>);
+
+    #[async_trait]
+    impl Tool for CaptureShare {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        fn description(&self) -> &str {
+            self.0.description()
+        }
+        fn schema(&self) -> serde_json::Value {
+            self.0.schema()
+        }
+        fn capability(&self) -> CapabilityTier {
+            self.0.capability()
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            cx: &ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.0.execute(args, cx).await
+        }
+    }
+
+    /// 两轮桩 Provider：第 1 轮把请求中看到的占位符回显进工具参数（模拟模型引用），
+    /// 第 2 轮返回最终文本。每次收到的 messages 全量留档供事后断言。
+    struct SecretRoundtripProvider {
+        captured: parking_lot::Mutex<Vec<Vec<agent_core::ProviderMessage>>>,
+        /// 第 1 轮是否要求请求已脱敏（off 直通测试为 false，直接单轮终答）。
+        expect_placeholder: bool,
+    }
+
+    #[async_trait]
+    impl agent_core::LlmProvider for SecretRoundtripProvider {
+        fn id(&self) -> &'static str {
+            "secret-stub"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let n = {
+                let mut c = self.captured.lock();
+                c.push(req.messages.clone());
+                c.len()
+            };
+            let msg = if n == 1 && self.expect_placeholder {
+                // 从已脱敏的用户文本抓占位符，塞进工具参数（模拟模型回显占位符）。
+                let ph = req
+                    .messages
+                    .iter()
+                    .find_map(|m| match m {
+                        agent_core::ProviderMessage::User { content } => {
+                            content.iter().find_map(|b| match b {
+                                agent_core::UserContent::Text { text } => extract_placeholder(text),
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .expect("第 1 轮用户消息应含 <secret:> 占位符（出向脱敏未生效？）");
+                AssistantMessage {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "capture".into(),
+                        arguments: serde_json::json!({ "q": ph }),
+                        signature: None,
+                    }],
+                    usage: Usage::default(),
+                    model: "secret-stub".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_details: None,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "all done".into(),
+                    }],
+                    usage: Usage::default(),
+                    model: "secret-stub".into(),
+                    stop_reason: Some(StopReason::Stop),
+                    stop_details: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                agent_core::AssistantEvent::MessageEnd(msg),
+            ])))
+        }
+    }
+
+    fn secret_test_model() -> agent_core::Model {
+        let mut model = agent_core::Model::with_defaults(
+            "secret-stub",
+            "secret-stub",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        model
+    }
+
+    fn user_texts(msgs: &[agent_core::ProviderMessage]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            agent_core::UserContent::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_texts(msgs: &[agent_core::ProviderMessage]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                agent_core::ProviderMessage::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 出向脱敏 → 入向还原 roundtrip：provider 收到的 req 已脱敏；工具收到的参数与
+    /// 发出的结果均为明文（restore 先于工具分发）；第 2 轮请求中工具结果再脱敏。
+    #[tokio::test]
+    async fn secrets_engine_roundtrip_obfuscate_and_restore() {
+        let secret = "ghp_Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78";
+        let obf = Arc::new(agent_core::SecretsObfuscator::with_key([9u8; 32]));
+
+        let provider = Arc::new(SecretRoundtripProvider {
+            captured: parking_lot::Mutex::new(Vec::new()),
+            expect_placeholder: true,
+        });
+        let tool = Arc::new(ArgsCaptureTool {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(CaptureShare(tool.clone())));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+
+        let agent = Agent::builder(secret_test_model())
+            .provider(provider.clone())
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .secrets(Some(obf))
+            .build();
+
+        let mut done = false;
+        let stream = agent.run(&format!("the key is {secret} keep it"));
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, AgentEvent::Done(_)) {
+                done = true;
+            }
+        }
+        assert!(done, "run 应正常结束");
+
+        let captured = provider.captured.lock();
+        assert_eq!(captured.len(), 2, "provider 应被调用两轮");
+
+        // ── 出向：第 1 轮用户消息已脱敏 ──
+        let turn1 = user_texts(&captured[0]).join("\n");
+        assert!(turn1.contains("<secret:"), "第 1 轮请求应含占位符: {turn1}");
+        assert!(!turn1.contains(secret), "第 1 轮请求不得含明文: {turn1}");
+
+        // ── 入向：工具收到的参数已还原为明文（restore 先于工具分发）──
+        let seen = tool.seen.lock();
+        assert_eq!(seen.len(), 1, "工具应执行一次");
+        assert_eq!(
+            seen[0]["q"].as_str(),
+            Some(secret),
+            "工具参数必须还原为明文: {:?}",
+            seen[0]
+        );
+
+        // ── 出向：第 2 轮工具结果（明文回显）再次脱敏 ──
+        let turn2_tools = tool_texts(&captured[1]).join("\n");
+        assert!(
+            turn2_tools.contains("<secret:"),
+            "第 2 轮工具结果应脱敏: {turn2_tools}"
+        );
+        assert!(
+            !turn2_tools.contains(secret),
+            "第 2 轮工具结果不得含明文: {turn2_tools}"
+        );
+        // 第 2 轮用户消息（重放）仍脱敏。
+        let turn2_users = user_texts(&captured[1]).join("\n");
+        assert!(!turn2_users.contains(secret), "重放用户消息不得含明文");
+    }
+
+    /// off 路径直通：`.secrets(None)` 显式关闭时，请求原样携带明文、无占位符。
+    #[tokio::test]
+    async fn secrets_engine_off_passthrough() {
+        let secret = "ghp_Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78";
+
+        let provider = Arc::new(SecretRoundtripProvider {
+            captured: parking_lot::Mutex::new(Vec::new()),
+            expect_placeholder: false,
+        });
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ArgsCaptureTool {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+
+        let agent = Agent::builder(secret_test_model())
+            .provider(provider.clone())
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .secrets(None) // 显式关闭（等价 GYRE_SECRETS=off，但不经 env——测试并行安全）
+            .build();
+
+        let stream = agent.run(&format!("the key is {secret} keep it"));
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Done(_) = ev {
+                break;
+            }
+        }
+
+        let captured = provider.captured.lock();
+        assert!(!captured.is_empty(), "provider 应被调用");
+        let turn1 = user_texts(&captured[0]).join("\n");
+        assert!(turn1.contains(secret), "off 路径请求应含明文: {turn1}");
+        assert!(
+            !turn1.contains("<secret:"),
+            "off 路径不得出现占位符: {turn1}"
+        );
     }
 }

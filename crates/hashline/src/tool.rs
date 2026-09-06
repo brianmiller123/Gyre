@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use agent_core::{CapabilityTier, ToolError, ToolResult};
-use agent_tools::{Tool, ToolContext, WriteReport, render_diagnostics, write_with_effects};
+use agent_tools::{
+    Tool, ToolContext, ToolUpdate, WriteReport, render_diagnostics, write_with_effects,
+};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -32,6 +34,14 @@ impl HashlineTool {
         Self {
             snapshots: Arc::new(RwLock::new(crate::snapshots::InMemorySnapshotStore::new())),
         }
+    }
+
+    /// 构造并共享外部会话快照存储。装配层用同一 `Arc` 注入 engine 的
+    /// `ToolContext::snapshots`（`read_file` 侧），使 read 记录的版本对 stale-hash
+    /// 恢复可见（读写共享同一份版本历史）。
+    #[must_use]
+    pub fn with_snapshots(snapshots: Arc<RwLock<crate::snapshots::InMemorySnapshotStore>>) -> Self {
+        Self { snapshots }
     }
 }
 
@@ -99,7 +109,16 @@ impl Tool for HashlineTool {
 
         let mut summary: Vec<String> = Vec::new();
         let mut all_diagnostics: Vec<agent_core::WriteDiagnostic> = Vec::new();
-        for section in &sections {
+        let total = sections.len();
+        for (k, section) in sections.iter().enumerate() {
+            // P1-F：逐区段应用进度 partial（移植 oh-my-pi partialResult）。发送失败不致命。
+            if let Some(tx) = ctx.update_tx {
+                let _ = tx.send(ToolUpdate {
+                    tool_call_id: ctx.tool_call_id.unwrap_or("").to_string(),
+                    name: "apply_hashline".to_string(),
+                    partial: format!("[{}/{}] 应用区段 {}", k + 1, total, section.path),
+                });
+            }
             let target = ctx.workspace.resolve(Path::new(&section.path));
             // REM：删除文件
             let is_rem = section
@@ -216,6 +235,7 @@ impl Tool for HashlineTool {
         if !diag_text.is_empty() {
             summary.push(diag_text.trim().to_string());
         }
+
         Ok(ToolResult::text(summary.join("\n")))
     }
 }
@@ -244,5 +264,103 @@ fn warning_suffix(extra: &[String], result_warnings: &[String]) -> String {
         String::new()
     } else {
         format!("\n{}", all.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::Workspace;
+
+    struct Allow;
+    #[async_trait]
+    impl agent_core::ApprovalPolicy for Allow {
+        fn decide(&self, _: &agent_core::ApprovalRequest<'_>) -> agent_core::ApprovalDecision {
+            agent_core::ApprovalDecision::Allow
+        }
+        async fn prompt(
+            &self,
+            _: &agent_core::AskMessage,
+        ) -> Result<agent_core::AskResponse, ToolError> {
+            Ok(agent_core::AskResponse::Yes)
+        }
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let nano = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hl-tool-{nano:x}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// with_snapshots 共享外部 store（与 engine 侧 ToolContext::snapshots 单例贯通，
+    /// Arc::ptr_eq 证实同一实例）；new() 自建。
+    #[test]
+    fn with_snapshots_shares_store() {
+        let store = Arc::new(RwLock::new(crate::snapshots::InMemorySnapshotStore::new()));
+        let tool = HashlineTool::with_snapshots(Arc::clone(&store));
+        assert!(Arc::ptr_eq(&tool.snapshots, &store));
+        let own = HashlineTool::new();
+        assert!(!Arc::ptr_eq(&own.snapshots, &store));
+    }
+
+    /// 逐区段应用时按区段发 partial（`[k/n] 应用区段 <path>`），tool_call_id 取 ctx
+    ///（契约#3）。
+    #[tokio::test]
+    async fn per_section_progress_partials() {
+        let dir = tmp_dir();
+        let ws = Workspace::new(&dir);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "x\ny\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext {
+            workspace: &ws,
+            approval: &Allow,
+            cancel: &cancel,
+            skills: None,
+            memory: None,
+            resources: None,
+            write_effect: None,
+            update_tx: Some(&tx),
+            conflicts: None,
+            pending_rewrites: None,
+            context: None,
+            snapshots: None,
+            tool_call_id: Some("hl-1"),
+        };
+        let patch = "[a.txt]\nSWAP 1.=1:\n+ONE\n[b.txt]\nSWAP 1.=1:\n+X\n";
+        let tool = HashlineTool::new();
+        let result = tool
+            .execute(serde_json::json!({ "patch": patch }), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(result, ToolResult::Text(_)));
+
+        let mut got: Vec<(String, String, String)> = Vec::new();
+        while let Ok(u) = rx.try_recv() {
+            got.push((u.tool_call_id, u.name, u.partial));
+        }
+        assert_eq!(
+            got.len(),
+            4,
+            "两区段各 1 条进度 partial + 各 1 条写盘 partial（统一写路径）"
+        );
+        assert_eq!(got[0].0, "hl-1", "partial 应携带 ctx 的 tool_call_id");
+        assert_eq!(got[0].1, "apply_hashline");
+        assert_eq!(got[0].2, "[1/2] 应用区段 a.txt");
+        assert!(got[1].2.contains("正在写入"), "写盘 partial 来自统一写路径");
+        assert_eq!(got[2].1, "apply_hashline");
+        assert_eq!(got[2].2, "[2/2] 应用区段 b.txt");
+        assert!(got[3].2.contains("正在写入"));
+        // 区段确实落盘（SWAP 生效）。
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "ONE\ntwo\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

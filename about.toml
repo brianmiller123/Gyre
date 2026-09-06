@@ -1,0 +1,46 @@
+# cargo-about 配置（对齐 third/oh-my-pi/about.toml 结构，按 Gyre 许可证面修订）。
+# 与 deny.toml 同步维护：deny 的 allow/exceptions 决定"能否通过"，这里的 accepted
+# 决定"通知文件里选择哪条 OR 分支的许可证文本"。
+#
+# ── THIRD-PARTY-NOTICES 生成说明 ──────────────────────────────────────────────
+#
+#   cargo install cargo-about --locked
+#   cargo about generate --workspace --all-features --locked \
+#     --include-local about.hbs > THIRD-PARTY-NOTICES.txt
+#
+# 要点：
+#   * --include-local 必带：vendor/ 下 4 个 fork（pi-shell、pi-builtins、pi-walker、
+#     brush-core，均为 MIT path 依赖，brush-core 另经 [patch.crates-io] 生效）默认被
+#     cargo-about 忽略；不加则通知文件缺失这四项的 MIT 许可义务（保留版权与许可声明）。
+#   * --all-features 与 deny.toml 的审查面一致：fastembed/ort 链的许可同样进入通知。
+#   * 何时重新生成：Cargo.lock 变更（依赖增删/升级、vendor fork 更新）后必须重跑；
+#     发布前以全新生成的文件随 release 分发。
+#   * 校验口径：`cargo deny check licenses`（CI 硬门）通过 ⇒ 本文件 accepted 覆盖
+#     完整；两文件许可集漂移会在 unused-allowed-license/失败报错中暴露。
+#   * 接入 CI（生成 job 或脚本）为后续项：需安装 cargo-about（源码编译 ~2min），
+#     建议挂在 release 汇总 job 之前，产物随 release 资产上传。
+#
+# cargo-about 0.8 按本列表顺序解析 OR 表达式：宽松分支优先，通知文件因此给出
+# 义务最轻的许可证文本；deny.toml 的 clarifications/例外则保留全部 AND 义务。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
+]
+
+# 包级例外，与 deny.toml [licenses].exceptions 一一对应。不全局接受任何 copyleft。
+[option-ext]
+accepted = ["MPL-2.0"]
+
+[terminfo]
+accepted = ["WTFPL"]

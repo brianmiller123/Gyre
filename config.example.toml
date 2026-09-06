@@ -76,7 +76,7 @@ context_window_guard = 0.8               # token 占用达 80% 触发压缩
 # 思考模式（reasoning/thinking）
 enable_thinking      = false             # 启用后由支持思考的模型消费（如 deepseek-reasoner）
 reasoning_budget     = 16000             # 思考 token 预算（可选）
-max_turns            = 10000             # agent最大循环次数
+max_turns            = 10000             # agent 最大循环次数（默认 1000；0 = 不限制）
 
 # 逐工具审批覆盖（优先于 write/always-ask 模式与能力分级；yolo 模式会压过这里的 ask/prompt，
 # 仅 deny 仍生效）。code/debug 模式下写类（write_file / str_replace / apply_diff 等）默认已自动
@@ -136,10 +136,17 @@ transport = "http"            # "http"（HTTP+SSE）/ "stdio" / "both"
 
 [skills]
 enabled = true
-enable_commands = false
 # custom_directories = ["~/extra-skills"]   # 额外扫描目录（~ 展开，非递归 */SKILL.md）
 # ignored = []   # 排除 glob，作用于 skill 名
 # included = []  # 包含 glob，空 = 全部
+
+# 跨工具 skill 发现 provider 开关（缺省全开；native 恒开）。同名 skill 按
+# priority 去重：native(100) > claude(80) > codex(70) > opencode(55) > github(30)。
+# [skills.providers]
+# claude   = true   # ~/.claude/skills + 项目 .claude/skills（尊重 CLAUDE_CONFIG_DIR）
+# codex    = true   # ~/.codex/skills + 项目 .codex/skills
+# opencode = true   # ~/.config/opencode/skills + 项目 .opencode/skills
+# github   = true   # 项目 .github/skills
 
 # MCP server。每个 server 暴露的工具自动注册为 agent 工具。
 # 两种传输形态（按必填键区分）：
@@ -154,6 +161,18 @@ url = "http://127.0.0.1:3000/mcp"
 timeout_ms = 30000   # 单请求超时（毫秒）；0 = 不限制，缺省 30000
 [mcp.servers.remote.headers]
 Authorization = "Bearer ${MCP_TOKEN}"
+
+# Remote MCP OAuth（`agent mcp login remote` 交互登录；凭据落 oauth.toml 的
+# `mcp_oauth:<url>` 行，会话连接时自动携带 Bearer 并在过期/401 时刷新重试）。
+# 全部可选：缺省走 RFC 9728/8414 自动发现 + RFC 7591 动态客户端注册（DCR）；
+# 显式 client_id 供不开放 DCR 的服务商（如 Figma MCP Catalog 白名单制）。
+# [mcp.servers.remote.oauth]
+# client_id = "..."          # 手工 client id（跳过 DCR）
+# client_secret = "..."      # 机密客户端才需要
+# scope = "mcp:read mcp:write"
+# callback_port = 3000       # 回环回调端口（缺省 3000）
+# prompt = ""                # `""` 强制省略；缺省仅 offline_access 时补 consent
+# resource = "https://..."   # RFC 8707 资源指示（缺省自动发现，兜底 server URL）
 
 # 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + 后端按需合并）
 [memory]

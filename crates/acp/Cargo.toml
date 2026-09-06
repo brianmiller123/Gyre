@@ -18,5 +18,11 @@ serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 
+[dev-dependencies]
+# 测试 dispatch_rpc 需真实 SessionManager：示例配置可离线解析，reqwest 客户端为构造参数。
+agent-config = { workspace = true }
+reqwest      = { workspace = true }
+toml         = { workspace = true }
+
 [lints]
 workspace = true

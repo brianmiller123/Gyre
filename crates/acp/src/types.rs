@@ -65,6 +65,19 @@ pub struct RpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// ACP `session/available_commands` 响应中的命令条目。
+///
+/// 清单由装配层经 [`agent_server::SessionManager::set_available_commands`] 注入
+/// （共享可写存储，未注入时为空列表），分发层读取后投影为本类型序列化。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandInfo {
+    /// 命令名（不含前导斜杠，如 `review`）。
+    pub name: String,
+    /// 一行描述（客户端命令菜单的提示文案）。
+    pub description: String,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 标准 ACP session/update 事件类型
 // ──────────────────────────────────────────────────────────────────────────────
@@ -115,7 +128,7 @@ pub enum SessionUpdate {
         /// 工具调用 id。
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
-        /// 人类可读标题（工具名）。
+        /// 人类可读标题（参数摘要，如 `$ ls -la`、`read_file: src/main.rs`）。
         title: String,
         /// 工具类别（`read`/`edit`/`execute`/`search`/…）。
         kind: String,
@@ -264,6 +277,46 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_update_serializes_camel_case_fields() {
+        let notif = SessionNotification::new(
+            "s",
+            SessionUpdate::ToolCallUpdate {
+                tool_call_id: "tc-2".into(),
+                status: Some("failed".into()),
+                raw_output: Some("boom".into()),
+            },
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&notif).unwrap()).unwrap();
+        let update = &v["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call_update");
+        // camelCase: tool_call_id → toolCallId, raw_output → rawOutput
+        assert_eq!(update["toolCallId"], "tc-2");
+        assert_eq!(update["status"], "failed");
+        assert_eq!(update["rawOutput"], "boom");
+    }
+
+    #[test]
+    fn tool_call_update_omits_absent_option_fields() {
+        // 仅更新 id（无状态 / 输出变化）时省略可空键，不产 null 字段。
+        let notif = SessionNotification::new(
+            "s",
+            SessionUpdate::ToolCallUpdate {
+                tool_call_id: "tc-3".into(),
+                status: None,
+                raw_output: None,
+            },
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&notif).unwrap()).unwrap();
+        let update = &v["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call_update");
+        assert_eq!(update["toolCallId"], "tc-3");
+        assert!(update.get("status").is_none());
+        assert!(update.get("rawOutput").is_none());
+    }
+
+    #[test]
     fn usage_update_serializes_correctly() {
         let notif = SessionNotification::new(
             "s",
@@ -278,5 +331,19 @@ mod tests {
         assert_eq!(update["sessionUpdate"], "usage_update");
         assert_eq!(update["used"], 100);
         assert_eq!(update["size"], 1000);
+    }
+
+    #[test]
+    fn command_info_serializes_name_and_description() {
+        let cmd = CommandInfo {
+            name: "review".into(),
+            description: "代码评审".into(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        // 仅 name/description 两键，camelCase（单词形与 snake_case 同形，锁定键名）。
+        assert_eq!(v["name"], "review");
+        assert_eq!(v["description"], "代码评审");
+        assert_eq!(v.as_object().map(|o| o.len()), Some(2));
     }
 }

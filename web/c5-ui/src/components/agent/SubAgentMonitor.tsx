@@ -60,7 +60,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
   return (
     <div className="space-y-2">
       {/* 汇总条 */}
-      <div className="flex items-center justify-between rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-[11px]">
+      <div className="flex items-center justify-between rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-2xs">
         <span className="text-muted">
           {t('monitor.active')} <span className="tabular font-semibold text-text">{running}</span> · {t('monitor.done')}{' '}
           <span className="tabular font-semibold text-success">{done}</span> · {t('monitor.failed')}{' '}
@@ -88,7 +88,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
               <span className="min-w-0 flex-1 truncate text-xs font-medium text-text" title={a.task}>
                 {a.label}
               </span>
-              <span className="shrink-0 font-mono text-[10px] text-muted">
+              <span className="shrink-0 font-mono text-2xs text-muted">
                 {formatDuration(a.updated_at - a.started_at)}
               </span>
             </div>
@@ -101,7 +101,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
             />
 
             {/* 资源消耗 */}
-            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-muted">
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-muted">
               <span>
                 {t('monitor.turns')} <span className="tabular text-text-2">{a.turns}</span>
               </span>
@@ -126,7 +126,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
 
             {/* 错误 */}
             {a.error && (
-              <p className="mt-1.5 flex items-start gap-1 text-[10px] text-danger">
+              <p className="mt-1.5 flex items-start gap-1 text-2xs text-danger">
                 <Icon name="alert" size={11} className="mt-px shrink-0" />
                 <span className="break-all">{a.error}</span>
               </p>
@@ -137,13 +137,13 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
               <div className="mt-1.5">
                 <button
                   onClick={() => toggle(a.id)}
-                  className="flex items-center gap-1 text-[10px] text-muted transition-colors hover:text-text-2"
+                  className="flex items-center gap-1 text-2xs text-muted transition-colors hover:text-text-2"
                 >
                   <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={11} />
                   {t('inspector.logs_count', { n: a.logs.length })}
                 </button>
                 {isOpen && (
-                  <pre className="mt-1 max-h-32 overflow-y-auto rounded bg-surface-3/60 p-1.5 font-mono text-[10px] leading-relaxed">
+                  <pre className="mt-1 max-h-32 overflow-y-auto rounded bg-surface-3/60 p-1.5 font-mono text-2xs leading-relaxed">
                     {a.logs.map((l, i) => (
                       <div key={i} className={cn('whitespace-pre-wrap break-all', LOG_COLOR[l.level])}>
                         {l.text}

@@ -15,6 +15,7 @@ import { Icon } from '@/components/icons'
 import { Badge, Button, Spinner } from '@/components/ui'
 import { compact } from '@/lib/format'
 import { cn } from '@/lib/cn'
+import { treeIndent } from '@/lib/tree'
 import { useI18n } from '@/lib/i18n'
 import { useNotifications } from '@/lib/notifications'
 
@@ -472,7 +473,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
-        <span className="max-w-[60%] truncate text-[11px] text-muted" title={info?.root}>
+        <span className="max-w-[60%] truncate text-2xs text-muted" title={info?.root}>
           {info ? info.root : t('workspace.loading')}
         </span>
         <div className="flex-1" />
@@ -482,7 +483,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
       </div>
 
       {error && (
-        <div className="border-b border-danger/20 bg-danger/[0.06] px-3 py-1.5 text-[11px] text-danger">{error}</div>
+        <div className="border-b border-danger/20 bg-danger/[0.06] px-3 py-1.5 text-2xs text-danger">{error}</div>
       )}
 
       <div className="relative flex min-h-0 flex-1">
@@ -527,15 +528,15 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
                 <Icon name={fileIcon(activePath)} size={14} className="shrink-0 text-muted" />
                 <span className="truncate font-mono text-[12px] text-text-2">{activePath}</span>
                 {file && (
-                  <Badge tone="neutral" className="ml-auto px-1.5 py-0 text-[10px]">
+                  <Badge tone="neutral" className="ml-auto px-1.5 py-0 text-2xs">
                     {compact(file.size)} B
                   </Badge>
                 )}
-                <Badge tone="primary" className="px-1.5 py-0 text-[10px]">
+                <Badge tone="primary" className="px-1.5 py-0 text-2xs">
                   {lang}
                 </Badge>
               </div>
-              <div className="no-scrollbar min-h-0 flex-1 overflow-auto bg-[#0b0d12] dark:bg-[#070809]">
+              <div className="min-h-0 flex-1 overflow-auto bg-code-bg text-code-fg">
                 {fileLoading ? (
                   <div className="flex justify-center py-12">
                     <Spinner className="text-muted" />
@@ -543,7 +544,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
                 ) : file?.binary ? (
                   <BinaryPlaceholder size={file.size} />
                 ) : file?.truncated ? (
-                  <div className="border-b border-warning/20 bg-warning/[0.06] px-3 py-1.5 text-[11px] text-warning">
+                  <div className="border-b border-warning/20 bg-warning/[0.06] px-3 py-1.5 text-2xs text-warning">
                     {t('workspace.too_large')}
                   </div>
                 ) : null}
@@ -594,7 +595,7 @@ function TreeRow({
           'flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[13px] transition-colors',
           isActive ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2',
         )}
-        style={{ paddingLeft: depth * 12 + 4 }}
+        style={{ paddingLeft: treeIndent(depth) }}
       >
         {isDir ? (
           <>
@@ -656,7 +657,7 @@ function CodeView({
     <div className="flex min-w-full">
       <pre
         aria-hidden
-        className="select-none border-r border-white/5 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-white/45"
+        className="select-none border-r border-code-fg/10 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-code-fg/50"
       >
         {gutter ?? lines.map((_, i) => <div key={i}>{i + 1}</div>)}
       </pre>

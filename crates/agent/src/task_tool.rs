@@ -61,7 +61,7 @@ pub struct TaskTool {
     /// 父级审批策略（可选；注入后子 Agent 尊重父级 `decide` 的 Deny，仅交互式 prompt 自动放行）。
     approval: Option<Arc<dyn ApprovalPolicy>>,
     /// 子 Agent 监控总线（可选；注入后子 Agent 生命周期可被 Web/CLI 实时观测）。
-    supervisor: Option<agent_supervisor::Supervisor>,
+    supervisor: Option<Arc<agent_supervisor::Supervisor>>,
     /// 在途委派计数（TaskTool 经注册表在父/子 Agent 间共享同一 Arc，故可追踪整棵递归树，
     /// 用作 [`MAX_INFLIGHT_TASKS`] 护栏，防止指数级递归委派耗尽资源）。
     depth: Arc<AtomicUsize>,
@@ -110,7 +110,7 @@ impl TaskTool {
 
     /// 注入监控总线（构建器式；不改 `new()` 签名以保持向后兼容）。
     #[must_use]
-    pub fn with_supervisor(mut self, supervisor: agent_supervisor::Supervisor) -> Self {
+    pub fn with_supervisor(mut self, supervisor: Arc<agent_supervisor::Supervisor>) -> Self {
         self.supervisor = Some(supervisor);
         self
     }

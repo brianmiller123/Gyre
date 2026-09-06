@@ -86,6 +86,18 @@ pub async fn write_with_effects(
     text: &str,
     ctx: &ToolContext<'_>,
 ) -> Result<WriteReport, ToolError> {
+    // P1-F：写入开始 partial（移植 oh-my-pi partialResult）。本函数是全部写工具
+    //（write_file / apply_hashline / replace_block / ast_rewrite / lsp_apply）的统一落盘
+    // 路径，无法得知调用方工具名，故 name 以主路径 write_file 发射；消费者以
+    // tool_call_id 与 ToolExecutionStart/End 配对。发送失败不致命（`let _`）。
+    if let Some(tx) = ctx.update_tx {
+        let _ = tx.send(crate::ToolUpdate {
+            tool_call_id: ctx.tool_call_id.unwrap_or("").to_string(),
+            name: "write_file".to_string(),
+            partial: format!("正在写入 {}（{} 字节）", full_path.display(), text.len()),
+        });
+    }
+
     // 1. 落盘。
     tokio::fs::write(full_path, text)
         .await
@@ -210,6 +222,8 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         };
         let p = dir.join("a.txt");
         let report = write_with_effects(&p, "hi\n", &ctx).await.unwrap();
@@ -244,6 +258,8 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         };
         let p = dir.join("b.txt");
         let report = write_with_effects(&p, "ok\n", &ctx).await.unwrap();
@@ -279,6 +295,8 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         };
         let p = dir.join("c.txt");
         let report = write_with_effects(&p, "raw\n", &ctx).await.unwrap();
@@ -315,10 +333,53 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         };
         let p = dir.join("d.txt");
         let report = write_with_effects(&p, "stable\n", &ctx).await.unwrap();
         assert!(!report.formatted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_start_partial_emitted() {
+        // update_tx 注入时，写盘开始前发一条「正在写入」partial（契约#3：tool_call_id
+        // 取自 ctx，发送失败不致命）。
+        let dir = tmp_dir("partial");
+        let ws = agent_core::Workspace::new(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolContext {
+            workspace: &ws,
+            approval: &Allow,
+            cancel: cancel(),
+            skills: None,
+            memory: None,
+            resources: None,
+            write_effect: None,
+            update_tx: Some(&tx),
+            conflicts: None,
+            pending_rewrites: None,
+            context: None,
+            snapshots: None,
+            tool_call_id: Some("call-9"),
+        };
+        let p = dir.join("p.txt");
+        write_with_effects(&p, "abc", &ctx).await.unwrap();
+        let u = rx.try_recv().expect("应有一条写入开始 partial");
+        assert_eq!(u.tool_call_id, "call-9");
+        assert_eq!(u.name, "write_file");
+        assert!(
+            u.partial.contains("正在写入"),
+            "partial 应含路径：{}",
+            u.partial
+        );
+        assert!(
+            u.partial.contains("3 字节"),
+            "partial 应含字节数：{}",
+            u.partial
+        );
+        assert!(rx.try_recv().is_err(), "开始阶段只发一条 partial");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

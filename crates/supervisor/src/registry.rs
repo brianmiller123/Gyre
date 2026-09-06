@@ -254,6 +254,43 @@ impl Supervisor {
     }
 }
 
+/// 监督阶段 → 稳定状态标签（snake_case；hub 工具 jobs 面原样透传，不转译）。
+const fn phase_tag(p: SubAgentPhase) -> &'static str {
+    match p {
+        SubAgentPhase::Pending => "pending",
+        SubAgentPhase::Running | SubAgentPhase::Streaming | SubAgentPhase::WaitingTool => "running",
+        SubAgentPhase::Done => "done",
+        SubAgentPhase::Failed => "failed",
+        SubAgentPhase::Cancelled => "cancelled",
+    }
+}
+
+/// 监督总线即 hub 监督句柄：`jobs` 提供真实快照；`cancel` 如实报错——
+/// 观测注册表没有取消通道（取消令牌在任务框架侧），假装取消会谎报状态。
+#[async_trait::async_trait]
+impl agent_core::hub::HubSupervision for Supervisor {
+    async fn jobs(&self) -> Vec<agent_core::hub::HubJobSnapshot> {
+        self.snapshot()
+            .await
+            .into_iter()
+            .map(|s| agent_core::hub::HubJobSnapshot {
+                id: s.id,
+                label: s.label,
+                status: phase_tag(s.phase).to_string(),
+                in_flight: !s.phase.is_terminal(),
+                turns: Some(s.turns),
+                progress: Some(s.progress),
+            })
+            .collect()
+    }
+
+    async fn cancel(&self, id: &str) -> Result<(), String> {
+        Err(format!(
+            "子任务 {id} 无法取消：监督注册表仅观测，暂无取消通道（需任务框架接入取消令牌）"
+        ))
+    }
+}
+
 /// 当前时间戳（毫秒 epoch）；时钟不可用时回退 0。
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -344,5 +381,29 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].id, a);
         assert_eq!(snap[1].id, b);
+    }
+
+    #[tokio::test]
+    async fn supervision_port_maps_snapshot_and_rejects_cancel() {
+        let s = Supervisor::new();
+        let id = s.spawn(None, "Demo".into(), "任务".into()).await;
+        s.set_phase(&id, SubAgentPhase::Running).await;
+
+        let jobs = agent_core::hub::HubSupervision::jobs(&s).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].label, "Demo");
+        assert_eq!(jobs[0].status, "running");
+        assert!(jobs[0].in_flight);
+        assert_eq!(jobs[0].turns, Some(0));
+
+        s.finish(&id, true, None).await;
+        let jobs = agent_core::hub::HubSupervision::jobs(&s).await;
+        assert_eq!(jobs[0].status, "done");
+        assert!(!jobs[0].in_flight);
+
+        // cancel 如实报错（观测注册表无取消通道），而非假装取消。
+        let err = agent_core::hub::HubSupervision::cancel(&s, &id).await;
+        assert!(err.is_err());
     }
 }

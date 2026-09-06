@@ -39,6 +39,6 @@ mod types;
 pub use http::acp_routes;
 pub use stdio::run_stdio;
 pub use types::{
-    AcpError, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, RpcError,
+    AcpError, CommandInfo, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, RpcError,
     SessionNotification, SessionNotificationParams, SessionUpdate, TextContent,
 };

@@ -14,7 +14,8 @@ const DEFAULT_ALIAS = '__default__'
  * because it starts a fresh session.
  */
 export function ModelSwitcher() {
-  const { models, currentModel, items, running, switchModel } = useAgentSession()
+  // hasTranscript 是 items.length>0 的低频派生布尔：不订阅 items 本身，流式期间不重渲染。
+  const { models, currentModel, hasTranscript, running, switchModel } = useAgentSession()
   const { t } = useI18n()
   // null = closed; otherwise the pending alias (DEFAULT_ALIAS for the server default).
   const [pending, setPending] = useState<string | null>(null)
@@ -26,7 +27,7 @@ export function ModelSwitcher() {
   // Re-picking the active model is a no-op; with an existing conversation, confirm first.
   const pick = (alias: string | null) => {
     if (alias === currentAlias) return
-    if (items.length > 0) setPending(alias ?? DEFAULT_ALIAS)
+    if (hasTranscript) setPending(alias ?? DEFAULT_ALIAS)
     else switchModel(alias)
   }
 

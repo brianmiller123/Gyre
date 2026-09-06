@@ -56,6 +56,85 @@ turn 执行期间事件流式输出（同 `id`），最终恰好一条 `done`（
 
 `done` 的 `usage` 同 `usage` 事件形状（`input/output/cache_read/cache_write/cost`）。
 
+
+## 握手（ready 帧）
+
+连接建立后、处理任何请求之前，服务端先输出一行 ready 帧（协议 v2，对齐 oh-my-pi
+`RpcReadyFrame`）：
+
+```json
+{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}
+```
+
+客户端应以 ready 帧作为通道就绪信号；其后才是对请求的响应 / 事件流。
+
+## 会话控制命令
+
+除 `prompt` / `cancel` / `ping` 外，以下会话控制命令可用（对标 oh-my-pi `RpcCommand`
+的最小会话面）。查询类空闲与运行中均可受理；变更型（`set_model` / `compact`）仅空闲受理，
+运行中回 busy 错误：
+
+| type           | 请求字段                  | 成功响应帧                                                                              |
+|----------------|---------------------------|------------------------------------------------------------------------------------------|
+| `get_state`    | —                         | `{"type":"state","id":N,"state":{…}}`                                                    |
+| `set_model`    | `alias`                   | `{"type":"ok","id":N,"ok":true,"model":"<模型 id>"}`（切换失败 → `error` 帧）             |
+| `set_thinking` | `budget`（数字或 `null`） | `{"type":"ok","id":N,"ok":true,"budget":N}`；`budget:null` = 关闭思考；缺失/非法 → `error` |
+| `get_messages` | `limit?`（默认 20）       | `{"type":"messages","id":N,"messages":[{"role":"…","text":"预览"},…]}`（活跃路径最近 N 条） |
+| `compact`      | —                         | 立即 `{"type":"ok","id":N,"ok":true}`；完成后另发 `{"type":"event",…,"event":{"kind":"compact_done","tokens":{…}}}` |
+| `get_tree`     | —                         | `{"type":"tree","id":N,"tree":[{"id":…,"parent":…,"role":…,"preview":…,"active":…},…]}`   |
+| `switch_branch`| `node`（id 或 ≥4 字符前缀）、`handoff?` | `{"type":"ok","id":N,"ok":true}`；`handoff:true` 走离支摘要交接（无摘要器 → `error`） |
+| `list_models`  | —                         | `{"type":"models","id":N,"models":[{"id":…,"ownedBy":…},…]}`（当前 provider /models 端点） |
+
+`state` 对象字段（camelCase）：`model{id,provider,maxInputTokens,maxOutputTokens}`、
+`modelAlias`、`mode`、`sessionId`、`sessionFile`、`contextTokens`、`contextLimit`、
+`turns`、`messageCount`、`thinkingBudget`、`isStreaming`、`isCompacting`。
+
+`set_thinking` 的 `budget` 显式传 `null` 即关闭思考（区别于字段缺失 = 参数错误）；生效经
+运行期覆盖注入，每轮 LLM 请求前解析，无需重建 Agent。
+
+## 反向通道（agent→host 请求，`--rpc-forward-ask`）
+
+默认审批 / 追问在 RPC 模式被自动拒绝（stdin 是协议通道，无法交互）。以
+`--rpc-forward-ask` 启动时，agent 把审批 / 追问作为**反向请求**发给宿主：
+
+```json
+{"type":"request","id":1,"method":"ask","params":{"kind":"tool","tool":"run_command","prompt":"…"}}
+```
+
+- `params.kind`：`tool`（含 `tool` 字段）/ `command`（含 `command` 字段）/
+  `followup` / `completion_result`，均含 `prompt`。
+- 宿主回答（随时可发，含 turn 运行中）：
+
+```json
+{"type":"response","id":1,"result":{"answer":"yes"}}
+```
+
+- `answer`：`"yes"` / `"no"` / `"text"`（后者须带 `text` 字段，作为自由文本回答）。
+- `result` 缺失、`error` 帧、10 分钟超时、无对应反向请求的回答，一律按**拒绝**处理
+  （宁拒勿挂）；迟到 / 重复回答静默忽略。
+- 反向 id 与宿主请求 id 命名空间独立（方向不同）。
+
+未启用该标志时行为不变（自动拒绝），已有嵌入方无感。
+
+## 大帧分片（`rpc_chunk`）
+
+超过 `maxFrameBytes`（1 MiB）的逻辑帧按 v2 语义分片传输（对齐 oh-my-pi `RpcChunkFrame`）：
+每片为独立 JSON 行，`data` 为该片的 base64（标准字母表）片段，单片原始负载 ≤ 256 KiB：
+
+```json
+{"type":"rpc_chunk","chunkId":"rpc-0","index":0,"count":4,"byteLength":1234567,"data":"…"}
+{"type":"rpc_chunk","chunkId":"rpc-0","index":1,"count":4,"byteLength":1234567,"data":"…"}
+```
+
+- `byteLength`：整个逻辑帧的原始字节数（所有片相同）；`index ∈ [0, count)`；`count ≥ 2`。
+- 同一 `chunkId` 集齐 `count` 片后按 `index` 排序拼接 base64 解码还原；重复片忽略；
+  同一序列内混入普通帧会中断重组并丢弃残片（普通帧照常处理）。
+- 元数据不一致（`byteLength` / `count` 冲突）→ 丢弃该序列。
+- 逻辑帧超过 `maxReassembledFrameBytes`（64 MiB）→ 不传输，输出
+  `{"type":"rpc_frame_error","error":"RPC frame exceeded the transport limit"}`。
+- 入站方向同样支持：客户端向服务端发送分片序列，服务端经 `RpcFrameDecoder` 重组后
+  按普通请求处理；≤ 1 MiB 的普通帧行为与 v1 完全一致（向后兼容）。
+
 ## 示例
 
 ```bash

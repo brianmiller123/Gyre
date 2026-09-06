@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Badge, Button, ConfirmDialog, IconButton, useDialogA11y } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { Sidebar } from '@/components/agent/Sidebar'
@@ -8,8 +8,9 @@ import { Inspector } from '@/components/agent/Inspector'
 import { SettingsPanel } from '@/components/agent/SettingsPanel'
 import { StatisticsPanel } from '@/components/agent/StatisticsPanel'
 import { WorkspacePanel } from '@/components/agent/WorkspacePanel'
+import { PanelBoundary } from '@/components/ErrorBoundary'
 import { Toaster } from '@/components/Toaster'
-import { useAgentSession } from '@/lib/agent/useAgentSession'
+import { useAgentSession, useTranscriptItems } from '@/lib/agent/useAgentSession'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact } from '@/lib/format'
 import { useI18n } from '@/lib/i18n'
@@ -59,11 +60,13 @@ export function AgentShell() {
     <div className="app-aurora relative flex h-screen overflow-hidden text-text">
       {/* Desktop sidebar */}
       <div className="hidden lg:block">
-        <Sidebar
-          onOpenSettings={() => setSettingsOpen(true)}
-          onOpenWorkspace={() => setWorkspaceOpen(true)}
-          onOpenStats={openStats}
-        />
+        <PanelBoundary label={t('sidebar.history')}>
+          <Sidebar
+            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenWorkspace={() => setWorkspaceOpen(true)}
+            onOpenStats={openStats}
+          />
+        </PanelBoundary>
       </div>
 
       {/* Mobile sidebar drawer */}
@@ -79,12 +82,14 @@ export function AgentShell() {
             tabIndex={-1}
             className="absolute left-0 top-0 h-full animate-slide-left outline-none"
           >
-            <Sidebar
-              onOpenSettings={() => { setSettingsOpen(true); setMobileNav(false) }}
-              onOpenWorkspace={() => { setWorkspaceOpen(true); setMobileNav(false) }}
-              onOpenStats={() => { openStats(); setMobileNav(false) }}
-              onClose={() => setMobileNav(false)}
-            />
+            <PanelBoundary label={t('sidebar.history')}>
+              <Sidebar
+                onOpenSettings={() => { setSettingsOpen(true); setMobileNav(false) }}
+                onOpenWorkspace={() => { setWorkspaceOpen(true); setMobileNav(false) }}
+                onOpenStats={() => { openStats(); setMobileNav(false) }}
+                onClose={() => setMobileNav(false)}
+              />
+            </PanelBoundary>
           </div>
         </div>
       )}
@@ -110,7 +115,9 @@ export function AgentShell() {
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
             <div className="min-h-0 flex-1">
-              <Transcript />
+              <PanelBoundary label={t('shell.conversation')}>
+                <Transcript />
+              </PanelBoundary>
             </div>
             <Composer
               onOpenSettings={() => setSettingsOpen(true)}
@@ -120,7 +127,9 @@ export function AgentShell() {
 
           {/* Desktop inspector */}
           <div className="hidden xl:block">
-            <Inspector />
+            <PanelBoundary label={t('shell.run_panel')}>
+              <Inspector />
+            </PanelBoundary>
           </div>
         </div>
       </div>
@@ -138,16 +147,26 @@ export function AgentShell() {
             tabIndex={-1}
             className="absolute right-0 top-0 h-full w-80 animate-slide-right outline-none"
           >
-            <Inspector onClose={() => setInspectorOpen(false)} />
+            <PanelBoundary label={t('shell.run_panel')}>
+              <Inspector onClose={() => setInspectorOpen(false)} />
+            </PanelBoundary>
           </div>
         </div>
       )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
 
-      {statsOpen && <StatisticsPanel onClose={closeStats} />}
+      {statsOpen && (
+        <PanelBoundary label={t('stats.title')}>
+          <StatisticsPanel onClose={closeStats} />
+        </PanelBoundary>
+      )}
 
-      {workspaceOpen && <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />}
+      {workspaceOpen && (
+        <PanelBoundary label={t('workspace.browse')}>
+          <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />
+        </PanelBoundary>
+      )}
 
       <ConfirmDialog
         open={confirmClear}
@@ -223,6 +242,21 @@ function TopBar({
   onCancel: () => void
 }) {
   const { t } = useI18n()
+  // 会话标题：首条非空用户消息（截断）。空会话回退到「对话」。
+  // 顺带同步 document.title，多会话多标签页时可辨认。
+  const items = useTranscriptItems()
+  const title = useMemo(() => {
+    for (const it of items) {
+      if (it.kind === 'user' && it.text.trim()) {
+        return it.text.replace(/\s+/g, ' ').trim().slice(0, 80)
+      }
+    }
+    return ''
+  }, [items])
+  useEffect(() => {
+    document.title = title ? `${title} · Agent · Console` : 'Agent · Console'
+  }, [title])
+
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface/70 px-3 backdrop-blur-xl sm:px-5">
       <IconButton
@@ -233,6 +267,12 @@ function TopBar({
       />
 
       <h1 className="font-display text-[15px] font-semibold text-text">{t('shell.conversation')}</h1>
+
+      {title && (
+        <span className="hidden min-w-0 items-center md:flex" title={title}>
+          <span className="max-w-[36ch] truncate text-sm text-muted lg:max-w-[52ch]">{title}</span>
+        </span>
+      )}
 
       <Badge tone={stateTone} dot={stateDot} className="hidden sm:inline-flex">
         {stateLabel}

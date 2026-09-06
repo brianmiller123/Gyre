@@ -11,11 +11,20 @@
 //! - `agent_cli` 直读 `Supervisor::snapshot` 渲染终端备用屏仪表盘。
 //!
 //! 三者共享同一份 `Arc` 状态（`Supervisor` 廉价克隆），无需额外接线。
+//!
+//! 另含进程托管（`process`）：hub 工具 launch 面（start/ps/logs/send/stop/
+//! restart/describe）的进程内最小实现——拉起/就绪等待/日志环形缓冲/进程组
+//! 信号/自动重启看护。无 broker 子进程、无磁盘持久化（有意偏差见模块文档）。
 
 #![deny(unsafe_code)]
 
 mod model;
+mod process;
 mod registry;
 
 pub use model::{LogLevel, LogLine, SubAgentPhase, SubAgentStatus};
+pub use process::{
+    LogPage, LogStream, ProcessError, ProcessInfo, ProcessLogLine, ProcessManager, ProcessSpec,
+    ProcessState, ProcessStatus, ReadySpec, RestartPolicy, Signal,
+};
 pub use registry::{Supervisor, SupervisorEvent};

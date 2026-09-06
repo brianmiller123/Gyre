@@ -10,9 +10,10 @@ import type { ReactNode } from 'react'
 import {
   DEFAULT_LOCALE,
   SUPPORTED_LOCALES,
-  locales,
+  en,
+  loadLocaleDict,
 } from '@/lib/locales'
-import type { LocaleCode } from '@/lib/locales'
+import type { Dict, LocaleCode } from '@/lib/locales'
 
 const STORAGE_KEY = 'agent-ui-locale'
 
@@ -101,6 +102,8 @@ const I18nContext = createContext<I18nContextValue | null>(null)
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [preference, setPreferenceState] = useState<LocaleCode | 'auto'>(loadStored)
   const [locale, setLocale] = useState<LocaleCode>(() => resolveLocale(loadStored()))
+  // 已加载的语言字典：en（默认回退）内嵌即时可用，其余经 loadLocaleDict 懒加载。
+  const [dicts, setDicts] = useState<Partial<Record<LocaleCode, Dict>>>(() => ({ en }))
 
   // 持久化偏好
   useEffect(() => {
@@ -125,14 +128,26 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     document.documentElement.lang = locale
   }, [locale])
 
+  // 当前语言字典未加载时按需拉取（本地 chunk，通常一帧内完成）。
+  useEffect(() => {
+    if (dicts[locale]) return
+    let cancelled = false
+    void Promise.resolve(loadLocaleDict(locale)).then((d) => {
+      if (!cancelled) setDicts((prev) => ({ ...prev, [locale]: d }))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [locale, dicts])
+
   const setPreference = useCallback((pref: LocaleCode | 'auto') => {
     setPreferenceState(pref)
   }, [])
 
   const t = useCallback(
     (key: string, args?: Record<string, unknown>) => {
-      const dict = locales[locale] ?? locales[DEFAULT_LOCALE]
-      let raw = dict[key] ?? locales[DEFAULT_LOCALE][key] ?? key
+      const dict = dicts[locale] ?? en
+      let raw = dict[key] ?? en[key] ?? key
       if (args && raw.includes('{')) {
         for (const [name, val] of Object.entries(args)) {
           const ph = `{${name}}`
@@ -141,13 +156,22 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       }
       return raw
     },
-    [locale],
+    [locale, dicts],
   )
 
   const value = useMemo<I18nContextValue>(
     () => ({ locale, preference, setPreference, t }),
     [locale, preference, setPreference, t],
   )
+
+  // 仅在首个字典就绪前门控渲染（避免首屏对非英文用户闪现英文回退）；
+  // 就绪后永不再门控——切换语言时宁可短暂回退英文，也不能 return null 卸载
+  // 整棵组件树（输入草稿、打开的弹窗等状态会全部丢失）。
+  const [bootstrapped, setBootstrapped] = useState(false)
+  useEffect(() => {
+    if (!bootstrapped && dicts[locale]) setBootstrapped(true)
+  }, [locale, dicts, bootstrapped])
+  if (!bootstrapped) return null
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
 }

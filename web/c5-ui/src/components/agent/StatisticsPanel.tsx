@@ -250,7 +250,7 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
               </div>
 
               {/* 口径脚注 */}
-              <p className="text-[11px] leading-relaxed text-muted">
+              <p className="text-2xs leading-relaxed text-muted">
                 {t('stats.scan_note', { n: formatNumber(stats.sessions.total) })}
               </p>
             </>
@@ -280,7 +280,7 @@ function MetricCard({
         <span className="text-xs">{label}</span>
       </div>
       <div className={cn('mt-1.5 font-display text-xl font-semibold tabular text-text')}>{value}</div>
-      {sub && <div className="mt-0.5 truncate text-[11px] text-muted">{sub}</div>}
+      {sub && <div className="mt-0.5 truncate text-2xs text-muted">{sub}</div>}
     </div>
   )
 }

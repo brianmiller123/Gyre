@@ -8,9 +8,17 @@ description = "Sub-agent supervision bus: live status registry + event stream fo
 
 [dependencies]
 agent-core = { workspace = true }
+async-trait = { workspace = true }
 serde      = { workspace = true }
 tokio      = { workspace = true }
 tracing    = { workspace = true }
+regex      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# 进程组信号（stop/signal 对整树击杀，与 browser 工具同套路）
+nix        = { workspace = true }
 
 [lints]
 workspace = true

@@ -8,6 +8,7 @@ description = "Layered TOML config: model profiles + agent approval rules engine
 
 [dependencies]
 agent-core  = { workspace = true }
+agent-skills = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }

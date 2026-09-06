@@ -1,8 +1,8 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Markdown } from '@/lib/agent/markdown'
 import { Icon } from '@/components/icons'
 import { Badge, Button } from '@/components/ui'
-import { useAgentSession } from '@/lib/agent/useAgentSession'
+import { useAgentSession, useTranscriptItems } from '@/lib/agent/useAgentSession'
 import { askKindLabel, levelMeta, stateMeta } from '@/lib/agent/ui'
 import type { AskMessage, TranscriptItem } from '@/lib/agent/types'
 import { useNotifications } from '@/lib/notifications'
@@ -19,16 +19,21 @@ const EXAMPLES = [
 
 /** Scrollable conversation transcript. */
 export function Transcript() {
-  const { items, state, connected } = useAgentSession()
+  // items 走独立高频 context：仅本组件随流式 flush 重渲染（其余面板订阅主 context 不受影响）。
+  const items = useTranscriptItems()
+  const { state, connected } = useAgentSession()
   const { t } = useI18n()
   const scrollRef = useRef<HTMLDivElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const atBottom = useRef(true)
+  const [showJump, setShowJump] = useState(false)
 
   const onScroll = () => {
     const el = scrollRef.current
     if (!el) return
-    atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    atBottom.current = atEnd
+    setShowJump(!atEnd)
   }
 
   useEffect(() => {
@@ -41,20 +46,44 @@ export function Transcript() {
 
   return (
     // role="log"（隐含 aria-live=polite）：新消息对读屏用户可感知（WCAG 4.1.3 状态消息）。
-    <div
-      ref={scrollRef}
-      onScroll={onScroll}
-      role="log"
-      aria-live="polite"
-      aria-label={t('transcript.log_aria')}
-      className="no-scrollbar h-full overflow-y-auto"
-    >
-      <div className="mx-auto w-full max-w-3xl space-y-5 px-4 py-6">
-        {items.map((item) => (
-          <ItemView key={item.id} item={item} />
-        ))}
-        <div ref={endRef} className="h-2" />
+    <div className="relative h-full">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        role="log"
+        aria-live="polite"
+        aria-label={t('transcript.log_aria')}
+        className="h-full overflow-y-auto"
+      >
+        {/* 回合分组：用户消息开启新回合，回合间距大于回合内条目间距。 */}
+        <div className="mx-auto w-full max-w-3xl px-4 py-6">
+          {items.map((item, i) => {
+            const turnStart = item.kind === 'user' && i > 0
+            const prev = items[i - 1]
+            return (
+              <div key={item.id} className={cn(i > 0 && (turnStart ? 'mt-9' : 'mt-5'))}>
+                <ItemView
+                  item={item}
+                  showAvatar={item.kind === 'assistant' && prev?.kind !== 'assistant'}
+                />
+              </div>
+            )
+          })}
+          <div ref={endRef} className="h-2" />
+        </div>
       </div>
+      {/* 上翻阅读时提供「回到底部」，避免长会话里手动滚回。 */}
+      {showJump && (
+        <button
+          type="button"
+          onClick={() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })}
+          aria-label={t('transcript.jump_latest')}
+          title={t('transcript.jump_latest')}
+          className="animate-fade-in absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-surface text-text-2 shadow-pop transition-colors hover:bg-surface-2 hover:text-text"
+        >
+          <Icon name="chevron-down" size={17} />
+        </button>
+      )}
     </div>
   )
 }
@@ -93,7 +122,7 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
           ))}
         </div>
 
-        <p className="mt-6 text-[11px] text-muted">
+        <p className="mt-6 text-2xs text-muted">
           {t('transcript.hint_serve')}
         </p>
       </div>
@@ -101,17 +130,24 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
   )
 }
 
-const ItemView = memo(function ItemView({ item }: { item: TranscriptItem }) {
+const ItemView = memo(function ItemView({
+  item,
+  showAvatar = true,
+}: {
+  item: TranscriptItem
+  /** 连续 assistant 消息只在首条渲染头像，减少长回合里的重复装饰。 */
+  showAvatar?: boolean
+}) {
   const { t } = useI18n()
   switch (item.kind) {
     case 'user':
       return <UserMessage item={item} />
     case 'assistant':
-      return <AssistantMessage item={item} />
+      return <AssistantMessage item={item} showAvatar={showAvatar} />
     case 'thinking':
-      return <ThinkingBlock text={item.text} streaming={!!item.streaming} />
+      return <ThinkingBlock text={item.text} streaming={!!item.streaming} ts={item.ts} />
     case 'tool':
-      return <ToolBlock name={item.name} command={item.command} output={item.output} />
+      return <ToolBlock name={item.name} command={item.command} output={item.output} ts={item.ts} />
     case 'say':
       return <SayLine text={item.text} level={item.level} />
     case 'ask':
@@ -158,6 +194,16 @@ function Avatar() {
   )
 }
 
+/** 消息时间（HH:mm），随界面语言本地化；ts 缺失时返回空串。 */
+function fmtTime(ts: number | undefined, locale: string): string {
+  if (!ts) return ''
+  try {
+    return new Date(ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', hour12: false })
+  } catch {
+    return ''
+  }
+}
+
 /**
  * 消息删除按钮：两步确认（首次点击进入确认态 → ✓ 执行 / ✕ 取消）。
  *
@@ -197,13 +243,13 @@ function MessageDeleteButton({
   if (confirming) {
     return (
       <span className="inline-flex items-center gap-1">
-        <span className="mr-0.5 text-[11px] text-danger">{t(confirmKey)}</span>
+        <span className="mr-0.5 text-2xs text-danger">{t(confirmKey)}</span>
         <button
           type="button"
           onClick={doDelete}
           disabled={busy}
           title={t('common.confirm')}
-          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] font-medium text-danger transition-colors hover:bg-danger/10 disabled:opacity-50"
+          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-2xs font-medium text-danger transition-colors hover:bg-danger/10 disabled:opacity-50"
         >
           <Icon name="check" size={12} />
         </button>
@@ -212,7 +258,7 @@ function MessageDeleteButton({
           onClick={() => setConfirming(false)}
           disabled={busy}
           title={t('common.cancel')}
-          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface-2 hover:text-text-2 disabled:opacity-50"
+          className="inline-flex items-center rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-surface-2 hover:text-text-2 disabled:opacity-50"
         >
           <Icon name="close" size={12} />
         </button>
@@ -227,7 +273,7 @@ function MessageDeleteButton({
       disabled={disabled}
       title={disabled ? t('transcript.delete_running') : t('transcript.delete')}
       aria-label={t('transcript.delete')}
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
     >
       <Icon name="trash" size={12} />
       {t('common.delete')}
@@ -241,7 +287,8 @@ function MessageDeleteButton({
  * 删除按钮绝对定位于气泡左侧（right-full），不占据布局空间，避免气泡位移。
  */
 function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }> }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
+  const time = fmtTime(item.ts, locale)
   return (
     <div className="group flex justify-end">
       <div className="relative max-w-[85%]">
@@ -254,10 +301,15 @@ function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }>
         <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-white dark:text-[#06241f]">
           <p className="whitespace-pre-wrap break-words">{item.text}</p>
         </div>
-        {item.steered && (
-          <p className="mt-1 flex items-center justify-end gap-1 text-[11px] text-muted">
-            <Icon name="zap" size={11} />
-            {t('transcript.steered')}
+        {(item.steered || time) && (
+          <p className="mt-1 flex items-center justify-end gap-1.5 text-2xs text-muted">
+            {time && <span className="tabular">{time}</span>}
+            {item.steered && (
+              <>
+                <Icon name="zap" size={11} />
+                {t('transcript.steered')}
+              </>
+            )}
           </p>
         )}
       </div>
@@ -272,10 +324,17 @@ function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }>
  * 贴回编辑器或其它会话。流式过程中隐藏按钮（内容仍在增长），结束后
  * 常驻显示——移动端无 hover，故按钮默认可见；桌面端用 group-hover 淡入。
  */
-function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'assistant' }> }) {
-  const { t } = useI18n()
+function AssistantMessage({
+  item,
+  showAvatar = true,
+}: {
+  item: Extract<TranscriptItem, { kind: 'assistant' }>
+  showAvatar?: boolean
+}) {
+  const { t, locale } = useI18n()
   const [copied, setCopied] = useState(false)
   const hasText = item.text.trim().length > 0
+  const time = fmtTime(item.ts, locale)
 
   const copy = async () => {
     if (!hasText) return
@@ -288,7 +347,12 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'ass
 
   return (
     <div className="group flex gap-3">
-      <Avatar />
+      {showAvatar ? (
+        <Avatar />
+      ) : (
+        // 占位与头像同宽，保持后续消息文本列对齐。
+        <span className="h-8 w-8 shrink-0" aria-hidden />
+      )}
       <div className="min-w-0 flex-1 pt-0.5">
         {hasText ? (
           <Markdown>{item.text}</Markdown>
@@ -300,12 +364,13 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'ass
         )}
         {hasText && !item.streaming && (
           <div className="mt-1.5 flex items-center gap-2 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+            {time && <span className="tabular text-2xs text-muted/70">{time}</span>}
             <button
               type="button"
               onClick={copy}
               title={copied ? t('common.copied') : t('common.copy')}
               aria-label={copied ? t('common.copied') : t('common.copy')}
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface-2 hover:text-text-2"
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-surface-2 hover:text-text-2"
             >
               <Icon name={copied ? 'check' : 'copy'} size={12} />
               {copied ? t('common.copied') : t('common.copy')}
@@ -318,21 +383,47 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: 'ass
   )
 }
 
-function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }) {
-  const [open, setOpen] = useState(true)
-  const { t } = useI18n()
+function ThinkingBlock({
+  text,
+  streaming,
+  ts,
+}: {
+  text: string
+  streaming: boolean
+  ts: number
+}) {
+  // 默认只在流式输出时展开；结束后自动收起（用户手动切换过则尊重其选择）。
+  const [open, setOpen] = useState(streaming)
+  const touched = useRef(false)
+  const { t, locale } = useI18n()
+  useEffect(() => {
+    if (!streaming && !touched.current) setOpen(false)
+  }, [streaming])
+  // 折叠时的单行摘要：取首段非空文本，长内容截断。
+  const preview = useMemo(
+    () => text.split('\n').map((l) => l.trim()).find(Boolean) ?? '',
+    [text],
+  )
+  const time = fmtTime(ts, locale)
   return (
     <div className="rounded-xl border border-border bg-surface-2/50">
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          touched.current = true
+          setOpen((o) => !o)
+        }}
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs font-medium text-muted"
       >
-        <Icon name="activity" size={14} className={streaming ? 'animate-pulse text-primary' : ''} />
+        <Icon name="activity" size={14} className={streaming ? 'shrink-0 animate-pulse text-primary' : 'shrink-0'} />
         {t('transcript.thinking')}
-        {streaming && <Badge tone="primary" className="px-1.5 py-0 text-[10px]">{t('transcript.generating')}</Badge>}
-        <span className="flex-1" />
-        <Icon name="chevron-down" size={14} className={cn('transition-transform', open && 'rotate-180')} />
+        {streaming && <Badge tone="primary" className="px-1.5 py-0 text-2xs">{t('transcript.generating')}</Badge>}
+        {!open && preview && (
+          <span className="min-w-0 flex-1 truncate text-left font-normal text-muted/70">{preview}</span>
+        )}
+        {open && <span className="flex-1" />}
+        {time && <span className="tabular shrink-0 text-2xs font-normal text-muted/60">{time}</span>}
+        <Icon name="chevron-down" size={14} className={cn('shrink-0 transition-transform', open && 'rotate-180')} />
       </button>
       {open && (
         <div className="max-h-60 overflow-y-auto border-t border-border px-3 py-2.5">
@@ -345,9 +436,21 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
   )
 }
 
-function ToolBlock({ name, command, output }: { name: string; command?: string; output: string }) {
+function ToolBlock({
+  name,
+  command,
+  output,
+  ts,
+}: {
+  name: string
+  command?: string
+  output: string
+  ts: number
+}) {
   const [open, setOpen] = useState(false)
+  const { locale } = useI18n()
   const hasOutput = output.trim().length > 0
+  const time = fmtTime(ts, locale)
   return (
     <div className="rounded-xl border border-border bg-surface-2/50">
       <button
@@ -355,29 +458,30 @@ function ToolBlock({ name, command, output }: { name: string; command?: string; 
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs"
       >
-        <span className="flex h-6 w-6 items-center justify-center rounded-md bg-primary/10 text-primary">
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
           <Icon name="cpu" size={13} />
         </span>
         <span className="font-mono font-medium text-text-2">{name}</span>
         {/* 被执行的命令/主操作数：yolo 等无审批帧的模式下也能一眼看到工具在做什么。 */}
         {command && (
           <code
-            className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted"
+            className="min-w-0 flex-1 truncate font-mono text-2xs text-muted"
             title={command}
           >
             {command}
           </code>
         )}
+        {time && <span className="tabular ml-auto shrink-0 text-2xs text-muted/60">{time}</span>}
         {hasOutput && (
           <Icon
             name="chevron-down"
             size={13}
-            className={cn('text-muted transition-transform', open && 'rotate-180', !command && 'ml-auto')}
+            className={cn('shrink-0 text-muted transition-transform', open && 'rotate-180')}
           />
         )}
       </button>
       {open && hasOutput && (
-        <pre className="max-h-72 overflow-auto border-t border-border bg-[#0b0d12] p-3 text-[12px] leading-relaxed text-white/85 dark:bg-[#070809]">
+        <pre className="max-h-72 overflow-auto border-t border-border bg-code-bg p-3 text-[12px] leading-relaxed text-code-fg">
           <code className="font-mono whitespace-pre-wrap break-words">{output}</code>
         </pre>
       )}

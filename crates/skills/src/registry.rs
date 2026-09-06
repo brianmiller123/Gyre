@@ -20,6 +20,15 @@ impl SkillRegistry {
         Self::with_providers(vec![Arc::new(NativeSkillProvider::new(cwd))])
     }
 
+    /// native + 跨工具 provider（Claude/Codex/OpenCode/GitHub，按开关启用）的构造。
+    ///
+    /// 去重优先级：native(100) > claude(80) > codex(70) > opencode(55) > github(30)；
+    /// 胜出 skill 的来源随 [`SkillCatalog`] 暴露（`Skill.source.provider` / `.level`）。
+    #[must_use]
+    pub fn cross_tool(cwd: PathBuf, toggles: &crate::providers::ProviderToggles) -> Self {
+        Self::with_providers(crate::providers::cross_tool_providers(cwd, toggles))
+    }
+
     /// 自定义 provider 集合（按 [`SkillProvider::priority`] 降序稳定排序）。
     #[must_use]
     pub fn with_providers(providers: Vec<Arc<dyn SkillProvider>>) -> Self {

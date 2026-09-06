@@ -562,6 +562,8 @@ mod tests {
             conflicts: None,
             pending_rewrites: None,
             context: None,
+            snapshots: None,
+            tool_call_id: None,
         }
     }
 

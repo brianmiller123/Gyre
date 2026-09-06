@@ -26,6 +26,9 @@
   --c-warning: 217 119 6;
   --c-danger: 220 38 38;
   --c-info: 37 99 235;
+  /* 代码块底/字色：与 highlight.js github 主题的两套底色保持一致。 */
+  --c-code-bg: 255 255 255;
+  --c-code-fg: 31 35 40;
 
   --grid: 15 23 42;
   --aurora-1: 45 212 191;
@@ -51,6 +54,8 @@
   --c-warning: 251 191 36;
   --c-danger: 248 113 113;
   --c-info: 96 165 250;
+  --c-code-bg: 13 17 23; /* github-dark #0d1117 */
+  --c-code-fg: 201 209 217; /* github-dark #c9d1d9 */
 
   --grid: 255 255 255;
   --aurora-1: 45 212 191;
@@ -199,5 +204,20 @@
       transparent
     );
     animation: shimmer 1.4s infinite;
+  }
+}
+
+/* P2-4 prefers-reduced-motion：用户系统开启「减少动态效果」时，全局停用装饰性
+   动画/过渡（脉冲、shimmer、滑入、aurora 视差等），只保留瞬时状态切换。
+   这里的 !important 是刻意的例外（全库其余处零 !important）：媒体查询作用域内
+   必须压过工具类的 animation/transition 声明，且仅在用户偏好开启时生效。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

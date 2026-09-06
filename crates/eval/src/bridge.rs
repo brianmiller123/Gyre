@@ -166,6 +166,8 @@ async fn call_handler(
         conflicts: None,
         pending_rewrites: None,
         context: None,
+        snapshots: None,
+        tool_call_id: None,
     };
     match tool.execute(req.args, &ctx).await {
         Ok(ToolResult::Text(text)) => (StatusCode::OK, Json(json!({"ok": true, "output": text}))),

@@ -5,12 +5,12 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import './index.css'
 
 // Bundled fonts (no network at runtime): Sora (display) + Plus Jakarta Sans
-// (body) + JetBrains Mono (data). Only the weights actually used are imported.
+// (body) + JetBrains Mono (data). Only the weights actually used are imported
+// (Sora 800 裁掉：全库无 font-extrabold/font-black 用法).
 import '@fontsource/sora/400.css'
 import '@fontsource/sora/500.css'
 import '@fontsource/sora/600.css'
 import '@fontsource/sora/700.css'
-import '@fontsource/sora/800.css'
 import '@fontsource/plus-jakarta-sans/400.css'
 import '@fontsource/plus-jakarta-sans/500.css'
 import '@fontsource/plus-jakarta-sans/600.css'

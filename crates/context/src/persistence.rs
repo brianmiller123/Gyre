@@ -1,13 +1,152 @@
 //! 会话持久化：JSONL 落盘 + 恢复（断点续跑）。
 //!
-//! 会话树原生持久化：每行一个 [`SessionNode`]（`id` + `parent_id` + `message`），
-//! 完整保留分支结构。旧版线性日志（每行一个裸 [`AgentMessage`]）在加载时被无损
-//! 迁移为单链树。活跃叶子（续写点）经 sidecar `<id>.jsonl.leaf` 跨进程保留。
+//! 文件布局（v1 起，参照 oh-my-pi `session-entries.ts` 的 header + 版本化精神）：
+//! **首行**为 header 记录 [`SessionRecord::Header`]（格式版本 + 创建元信息），
+//! 其后每行为一条会话树节点条目（裸 [`SessionNode`]，完整保留分支结构）。
+//! 读取端兼容三种历史形态：无 header 的树节点文件（v0）、旧版线性日志（每行一个裸
+//! [`AgentMessage`]，加载时无损迁移为单链树）——均全量兼容读入，不破坏既有会话；
+//! 版本高于 [`CURRENT_SESSION_VERSION`] 的文件在加载时明确报错「版本过新」。
+//! 活跃叶子（续写点）经 sidecar `<id>.jsonl.leaf` 跨进程保留。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use agent_core::{AgentMessage, NodeId, SessionNode};
+
+/// 当前会话文件格式版本。
+///
+/// v1 = 首行 [`SessionRecord::Header`] + 每行一条裸 [`SessionNode`] 条目。
+/// 读取端对 v0（无 header 的树节点 / 线性日志）保持全量兼容。
+pub const CURRENT_SESSION_VERSION: u32 = 1;
+
+/// header 的 `agent` 字段：写入方标识。
+const SESSION_AGENT: &str = "gyre";
+
+/// 会话文件首行 header：格式版本 + 创建元信息（serde 形状对齐 oh-my-pi
+/// `SessionHeader` 的版本化精神）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionHeader {
+    /// 文件格式版本（缺省按 1 处理，容错手写/截断的 header）。
+    #[serde(default = "default_session_version")]
+    pub version: u32,
+    /// 会话创建时间（Unix 秒）。
+    pub created_at_unix: i64,
+    /// 写入方标识（如 `"gyre"`）。
+    pub agent: String,
+}
+
+/// `version` 字段缺省值（供 serde `default`）。
+fn default_session_version() -> u32 {
+    CURRENT_SESSION_VERSION
+}
+
+/// 会话 JSONL 单行记录：header（首行）或会话树节点条目。
+///
+/// 内部 tag `type`（`header` / `snake_case` 变体名）；`Node` 变体序列化为
+/// `type:"node"` + 内联节点字段。反序列化层面，条目行兼容两种形状——
+/// 本包装与历史裸 [`SessionNode`]（无 `type` 字段）皆可（后者走各读取方的回退链）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionRecord {
+    /// 文件首行 header 记录。
+    Header(SessionHeader),
+    /// 会话树节点条目。
+    Node(SessionNode),
+}
+
+/// 判断一行 JSONL 文本是否为会话 header 记录（各会话读取方据此跳过 header 行）。
+#[must_use]
+pub fn is_session_header_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && serde_json::from_str::<SessionRecord>(trimmed)
+            .is_ok_and(|r| matches!(r, SessionRecord::Header(_)))
+}
+
+/// 读取会话文件首行 header（文件缺失 / 空 / 无 header / 首行非 header → `None`）。
+#[must_use]
+pub fn read_session_header(path: &Path) -> Option<SessionHeader> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let first = std::io::BufReader::new(file).lines().next()?.ok()?;
+    let trimmed = first.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<SessionRecord>(trimmed) {
+        Ok(SessionRecord::Header(h)) => Some(h),
+        _ => None,
+    }
+}
+
+/// 迁移链骨架：把 `from_version` 时代的单条记录迁移到当前版本（当前 v1 恒等）。
+///
+/// 后续格式版本在此按 `from_version < N` 逐级生长（参照 oh-my-pi
+/// `session-migrations.ts` 的版本链）；每级迁移只做必要变换，缺省恒等。
+fn migrate_record(rec: SessionRecord, from_version: u32) -> SessionRecord {
+    // 后续版本在此生长，例如：
+    // if from_version < 2 { /* v1 → v2：字段改名/补默认 */ }
+    let _ = from_version;
+    rec
+}
+
+/// Unix 秒 → [`SystemTime`](std::time::SystemTime)（负值/溢出回退 `None`）。
+fn unix_to_system_time(secs: i64) -> Option<std::time::SystemTime> {
+    let u = u64::try_from(secs).ok()?;
+    std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(u))
+}
+
+/// 当前 Unix 秒（时钟回退等异常回退 0）。
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 序列化 header 记录为单行 JSONL 文本。
+fn header_line(header: &SessionHeader) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&SessionRecord::Header(header.clone()))
+}
+
+/// 新会话文件写入首行 header 记录（文件缺失或为空时；已有内容的 legacy 文件保持
+/// 不动——append-only，不为一纸 header 重写历史）。
+async fn ensure_session_header(path: &Path) {
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if meta.len() > 0 {
+            return;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!("创建会话目录失败: {e}");
+            return;
+        }
+    }
+    let header = SessionHeader {
+        version: CURRENT_SESSION_VERSION,
+        created_at_unix: now_unix(),
+        agent: SESSION_AGENT.to_string(),
+    };
+    let Ok(line) = header_line(&header) else {
+        tracing::warn!("序列化会话 header 失败");
+        return;
+    };
+    let write = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await
+    };
+    if let Err(e) = write.await {
+        tracing::warn!("写入会话 header 失败: {e}");
+    }
+}
 
 /// JSONL 持久化的上下文：包裹 [`InMemoryContext`](crate::InMemoryContext)，append 时自动追加写盘。
 pub struct PersistentContext {
@@ -18,10 +157,11 @@ pub struct PersistentContext {
 }
 
 impl PersistentContext {
-    /// 异步构造：加载已有 JSONL 恢复日志（会话树 + 活跃叶子）。若文件不存在则创建空会话。
+    /// 异步构造：加载已有 JSONL 恢复日志（会话树 + 活跃叶子）。新会话（文件缺失或为空）
+    /// 写入首行 header 记录（[`SessionHeader`]）；已有内容的 legacy 文件保持原样读入。
     ///
     /// # Errors
-    /// 读取已有文件解析失败时返回错误。
+    /// 读取已有文件解析失败（含会话文件版本过新）时返回错误。
     pub async fn open(
         system: Vec<String>,
         path: impl Into<PathBuf>,
@@ -29,6 +169,8 @@ impl PersistentContext {
         let path = path.into();
         let leaf_path = leaf_sidecar(&path);
         let inner = crate::InMemoryContext::new(system);
+        // 新会话（文件缺失或空）写入首行 header 记录；已有内容的 legacy 文件不动。
+        ensure_session_header(&path).await;
         if path.exists() {
             let nodes = load_jsonl(&path).await?;
             inner.restore_nodes(nodes).await;
@@ -185,6 +327,8 @@ pub struct SessionInfo {
     pub mtime: std::time::SystemTime,
     /// 文件字节数。
     pub bytes: u64,
+    /// 会话创建时间（来自 header 记录；legacy 无 header 的旧文件为 `None`）。
+    pub created_at: Option<std::time::SystemTime>,
 }
 
 impl SessionStore {
@@ -260,6 +404,8 @@ impl SessionStore {
                 id,
                 mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                 bytes: meta.len(),
+                created_at: read_session_header(&path)
+                    .and_then(|h| unix_to_system_time(h.created_at_unix)),
             });
         }
         out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
@@ -459,7 +605,9 @@ async fn append_jsonl_node(path: &Path, node: &SessionNode) -> Result<(), std::i
 }
 
 /// 整体重写（异步 + 原子）：先写临时文件并 sync，再 rename 覆盖，避免中途崩溃导致
-/// 会话 JSONL 被截断/损坏（数据丢失）。
+/// 会话 JSONL 被截断/损坏（数据丢失）。首行为 header 记录——结构性重写视为一次
+/// 「迁移落盘」：legacy 文件（无 header）自此升级为当前版本；已有 header 则保留原
+/// `created_at_unix`（重写不重置会话创建时间）。
 async fn rewrite_jsonl(path: &Path, nodes: &[SessionNode]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -472,6 +620,15 @@ async fn rewrite_jsonl(path: &Path, nodes: &[SessionNode]) -> Result<(), std::io
     {
         let mut file = tokio::fs::File::create(&tmp).await?;
         use tokio::io::AsyncWriteExt;
+        let header = SessionHeader {
+            version: CURRENT_SESSION_VERSION,
+            created_at_unix: read_session_header(path).map_or_else(now_unix, |h| h.created_at_unix),
+            agent: SESSION_AGENT.to_string(),
+        };
+        let header = header_line(&header)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        file.write_all(header.as_bytes()).await?;
+        file.write_all(b"\n").await?;
         for n in nodes {
             let line = serde_json::to_string(n)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -513,7 +670,15 @@ pub async fn delete_message_in_file(
 }
 
 /// 加载恢复：流式逐行反序列化为 [`SessionNode`]，并对总字节数与单行长度设上限，
-/// 防止超大历史会话 OOM。旧版线性日志（裸 [`AgentMessage`]）被无损迁移为单链树。
+/// 防止超大历史会话 OOM。
+/// header + 版本校验：首行为 [`SessionRecord::Header`] 记录时校验其 `version` 字段——
+/// ≤ [`CURRENT_SESSION_VERSION`] 时逐条读 entries（经迁移链 [`migrate_record`]）；
+/// 大于当前版本则在加载时明确报错「会话文件版本过新」。无 header 的旧文件
+/// （v0：裸 `SessionNode` 树 / 裸 [`AgentMessage`] 线性日志）按既有行为全量兼容
+/// 读入，线性日志被无损迁移为单链树。
+///
+/// # Errors
+/// 文件读取失败，或 header 版本高于 [`CURRENT_SESSION_VERSION`] 时返回错误。
 async fn load_jsonl(path: &Path) -> Result<Vec<SessionNode>, agent_core::ContextError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     /// 会话恢复加载的最大总字节数（超出则仅加载首部并告警）。
@@ -552,23 +717,62 @@ async fn load_jsonl(path: &Path) -> Result<Vec<SessionNode>, agent_core::Context
         }
     }
 
-    // 两阶段解析：先按 SessionNode 解析；失败的行回退为裸 AgentMessage（旧版线性日志）
-    // 并就地迁移为单链树节点（顺序 parent 链）。
-    let mut nodes: Vec<SessionNode> = Vec::with_capacity(raw_lines.len());
+    // ── header 检测 + 版本校验 ──
+    // 首行是 header 记录：版本 ≤ 当前 → 逐条读 entries（经迁移链）；> 当前 → 明确报错。
+    // 无 header（v0 legacy）→ 全量兼容读入，不破坏既有会话。
+    let mut from_version = CURRENT_SESSION_VERSION;
+    let mut body_lines: &[String] = &raw_lines;
+    if let Some(first) = raw_lines.first() {
+        if let Ok(SessionRecord::Header(h)) = serde_json::from_str::<SessionRecord>(first) {
+            if h.version > CURRENT_SESSION_VERSION {
+                return Err(agent_core::ContextError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "会话文件版本过新: v{} > 当前支持的 v{CURRENT_SESSION_VERSION}，请升级程序后再打开该会话",
+                        h.version
+                    ),
+                )));
+            }
+            from_version = h.version;
+            body_lines = &raw_lines[1..];
+        }
+    }
+
+    // 三形态逐行解析（`body_lines` 已剥离首行 header）：
+    // 1. `SessionRecord`（新版 `type` tag 行；条目区的意外 header 告警跳过）；
+    // 2. 裸 `SessionNode`（v0 树文件）；
+    // 3. 裸 `AgentMessage`（旧版线性日志）→ 就地迁移为单链树节点（顺序 parent 链）。
+    let mut nodes: Vec<SessionNode> = Vec::with_capacity(body_lines.len());
     let mut legacy_buffer: Vec<AgentMessage> = Vec::new();
-    for raw in &raw_lines {
-        match serde_json::from_str::<SessionNode>(raw) {
-            Ok(n) => {
-                // 切到 SessionNode 前，若有遗留线性消息，先 flush 为迁移链。
+    for raw in body_lines {
+        match serde_json::from_str::<SessionRecord>(raw) {
+            Ok(SessionRecord::Header(h)) => {
+                tracing::warn!("条目区出现意外 header 记录（v{}），跳过", h.version);
+            }
+            Ok(SessionRecord::Node(n)) => {
+                // 切到树节点前，若有遗留线性消息，先 flush 为迁移链。
                 if !legacy_buffer.is_empty() {
                     nodes.extend(crate::tree::wrap_linear_as_nodes(&legacy_buffer));
                     legacy_buffer.clear();
                 }
-                nodes.push(n);
+                match migrate_record(SessionRecord::Node(n), from_version) {
+                    SessionRecord::Node(migrated) => nodes.push(migrated),
+                    // 恒等迁移下不可达；防御性忽略，绝不让迁移骨架panic加载路径。
+                    SessionRecord::Header(_) => {}
+                }
             }
-            Err(_) => match serde_json::from_str::<AgentMessage>(raw) {
-                Ok(m) => legacy_buffer.push(m),
-                Err(e) => tracing::warn!("持久化一行解析失败，跳过: {e}"),
+            Err(_) => match serde_json::from_str::<SessionNode>(raw) {
+                Ok(n) => {
+                    if !legacy_buffer.is_empty() {
+                        nodes.extend(crate::tree::wrap_linear_as_nodes(&legacy_buffer));
+                        legacy_buffer.clear();
+                    }
+                    nodes.push(n);
+                }
+                Err(_) => match serde_json::from_str::<AgentMessage>(raw) {
+                    Ok(m) => legacy_buffer.push(m),
+                    Err(e) => tracing::warn!("持久化一行解析失败，跳过: {e}"),
+                },
             },
         }
     }
@@ -601,6 +805,160 @@ mod tests {
         assert!(!seg.contains(".."), "{seg} 仍含穿越片段");
         assert!(!seg.is_empty());
         assert_eq!(sanitize_session_id_segment("normal-id"), "normal-id");
+    }
+
+    /// 构造一个测试节点（手写 JSONL 用）。
+    fn test_node_json(text: &str) -> String {
+        serde_json::to_string(&SessionNode::root(
+            format!("n-{text}"),
+            AgentMessage::user_text(text),
+        ))
+        .unwrap()
+    }
+    /// roundtrip：新会话文件首行为 header 记录（version/created_at/agent 齐全），
+    /// 条目为裸 SessionNode；重开恢复全部消息。
+    #[tokio::test]
+    async fn roundtrip_header_and_entries() {
+        let path = tmp_path();
+        {
+            let pc = PersistentContext::open(vec!["sys".into()], &path)
+                .await
+                .unwrap();
+            pc.append(AgentMessage::user_text("a")).await;
+            pc.append(AgentMessage::user_text("b")).await;
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines = raw.lines();
+        let first = lines.next().expect("新会话文件应有首行 header");
+        let rec: SessionRecord = serde_json::from_str(first).unwrap();
+        let SessionRecord::Header(h) = rec else {
+            panic!("首行应为 header 记录，实为 {first}");
+        };
+        assert_eq!(h.version, CURRENT_SESSION_VERSION);
+        assert!(h.created_at_unix > 0, "created_at_unix 应为正的 Unix 秒");
+        assert_eq!(h.agent, "gyre");
+        // 条目行：裸 SessionNode（无 type tag），v1 磁盘格式保持条目形状不变。
+        let entry_count = lines
+            .filter(|l| serde_json::from_str::<SessionNode>(l).is_ok())
+            .count();
+        assert_eq!(entry_count, 2, "应有 2 条节点条目");
+        // 重开恢复。
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
+        assert_eq!(pc.snapshot_nodes().await.len(), 2);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
+    }
+
+    /// legacy 兼容（v0）：无 header 的树节点文件全量兼容读入；
+    /// list() 的 created_at 对 legacy 文件为 None。
+    #[tokio::test]
+    async fn legacy_tree_file_without_header_loads() {
+        let path = tmp_path();
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{}", test_node_json("old-1")).unwrap();
+            writeln!(f, "{}", test_node_json("old-2")).unwrap();
+        }
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
+        let nodes = pc.snapshot_nodes().await;
+        assert_eq!(nodes.len(), 2, "legacy 树文件应全量读入");
+        assert!(read_session_header(&path).is_none(), "legacy 文件无 header");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(leaf_sidecar(&path));
+    }
+
+    /// 过新版本：header version > CURRENT_SESSION_VERSION → 明确报错「版本过新」。
+    #[tokio::test]
+    async fn future_version_file_is_rejected() {
+        let path = tmp_path();
+        {
+            use std::io::Write;
+            let header = SessionHeader {
+                version: CURRENT_SESSION_VERSION + 1,
+                created_at_unix: 1_700_000_000,
+                agent: "future".into(),
+            };
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{}", header_line(&header).unwrap()).unwrap();
+            writeln!(f, "{}", test_node_json("x")).unwrap();
+        }
+        let err = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .err()
+            .expect("过新版本应报错");
+        assert!(
+            err.to_string().contains("会话文件版本过新"),
+            "错误信息应明确提示版本过新，实为: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 迁移链骨架：当前 v1 恒等（含 from_version=0 的 legacy 视角）。
+    #[test]
+    fn migrate_record_is_identity_at_v1() {
+        let rec = SessionRecord::Node(SessionNode::root(
+            "n1".to_string(),
+            AgentMessage::user_text("hello"),
+        ));
+        for from in [0u32, 1] {
+            let cloned = rec.clone();
+            assert_eq!(
+                migrate_record(rec.clone(), from),
+                cloned,
+                "v1 迁移应为恒等（from_version={from}）"
+            );
+        }
+    }
+
+    /// header 行识别：读取方据此跳过 header；节点行/垃圾行/空行不误判。
+    #[test]
+    fn is_session_header_line_detection() {
+        let header = SessionHeader {
+            version: 1,
+            created_at_unix: 42,
+            agent: "gyre".into(),
+        };
+        assert!(is_session_header_line(&header_line(&header).unwrap()));
+        assert!(!is_session_header_line(&test_node_json("x")));
+        assert!(!is_session_header_line("{not json"));
+        assert!(!is_session_header_line("   "));
+    }
+
+    /// read_session_header + list().created_at：新文件可取回 header；结构性重写
+    /// （delete → rewrite_jsonl）保留原 created_at 并落在当前版本。
+    #[tokio::test]
+    async fn rewrite_preserves_created_at_and_list_reads_header() {
+        let store = tmp_store();
+        let path = store.path_for("hdr-sess");
+        {
+            let pc = PersistentContext::open(vec!["sys".into()], &path)
+                .await
+                .unwrap();
+            pc.append(AgentMessage::user_text("a")).await;
+            pc.append(AgentMessage::user_text("b")).await;
+        }
+        let created = read_session_header(&path)
+            .expect("header 应可读回")
+            .created_at_unix;
+        // 结构性重写：删 1 条触发 persist_full → rewrite_jsonl。
+        let pc = PersistentContext::open(vec!["sys".into()], &path)
+            .await
+            .unwrap();
+        pc.delete_message_at(0).await.unwrap();
+        let h = read_session_header(&path).expect("重写后 header 仍在");
+        assert_eq!(h.version, CURRENT_SESSION_VERSION);
+        assert_eq!(h.created_at_unix, created, "重写不重置创建时间");
+        // list() 暴露 created_at。
+        let infos = store.list();
+        let info = infos.iter().find(|i| i.id == "hdr-sess").unwrap();
+        let expect = unix_to_system_time(created).unwrap();
+        assert_eq!(info.created_at, Some(expect));
+        let _ = std::fs::remove_dir_all(&store.dir);
     }
 
     fn tmp_path() -> PathBuf {

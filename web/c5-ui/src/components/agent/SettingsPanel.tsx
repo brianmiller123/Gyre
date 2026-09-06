@@ -23,7 +23,7 @@ const accents = [
 /** Connection + appearance settings modal. */
 export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { settings, update } = useSettings()
-  const { disconnect, connect, clear, sessionId, socks5Status, refreshSocks5Status, setSocks5Enabled, approvalModeStatus, refreshApprovalModeStatus, setApprovalMode } =
+  const { disconnect, connect, clear, sessionId, socks5Status, refreshSocks5Status, setSocks5Enabled } =
     useAgentSession()
   const { theme, setTheme } = useTheme()
   const { toast } = useNotifications()
@@ -37,8 +37,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   // SOCKS5 状态拉取过程/失败标记：与「服务端未配置」严格区分，避免误导读屏与用户。
   const [socks5Loading, setSocks5Loading] = useState(false)
   const [socks5LoadError, setSocks5LoadError] = useState(false)
-  // 审批模式切换在途状态。
-  const [approvalBusy, setApprovalBusy] = useState(false)
   // 清空对话二次确认。
   const [confirmClear, setConfirmClear] = useState(false)
 
@@ -59,13 +57,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   useEffect(() => {
     if (open) {
       setDraft(settings)
-      // 打开面板时主动刷新代理状态与审批模式（不依赖 WS 连接），保证控件即时显示。
+      // 打开面板时主动刷新代理状态（不依赖 WS 连接），保证控件即时显示。
       setSocks5Loading(true)
       void refreshSocks5Status().then((ok) => {
         setSocks5Loading(false)
         setSocks5LoadError(!ok)
       })
-      void refreshApprovalModeStatus()
     }
     // 仅依赖 open 上升沿：面板打开期间 settings 的身份变化（如刷新回写）不得重置草稿
     // 或触发重取——曾因把 settings 放进依赖造成无限刷新循环 + 用户输入被周期性回滚。
@@ -237,52 +234,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                 />
               )}
             </div>
-            {/* 审批模式：写/执行操作的审批门槛。切换实时生效（已建会话立即跟随）并由
-                服务端持久化（.gyre/approval-mode.state）——下次启动自动记住，无需 CLI 指定。 */}
-            <div className="rounded-lg border border-border bg-surface-2/50 p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-text-1">{t('settings.approval_title')}</p>
-                  <p className="mt-0.5 text-xs text-muted">{t('settings.approval_desc')}</p>
-                </div>
-              </div>
-              <div className="mt-2 flex items-center gap-2">
-                <Select
-                  value={approvalModeStatus?.effective ?? 'always-ask'}
-                  disabled={approvalBusy || !approvalModeStatus}
-                  onChange={(e) => {
-                    const v = e.target.value as 'always-ask' | 'write' | 'yolo'
-                    setApprovalBusy(true)
-                    void setApprovalMode(v).then((ok) => {
-                      setApprovalBusy(false)
-                      if (!ok)
-                        toast({ title: t('settings.approval_fail'), severity: 'danger' })
-                    })
-                  }}
-                >
-                  <option value="always-ask">{t('settings.approval_always_ask')}</option>
-                  <option value="write">{t('settings.approval_write')}</option>
-                  <option value="yolo">{t('settings.approval_yolo')}</option>
-                </Select>
-                {approvalModeStatus?.mode && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={approvalBusy}
-                    onClick={() => {
-                      setApprovalBusy(true)
-                      void setApprovalMode(null).then((ok) => {
-                        setApprovalBusy(false)
-                        if (!ok)
-                          toast({ title: t('settings.approval_fail'), severity: 'danger' })
-                      })
-                    }}
-                  >
-                    {t('settings.approval_reset')}
-                  </Button>
-                )}
-              </div>
-            </div>
           </div>
         </div>
 
@@ -324,7 +275,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   className="h-8 w-8 rounded-full"
                   style={{ background: `rgb(${a.primary})`, boxShadow: accent === a.name ? `0 0 0 2px rgb(${a.glow})` : 'none' }}
                 />
-                <span className="text-[11px] text-text-2">{a.name}</span>
+                <span className="text-2xs text-text-2">{a.name}</span>
               </button>
             ))}
           </div>

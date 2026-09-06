@@ -28,6 +28,8 @@ const config: Config = {
         text: 'rgb(var(--c-text) / <alpha-value>)',
         'text-2': 'rgb(var(--c-text-2) / <alpha-value>)',
         muted: 'rgb(var(--c-muted) / <alpha-value>)',
+        'code-bg': 'rgb(var(--c-code-bg) / <alpha-value>)',
+        'code-fg': 'rgb(var(--c-code-fg) / <alpha-value>)',
         primary: {
           DEFAULT: 'rgb(var(--c-primary) / <alpha-value>)',
           glow: 'rgb(var(--c-primary-glow) / <alpha-value>)',
@@ -42,6 +44,10 @@ const config: Config = {
         sans: ['"Plus Jakarta Sans"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
         display: ['Sora', 'ui-sans-serif', 'system-ui', 'sans-serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+      },
+      /* 字号下限档位：正文最小 11px，禁用 text-[9px]/[10px]/[11px] 任意值碎片。 */
+      fontSize: {
+        '2xs': '11px',
       },
       boxShadow: {
         soft: '0 1px 2px rgb(0 0 0 / .04), 0 6px 20px rgb(0 0 0 / .06)',

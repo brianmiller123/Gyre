@@ -114,7 +114,7 @@ export function Sidebar({
           <div className="font-display text-[15px] font-bold leading-none tracking-tight text-text">
             Agent<span className="text-primary"> ·</span> Console
           </div>
-          <div className="mt-1 text-[10px] uppercase tracking-[0.16em] text-muted">
+          <div className="mt-1 text-2xs uppercase tracking-[0.16em] text-muted">
             {t('sidebar.brand')}
           </div>
         </div>
@@ -155,19 +155,19 @@ export function Sidebar({
             {statusLabel}
           </span>
         </div>
-        <p className="mt-1.5 truncate font-mono text-[10px] text-muted">
+        <p className="mt-1.5 truncate font-mono text-2xs text-muted">
           {serverHost}
         </p>
         {sessionId && (
-          <p className="mt-0.5 truncate font-mono text-[10px] text-muted">
+          <p className="mt-0.5 truncate font-mono text-2xs text-muted">
             session: {sessionId.slice(0, 13)}…
           </p>
         )}
-        {error && <p className="mt-1 text-[10px] text-danger">{error}</p>}
+        {error && <p className="mt-1 text-2xs text-danger">{error}</p>}
       </div>
 
       {/* 操作（统计 / 浏览 / 设置 / 清空） */}
-      <nav className="mt-2 grid shrink-0 grid-cols-4 gap-1 px-3">
+      <nav className="mt-2 grid shrink-0 grid-cols-4 gap-0.5 px-2.5">
         <NavAction icon="bar-chart" label={t('sidebar.stats')} onClick={() => { onOpenStats(); onClose?.() }} />
         <NavAction icon="layers" label={t('sidebar.browse')} onClick={() => { onOpenWorkspace(); onClose?.() }} />
         <NavAction icon="settings" label={t('sidebar.settings')} onClick={() => { onOpenSettings(); onClose?.() }} />
@@ -242,7 +242,7 @@ export function Sidebar({
             </>
           )}
         </div>
-        <div className="mt-1 flex items-center justify-between px-2.5 py-1 text-[10px] text-muted">
+        <div className="mt-1 flex items-center justify-between px-2.5 py-1 text-2xs text-muted">
           <span>v{__APP_VERSION__} · WebUI</span>
           <span className="inline-flex items-center gap-1">
             <Icon name="github" size={12} /> {t('sidebar.source')}
@@ -281,7 +281,7 @@ function NavAction({
     <button
       onClick={onClick}
       title={label}
-      className={`flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[10px] font-medium transition-colors hover:bg-surface-2 ${
+      className={`flex flex-col items-center gap-1 rounded-lg px-0.5 py-2 text-2xs font-medium transition-colors hover:bg-surface-2 ${
         danger ? 'text-danger hover:bg-danger/10' : 'text-text-2 hover:text-text'
       }`}
     >

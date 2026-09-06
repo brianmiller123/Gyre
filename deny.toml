@@ -1,0 +1,70 @@
+# cargo-deny 0.20.2 策略（对齐 third/oh-my-pi/deny.toml 基线，按 Gyre 实际依赖图修订；
+# 2026-09 已用 0.20.2 对 Cargo.lock 全图（targets=[] + all-features）实跑验证）。
+# 空 targets 评估所有 target 专属依赖（windows-sys 等）；all-features 把可选边
+# （fastembed→ort 等）一并纳入许可证审查。
+[graph]
+targets = []
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# 软门起点：CI 中 advisories 检查以 continue-on-error 运行（DB 随时间新增，无法
+# 事先 pin）。triage 流程建立后：真实通告记入 ignore（附 issue 链接与复核日期），
+# 并把 CI 步骤升级为硬门。
+ignore = []
+
+[licenses]
+version = 2
+include-dev = true
+include-build = true
+# 允许表必须与实际遭遇完全对齐：多一条即失败（防"顺手加许可"腐化），少一条也失败。
+unused-allowed-license = "deny"
+unused-license-exception = "deny"
+confidence-threshold = 0.8
+# cargo-deny 对 OR 表达式按存在性求值：许可选中一条宽松分支即可通过；AND 则每条
+# 义务都必须被允许。以下清单已覆盖全图（见 allow/exceptions 拆分理由）。
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "BSD-3-Clause",
+    # webpki-roots@1.0.8（经 reqwest/hyper-rustls、fastembed/ureq 引入）：随包分发的
+    # Mozilla 根证书库数据。CDLA-Permissive-2.0 非 OSI 认证，但对"根证书数据集"是
+    # 行业标准许可（允许再分发、要求附带协议文本——THIRD-PARTY-NOTICES 承接）。
+    # 不放行它的替代方案是运行期加载系统证书库，属行为变更，不在此处理。
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# 包级例外：保持"无全局 copyleft"策略（对齐 omp——MPL/WTFPL 只对点名 crate 开口）。
+# 注意 self_cell(GPL-2.0-only)、r-efi(LGPL-2.1+)、memchr/ignore 等(Unlicense) 均为
+# OR 表达式的未选中分支，经宽松分支通过，无需在此登记。
+exceptions = [
+    # dirs → dirs-sys 依赖链上的 option-ext：MPL-2.0 文件级 copyleft，靠上游源码
+    # 公开即满足义务；我们未修改它，无额外义务传导。
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+    # syntect 依赖链上的 terminfo：WTFPL（实质公有领域），仅点名放行。
+    { allow = ["WTFPL"], crate = "terminfo@0.9.0" },
+]
+
+# [bans] 基线：多版本依赖暂只告警（900+ crate 图收敛多版本是渐进工程，收紧路径：
+# `cargo tree --duplicates` 逐个归并后再升 deny）；通配符版本需求（"1.*"）暂只告警
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+# 注：sources 以 Cargo.lock 的 registry 身份为准，本地镜像（rsproxy 等）不影响判定；
+# 2026-09 已在配置了镜像的环境实跑通过。

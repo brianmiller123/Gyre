@@ -57,7 +57,7 @@ pub struct ReviewEnv<'a> {
     /// 子 Agent 并发护栏。
     pub max_concurrent: usize,
     /// 子 Agent 监控总线（与 `/agents` 仪表盘共享）。
-    pub supervisor: agent_supervisor::Supervisor,
+    pub supervisor: Arc<agent_supervisor::Supervisor>,
     /// 评审子代理审批策略（只读：写操作硬拒绝）。
     pub approval: Arc<dyn ApprovalPolicy>,
 }
@@ -168,6 +168,8 @@ pub async fn run_review(staged: bool, explicit: Option<usize>, env: &ReviewEnv<'
         conflicts: None,
         pending_rewrites: None,
         context: None,
+        snapshots: None,
+        tool_call_id: None,
     };
     let all_text = match task_tool
         .execute(json!({ "tasks": tasks }), &tool_ctx)

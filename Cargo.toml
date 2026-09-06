@@ -76,7 +76,6 @@ mime_guess  = "2"
 
 # 代码操控 / 计数
 tiktoken-rs = "0.6"
-tree-sitter = "0.25"
 # 搜索（移植 pi-natives grep/glob/fd）
 ignore     = "0.4"            # ripgrep 核心：尊重 .gitignore 的并行遍历
 regex      = "1"
@@ -101,6 +100,8 @@ image      = { version = "0.25", default-features = false, features = ["png"] }
 arboard    = "3"
 # 散列（hashline 文件版本绑定 / 文件指纹）
 sha2       = "0.10"
+# HMAC（密钥脱敏 placeholder 摘要，crates/core secrets）
+hmac       = "0.12"
 # 跨平台 PTY（ConPTY / posix openpty）
 portable-pty = "0.8"
 # 进程组信号（browser 工具关闭时整树击杀 chromium）；nix 0.28 默认无 feature

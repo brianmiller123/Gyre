@@ -110,10 +110,10 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
     <div className="flex min-h-0 flex-1 flex-col px-3 pb-1.5">
       {/* 标题栏：标题 + 计数 + 刷新 */}
       <div className="flex items-center justify-between px-1 pb-1.5 pt-0.5">
-        <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+        <span className="flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-muted">
           {t('sessions.heading')}
           {sessions.length > 0 && (
-            <span className="rounded-full bg-surface-3 px-1.5 text-[9px] tabular leading-[1.4] text-muted">
+            <span className="rounded-full bg-surface-3 px-1.5 text-2xs tabular leading-[1.4] text-muted">
               {t('sessions.count', { n: sessions.length })}
             </span>
           )}
@@ -216,10 +216,10 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
         {noMatch && (
           <div className="flex flex-col items-center px-3 py-8 text-center">
             <Icon name="search" size={18} className="text-muted" />
-            <p className="mt-2 max-w-full truncate text-[11px] text-muted">{query}</p>
+            <p className="mt-2 max-w-full truncate text-2xs text-muted">{query}</p>
             <button
               onClick={() => setQuery('')}
-              className="mt-1 text-[11px] font-medium text-primary hover:underline"
+              className="mt-1 text-2xs font-medium text-primary hover:underline"
             >
               {t('sessions.clear_filter')}
             </button>

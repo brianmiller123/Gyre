@@ -32,7 +32,7 @@ pub mod kw {
 }
 
 /// 指纹 hex 长度。
-pub const HASH_LEN: usize = 4;
+pub use agent_tools::snapshot::HASH_LEN;
 
 /// 格式化段头：`[path#hash]` 或 `[path]`（无 hash）。
 #[must_use]
@@ -81,42 +81,14 @@ pub fn format_numbered_lines(text: &str, start_line: Anchor) -> String {
 }
 
 /// 内容指纹：4 hex 大写。规范化先去除每行尾随空白与 `\r`。
-#[must_use]
-pub fn compute_file_hash(text: &str) -> String {
-    let normalized: String = normalize_for_hash(text);
-    let h = fnv1a_32(normalized.as_bytes());
-    let low16 = h & 0xFFFF;
-    format!("{low16:0HASH_LEN$X}")
-}
-
-fn normalize_for_hash(text: &str) -> String {
-    text.split('\n')
-        .map(|line| line.trim_end_matches([' ', '\t', '\r']))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// FNV-1a 32-bit（确定性、无依赖）。
-fn fnv1a_32(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811C_9DC5;
-    for &b in bytes {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
+///
+/// 实体在 `agent-tools::snapshot`（`ToolContext` 字段所在 crate；本 crate 再导出，
+/// `agent_hashline::format::compute_file_hash` 对外路径不变）。
+pub use agent_tools::snapshot::compute_file_hash;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hash_is_stable_and_trim_insensitive() {
-        let a = compute_file_hash("line1\nline2\n");
-        let b = compute_file_hash("line1 \nline2\t\n");
-        assert_eq!(a, b);
-        assert_eq!(a.len(), HASH_LEN);
-    }
 
     #[test]
     fn formats_headers() {

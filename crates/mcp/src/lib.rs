@@ -5,7 +5,11 @@
 //! - [`McpClient`]：连接 MCP server（子进程 stdio 或 HTTP 端点），JSON-RPC 2.0 通信
 //!   （initialize / tools/list / tools/call / resources/*）
 //! - [`McpTool`]：把 server 工具包装为 agent [`Tool`](agent_tools::Tool)
-//! - [`McpRegistry`]：从 `[mcp.servers]` 配置加载多 server 的全部工具
+//! - [`McpRegistry`]：从 `[mcp.servers]` 配置加载多 server 的全部工具；消费
+//!   server→client 通知（`tools/list_changed` 自动重拉 + 变更监听器）；
+//!   每 server 重连监督（指数退避 + 爆发熔断，见 [`reconnect`] 模块文档）；
+//!   连接状态经 [`McpRegistry::server_status`] 暴露（`connected` / `reconnecting` /
+//!   `open` + 最近错误）
 //!
 //! 分层（对标 oh-my-pi `src/mcp/transports/`）：`client` 为协议层（方法序 + id 关联），
 //! `stdio` / `http` 为传输层（帧与 I/O）。
@@ -14,10 +18,17 @@
 
 #![deny(unsafe_code)]
 
+pub mod cache;
 mod client;
 mod http;
+pub mod oauth;
+mod reconnect;
+mod registry;
 mod stdio;
 mod tool;
 
-pub use client::{McpClient, McpError, McpToolInfo};
-pub use tool::{McpRegistry, McpTool};
+pub use cache::{CachedTool, CachedTools};
+pub use client::{McpClient, McpError, McpNotification, McpToolInfo, ServerInfo};
+pub use reconnect::{McpConnState, McpServerStatus};
+pub use registry::{hydrate_from_cache, store_tools};
+pub use tool::{McpRegistry, McpTool, ToolsChangedListener};
