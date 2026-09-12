@@ -156,6 +156,8 @@ export const en: Dict = {
   'shell.conversation': 'Conversation',
   'shell.stop': 'Stop',
   'shell.stopping': 'Stopping…',
+  'shell.retrying': 'Retrying ({attempt}/{max})…',
+  'shell.compacting': 'Compacting context…',
   'shell.clear': 'Clear',
   'shell.clear_confirm_body': 'This clears the current conversation view. It cannot be undone.',
   'shell.session_actions': 'Session actions',

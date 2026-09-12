@@ -154,6 +154,8 @@ export const zh: Dict = {
   'shell.conversation': '对话',
   'shell.stop': '停止',
   'shell.stopping': '停止中…',
+  'shell.retrying': '重试中（{attempt}/{max}）…',
+  'shell.compacting': '正在压缩上下文…',
   'shell.clear': '清空',
   'shell.clear_confirm_body': '将清空当前对话视图，此操作不可撤销。',
   'shell.session_actions': '会话操作',

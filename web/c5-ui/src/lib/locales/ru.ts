@@ -156,6 +156,8 @@ export const ru: Dict = {
   'shell.conversation': 'Диалог',
   'shell.stop': 'Стоп',
   'shell.stopping': 'Остановка…',
+  'shell.retrying': 'Повтор ({attempt}/{max})…',
+  'shell.compacting': 'Сжатие контекста…',
   'shell.clear': 'Очистить',
   'shell.clear_confirm_body': 'Текущая переписка будет очищена. Действие необратимо.',
   'shell.session_actions': 'Действия сессии',

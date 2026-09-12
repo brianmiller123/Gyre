@@ -11,6 +11,7 @@ import { WorkspacePanel } from '@/components/agent/WorkspacePanel'
 import { PanelBoundary } from '@/components/ErrorBoundary'
 import { Toaster } from '@/components/Toaster'
 import { useAgentSession, useTranscriptItems } from '@/lib/agent/useAgentSession'
+import type { SessionActivity } from '@/lib/agent/types'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact } from '@/lib/format'
 import { useI18n } from '@/lib/i18n'
@@ -50,7 +51,7 @@ export function AgentShell() {
     }
   }
 
-  const { state, usage, error, running, stopping, clear, cancel, connect, sessionId, newChat } =
+  const { state, usage, error, running, stopping, activity, clear, cancel, connect, sessionId, newChat } =
     useAgentSession()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
@@ -104,6 +105,7 @@ export function AgentShell() {
           cost={usage.cost_usd}
           running={running}
           stopping={stopping}
+          activity={activity}
           onMenu={() => setMobileNav(true)}
           onInspector={() => setInspectorOpen(true)}
           onClear={() => setConfirmClear(true)}
@@ -225,6 +227,7 @@ function TopBar({
   cost,
   running,
   stopping,
+  activity,
   onMenu,
   onInspector,
   onClear,
@@ -238,6 +241,7 @@ function TopBar({
   cost: number
   running: boolean
   stopping: boolean
+  activity: SessionActivity | null
   onMenu: () => void
   onInspector: () => void
   onClear: () => void
@@ -285,6 +289,17 @@ function TopBar({
         <Badge tone={stateTone} dot={stateDot} className="hidden shrink-0 sm:inline-flex">
           {stateLabel}
         </Badge>
+
+        {activity && (
+          <Badge tone="warning" dot className="hidden shrink-0 sm:inline-flex" aria-live="polite">
+            {activity.kind === 'retry'
+              ? t('shell.retrying', {
+                  attempt: activity.attempt,
+                  max: activity.maxAttempts,
+                })
+              : t('shell.compacting')}
+          </Badge>
+        )}
       </div>
 
       <div className="flex-1" />

@@ -154,6 +154,8 @@ export const ja: Dict = {
   'shell.conversation': '会話',
   'shell.stop': '停止',
   'shell.stopping': '停止中…',
+  'shell.retrying': '再試行中（{attempt}/{max}）…',
+  'shell.compacting': 'コンテキストを圧縮中…',
   'shell.clear': '消去',
   'shell.clear_confirm_body': '現在の会話ビューを消去します。この操作は元に戻せません。',
   'shell.session_actions': 'セッション操作',

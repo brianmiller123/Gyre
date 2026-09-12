@@ -100,6 +100,30 @@ export type Frame =
   | { type: 'sub_agents'; agents: SubAgentStatus[] }
   | { type: 'context_usage'; current: number; limit: number }
   | { type: 'steered'; text: string }
+  // 会话级结构化事件（镜像 ServerFrame::Session，omp AgentSessionEvent 子集）：
+  // 展示文本仍走 say 帧（双通道），此处供状态机消费（重试/压缩指示等）。
+  | { type: 'session'; event: SessionEventPayload }
+
+/** `ServerFrame::Session` 载荷（判别字段 `type`，kebab/snake 命名与 omp 对齐）。 */
+export type SessionEventPayload =
+  | { type: 'auto_compaction_start'; reason?: string; action?: string }
+  | { type: 'auto_compaction_end'; action?: string; stages?: string[]; ok?: boolean; error?: string }
+  | {
+      type: 'auto_retry_start'
+      attempt?: number
+      max_attempts?: number
+      delay_ms?: number
+      error_message?: string
+      model?: string
+    }
+  | { type: 'auto_retry_end'; success?: boolean; attempt?: number; final_error?: string }
+  | { type: 'retry_fallback_applied'; from?: string; to?: string }
+  | { type: 'retry_fallback_succeeded'; model?: string }
+
+/** 维护态（重试 / 压缩中）——由 session 帧驱动，顶栏据此显示活动徽标。 */
+export type SessionActivity =
+  | { kind: 'retry'; attempt: number; maxAttempts: number }
+  | { kind: 'compaction' }
 
 /** Normalize a raw JSON message into a typed Frame (tolerant of serde quirks). */
 export function parseFrame(raw: unknown): Frame | null {
@@ -178,6 +202,12 @@ export function parseFrame(raw: unknown): Frame | null {
       }
     case 'steered':
       return { type: 'steered', text: r.text ?? r.steered ?? '' }
+    case 'session': {
+      const ev = r.event && typeof r.event === 'object' ? (r.event as SessionEventPayload) : null
+      // 未知 event.type（服务端更新）→ 整体忽略，不干扰既有渲染。
+      if (!ev || typeof ev.type !== 'string') return null
+      return { type: 'session', event: ev }
+    }
     default:
       return null
   }

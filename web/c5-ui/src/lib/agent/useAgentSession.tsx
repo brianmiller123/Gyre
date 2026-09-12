@@ -20,6 +20,7 @@ import {
   type CustomCommandInfo,
   type McpToolInfo,
   type ModelInfo,
+  type SessionActivity,
   type SessionHistoryItem,
   type SessionListItem,
   type SessionOpResult,
@@ -73,6 +74,8 @@ interface AgentSessionValue {
   /** 上下文窗口 token 占比（current / limit），来自 ServerFrame::ContextUsage。 */
   contextUsage: { current: number; limit: number } | null
   running: boolean
+  /** 维护态（重试 / 压缩中），来自 ServerFrame::Session；null = 无维护活动。 */
+  activity: SessionActivity | null
   /** 正在请求停止（点击停止后的过渡态，给 UI 即时反馈；后端确认 / 断连后自动清除）。 */
   stopping: boolean
   connected: boolean
@@ -249,6 +252,9 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
   const [agents, setAgents] = useState<SubAgentStatus[]>([])
   const [sessions, setSessions] = useState<SessionListItem[]>([])
   const [contextUsage, setContextUsage] = useState<{ current: number; limit: number } | null>(null)
+  // 会话级结构化事件派生的维护态（重试 / 压缩中）：由 ServerFrame::Session 驱动，
+  // 与 say 展示文本双通道；无维护活动时为 null。
+  const [activity, setActivity] = useState<SessionActivity | null>(null)
   // 停止过渡态：点击「停止」后置 true，给输入框 / 顶栏按钮即时反馈；running 或 connected
   // 翻为 false 时由下方 effect 自动复位。
   const [stopping, setStopping] = useState(false)
@@ -658,6 +664,31 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
           case 'say':
             pushItem({ kind: 'say', text: frame.text, level: frame.kind ?? 'info' })
             break
+          case 'session': {
+            // 结构化维护态：开始进、结束清；未知 type 由 parseFrame 过滤。
+            const ev = frame.event
+            switch (ev.type) {
+              case 'auto_retry_start':
+                setActivity({
+                  kind: 'retry',
+                  attempt: ev.attempt ?? 1,
+                  maxAttempts: ev.max_attempts ?? 1,
+                })
+                break
+              case 'auto_retry_end':
+                setActivity(null)
+                break
+              case 'auto_compaction_start':
+                setActivity({ kind: 'compaction' })
+                break
+              case 'auto_compaction_end':
+                setActivity(null)
+                break
+              default:
+                break
+            }
+            break
+          }
           case 'ask':
             if (!seenAskIds.current.has(frame.ask.id)) {
               // 上限保护：极端长会话下集合无界增长（内存泄漏），超限整体重置（去重窗口重启）。
@@ -701,6 +732,8 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
               success: frame.success,
             })
             setState('idle')
+            // 轮次收尾兜底：维护态不跨轮残留（结束帧丢失时也能复位）。
+            setActivity(null)
             break
           case 'error':
             pushItem({ kind: 'error', message: frame.message })
@@ -1329,6 +1362,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       usage,
       contextUsage,
       running,
+      activity,
       stopping,
       connected,
       connecting,
@@ -1383,6 +1417,7 @@ export function AgentSessionProvider({ children }: { children: ReactNode }) {
       usage,
       contextUsage,
       running,
+      activity,
       stopping,
       connected,
       connecting,
