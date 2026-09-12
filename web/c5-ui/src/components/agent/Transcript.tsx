@@ -56,7 +56,7 @@ export function Transcript() {
         className="h-full overflow-y-auto"
       >
         {/* 回合分组：用户消息开启新回合，回合间距大于回合内条目间距。 */}
-        <div className="mx-auto w-full max-w-3xl px-4 py-6">
+        <div className="chat-column py-6">
           {items.map((item, i) => {
             const turnStart = item.kind === 'user' && i > 0
             const prev = items[i - 1]
@@ -72,17 +72,22 @@ export function Transcript() {
           <div ref={endRef} className="h-2" />
         </div>
       </div>
-      {/* 上翻阅读时提供「回到底部」，避免长会话里手动滚回。 */}
+      {/* 上翻阅读时提供「回到底部」，避免长会话里手动滚回。
+          按钮挂在同一条 chat-column 上：否则视口越宽，它离正文右边界越远。 */}
       {showJump && (
-        <button
-          type="button"
-          onClick={() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })}
-          aria-label={t('transcript.jump_latest')}
-          title={t('transcript.jump_latest')}
-          className="animate-fade-in absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-surface text-text-2 shadow-pop transition-colors hover:bg-surface-2 hover:text-text"
-        >
-          <Icon name="chevron-down" size={17} />
-        </button>
+        <div className="pointer-events-none absolute inset-x-0 bottom-4">
+          <div className="chat-column relative">
+            <button
+              type="button"
+              onClick={() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })}
+              aria-label={t('transcript.jump_latest')}
+              title={t('transcript.jump_latest')}
+              className="animate-fade-in pointer-events-auto absolute bottom-0 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-surface text-text-2 shadow-pop transition-colors hover:bg-surface-2 hover:text-text"
+            >
+              <Icon name="chevron-down" size={17} />
+            </button>
+          </div>
+        </div>
       )}
     </div>
   )
@@ -93,8 +98,8 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
   const { t } = useI18n()
   const meta = stateMeta[state] ?? stateMeta.no_task
   return (
-    <div className="flex h-full items-center justify-center overflow-y-auto p-6">
-      <div className="w-full max-w-2xl text-center">
+    <div className="flex h-full items-center justify-center overflow-y-auto py-8">
+      <div className="chat-column text-center">
         <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary to-primary-glow text-white shadow-glow">
           <Icon name="command" size={30} />
         </div>
@@ -273,7 +278,7 @@ function MessageDeleteButton({
       disabled={disabled}
       title={disabled ? t('transcript.delete_running') : t('transcript.delete')}
       aria-label={t('transcript.delete')}
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+      className="inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
     >
       <Icon name="trash" size={12} />
       {t('common.delete')}
@@ -294,7 +299,7 @@ function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }>
       <div className="relative max-w-[85%]">
         {/* 纯图片占位项无对应历史行，无法定位删除目标，不渲染删除按钮。 */}
         {!item.placeholder && (
-          <div className="absolute right-full top-0 mr-1 flex items-center opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+          <div className="absolute right-full top-0 mr-1 flex items-center whitespace-nowrap opacity-100 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:focus-within:opacity-100">
             <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_user" />
           </div>
         )}

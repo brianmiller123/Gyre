@@ -158,6 +158,7 @@ export const en: Dict = {
   'shell.stopping': 'Stopping…',
   'shell.clear': 'Clear',
   'shell.clear_confirm_body': 'This clears the current conversation view. It cannot be undone.',
+  'shell.session_actions': 'Session actions',
   'shell.switch_running_warn': 'A task is running — switching will cancel it and start a fresh session.',
 
   'sidebar.connected': 'Connected',

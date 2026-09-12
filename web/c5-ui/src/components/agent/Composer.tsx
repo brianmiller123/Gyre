@@ -348,7 +348,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
 
   return (
     <div className="relative border-t border-border bg-surface/70 backdrop-blur-xl">
-      <div className="mx-auto w-full max-w-3xl px-3 py-3 sm:px-4">
+      <div className="chat-column py-3">
         {/* Slash-command menu */}
         {menuOpen && list.length > 0 && (
           <div className="absolute bottom-full left-3 right-3 z-30 mb-2 overflow-hidden rounded-xl border border-border bg-surface shadow-pop sm:left-4 sm:right-4">
@@ -580,6 +580,7 @@ function EnhanceButton({
       onClick={run}
       disabled={disabled || empty || loading}
       title={t('composer.enhance')}
+      aria-label={t('composer.enhance')}
       className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface hover:text-text disabled:cursor-not-allowed"
     >
       <Icon name="sparkles" size={18} className={loading ? 'animate-pulse text-primary' : ''} />

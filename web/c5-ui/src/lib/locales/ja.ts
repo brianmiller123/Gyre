@@ -156,6 +156,7 @@ export const ja: Dict = {
   'shell.stopping': '停止中…',
   'shell.clear': '消去',
   'shell.clear_confirm_body': '現在の会話ビューを消去します。この操作は元に戻せません。',
+  'shell.session_actions': 'セッション操作',
   'shell.switch_running_warn': 'タスクが実行中です——切り替えると中断され、新しいセッションを開始します。',
 
   'sidebar.connected': '接続済み',

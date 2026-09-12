@@ -121,6 +121,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
         <button
           onClick={() => void refreshSessions()}
           title={t('sidebar.refresh')}
+          aria-label={t('sidebar.refresh')}
           className="flex h-5 w-5 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-text"
         >
           <Icon name="refresh" size={12} className={sessionsLoading ? 'animate-spin' : ''} />

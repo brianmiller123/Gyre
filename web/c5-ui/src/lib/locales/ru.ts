@@ -158,6 +158,7 @@ export const ru: Dict = {
   'shell.stopping': 'Остановка…',
   'shell.clear': 'Очистить',
   'shell.clear_confirm_body': 'Текущая переписка будет очищена. Действие необратимо.',
+  'shell.session_actions': 'Действия сессии',
   'shell.switch_running_warn': 'Выполняется задача — переключение отменит её и начнёт новый диалог.',
 
   'sidebar.connected': 'Подключено',

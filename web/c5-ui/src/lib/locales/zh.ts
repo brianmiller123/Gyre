@@ -156,6 +156,7 @@ export const zh: Dict = {
   'shell.stopping': '停止中…',
   'shell.clear': '清空',
   'shell.clear_confirm_body': '将清空当前对话视图，此操作不可撤销。',
+  'shell.session_actions': '会话操作',
   'shell.switch_running_warn': '当前有任务正在运行：切换将中断该任务并开启新会话。',
 
   'sidebar.connected': '已连接',

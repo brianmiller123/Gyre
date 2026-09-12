@@ -18,6 +18,10 @@ const config: Config = {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
+      /* 超宽屏断点：1920px 以上再放宽一档对话列（2xl 只到 1536）。 */
+      screens: {
+        '3xl': '1920px',
+      },
       colors: {
         bg: 'rgb(var(--c-bg) / <alpha-value>)',
         surface: 'rgb(var(--c-surface) / <alpha-value>)',
@@ -60,6 +64,9 @@ const config: Config = {
       },
       /* Elevation layers: one token per overlay kind — never bare z-[N] values. */
       zIndex: {
+        /* 顶栏自带 backdrop-blur（会建立层叠上下文），其溢出菜单必须整体抬到
+           滚动内容之上，否则会被后面的对话流盖住。 */
+        header: '20',
         dropdown: '50',
         stats: '80',
         drawer: '90',

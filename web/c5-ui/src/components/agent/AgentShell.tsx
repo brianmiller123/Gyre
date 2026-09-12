@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Badge, Button, ConfirmDialog, IconButton, useDialogA11y } from '@/components/ui'
+import { Badge, Button, ConfirmDialog, Dropdown, IconButton, useDialogA11y } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { Sidebar } from '@/components/agent/Sidebar'
 import { Transcript } from '@/components/agent/Transcript'
@@ -50,7 +50,7 @@ export function AgentShell() {
     }
   }
 
-  const { state, usage, error, running, stopping, clear, cancel, connect, sessionId } =
+  const { state, usage, error, running, stopping, clear, cancel, connect, sessionId, newChat } =
     useAgentSession()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
@@ -107,6 +107,7 @@ export function AgentShell() {
           onMenu={() => setMobileNav(true)}
           onInspector={() => setInspectorOpen(true)}
           onClear={() => setConfirmClear(true)}
+          onNewChat={newChat}
           onCancel={cancel}
         />
 
@@ -227,6 +228,7 @@ function TopBar({
   onMenu,
   onInspector,
   onClear,
+  onNewChat,
   onCancel,
 }: {
   stateLabel: string
@@ -239,6 +241,7 @@ function TopBar({
   onMenu: () => void
   onInspector: () => void
   onClear: () => void
+  onNewChat: () => void
   onCancel: () => void
 }) {
   const { t } = useI18n()
@@ -258,7 +261,7 @@ function TopBar({
   }, [title])
 
   return (
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface/70 px-3 backdrop-blur-xl sm:px-5">
+    <header className="relative z-header flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface/70 px-3 backdrop-blur-xl sm:px-5">
       <IconButton
         icon="menu"
         label={t('shell.menu')}
@@ -266,17 +269,23 @@ function TopBar({
         className="lg:hidden"
       />
 
-      <h1 className="font-display text-[15px] font-semibold text-text">{t('shell.conversation')}</h1>
+      {/* 会话身份区：真正的会话标题占 h1，固定文案只作为空会话的占位。
+          旧版把「对话」当主标题、把会话标题降级为 14px 灰字，层级正好倒置。 */}
+      <div className="flex min-w-0 items-center gap-2.5">
+        <h1
+          className={cn(
+            'min-w-0 truncate font-display text-[15px] font-semibold',
+            title ? 'text-text' : 'text-muted',
+          )}
+          title={title || undefined}
+        >
+          {title || t('shell.conversation')}
+        </h1>
 
-      {title && (
-        <span className="hidden min-w-0 items-center md:flex" title={title}>
-          <span className="max-w-[36ch] truncate text-sm text-muted lg:max-w-[52ch]">{title}</span>
-        </span>
-      )}
-
-      <Badge tone={stateTone} dot={stateDot} className="hidden sm:inline-flex">
-        {stateLabel}
-      </Badge>
+        <Badge tone={stateTone} dot={stateDot} className="hidden shrink-0 sm:inline-flex">
+          {stateLabel}
+        </Badge>
+      </div>
 
       <div className="flex-1" />
 
@@ -301,9 +310,18 @@ function TopBar({
           <span className="hidden sm:inline">{stopping ? t('shell.stopping') : t('shell.stop')}</span>
         </Button>
       )}
-      <Button size="sm" variant="ghost" leftIcon="trash" onClick={onClear} aria-label={t('shell.clear')}>
-        <span className="hidden sm:inline">{t('shell.clear')}</span>
-      </Button>
+
+      {/* 会话级低频/破坏性操作收进溢出菜单：顶栏只保留「身份 + 状态 + 中断」，
+          清空不再与停止按钮争夺唯一的高亮位（侧栏另有带二次确认的同名入口）。 */}
+      <Dropdown
+        align="right"
+        trigger={<IconButton icon="dots" label={t('shell.session_actions')} />}
+        items={[
+          { label: t('inspector.new_session'), icon: 'plus', onClick: onNewChat },
+          { divider: true },
+          { label: t('shell.clear'), icon: 'trash', danger: true, onClick: onClear },
+        ]}
+      />
 
       <IconButton
         icon="gauge"

@@ -34,6 +34,11 @@
   --aurora-1: 45 212 191;
   --aurora-2: 59 130 246;
   --aurora-3: 251 191 36;
+  /* 氛围强度按主题分离：浅色底上高饱和暖色会被读成「脏色斑块」，
+     故浅色只保留冷色低透明度，暖色直接归零。 */
+  --aurora-a1: 0.1;
+  --aurora-a2: 0.07;
+  --aurora-a3: 0;
 }
 
 .dark {
@@ -61,6 +66,9 @@
   --aurora-1: 45 212 191;
   --aurora-2: 99 102 241;
   --aurora-3: 251 191 36;
+  --aurora-a1: 0.16;
+  --aurora-a2: 0.14;
+  --aurora-a3: 0.1;
 }
 
 @layer base {
@@ -133,6 +141,28 @@
     @apply absolute inset-0 bg-black/55 backdrop-blur-sm animate-fade-in;
   }
 
+  /**
+   * 对话列（唯一事实源）。
+   *
+   * Transcript / Welcome / Composer 三处必须共用本类，否则空态卡片、消息气泡与
+   * 输入框会出现互不对齐的多条内容栏（历史上分别为 768 / 672 / 768px）。
+   * 宽度随视口分档放宽：代码块与 Markdown 表格在 768px 下横向明显拥挤，
+   * 而超宽屏上固定 768px 会在两侧留下大片空白。
+   */
+  .chat-column {
+    @apply mx-auto w-full max-w-3xl px-4;
+  }
+  @screen 2xl {
+    .chat-column {
+      @apply max-w-4xl;
+    }
+  }
+  @screen 3xl {
+    .chat-column {
+      @apply max-w-5xl;
+    }
+  }
+
   /* Gradient text for the wordmark + hero numbers */
   .gradient-text {
     background: linear-gradient(
@@ -169,9 +199,9 @@
     z-index: 0;
     pointer-events: none;
     background:
-      radial-gradient(60% 50% at 12% 0%, rgb(var(--aurora-1) / 0.16), transparent 60%),
-      radial-gradient(55% 45% at 100% 8%, rgb(var(--aurora-2) / 0.14), transparent 60%),
-      radial-gradient(45% 40% at 85% 100%, rgb(var(--aurora-3) / 0.1), transparent 60%);
+      radial-gradient(60% 50% at 12% 0%, rgb(var(--aurora-1) / var(--aurora-a1)), transparent 60%),
+      radial-gradient(55% 45% at 100% 8%, rgb(var(--aurora-2) / var(--aurora-a2)), transparent 60%),
+      radial-gradient(45% 40% at 85% 100%, rgb(var(--aurora-3) / var(--aurora-a3)), transparent 60%);
   }
   .app-aurora::after {
     content: '';
