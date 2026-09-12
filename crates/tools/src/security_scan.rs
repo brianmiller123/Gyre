@@ -101,7 +101,8 @@ const SECRET_RULES: &[SecretRule] = &[
 /// 私钥头（PEM）。
 const PRIVATE_KEY_HEADER: &str = "-----BEGIN";
 
-/// 危险文件模式：扫描这些文件中的明文密钥。
+/// 危险文件模式：扫描这些文件中的明文密钥（仅 unix 权限检查使用）。
+#[cfg(unix)]
 const SECRET_FILE_HINTS: &[&str] = &[
     ".env",
     ".pem",
