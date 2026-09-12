@@ -36,6 +36,12 @@ const MIN_W = 420
 const MIN_H = 300
 const MIN_DOCK = 280
 const MAX_DOCK = 720
+/** 浮动窗口与视口边缘的安全间距——所有夹取计算的唯一边距来源。 */
+const EDGE = 8
+/** 文件树栏宽的可调范围；VIEWER_MIN 保证代码预览区不会被挤成 0 宽。 */
+const TREE_MIN = 140
+const TREE_MAX = 480
+const VIEWER_MIN = 200
 
 interface SavedWin {
   mode: WsMode
@@ -60,6 +66,26 @@ function clamp(n: number, min: number, max: number) {
 }
 
 /**
+ * 把浮动窗口整体夹回视口内，返回校正后的 `{x, y, w, h}`。
+ *
+ * 必须**先定尺寸、再用尺寸定位置**：分开独立夹取会让右下角的缩放把手落到
+ * 视口之外（旧实现里 size 用 `innerWidth-32`、pos 用 `innerWidth-160`，底边
+ * 最远可达 `2×innerHeight-200`）。视口比 MIN_W/MIN_H 还小时以视口为准。
+ */
+function fitFloating(
+  pos: { x: number; y: number },
+  size: { w: number; h: number },
+  vw: number,
+  vh: number,
+) {
+  const w = clamp(size.w, MIN_W, vw - EDGE * 2)
+  const h = clamp(size.h, MIN_H, vh - EDGE * 2)
+  const x = clamp(pos.x, EDGE, vw - w - EDGE)
+  const y = clamp(pos.y, EDGE, vh - h - EDGE)
+  return { x, y, w, h }
+}
+
+/**
  * File browser rendered as a dockable, draggable and resizable window.
  *
  *  - `left` / `right`: full-height side rail whose width is adjustable by
@@ -76,14 +102,25 @@ export function WorkspacePanel({ onClose }: { onClose?: () => void }) {
   const vh = typeof window !== 'undefined' ? window.innerHeight : 800
 
   const [mode, setMode] = useState<WsMode>(saved.current.mode)
-  const [pos, setPos] = useState<{ x: number; y: number }>(
-    saved.current.pos ?? { x: clamp((vw - 760) / 2, 16, vw), y: 64 },
+  // 保存的几何可能来自更大的屏幕：首帧就按当前视口夹取，否则右下角缩放把手会
+  // 落在视口外，面板既不能缩放也拖不回可见区域（旧 bug）。
+  const seed = useRef(
+    fitFloating(
+      saved.current.pos ?? { x: (vw - 760) / 2, y: 64 },
+      saved.current.size ?? { w: 760, h: 640 },
+      vw,
+      vh,
+    ),
   )
-  const [size, setSize] = useState<{ w: number; h: number }>(
-    saved.current.size ?? { w: clamp(760, MIN_W, vw - 32), h: clamp(640, MIN_H, vh - 96) },
-  )
+  const [pos, setPos] = useState<{ x: number; y: number }>({ x: seed.current.x, y: seed.current.y })
+  const [size, setSize] = useState<{ w: number; h: number }>({ w: seed.current.w, h: seed.current.h })
   const [dockW, setDockW] = useState<number>(saved.current.dockW ?? 360)
   const [treeW, setTreeW] = useState<number>(saved.current.treeW ?? 208)
+
+  // 指针拖动回调保持 [] 依赖（拖拽中途重建 handler 会打断 pointer capture），
+  // 所以用 ref 读取最新几何，而不是闭包变量。
+  const geo = useRef({ pos, size })
+  geo.current = { pos, size }
 
   // Persist all geometry.
   useEffect(() => {
@@ -103,15 +140,18 @@ export function WorkspacePanel({ onClose }: { onClose?: () => void }) {
     }
   }, [mode, pos, size, dockW, treeW])
 
-  // Keep floating window in-bounds on viewport resize.
+  // 视口变化时把浮动窗口整体夹回可见区域；进入 floating（含 dock→floating）
+  // 时立即执行一次——旧实现只在 resize 事件里夹取，启动/切模式时从不夹取。
   useEffect(() => {
     if (mode !== 'floating') return
-    const onResize = () => {
-      setSize((s) => ({ w: Math.min(s.w, window.innerWidth - 32), h: Math.min(s.h, window.innerHeight - 80) }))
-      setPos((p) => ({ x: Math.min(p.x, window.innerWidth - 160), y: Math.min(p.y, window.innerHeight - 120) }))
+    const apply = () => {
+      const f = fitFloating(geo.current.pos, geo.current.size, window.innerWidth, window.innerHeight)
+      setSize((s) => (s.w === f.w && s.h === f.h ? s : { w: f.w, h: f.h }))
+      setPos((p) => (p.x === f.x && p.y === f.y ? p : { x: f.x, y: f.y }))
     }
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
+    apply()
+    window.addEventListener('resize', apply)
+    return () => window.removeEventListener('resize', apply)
   }, [mode])
 
   // --- move (floating) ---
@@ -129,9 +169,12 @@ export function WorkspacePanel({ onClose }: { onClose?: () => void }) {
     if (!move.current) return
     const dx = e.clientX - move.current.sx
     const dy = e.clientY - move.current.sy
+    // 夹取必须减去面板自身尺寸，否则 760px 宽的面板能拖到 x=innerWidth-120，
+    // 右边缘连同缩放把手直接越出视口。
+    const { w, h } = geo.current.size
     setPos({
-      x: clamp(move.current.px + dx, 8, window.innerWidth - 120),
-      y: clamp(move.current.py + dy, 8, window.innerHeight - 64),
+      x: clamp(move.current.px + dx, EDGE, window.innerWidth - w - EDGE),
+      y: clamp(move.current.py + dy, EDGE, window.innerHeight - h - EDGE),
     })
   }, [])
   const onMoveEnd = useCallback(() => {
@@ -152,9 +195,11 @@ export function WorkspacePanel({ onClose }: { onClose?: () => void }) {
     if (!rsz.current) return
     const dx = e.clientX - rsz.current.sx
     const dy = e.clientY - rsz.current.sy
+    // 上限还要减去窗口当前坐标，保证右/下边缘不越出视口。
+    const { x, y } = geo.current.pos
     setSize({
-      w: clamp(rsz.current.sw + dx, MIN_W, window.innerWidth - 16),
-      h: clamp(rsz.current.sh + dy, MIN_H, window.innerHeight - 16),
+      w: clamp(rsz.current.sw + dx, MIN_W, window.innerWidth - x - EDGE),
+      h: clamp(rsz.current.sh + dy, MIN_H, window.innerHeight - y - EDGE),
     })
   }, [])
   const onResizeEnd = useCallback(() => {
@@ -225,7 +270,7 @@ function WindowChrome({
   size: { w: number; h: number }
   dockW: number
   treeW: number
-  setTreeW: (n: number) => void
+  setTreeW: React.Dispatch<React.SetStateAction<number>>
   setMode: (m: WsMode) => void
   onClose?: () => void
   moveProps: PointerHandlers
@@ -367,7 +412,7 @@ function DockBtn({
 }
 
 /* ------------------------------- browser body ------------------------------ */
-function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number) => void }) {
+function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: React.Dispatch<React.SetStateAction<number>> }) {
   const { theme } = useTheme()
   const { t } = useI18n()
   const { toast } = useNotifications()
@@ -380,6 +425,27 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
   const [fileLoading, setFileLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  // 文件树/预览分栏：树宽上限必须与分栏容器的**实测宽度**相关，否则在窄面板上
+  // 分隔条会被推到面板之外（既不可见也无法再拖回），预览区同时被挤成 0 宽。
+  const rowRef = useRef<HTMLDivElement>(null)
+  const clampTreeW = useCallback((n: number) => {
+    const rowW = rowRef.current?.clientWidth ?? 0
+    const hi = rowW > 0 ? Math.max(TREE_MIN, Math.min(TREE_MAX, rowW - VIEWER_MIN)) : TREE_MAX
+    return clamp(n, TREE_MIN, hi)
+  }, [])
+
+  // 面板变窄（切 dock/floating、拖窄、窗口缩小）时，把已保存的树宽一并收回，
+  // 否则 localStorage 里的旧值会让预览区在窄面板上直接消失。
+  useEffect(() => {
+    const el = rowRef.current
+    if (!el) return
+    const apply = () => setTreeW((w) => clampTreeW(w))
+    apply()
+    const ro = new ResizeObserver(apply)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [setTreeW, clampTreeW])
 
   const loadRoot = useCallback(async () => {
     setRootLoading(true)
@@ -452,10 +518,13 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
     },
     [treeW],
   )
-  const onSplitMove = useCallback((e: React.PointerEvent) => {
-    if (!split.current) return
-    setTreeW(clamp(split.current.sw + (e.clientX - split.current.sx), 140, 480))
-  }, [setTreeW])
+  const onSplitMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!split.current) return
+      setTreeW(clampTreeW(split.current.sw + (e.clientX - split.current.sx)))
+    },
+    [clampTreeW],
+  )
   const onSplitUp = useCallback(() => {
     split.current = null
   }, [])
@@ -486,7 +555,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: (n: number)
         <div className="border-b border-danger/20 bg-danger/[0.06] px-3 py-1.5 text-2xs text-danger">{error}</div>
       )}
 
-      <div className="relative flex min-h-0 flex-1">
+      <div ref={rowRef} className="relative flex min-h-0 flex-1">
         {/* Tree */}
         <div className="no-scrollbar shrink-0 overflow-y-auto border-r border-border p-2" style={{ width: treeW }}>
           {rootLoading ? (
