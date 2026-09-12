@@ -374,28 +374,8 @@ fn copy_dir_mtime(src: &Path, dst: &Path) {
 
 #[cfg(unix)]
 fn filetime_set(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let dur = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let times = [
-        libc::timespec {
-            tv_sec: dur.as_secs() as libc::time_t,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: dur.as_secs() as libc::time_t,
-            tv_nsec: libc::c_long::from(dur.subsec_nanos()),
-        },
-    ];
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: c_path 和 times 在 syscall 期间有效。
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
 }
 
 #[cfg(not(unix))]
