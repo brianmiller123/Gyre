@@ -40,14 +40,14 @@ function ToastCard({ toast, onClose }: { toast: Toast; onClose: () => void }) {
       </span>
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium text-text">{toast.title}</p>
-        {toast.body && <p className="mt-0.5 text-[13px] text-muted">{toast.body}</p>}
+        {toast.body && <p className="mt-0.5 text-sm text-muted">{toast.body}</p>}
       </div>
       <button
         onClick={onClose}
         className="absolute right-2 top-2.5 flex h-6 w-6 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-text"
         aria-label={t('common.close')}
       >
-        <Icon name="close" size={15} />
+        <Icon name="close" size={16} />
       </button>
     </div>
   )

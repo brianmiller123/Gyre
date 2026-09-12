@@ -68,7 +68,7 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
         aria-modal="true"
         aria-label={t('stats.title')}
         tabIndex={-1}
-        className="relative z-10 flex h-full max-h-[88vh] w-full max-w-[1080px] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-pop outline-none animate-scale-in"
+        className="overlay-panel h-full max-h-[88vh] w-full max-w-[1080px] animate-scale-in rounded-2xl"
       >
         {/* 头部 */}
         <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-6 py-4">
@@ -144,9 +144,9 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
               </div>
 
               {/* 14 天趋势 */}
-              <section className="rounded-xl border border-border bg-surface-2/40 p-4">
+              <section className="card p-4">
                 <h3 className="mb-1 flex items-center gap-2 font-display text-sm font-semibold text-text">
-                  <Icon name="trending-up" size={15} className="text-primary" />
+                  <Icon name="trending-up" size={16} className="text-primary" />
                   {t('stats.trend')}
                 </h3>
                 {trend && trend.length > 0 ? (
@@ -165,9 +165,9 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
 
               {/* 工具调用 TOP + 模型用量 */}
               <div className="grid gap-5 lg:grid-cols-2">
-                <section className="overflow-hidden rounded-xl border border-border">
+                <section className="card overflow-hidden">
                   <header className="flex items-center gap-2 border-b border-border px-4 py-3">
-                    <Icon name="zap" size={15} className="text-primary" />
+                    <Icon name="zap" size={16} className="text-primary" />
                     <h3 className="font-display text-sm font-semibold text-text">{t('stats.tools')}</h3>
                   </header>
                   {stats.tools.length === 0 ? (
@@ -207,9 +207,9 @@ export function StatisticsPanel({ onClose }: { onClose?: () => void }) {
                   )}
                 </section>
 
-                <section className="overflow-hidden rounded-xl border border-border">
+                <section className="card overflow-hidden">
                   <header className="flex items-center gap-2 border-b border-border px-4 py-3">
-                    <Icon name="cube" size={15} className="text-primary" />
+                    <Icon name="cube" size={16} className="text-primary" />
                     <h3 className="font-display text-sm font-semibold text-text">{t('stats.models')}</h3>
                   </header>
                   {stats.top_models.length === 0 ? (
@@ -274,7 +274,7 @@ function MetricCard({
   sub?: string
 }) {
   return (
-    <div className="rounded-xl border border-border bg-surface-2/40 p-4">
+    <div className="card p-4">
       <div className="flex items-center gap-2 text-muted">
         <Icon name={icon} size={14} />
         <span className="text-xs">{label}</span>

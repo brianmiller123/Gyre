@@ -114,7 +114,7 @@ export function BranchTreeModal({
         </label>
       </div>
 
-      <div className="no-scrollbar max-h-[55vh] overflow-y-auto rounded-lg border border-border bg-surface p-2">
+      <div className="card-inset no-scrollbar max-h-[55vh] overflow-y-auto p-2">
         {loading && (
           <div className="space-y-2 px-1 py-2">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -219,20 +219,20 @@ function BranchNodeView({
         />
         <Icon
           name="message-square"
-          size={11}
+          size={12}
           className={cn('shrink-0', onActivePath ? 'text-primary/80' : 'text-muted')}
         />
         <span className="min-w-0 flex-1">
           <span
             className={cn(
-              'block truncate text-[11.5px] leading-tight',
+              'block truncate text-2xs leading-tight',
               isActive ? 'font-medium text-primary' : 'text-text-2',
             )}
             title={node.preview}
           >
             {node.preview || t('branches.no_preview')}
           </span>
-          <span className="text-2xs uppercase tracking-wide text-muted/70">
+          <span className="section-label">
             {roleLabel(node.role, t)}
             {isLeaf && kids.length === 0 ? '' : ''}
           </span>
@@ -244,7 +244,7 @@ function BranchNodeView({
             onClick={() => onSwitch(node.id)}
             className={cn(
               'shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium transition-colors',
-              'bg-surface-3 text-text-2 hover:bg-primary hover:text-white',
+              'bg-surface-3 text-text-2 hover:bg-primary hover:text-primary-fg',
               'disabled:cursor-not-allowed disabled:opacity-50',
             )}
           >
@@ -252,7 +252,7 @@ function BranchNodeView({
           </button>
         )}
         {isActive && (
-          <span className="shrink-0 rounded bg-primary/20 px-1.5 py-0.5 text-[9.5px] font-medium text-primary">
+          <span className="shrink-0 rounded bg-primary/20 px-1.5 py-0.5 text-2xs font-medium text-primary">
             {t('branches.current')}
           </span>
         )}

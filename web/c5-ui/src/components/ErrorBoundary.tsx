@@ -29,7 +29,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { error: E
             </pre>
             <button
               onClick={() => window.location.reload()}
-              className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+              className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-fg transition-opacity hover:opacity-90"
             >
               重新加载 / Reload
             </button>

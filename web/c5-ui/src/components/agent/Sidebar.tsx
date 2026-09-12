@@ -1,86 +1,41 @@
-import { useEffect, useRef, useState } from 'react'
-import { Button, ConfirmDialog, Divider, IconButton } from '@/components/ui'
+import { Button, Divider, IconButton } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { cn } from '@/lib/cn'
 import { SessionList } from '@/components/agent/SessionList'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { useSettings } from '@/lib/settings'
-import { useTheme } from '@/lib/theme'
 import { useI18n } from '@/lib/i18n'
-import { SUPPORTED_LOCALES } from '@/lib/locales'
-import type { LocaleCode } from '@/lib/locales'
+import type { AppAction } from '@/components/agent/CommandPalette'
+import type { SettingsTab } from '@/components/agent/AgentShell'
 
 /**
- * 左侧控制栏：品牌、新建对话、会话管理列表（主区域）、连接状态、操作与外观。
+ * 侧栏底部**视图导航**的固定顺序。
  *
- * 历史会话的展示与交互（搜索 / 切换 / 重命名 / 删除 / 加载与空态等）已下沉到
- * [`SessionList`]，本组件仅保留全局骨架（品牌、连接卡片、设置入口、主题与语言）。
+ * 只收「打开一个独立视图」的动作（文件浏览器 / 统计）。运行面板是**面板开合**
+ * 而非视图切换，它的唯一入口在顶栏遥测按钮；把两类混进同一列会重现旧版
+ * 「四个图标平铺、导航/配置/破坏性操作混排」的问题。
+ */
+const NAV_IDS = ['files', 'stats']
+
+/**
+ * 左侧控制栏：品牌 → 主行动（新建对话）→ 会话历史 → 全局入口（导航/设置/状态）。
+ *
+ * 自上而下是「越往下越低频」的排序：会话历史占据唯一的弹性空间，全局与偏好类
+ * 入口全部压在底部固定区。主题/语言快捷开关已移除——它们是**设一次**的偏好，
+ * 唯一归属地是设置面板的外观标签页；需要快速切换时走 ⌘K（Toggle theme）。
  */
 export function Sidebar({
+  actions,
   onOpenSettings,
-  onOpenWorkspace,
-  onOpenStats,
   onClose,
 }: {
-  onOpenSettings: () => void
-  onOpenWorkspace: () => void
-  onOpenStats: () => void
+  actions: AppAction[]
+  onOpenSettings: (tab: SettingsTab) => void
   onClose?: () => void
 }) {
-  const { connected, connecting, newChat, clear, error, sessionId } = useAgentSession()
+  const { connected, connecting, newChat } = useAgentSession()
   const { settings } = useSettings()
-  const { theme, toggle } = useTheme()
-  const { t, preference, setPreference, locale } = useI18n()
-  const [langMenuOpen, setLangMenuOpen] = useState(false)
-  const [confirmClear, setConfirmClear] = useState(false)
-  // 语言菜单键盘导航：Arrow 循环移动高亮，Esc 关闭并归还焦点到触发按钮。
-  const langMenuRef = useRef<HTMLDivElement>(null)
-  const langTriggerRef = useRef<HTMLButtonElement>(null)
-  const langOpenedViaKb = useRef(false)
-
-  useEffect(() => {
-    if (!langMenuOpen || !langOpenedViaKb.current) return
-    langOpenedViaKb.current = false
-    langMenuRef.current
-      ?.querySelector<HTMLButtonElement>('[role="menuitem"]')
-      ?.focus()
-  }, [langMenuOpen])
-
-  const focusLangItem = (dir: 1 | -1) => {
-    const items = Array.from(
-      langMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
-    )
-    if (items.length === 0) return
-    const idx = items.indexOf(document.activeElement as HTMLButtonElement)
-    items[(idx + dir + items.length) % items.length].focus()
-  }
-
-  const onLangTriggerKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
-    e.preventDefault()
-    if (!langMenuOpen) {
-      langOpenedViaKb.current = true
-      setLangMenuOpen(true)
-      return
-    }
-    focusLangItem(e.key === 'ArrowDown' ? 1 : -1)
-  }
-
-  const onLangMenuKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      focusLangItem(1)
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      focusLangItem(-1)
-    } else if (e.key === 'Escape') {
-      e.stopPropagation()
-      setLangMenuOpen(false)
-      langTriggerRef.current?.focus()
-    } else if (e.key === 'Tab') {
-      setLangMenuOpen(false)
-    }
-  }
+  const { t } = useI18n()
 
   const status = connecting ? 'connecting' : connected ? 'connected' : 'disconnected'
   const statusDot =
@@ -103,18 +58,22 @@ export function Sidebar({
     /* 非法地址保持占位符，交由设置面板校验与错误横幅提示 */
   }
 
+  const navActions = NAV_IDS.map((id) => actions.find((a) => a.id === id)).filter(
+    (a): a is AppAction => !!a,
+  )
+
   return (
-    <div className="flex h-full w-60 flex-col border-r border-border bg-surface/80 backdrop-blur-xl">
-      {/* 品牌 */}
-      <div className="flex h-16 shrink-0 items-center gap-2.5 px-4">
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary-glow text-white shadow-glow">
-          <Icon name="command" size={18} />
+    <div className="glass-bar flex h-full w-64 flex-col border-r">
+      {/* 品牌 —— 行高与顶栏一致（h-14），让外壳上沿只有一条水平基准线 */}
+      <div className="flex h-14 shrink-0 items-center gap-2.5 px-4">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-primary-glow text-primary-fg shadow-glow">
+          <Icon name="command" size={16} />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="font-display text-[15px] font-bold leading-none tracking-tight text-text">
+          <div className="truncate font-display text-md font-bold leading-none tracking-tight text-text">
             Agent<span className="text-primary"> ·</span> Console
           </div>
-          <div className="mt-1 text-2xs uppercase tracking-[0.16em] text-muted">
+          <div className="brand-sub mt-1 truncate">
             {t('sidebar.brand')}
           </div>
         </div>
@@ -124,12 +83,12 @@ export function Sidebar({
             label={t('common.close')}
             size="sm"
             onClick={onClose}
-            className="text-muted lg:hidden"
+            className="-mr-1 text-muted lg:hidden"
           />
         )}
       </div>
 
-      {/* 新建对话 */}
+      {/* 主行动：新建对话（唯一常驻的高饱和按钮） */}
       <div className="shrink-0 px-3 pb-2">
         <Button
           variant="primary"
@@ -144,149 +103,95 @@ export function Sidebar({
         </Button>
       </div>
 
-      {/* 会话管理列表（主区域，可滚动） */}
+      {/* 会话历史（弹性区域） */}
       <SessionList onClose={onClose} />
 
-      {/* 连接卡片 */}
-      <div className="mx-3 mt-2 shrink-0 rounded-xl border border-border bg-surface-2/60 p-3">
-        <div className="flex items-center justify-between">
-          <span className="flex items-center gap-2 text-xs font-medium text-text-2">
-            <span className={`h-2 w-2 rounded-full ${statusDot}`} />
-            {statusLabel}
-          </span>
-        </div>
-        <p className="mt-1.5 truncate font-mono text-2xs text-muted">
-          {serverHost}
-        </p>
-        {sessionId && (
-          <p className="mt-0.5 truncate font-mono text-2xs text-muted">
-            session: {sessionId.slice(0, 13)}…
-          </p>
-        )}
-        {error && <p className="mt-1 text-2xs text-danger">{error}</p>}
-      </div>
+      {/* 全局入口区：视图导航 / 设置 / 连接状态 / 版本 */}
+      <div className="shrink-0 border-t border-border px-2.5 py-2">
+        <nav aria-label={t('sidebar.nav_views')} className="space-y-0.5">
+          {navActions.map((a) => (
+            <NavRow
+              key={a.id}
+              icon={a.icon}
+              label={a.label}
+              onClick={() => {
+                a.run()
+                onClose?.()
+              }}
+            />
+          ))}
+        </nav>
 
-      {/* 操作（统计 / 浏览 / 设置 / 清空） */}
-      <nav className="mt-2 grid shrink-0 grid-cols-4 gap-0.5 px-2.5">
-        <NavAction icon="bar-chart" label={t('sidebar.stats')} onClick={() => { onOpenStats(); onClose?.() }} />
-        <NavAction icon="layers" label={t('sidebar.browse')} onClick={() => { onOpenWorkspace(); onClose?.() }} />
-        <NavAction icon="settings" label={t('sidebar.settings')} onClick={() => { onOpenSettings(); onClose?.() }} />
-        {/* 清空不可逆：与删除会话对齐，先二次确认。 */}
-        <NavAction icon="trash" label={t('sidebar.clear')} danger onClick={() => setConfirmClear(true)} />
-      </nav>
+        <Divider className="my-2" />
 
-      {/* 外观：主题 / 语言 */}
-      <div className="shrink-0 px-3 pb-3 pt-2">
-        <Divider className="mb-2" />
+        <NavRow
+          icon="settings"
+          label={t('sidebar.settings')}
+          onClick={() => {
+            onOpenSettings('connection')
+            onClose?.()
+          }}
+        />
+
+        <Divider className="my-2" />
+
+        {/* 连接状态：可点击 → 设置·连接（把只读信息变成有去处的控件） */}
         <button
-          onClick={toggle}
-          className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-text-2 transition-colors hover:bg-surface-2 hover:text-text"
+          type="button"
+          onClick={() => {
+            onOpenSettings('connection')
+            onClose?.()
+          }}
+          title={t('sidebar.connection_hint')}
+          className="focus-ring group flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors hover:bg-surface-2"
         >
-          <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={17} />
-          {theme === 'dark' ? t('sidebar.light') : t('sidebar.dark')}
+          <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', statusDot)} />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-medium text-text-2">{statusLabel}</span>
+            <span className="block truncate font-mono text-2xs text-muted">{serverHost}</span>
+          </span>
+          <Icon
+            name="chevron-right"
+            size={14}
+            className="shrink-0 text-muted opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+          />
         </button>
-        {/* 语言切换快捷按钮 */}
-        <div className="relative">
-          <button
-            ref={langTriggerRef}
-            onClick={() => setLangMenuOpen(!langMenuOpen)}
-            onKeyDown={onLangTriggerKeyDown}
-            aria-haspopup="menu"
-            aria-expanded={langMenuOpen}
-            className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-text-2 transition-colors hover:bg-surface-2 hover:text-text"
-          >
-            <Icon name="globe" size={17} />
-            <span className="flex-1 text-left">{t(`lang.${preference === 'auto' ? locale : preference}`)}</span>
-            <Icon name="chevron-down" size={13} className="text-muted" />
-          </button>
-          {langMenuOpen && (
-            <>
-              <div
-                ref={langMenuRef}
-                role="menu"
-                aria-orientation="vertical"
-                onKeyDown={onLangMenuKeyDown}
-                className="absolute bottom-full left-0 right-0 z-dropdown mb-1 overflow-hidden rounded-lg border border-border bg-surface shadow-lg"
-              >
-                <div className="py-1">
-                  <button
-                    role="menuitem"
-                    tabIndex={-1}
-                    onClick={() => { setPreference('auto'); setLangMenuOpen(false) }}
-                    className={cn(
-                      'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors focus-visible:bg-surface-2 focus-visible:text-text focus-visible:outline-none',
-                      preference === 'auto' ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2 hover:text-text',
-                    )}
-                  >
-                    {preference === 'auto' && <Icon name="check" size={12} className="shrink-0" />}
-                    <span className={cn(preference !== 'auto' && 'pl-[20px]')}>{t('lang.auto')}</span>
-                  </button>
-                  {SUPPORTED_LOCALES.map((code: LocaleCode) => (
-                    <button
-                      key={code}
-                      role="menuitem"
-                      tabIndex={-1}
-                      onClick={() => { setPreference(code); setLangMenuOpen(false) }}
-                      className={cn(
-                        'flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors focus-visible:bg-surface-2 focus-visible:text-text focus-visible:outline-none',
-                        preference === code ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2 hover:text-text',
-                      )}
-                    >
-                      {preference === code && <Icon name="check" size={12} className="shrink-0" />}
-                      <span className={cn(preference !== code && 'pl-[20px]')}>{t(`lang.${code}`)}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="fixed inset-0 z-40" onClick={() => setLangMenuOpen(false)} />
-            </>
-          )}
-        </div>
-        <div className="mt-1 flex items-center justify-between px-2.5 py-1 text-2xs text-muted">
-          <span>v{__APP_VERSION__} · WebUI</span>
+
+        <div className="mt-1 flex items-center justify-between px-2.5 text-2xs text-muted">
+          <span className="tabular">v{__APP_VERSION__}</span>
           <span className="inline-flex items-center gap-1">
-            <Icon name="github" size={12} /> {t('sidebar.source')}
+            <Icon name="github" size={12} />
+            {t('sidebar.source')}
           </span>
         </div>
       </div>
-
-      <ConfirmDialog
-        open={confirmClear}
-        onClose={() => setConfirmClear(false)}
-        onConfirm={() => {
-          clear()
-          onClose?.()
-        }}
-        title={t('sidebar.clear')}
-        body={t('shell.clear_confirm_body')}
-        confirmLabel={t('sidebar.clear')}
-      />
     </div>
   )
 }
 
-/** 紧凑操作按钮（图标 + 标签，用于底部 3 列网格）。 */
-function NavAction({
+/** 侧栏导航行（图标 + 标签），全站唯一的导航行样式。 */
+function NavRow({
   icon,
   label,
   onClick,
-  danger,
+  active,
 }: {
   icon: string
   label: string
   onClick: () => void
-  danger?: boolean
+  active?: boolean
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
-      title={label}
-      className={`flex flex-col items-center gap-1 rounded-lg px-0.5 py-2 text-2xs font-medium transition-colors hover:bg-surface-2 ${
-        danger ? 'text-danger hover:bg-danger/10' : 'text-text-2 hover:text-text'
-      }`}
+      className={cn(
+        'focus-ring flex h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-xs font-medium transition-colors',
+        active ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2 hover:text-text',
+      )}
     >
-      <Icon name={icon} size={17} />
-      <span className="max-w-full truncate">{label}</span>
+      <Icon name={icon} size={16} className={cn('shrink-0', active ? 'text-primary' : 'text-muted')} />
+      <span className="min-w-0 flex-1 truncate text-left">{label}</span>
     </button>
   )
 }

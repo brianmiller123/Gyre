@@ -143,7 +143,7 @@ export function BarChart({
 
       {hover !== null && (
         <div
-          className="pointer-events-none absolute z-10 -translate-x-1/2 rounded-xl border border-border bg-surface/95 px-3 py-2 text-xs shadow-pop backdrop-blur"
+          className="pointer-events-none absolute z-raised -translate-x-1/2 rounded-xl border border-border bg-surface/95 px-3 py-2 text-xs shadow-pop backdrop-blur"
           style={{ left: Math.min(Math.max(padL + groupW * hover + groupW / 2, 70), width - 70), top: 6 }}
         >
           <div className="mb-0.5 font-medium text-text">{data[hover].label}</div>

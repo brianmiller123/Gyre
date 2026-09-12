@@ -38,11 +38,7 @@ export function ModelSwitcher() {
         direction="up"
         panelClassName="min-w-[15rem]"
         trigger={
-          <button
-            type="button"
-            aria-label={t('shell.switch_model')}
-            className="flex h-8 min-w-0 max-w-[220px] items-center gap-1.5 rounded-lg border border-border bg-surface-2/70 px-2.5 text-xs transition-colors hover:border-border-strong hover:bg-surface-2 sm:max-w-[260px]"
-          >
+          <button type="button" aria-label={t('shell.switch_model')} className="chip">
             <Icon name="cube" size={14} className="shrink-0 text-primary" />
             <span className="truncate font-medium text-text">
               {currentAlias ?? t('shell.default_model')}

@@ -445,8 +445,8 @@ curl -X POST http://127.0.0.1:8080/acp/rpc \
 ```bash
 cd web/c5-ui
 npm install          # first run requires installing dependencies
-npm run build        # tsc -b type checking + vite build → output in dist/
-npm run deploy       # copies the contents of dist/ to ../ (the web/ root)
+npm run build        # tsc -b type checking + vite build → writes straight to ../ (the web/ root)
+npm run dev          # dev server on :5173, proxies /api and /ws to agent --serve
 ```
 ### build
 ```bash

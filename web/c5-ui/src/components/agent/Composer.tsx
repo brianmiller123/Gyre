@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, IconButton, Select } from '@/components/ui'
+import { Button, IconButton, Kbd } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { ModelSwitcher } from '@/components/agent/ModelSwitcher'
 import { ApprovalModeSwitcher } from '@/components/agent/ApprovalModeSwitcher'
+import { ModeSwitcher } from '@/components/agent/ModeSwitcher'
 import { useNotifications } from '@/lib/notifications'
 import { useSettings } from '@/lib/settings'
 import { cn } from '@/lib/cn'
@@ -18,13 +19,6 @@ import {
   type CommandContext,
 } from '@/lib/agent/commands'
 import { expandMentions, parseMentions } from '@/lib/agent/mentions'
-
-const MODE_OPTIONS = [
-  { value: 'code', label: 'Code', icon: 'cpu' },
-  { value: 'architect', label: 'Architect', icon: 'layers' },
-  { value: 'ask', label: 'Ask', icon: 'info' },
-  { value: 'debug', label: 'Debug', icon: 'activity' },
-] as const
 
 /** 支持的图片 MIME（与 CLI /paste 一致）。 */
 const IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
@@ -64,7 +58,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
     enhancePrompt,
     apiGet,
   } = useAgentSession()
-  const { settings, update } = useSettings()
+  const { settings } = useSettings()
   const { toast } = useNotifications()
   const { t } = useI18n()
   const [text, setText] = useState('')
@@ -176,7 +170,6 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
       cancel,
       switchModel,
       switchMode,
-      update,
       models,
       currentModel,
       sessionId,
@@ -347,16 +340,16 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
   }
 
   return (
-    <div className="relative border-t border-border bg-surface/70 backdrop-blur-xl">
+    <div className="glass-bar relative border-t">
       <div className="chat-column py-3">
         {/* Slash-command menu */}
         {menuOpen && list.length > 0 && (
-          <div className="absolute bottom-full left-3 right-3 z-30 mb-2 overflow-hidden rounded-xl border border-border bg-surface shadow-pop sm:left-4 sm:right-4">
-            <div className="flex items-center gap-1.5 border-b border-border bg-surface-2/70 px-3 py-1.5 text-2xs text-muted">
-              <Icon name="command" size={13} className="text-primary" />
+          <div className="overlay-surface absolute bottom-full left-3 right-3 z-dropdown mb-2 overflow-hidden sm:left-4 sm:right-4">
+            <div className="flex items-center gap-1.5 border-b border-border bg-surface-2 px-3 py-1.5 text-2xs text-muted">
+              <Icon name="command" size={14} className="text-primary" />
               {parsed!.hasArg ? `/${parsed!.name} ${t('composer.slash_args')}` : t('composer.slash_command')}
               <span className="ml-auto flex items-center gap-1">
-                <KbdMini>↑↓</KbdMini> {t('composer.hint_select')} <KbdMini>↵</KbdMini> {t('composer.hint_confirm')} <KbdMini>esc</KbdMini> {t('composer.hint_close')}
+                <Kbd>↑↓</Kbd> {t('composer.hint_select')} <Kbd>↵</Kbd> {t('composer.hint_confirm')} <Kbd>esc</Kbd> {t('composer.hint_close')}
               </span>
             </div>
             <ul ref={listRef} id="slash-menu" role="listbox" aria-label={t('composer.menu')} className="max-h-64 overflow-y-auto py-1">
@@ -374,9 +367,9 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                     )}
                   >
                     {parsed!.hasArg ? (
-                      <Icon name="cube" size={15} className="shrink-0 text-primary" />
+                      <Icon name="cube" size={16} className="shrink-0 text-primary" />
                     ) : (
-                      <span className="font-mono text-[13px] text-primary">/{item.label}</span>
+                      <span className="font-mono text-sm text-primary">/{item.label}</span>
                     )}
                     {parsed!.hasArg && <span className="font-medium">{item.label}</span>}
                     <span className="ml-auto truncate text-2xs text-muted">{item.desc}</span>
@@ -387,10 +380,12 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
           </div>
         )}
 
-        {/* 模型 / 审批模式切换行：输入框上方独立行，两者未就绪前各自隐藏。 */}
-        <div className="mb-1.5 flex items-center gap-1.5 px-1">
+        {/* 会话级上下文工具栏：模型 / 审批模式 / 模式三者同源同类，收在同一条
+            行里（此前模式被单独塞进输入框底部，与发送按钮挤在一起）。 */}
+        <div className="mb-1.5 flex flex-wrap items-center gap-1.5 px-1">
           <ModelSwitcher />
           <ApprovalModeSwitcher />
+          <ModeSwitcher />
         </div>
 
         {/* 单胶囊输入框：文本区在上，模式/发送收进框内底部工具行。 */}
@@ -417,7 +412,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                     className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-surface text-muted shadow hover:text-danger"
                     title={t('composer.remove')}
                   >
-                    <Icon name="close" size={11} />
+                    <Icon name="close" size={12} />
                   </button>
                 </div>
               ))}
@@ -448,7 +443,7 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
                   : t('composer.placeholder.idle')
                 : t('composer.placeholder.connecting')
             }
-            className="max-h-[220px] w-full resize-none bg-transparent px-2 py-1.5 text-[14px] text-text placeholder:text-muted/70 focus:outline-none disabled:cursor-not-allowed"
+            className="max-h-[220px] w-full resize-none bg-transparent px-2 py-1.5 text-base text-text placeholder:text-muted/70 focus:outline-none disabled:cursor-not-allowed"
           />
 
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
@@ -481,22 +476,6 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
               t={t}
             />
             <span className="min-w-2 flex-1" />
-            <Select
-              value={settings.mode}
-              onChange={(e) => {
-                const m = e.target.value as any
-                update({ mode: m })
-                switchMode(m)
-              }}
-              className="h-8 w-auto py-0 text-xs"
-              aria-label={t('composer.mode_aria')}
-            >
-              {MODE_OPTIONS.map((m) => (
-                <option key={m.value} value={m.value}>
-                  {m.label}
-                </option>
-              ))}
-            </Select>
             {running ? (
               <Button
                 size="sm"
@@ -521,28 +500,26 @@ export function Composer({ onOpenSettings, onOpenWorkspace }: ComposerProps) {
             )}
           </div>
         </div>
-        {/* 页脚只保留快捷键提示；连接状态与 session id 由侧栏连接卡唯一承载。 */}
-        <div className="mt-1.5 flex items-center justify-end px-1 text-2xs text-muted">
+        {/* 页脚只保留键盘提示：连接状态与 session id 由侧栏连接行 / 运行面板承载。
+            窄屏隐藏（移动端没有物理键盘，提示只是占位噪声），把垂直空间还给对话流。 */}
+        <div className="mt-1.5 hidden items-center gap-3 px-1 text-2xs text-muted sm:flex">
           <span className="flex items-center gap-1">
-            <Icon name="command" size={12} /> <span className="font-mono">/</span> {t('composer.footer_cmd')} ·{' '}
-            <Icon name="image" size={12} /> {t('composer.footer_paste')} · {t('composer.footer_enter')}
+            <Kbd>/</Kbd> {t('composer.footer_cmd')}
+          </span>
+          <span className="flex items-center gap-1">
+            <Icon name="image" size={12} /> {t('composer.footer_paste')}
+          </span>
+          <span className="ml-auto flex items-center gap-1">
+            <Kbd>↵</Kbd> {t('composer.footer_enter')}
             {running && (
               <>
-                {' '}· <KbdMini>esc</KbdMini> {t('composer.footer_stop')}
+                <Kbd>esc</Kbd> {t('composer.footer_stop')}
               </>
             )}
           </span>
         </div>
       </div>
     </div>
-  )
-}
-
-function KbdMini({ children }: { children: React.ReactNode }) {
-  return (
-    <kbd className="mx-0.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-border bg-surface px-1 font-mono text-2xs text-muted">
-      {children}
-    </kbd>
   )
 }
 

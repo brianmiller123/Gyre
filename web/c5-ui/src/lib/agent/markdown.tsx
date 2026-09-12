@@ -224,7 +224,7 @@ export const Markdown = memo(function Markdown({
   // 代码块底色随明暗模式切换（github / github-dark 主题 + --c-code-* 令牌）。
   useHljsTheme()
   return (
-    <div className={cn('space-y-3 text-[14px] leading-relaxed text-text-2', className)}>
+    <div className={cn('space-y-3 text-base leading-relaxed text-text-2', className)}>
       {blocks.map((b, idx) => {
         if (b.type === 'blank') return null
         if (b.type === 'hr') return <hr key={idx} className="border-border" />
@@ -300,9 +300,9 @@ function TableBlock({
   const colCount = headers.length
   return (
     <div className="overflow-x-auto rounded-xl border border-border">
-      <table className="w-full border-collapse text-[13px]">
+      <table className="w-full border-collapse text-sm">
         <thead>
-          <tr className="bg-surface-2/70">
+          <tr className="bg-surface-2">
             {headers.map((h, j) => (
               <th
                 key={j}
@@ -343,10 +343,10 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
     }
   }
   return (
-    <div className="group relative overflow-hidden rounded-xl border border-border text-[13px]">
+    <div className="group relative overflow-hidden rounded-xl border border-border text-sm">
       {/* 头部条用主题中立的 surface 配色：浅色模式不再压在深色代码底上。 */}
-      <div className="flex items-center justify-between border-b border-border bg-surface-2/70 px-3 py-1.5">
-        <span className="font-mono text-2xs uppercase tracking-wide text-muted">{lang || 'code'}</span>
+      <div className="flex items-center justify-between border-b border-border bg-surface-2 px-3 py-1.5">
+        <span className="section-label font-mono">{lang || 'code'}</span>
         <button
           onClick={copy}
           className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted transition-colors hover:bg-surface-3 hover:text-text-2"

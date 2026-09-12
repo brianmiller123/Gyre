@@ -442,8 +442,8 @@ curl -X POST http://127.0.0.1:8080/acp/rpc \
 ```bash
 cd web/c5-ui
 npm install          # 首次需要安装依赖
-npm run build        # tsc -b 类型检查 + vite build → 产物在 dist/
-npm run deploy       # 把 dist/ 内容拷贝到 ../（即 web/ 根目录）
+npm run build        # tsc -b 类型检查 + vite build → 产物直接写入 ../（即 web/ 根目录）
+npm run dev          # 开发服务器 :5173，/api 与 /ws 代理到 agent --serve
 ```
 ### build 
 ```bash

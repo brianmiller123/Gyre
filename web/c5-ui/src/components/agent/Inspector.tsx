@@ -1,14 +1,20 @@
 import { useAgentSession } from '@/lib/agent/useAgentSession'
 import { SubAgentMonitor } from '@/components/agent/SubAgentMonitor'
-import { useSettings } from '@/lib/settings'
-import { Badge, Button, ProgressBar } from '@/components/ui'
+import { Badge, Button, IconButton, ProgressBar, SectionLabel } from '@/components/ui'
 import { Icon } from '@/components/icons'
 import { stateMeta } from '@/lib/agent/ui'
 import { compact, formatNumber } from '@/lib/format'
 import { cn } from '@/lib/cn'
 import { useI18n } from '@/lib/i18n'
 
-/** Right-hand run inspector: connection, state machine, usage, models. */
+/**
+ * 右侧运行面板：状态机 / 用量 / 上下文 / 子代理 / 服务端统计。
+ *
+ * 定位（信息架构）：这是**遥测详情**的唯一归属地。顶栏那枚遥测胶囊只提供总量
+ * 摘要并负责开合本面板——两者是"摘要 → 详情"的层级关系，而非同一份读数的两份
+ * 拷贝。连接信息同样只在这里给"运行中"所需的最小集（状态 + 会话 id + 重连），
+ * 服务器地址属于偏好，归设置面板。
+ */
 export function Inspector({ onClose }: { onClose?: () => void }) {
   const {
     state,
@@ -22,10 +28,8 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
     lastDone,
     agents,
     connect,
-    newChat,
     compact: doCompact,
   } = useAgentSession()
-  const { settings } = useSettings()
   const { t } = useI18n()
   const meta = stateMeta[state as string] ?? stateMeta.no_task
 
@@ -33,72 +37,93 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
   const totalTokens = usage.input_tokens + usage.output_tokens
 
   return (
-    <aside className="flex h-full w-full flex-col border-l border-border bg-surface/60 lg:w-80">
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
-        <h2 className="font-display text-sm font-semibold text-text">{t('inspector.run_panel')}</h2>
+    <aside className="glass-bar flex h-full w-80 max-w-full flex-col border-l">
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
+        <h2 className="font-display text-md font-semibold text-text">{t('inspector.run_panel')}</h2>
         {onClose && (
-          <button onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-surface-2 hover:text-text lg:hidden">
-            <Icon name="close" size={16} />
-          </button>
+          <IconButton
+            icon="close"
+            label={t('common.close')}
+            size="sm"
+            onClick={onClose}
+            className="-mr-1 text-muted"
+          />
         )}
       </div>
 
-      <div className="no-scrollbar flex-1 space-y-4 overflow-y-auto p-4">
-        {/* Connection */}
+      <div className="no-scrollbar flex-1 space-y-5 overflow-y-auto p-4">
+        {/* 连接：只保留运行期必需的最小集（状态 / 会话 / 重连）。
+            断线重连必须 resume 当前会话：裸 connect() 会新建会话，导致本地
+            transcript 与服务端日志行号错位。 */}
         <Section title={t('inspector.connection')} icon="wifi">
-          <Row label={t('inspector.status')}>
+          <div className="card-inset flex items-center justify-between gap-2 px-3 py-2">
             <Badge tone={connected ? 'success' : 'neutral'} dot={connected}>
               {connected ? t('inspector.connected') : t('inspector.disconnected')}
             </Badge>
-          </Row>
-          <Row label={t('inspector.server')}>
-            <span className="max-w-[150px] truncate font-mono text-2xs text-text-2">
-              {settings.serverUrl || '—'}
-            </span>
-          </Row>
-          <Row label={t('inspector.session')}>
-            <span className="max-w-[150px] truncate font-mono text-2xs text-text-2">
+            <span className="truncate font-mono text-2xs text-muted">
               {sessionId ? sessionId.slice(0, 13) + '…' : '—'}
             </span>
-          </Row>
-          <div className="flex gap-2 pt-1">
-            {/* 断线重连必须 resume 当前会话：裸 connect() 会新建会话，导致本地 transcript 与服务端日志行号错位。 */}
-            <Button size="sm" variant="outline" leftIcon="refresh" className="flex-1" onClick={() => connect(sessionId)}>
-              {t('inspector.reconnect')}
-            </Button>
-            <Button size="sm" variant="ghost" leftIcon="plus" className="flex-1" onClick={() => newChat()}>
-              {t('inspector.new_session')}
-            </Button>
           </div>
+          <Button
+            size="sm"
+            variant="outline"
+            leftIcon="refresh"
+            className="w-full"
+            onClick={() => connect(sessionId)}
+          >
+            {t('inspector.reconnect')}
+          </Button>
         </Section>
 
-        {/* State machine */}
+        {/* 状态机 */}
         <Section title={t('inspector.state_machine')} icon="activity">
-          <div className="flex items-center justify-between rounded-lg border border-border bg-surface-2/60 px-3 py-2.5">
+          <div className="card-inset flex items-center justify-between px-3 py-2.5">
             <span className="text-xs text-muted">{t('inspector.current')}</span>
             <Badge tone={meta.tone} dot={meta.dot}>
               {t(meta.label)}
             </Badge>
           </div>
-          <p className="mt-1.5 text-2xs text-muted">{t(meta.desc)}</p>
+          <p className="text-2xs text-muted">{t(meta.desc)}</p>
         </Section>
 
-        {/* Usage */}
+        {/* 用量 */}
         <Section title={t('inspector.usage')} icon="gauge">
-          <div className="mb-2 flex items-baseline justify-between">
+          <div className="flex items-baseline justify-between">
             <span className="text-xs text-muted">{t('inspector.total_tokens')}</span>
-            <span className="tabular font-display text-lg font-bold text-text">
+            <span className="tabular font-display text-xl font-bold text-text">
               {compact(totalTokens)}
             </span>
           </div>
-          <UsageBar label={t('inspector.input')} value={usage.input_tokens} total={totalTokens} color="rgb(var(--c-info))" />
-          <UsageBar label={t('inspector.output')} value={usage.output_tokens} total={totalTokens} color="rgb(var(--c-primary))" />
+          <UsageBar
+            label={t('inspector.input')}
+            value={usage.input_tokens}
+            total={totalTokens}
+            color="rgb(var(--c-info))"
+          />
+          <UsageBar
+            label={t('inspector.output')}
+            value={usage.output_tokens}
+            total={totalTokens}
+            color="rgb(var(--c-primary))"
+          />
           {usage.cache_read_tokens > 0 && (
-            <UsageBar label={t('inspector.cache_read')} value={usage.cache_read_tokens} total={totalTokens} color="rgb(var(--c-success))" />
+            <UsageBar
+              label={t('inspector.cache_read')}
+              value={usage.cache_read_tokens}
+              total={totalTokens}
+              color="rgb(var(--c-success))"
+            />
           )}
-          <div className="mt-2 grid grid-cols-2 gap-2 text-center">
+          <div className="grid grid-cols-2 gap-2 text-center">
             <MiniStat label={t('inspector.cost')} value={usage.cost_usd.toFixed(4)} />
-            <MiniStat label={t('inspector.last_turn')} value={lastDone && lastDone.kind === 'done' ? `${lastDone.turns} / ${lastDone.tool_calls}` : '—'} />
+            <MiniStat
+              label={t('inspector.last_turn')}
+              value={
+                lastDone && lastDone.kind === 'done'
+                  ? `${lastDone.turns} / ${lastDone.tool_calls}`
+                  : '—'
+              }
+            />
           </div>
         </Section>
 
@@ -106,13 +131,10 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
         {contextUsage && contextUsage.limit > 0 && (
           <Section title={t('inspector.context_window')} icon="layers">
             {(() => {
-              const pct = Math.min(
-                100,
-                (contextUsage.current / contextUsage.limit) * 100,
-              )
+              const pct = Math.min(100, (contextUsage.current / contextUsage.limit) * 100)
               return (
                 <>
-                  <div className="mb-2 flex items-baseline justify-between">
+                  <div className="flex items-baseline justify-between">
                     <span className="text-xs text-muted">{t('inspector.ratio')}</span>
                     <span className="tabular text-xs font-medium text-text-2">
                       {compact(contextUsage.current)} / {compact(contextUsage.limit)} tok ·{' '}
@@ -127,7 +149,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
                     size="sm"
                     variant="outline"
                     leftIcon="layers"
-                    className="mt-2 w-full"
+                    className="w-full"
                     onClick={() => doCompact()}
                   >
                     {t('inspector.compact')}
@@ -138,14 +160,14 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           </Section>
         )}
 
-        {/* Sub-agent monitoring — only while sub-agents exist */}
+        {/* 子代理监控 —— 仅在有子代理时出现 */}
         {agents.length > 0 && (
           <Section title={t('inspector.subagents', { n: agents.length })} icon="activity">
             <SubAgentMonitor agents={agents} />
           </Section>
         )}
 
-        {/* Models — 状态展示；切换入口在输入区上方工具栏 */}
+        {/* 模型 —— 只读清单；切换入口是输入区上方的模型胶囊 */}
         {models.length > 0 && (
           <Section title={t('inspector.models')} icon="cube">
             <ul className="space-y-1">
@@ -155,16 +177,28 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
                 return (
                   <li
                     key={m.alias}
-                    className="flex items-center justify-between gap-2 rounded-md bg-surface-2/40 px-2 py-1.5 text-xs"
+                    className={cn(
+                      'flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-xs',
+                      active ? 'bg-primary/10' : 'bg-surface-2',
+                    )}
                   >
-                    <span className={cn('flex min-w-0 items-center gap-1.5 font-medium', active ? 'text-primary' : 'text-text-2')}>
-                      {active && <Icon name="check" size={12} />}
+                    <span
+                      className={cn(
+                        'flex min-w-0 items-center gap-1.5 font-medium',
+                        active ? 'text-primary' : 'text-text-2',
+                      )}
+                    >
+                      {active && <Icon name="check" size={12} className="shrink-0" />}
                       <span className="truncate">{m.alias}</span>
                       {isDefault && (
-                        <span className="rounded bg-surface-3 px-1 py-0 text-2xs text-muted">{t('inspector.default_badge')}</span>
+                        <span className="rounded-sm bg-surface-3 px-1 text-2xs text-muted">
+                          {t('inspector.default_badge')}
+                        </span>
                       )}
                     </span>
-                    <span className="max-w-[110px] shrink-0 truncate font-mono text-2xs text-muted">{m.id}</span>
+                    <span className="max-w-[110px] shrink-0 truncate font-mono text-2xs text-muted">
+                      {m.id}
+                    </span>
                   </li>
                 )
               })}
@@ -172,7 +206,7 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           </Section>
         )}
 
-        {/* Server stats */}
+        {/* 服务端统计 */}
         {stats && (
           <Section title={t('inspector.server_stats')} icon="server">
             <Row label={t('inspector.active_sessions')}>
@@ -184,9 +218,9 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
           </Section>
         )}
 
-        <div className="rounded-lg border border-border bg-surface-2/50 p-3 text-2xs leading-relaxed text-muted">
+        <div className="card-inset p-3 text-2xs leading-relaxed text-muted">
           <p className="mb-1 flex items-center gap-1.5 font-medium text-text-2">
-            <Icon name="sparkles" size={13} className="text-primary" /> {t('inspector.tip_title')}
+            <Icon name="sparkles" size={14} className="text-primary" /> {t('inspector.tip_title')}
           </p>
           {t('inspector.tip_body')}
         </div>
@@ -195,14 +229,22 @@ export function Inspector({ onClose }: { onClose?: () => void }) {
   )
 }
 
-function Section({ title, icon, children }: { title: string; icon: string; children: React.ReactNode }) {
+function Section({
+  title,
+  icon,
+  children,
+}: {
+  title: string
+  icon: string
+  children: React.ReactNode
+}) {
   return (
-    <div>
-      <p className="mb-2 flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-muted">
-        <Icon name={icon} size={13} /> {title}
-      </p>
+    <section>
+      <SectionLabel icon={icon} className="mb-2">
+        {title}
+      </SectionLabel>
       <div className="space-y-1.5">{children}</div>
-    </div>
+    </section>
   )
 }
 
@@ -215,22 +257,37 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   )
 }
 
-function UsageBar({ label, value, total, color }: { label: string; value: number; total: number; color: string }) {
+function UsageBar({
+  label,
+  value,
+  total,
+  color,
+}: {
+  label: string
+  value: number
+  total: number
+  color: string
+}) {
   const pct = total > 0 ? (value / total) * 100 : 0
   return (
     <div className="flex items-center gap-2 py-0.5">
       <span className="w-14 shrink-0 text-2xs text-muted">{label}</span>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-3">
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: color }} />
+        <div
+          className="h-full rounded-full transition-[width] duration-500"
+          style={{ width: `${pct}%`, background: color }}
+        />
       </div>
-      <span className="tabular w-12 shrink-0 text-right text-2xs text-text-2">{formatNumber(value)}</span>
+      <span className="tabular w-12 shrink-0 text-right text-2xs text-text-2">
+        {formatNumber(value)}
+      </span>
     </div>
   )
 }
 
 function MiniStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-border bg-surface-2/60 px-2 py-1.5">
+    <div className="card-inset px-2 py-1.5">
       <div className="tabular text-sm font-semibold text-text">{value}</div>
       <div className="text-2xs text-muted">{label}</div>
     </div>

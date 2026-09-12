@@ -84,7 +84,7 @@ export function Transcript() {
               title={t('transcript.jump_latest')}
               className="animate-fade-in pointer-events-auto absolute bottom-0 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-surface text-text-2 shadow-pop transition-colors hover:bg-surface-2 hover:text-text"
             >
-              <Icon name="chevron-down" size={17} />
+              <Icon name="chevron-down" size={18} />
             </button>
           </div>
         </div>
@@ -100,8 +100,8 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
   return (
     <div className="flex h-full items-center justify-center overflow-y-auto py-8">
       <div className="chat-column text-center">
-        <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary to-primary-glow text-white shadow-glow">
-          <Icon name="command" size={30} />
+        <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary to-primary-glow text-primary-fg shadow-glow">
+          <Icon name="command" size={26} />
         </div>
         <h1 className="font-display text-3xl font-bold tracking-tight text-text">
           <span className="gradient-text">{t('transcript.title_agent')}</span> {t('transcript.title_console')}
@@ -122,7 +122,7 @@ function Welcome({ connected, state }: { connected: boolean; state: string }) {
               <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary transition-colors group-hover:bg-primary/20">
                 <Icon name={ex.icon} size={16} />
               </span>
-              <span className="text-[13px] leading-relaxed text-text-2">{t(ex.textKey)}</span>
+              <span className="text-sm leading-relaxed text-text-2">{t(ex.textKey)}</span>
             </button>
           ))}
         </div>
@@ -193,7 +193,7 @@ const ItemView = memo(function ItemView({
 
 function Avatar() {
   return (
-    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-primary-glow text-white shadow-sm">
+    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-primary-glow text-primary-fg shadow-sm">
       <Icon name="command" size={16} />
     </span>
   )
@@ -303,7 +303,7 @@ function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }>
             <MessageDeleteButton item={item} confirmKey="transcript.delete_confirm_user" />
           </div>
         )}
-        <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-white dark:text-[#06241f]">
+        <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-base leading-relaxed text-primary-fg">
           <p className="whitespace-pre-wrap break-words">{item.text}</p>
         </div>
         {(item.steered || time) && (
@@ -311,7 +311,7 @@ function UserMessage({ item }: { item: Extract<TranscriptItem, { kind: 'user' }>
             {time && <span className="tabular">{time}</span>}
             {item.steered && (
               <>
-                <Icon name="zap" size={11} />
+                <Icon name="zap" size={12} />
                 {t('transcript.steered')}
               </>
             )}
@@ -411,7 +411,7 @@ function ThinkingBlock({
   )
   const time = fmtTime(ts, locale)
   return (
-    <div className="rounded-xl border border-border bg-surface-2/50">
+    <div className="card">
       <button
         onClick={() => {
           touched.current = true
@@ -432,7 +432,7 @@ function ThinkingBlock({
       </button>
       {open && (
         <div className="max-h-60 overflow-y-auto border-t border-border px-3 py-2.5">
-          <p className="whitespace-pre-wrap break-words font-mono text-[12px] italic leading-relaxed text-muted">
+          <p className="whitespace-pre-wrap break-words font-mono text-xs italic leading-relaxed text-muted">
             {text}
           </p>
         </div>
@@ -457,14 +457,14 @@ function ToolBlock({
   const hasOutput = output.trim().length > 0
   const time = fmtTime(ts, locale)
   return (
-    <div className="rounded-xl border border-border bg-surface-2/50">
+    <div className="card">
       <button
         onClick={() => (hasOutput || !!command) && setOpen((o) => !o)}
         aria-expanded={open}
         className="flex w-full items-center gap-2 px-3 py-2 text-xs"
       >
         <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
-          <Icon name="cpu" size={13} />
+          <Icon name="cpu" size={14} />
         </span>
         <span className="font-mono font-medium text-text-2">{name}</span>
         {/* 被执行的命令/主操作数：yolo 等无审批帧的模式下也能一眼看到工具在做什么。 */}
@@ -480,13 +480,13 @@ function ToolBlock({
         {hasOutput && (
           <Icon
             name="chevron-down"
-            size={13}
+            size={14}
             className={cn('shrink-0 text-muted transition-transform', open && 'rotate-180')}
           />
         )}
       </button>
       {open && hasOutput && (
-        <pre className="max-h-72 overflow-auto border-t border-border bg-code-bg p-3 text-[12px] leading-relaxed text-code-fg">
+        <pre className="max-h-72 overflow-auto border-t border-border bg-code-bg p-3 text-xs leading-relaxed text-code-fg">
           <code className="font-mono whitespace-pre-wrap break-words">{output}</code>
         </pre>
       )}
@@ -505,8 +505,8 @@ function SayLine({ text, level }: { text: string; level: string }) {
     neutral: 'text-muted',
   }
   return (
-    <div className="flex items-center gap-2 py-0.5 text-[12px]">
-      <Icon name={meta.icon} size={13} className={cn('shrink-0', toneText[level] ?? 'text-muted')} />
+    <div className="flex items-center gap-2 py-0.5 text-xs">
+      <Icon name={meta.icon} size={14} className={cn('shrink-0', toneText[level] ?? 'text-muted')} />
       <span className="text-muted">{text}</span>
     </div>
   )
@@ -538,11 +538,11 @@ function AskCard({
     <div role="alert" className="rounded-xl border border-primary/30 bg-primary/[0.04] p-3.5 shadow-soft">
       <div className="mb-2 flex items-center gap-2">
         <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/15 text-primary">
-          <Icon name="shield" size={15} />
+          <Icon name="shield" size={16} />
         </span>
         <Badge tone="info">{askKindLabel(ask.kind, t)}</Badge>
       </div>
-      <p className="mb-3 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-text">{ask.prompt}</p>
+      <p className="mb-3 whitespace-pre-wrap break-words text-sm leading-relaxed text-text">{ask.prompt}</p>
 
       {resolved ? (
         <div className="flex items-center gap-2 text-xs">
@@ -563,7 +563,7 @@ function AskCard({
             rows={1}
             aria-label={t('transcript.reply_placeholder')}
             placeholder={t('transcript.reply_placeholder')}
-            className="max-h-32 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-[13px] text-text placeholder:text-muted/60 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/15"
+            className="max-h-32 flex-1 resize-none rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-muted/60 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/15"
           />
           <Button
             variant="primary"

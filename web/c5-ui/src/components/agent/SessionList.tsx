@@ -5,7 +5,7 @@ import { useNotifications } from '@/lib/notifications'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/cn'
 import { Icon } from '@/components/icons'
-import { Button, Dropdown, EmptyState, Modal, Skeleton } from '@/components/ui'
+import { Button, ConfirmDialog, Dropdown, EmptyState, Skeleton } from '@/components/ui'
 import { BranchTreeModal } from '@/components/agent/BranchTreeModal'
 
 /**
@@ -110,7 +110,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
     <div className="flex min-h-0 flex-1 flex-col px-3 pb-1.5">
       {/* 标题栏：标题 + 计数 + 刷新 */}
       <div className="flex items-center justify-between px-1 pb-1.5 pt-0.5">
-        <span className="flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-muted">
+        <span className="section-label">
           {t('sessions.heading')}
           {sessions.length > 0 && (
             <span className="rounded-full bg-surface-3 px-1.5 text-2xs tabular leading-[1.4] text-muted">
@@ -133,7 +133,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
         <div className="relative mb-1.5">
           <Icon
             name="search"
-            size={13}
+            size={14}
             className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted"
           />
           <input
@@ -141,7 +141,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
             onChange={(e) => setQuery(e.target.value)}
             aria-label={t('sessions.search_placeholder')}
             placeholder={t('sessions.search_placeholder')}
-            className="h-8 w-full rounded-lg border border-border bg-surface-2 pl-8 pr-7 text-[12px] text-text outline-none transition-colors placeholder:text-muted/60 focus:border-primary focus:ring-2 focus:ring-primary/20"
+            className="h-8 w-full rounded-lg border border-border bg-surface-2 pl-8 pr-7 text-xs text-text outline-none transition-colors placeholder:text-muted/60 focus:border-primary focus:ring-2 focus:ring-primary/20"
           />
           {query && (
             <button
@@ -232,7 +232,7 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
             {BUCKET_ORDER.map((b) =>
               groups[b].length === 0 ? null : (
                 <div key={b}>
-                  <div className="px-2 pb-1 pt-0.5 text-[9.5px] font-semibold uppercase tracking-wider text-muted/70">
+                  <div className="section-label px-2 pb-1 pt-0.5">
                     {t(`sessions.bucket.${b}`)}
                   </div>
                   <div className="space-y-0.5">
@@ -266,27 +266,17 @@ export function SessionList({ onClose }: { onClose?: () => void }) {
         )}
       </div>
 
-      {/* 删除二次确认 */}
-      <Modal
+      {/* 删除二次确认 —— 与「清空对话」共用同一个 ConfirmDialog 原语，
+          不再各自实现一套按钮/标题/危险色。 */}
+      <ConfirmDialog
         open={confirmDel !== null}
-        onClose={() => !busy && setConfirmDel(null)}
+        loading={busy}
+        onClose={() => setConfirmDel(null)}
+        onConfirm={() => void doDelete()}
         title={t('sessions.delete_title')}
-        size="sm"
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => setConfirmDel(null)} disabled={busy}>
-              {t('sessions.cancel')}
-            </Button>
-            <Button variant="danger" leftIcon="trash" loading={busy} onClick={() => void doDelete()}>
-              {t('sessions.delete_confirm')}
-            </Button>
-          </>
-        }
-      >
-        <p className="text-sm leading-relaxed text-text-2">
-          {confirmDel ? t('sessions.delete_desc', { name: display(confirmDel) }) : ''}
-        </p>
-      </Modal>
+        body={confirmDel ? t('sessions.delete_desc', { name: display(confirmDel) }) : ''}
+        confirmLabel={t('sessions.delete_confirm')}
+      />
 
       {/* 分支树：查看 / 切换活跃叶子（可选手工 handoff） */}
       {branchesFor && (
@@ -366,9 +356,9 @@ function SessionRow({
                 }
               }}
               onBlur={() => onCommitRename()}
-              className="h-7 w-full rounded-md border border-primary bg-surface px-1.5 text-[12.5px] text-text outline-none ring-2 ring-primary/20 focus:ring-primary/30 disabled:opacity-60"
+              className="h-7 w-full rounded-md border border-primary bg-surface px-1.5 text-sm text-text outline-none ring-2 ring-primary/20 focus:ring-primary/30 disabled:opacity-60"
             />
-            <span className="mt-0.5 block text-[9.5px] text-muted">{timeLabel}</span>
+            <span className="mt-0.5 block text-2xs text-muted">{timeLabel}</span>
           </div>
         </>
       ) : (
@@ -387,13 +377,13 @@ function SessionRow({
             <span className="min-w-0 flex-1">
               <span
                 className={cn(
-                  'block truncate text-[12.5px] leading-tight',
+                  'block truncate text-sm leading-tight',
                   active ? 'font-medium text-primary' : 'text-text-2',
                 )}
               >
                 {display}
               </span>
-              <span className="mt-0.5 block text-[9.5px] text-muted">{timeLabel}</span>
+              <span className="mt-0.5 block text-2xs text-muted">{timeLabel}</span>
             </span>
           </button>
           <Dropdown
@@ -407,7 +397,7 @@ function SessionRow({
                   active ? 'opacity-70' : 'opacity-0 focus:opacity-100 group-hover:opacity-100',
                 )}
               >
-                <Icon name="dots" size={15} />
+                <Icon name="dots" size={16} />
               </button>
             }
             items={[

@@ -19,8 +19,12 @@
   --c-text: 15 23 42;
   --c-text-2: 51 65 85;
   --c-muted: 100 116 139;
-  --c-primary: 13 148 136; /* teal-600 */
+  /* 首帧兜底值：必须等于 applyAccent('Teal') 在**本主题**下的结果。
+     强调色的唯一事实源是 SettingsPanel 的 accents 表（React 挂载后立即覆写
+     这三个变量），此处仅用于避免"首帧闪一下默认色"。 */
+  --c-primary: 15 118 110; /* teal-700，白字 5.5:1 */
   --c-primary-glow: 45 212 191; /* teal-400 */
+  --c-on-primary: 255 255 255;
   --c-accent: 217 119 6; /* amber-600 */
   --c-success: 16 185 129;
   --c-warning: 217 119 6;
@@ -52,8 +56,11 @@
   --c-text: 232 237 245;
   --c-text-2: 197 205 219;
   --c-muted: 132 143 161;
-  --c-primary: 45 212 191;
-  --c-primary-glow: 94 234 212;
+  /* 暗色主题：浅色主题的深色 accent 会被 applyAccent 向白提亮后再写入，
+     这里的兜底值同理等于 applyAccent('Teal') 在暗色下的结果。 */
+  --c-primary: 90 182 174;
+  --c-primary-glow: 79 219 201;
+  --c-on-primary: 6 36 31;
   --c-accent: 251 191 36;
   --c-success: 52 211 153;
   --c-warning: 251 191 36;
@@ -139,6 +146,85 @@
   /* Shared overlay backdrop — one elevation for modal / drawer / full-screen panels */
   .app-backdrop {
     @apply absolute inset-0 bg-black/55 backdrop-blur-sm animate-fade-in;
+  }
+
+  /* ======================================================================
+   * Surface system (v2)
+   *
+   * 三级**实体**表面取代此前 9 种半透明叠加（bg-surface-2/40 … /70）。
+   * 依据：a) 不同 alpha 会让同一层级的卡片看起来处于不同高度，视觉重心散乱；
+   * b) 极光渐变是随视口变化的底图，半透明表面的实际对比度不可预测，浅色主题
+   *    下尤其容易糊成灰块。实体令牌让「面板 / 卡片 / 控件」三层的对比度恒定。
+   * ====================================================================== */
+
+  /** 顶栏 / 输入区 / 侧栏这类跨视口的长条容器：唯一允许走玻璃拟态的表面。 */
+  .glass-bar {
+    @apply border-border bg-surface/85 backdrop-blur-xl;
+  }
+
+  /** 静置卡片（统计卡、区块容器）。 */
+  .card {
+    @apply rounded-xl border border-border bg-surface-2;
+  }
+
+  /** 卡内嵌套的次级容器（行、指标小卡）。 */
+  .card-inset {
+    @apply rounded-lg border border-border bg-surface-2;
+  }
+
+  /** 浮层容器：下拉菜单 / 气泡（比卡片高一档的圆角与阴影）。 */
+  .overlay-surface {
+    @apply rounded-xl border border-border bg-surface shadow-pop;
+  }
+
+  /**
+   * 浮层主体外壳：Modal / 全屏 Sheet / 命令面板共用。
+   *
+   * 三处此前各自重复 `relative z-10 flex flex-col overflow-hidden border
+   * border-border bg-surface shadow-pop outline-none`——任一处改动都会让弹窗
+   * 「厚度」不一致。收敛成单一类后，尺寸/圆角由调用方追加，外壳恒等。
+   */
+  .overlay-panel {
+    @apply relative z-raised flex flex-col overflow-hidden border border-border bg-surface shadow-pop outline-none;
+  }
+
+  /** 区块小标题：全站唯一的大写微标签规格。 */
+  .section-label {
+    @apply flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-[0.08em] text-muted;
+  }
+
+  /**
+   * 品牌副标题：wordmark 的固定搭配（宽字距 + 常规字重）。
+   *
+   * 刻意**不**复用 `.section-label`：后者是「面板内区块标题」的语气（semibold、
+   * 紧字距），而品牌行需要更松的字距与更轻的字重。把它令牌化而不是留成
+   * `tracking-[0.14em]` 任意值，是为了让「字距」这一维度仍然只有两个具名取值。
+   */
+  .brand-sub {
+    @apply text-2xs uppercase tracking-[0.14em] text-muted;
+  }
+
+  /**
+   * 上下文选择器胶囊（模型 / 审批模式 / 模式）。
+   *
+   * 输入区上方的三个会话级选择器此前分散在「输入框上方一行」与「输入框内底部
+   * 一行」两处，且各自手写样式（一个用原生 select、两个用手写 button）。统一成
+   * 同一个类后，三者的高度、圆角、边框与悬停反馈完全一致，"同一行控件不同长相"
+   * 的割裂感消失。
+   */
+  .chip {
+    @apply flex h-8 min-w-0 max-w-[220px] shrink-0 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs text-text-2 transition-colors hover:border-border-strong hover:bg-surface-3 disabled:pointer-events-none disabled:opacity-60 sm:max-w-[260px];
+  }
+  .chip[aria-expanded='true'] {
+    @apply border-primary/40 bg-surface-3 text-text;
+  }
+  .chip[aria-pressed='true'] {
+    @apply border-primary/40 bg-primary/10;
+  }
+
+  /** 统一的键盘焦点态（用于非 Button 原语的自定义触发器）。 */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 focus-visible:ring-offset-bg;
   }
 
   /**

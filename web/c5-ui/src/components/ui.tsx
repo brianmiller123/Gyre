@@ -94,7 +94,7 @@ type ButtonSize = 'sm' | 'md' | 'lg' | 'icon' | 'icon-sm'
 
 const buttonVariants: Record<ButtonVariant, string> = {
   primary:
-    'bg-primary text-white dark:text-[#06241f] hover:brightness-[1.07] shadow-sm shadow-primary/30',
+    'bg-primary text-primary-fg hover:brightness-[1.07] shadow-sm shadow-primary/30',
   secondary: 'bg-surface-2 text-text border border-border hover:bg-surface-3',
   outline: 'border border-border-strong text-text-2 hover:bg-surface-2 hover:text-text',
   ghost: 'text-text-2 hover:bg-surface-2 hover:text-text',
@@ -483,7 +483,7 @@ export function Modal({
         tabIndex={-1}
         onKeyDown={trapTab}
         className={cn(
-          'relative z-10 flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border bg-surface shadow-pop animate-scale-in outline-none sm:rounded-2xl',
+          'overlay-panel max-h-[92vh] w-full animate-scale-in rounded-t-2xl sm:rounded-2xl',
           modalSizes[size],
         )}
       >
@@ -496,22 +496,22 @@ export function Modal({
             )}
             <div className="min-w-0 flex-1">
               {title && (
-                <h2 id={titleId} className="font-display text-base font-semibold text-text">{title}</h2>
+                <h2 id={titleId} className="font-display text-md font-semibold text-text">{title}</h2>
               )}
               {description && <p className="mt-0.5 text-xs text-muted">{description}</p>}
             </div>
-            <button
+            <IconButton
+              icon="close"
+              label={t('common.close')}
+              size="sm"
               onClick={onClose}
-              className="-mr-1 flex h-8 w-8 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface-2 hover:text-text"
-              aria-label={t('common.close')}
-            >
-              <Icon name="close" size={18} />
-            </button>
+              className="-mr-1 text-muted"
+            />
           </div>
         )}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
         {footer && (
-          <div className="flex items-center justify-end gap-2 border-t border-border bg-surface-2/60 px-5 py-3">
+          <div className="flex items-center justify-end gap-2 border-t border-border bg-surface-2 px-5 py-3">
             {footer}
           </div>
         )}
@@ -522,7 +522,12 @@ export function Modal({
 }
 
 /* ------------------------------ ConfirmDialog ----------------------------- */
-/** 二次确认对话框：破坏性操作（清空/删除）统一走这里，策略对齐删除会话。 */
+/**
+ * 二次确认对话框：破坏性操作（清空/删除）统一走这里。
+ *
+ * `loading` 支持异步确认（如删除会话在途）：置位时禁用关闭路径并保持弹窗，
+ * 由调用方在请求结束后自行关闭——避免"确认后弹窗已消失、失败却无处提示"。
+ */
 export function ConfirmDialog({
   open,
   onClose,
@@ -531,6 +536,7 @@ export function ConfirmDialog({
   body,
   confirmLabel,
   danger = true,
+  loading = false,
 }: {
   open: boolean
   onClose: () => void
@@ -539,25 +545,27 @@ export function ConfirmDialog({
   body?: ReactNode
   confirmLabel: string
   danger?: boolean
+  loading?: boolean
 }) {
   const { t } = useI18n()
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={() => !loading && onClose()}
       title={title}
       icon={danger ? 'alert' : 'info'}
       size="sm"
       footer={
         <>
-          <Button variant="secondary" onClick={onClose}>
+          <Button variant="secondary" onClick={onClose} disabled={loading}>
             {t('common.cancel')}
           </Button>
           <Button
             variant={danger ? 'danger' : 'primary'}
+            loading={loading}
             onClick={() => {
               onConfirm()
-              onClose()
+              if (!loading) onClose()
             }}
           >
             {confirmLabel}
@@ -666,7 +674,7 @@ export function Dropdown({
           role="menu"
           aria-orientation="vertical"
           className={cn(
-            'absolute z-dropdown min-w-[12rem] rounded-xl border border-border bg-surface p-1.5 shadow-pop animate-scale-in',
+            'overlay-surface absolute z-dropdown min-w-[12rem] p-1.5 animate-scale-in',
             direction === 'up' ? 'bottom-full mb-2 origin-bottom' : 'mt-2 origin-top',
             align === 'right' ? 'right-0' : 'left-0',
             panelClassName,
@@ -695,13 +703,144 @@ export function Dropdown({
               >
                 {it.icon && <Icon name={it.icon} size={16} className="shrink-0" />}
                 <span className="flex-1 truncate">{it.label}</span>
-                {it.active && <Icon name="check" size={15} className="text-primary" />}
+                {it.active && <Icon name="check" size={16} className="text-primary" />}
               </button>
             ),
           )}
         </div>
       )}
     </span>
+  )
+}
+
+/* ---------------------------------- Tabs ---------------------------------- */
+export interface TabItem {
+  id: string
+  label: string
+  icon?: string
+  /** 可选计数/状态点，渲染在标签右侧。 */
+  badge?: ReactNode
+}
+
+/**
+ * 受控标签页（roving tabindex + Arrow/Home/End 键位）。
+ *
+ * 用途：把「按主题分组的设置」这类长滚动表单拆成一屏内的平行视图，减少
+ * 用户在一列纵向堆叠中定位区块的成本。切换用「即时切换」而非「提交时切换」，
+ * 因为每个标签页内的表单都各自持有草稿并在保存时统一提交。
+ */
+export function Tabs({
+  items,
+  value,
+  onChange,
+  ariaLabel,
+  className,
+}: {
+  items: TabItem[]
+  value: string
+  onChange: (id: string) => void
+  ariaLabel: string
+  className?: string
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  const move = (dir: 1 | -1 | 'first' | 'last') => {
+    const root = ref.current
+    if (!root) return
+    const tabs = Array.from(root.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+    if (tabs.length === 0) return
+    const idx = tabs.indexOf(document.activeElement as HTMLButtonElement)
+    const next =
+      dir === 'first'
+        ? 0
+        : dir === 'last'
+          ? tabs.length - 1
+          : (idx + dir + tabs.length) % tabs.length
+    tabs[next]?.focus()
+    tabs[next]?.click()
+  }
+  return (
+    <div
+      ref={ref}
+      role="tablist"
+      aria-label={ariaLabel}
+      onKeyDown={(e) => {
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+          e.preventDefault()
+          move(1)
+        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+          e.preventDefault()
+          move(-1)
+        } else if (e.key === 'Home') {
+          e.preventDefault()
+          move('first')
+        } else if (e.key === 'End') {
+          e.preventDefault()
+          move('last')
+        }
+      }}
+      className={cn(
+        'inline-flex items-center gap-0.5 rounded-lg border border-border bg-surface-2 p-1',
+        className,
+      )}
+    >
+      {items.map((it) => {
+        const active = it.id === value
+        return (
+          <button
+            key={it.id}
+            role="tab"
+            type="button"
+            aria-selected={active}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onChange(it.id)}
+            className={cn(
+              'focus-ring flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+              active
+                ? 'bg-surface text-text shadow-card'
+                : 'text-muted hover:text-text',
+            )}
+          >
+            {it.icon && <Icon name={it.icon} size={14} />}
+            {it.label}
+            {it.badge}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/* ---------------------------------- Kbd ----------------------------------- */
+/** 键盘提示（键帽）。与快捷键提示文案成对出现，全站只有这一种键帽样式。 */
+export function Kbd({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <kbd
+      className={cn(
+        'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-sm border border-border bg-surface-2 px-1 font-mono text-2xs font-medium text-muted',
+        className,
+      )}
+    >
+      {children}
+    </kbd>
+  )
+}
+
+/* ------------------------------ SectionLabel ------------------------------ */
+/** 区块小标题（带可选图标）。取代各面板手写的 uppercase tracking-wide 组合。 */
+export function SectionLabel({
+  icon,
+  children,
+  className,
+}: {
+  icon?: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <p className={cn('section-label', className)}>
+      {icon && <Icon name={icon} size={14} />}
+      {children}
+    </p>
   )
 }
 

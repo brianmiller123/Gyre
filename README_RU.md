@@ -442,8 +442,8 @@ curl -X POST http://127.0.0.1:8080/acp/rpc \
 ```bash
 cd web/c5-ui
 npm install          # при первом запуске нужно установить зависимости
-npm run build        # проверка типов tsc -b + vite build → результат в dist/
-npm run deploy       # копирует содержимое dist/ в ../ (корень web/)
+npm run build        # проверка типов tsc -b + vite build → результат сразу в ../ (корень web/)
+npm run dev          # dev-сервер :5173, проксирует /api и /ws на agent --serve
 ```
 ### build
 ```bash

@@ -12,7 +12,7 @@ import {
 import { useHighlightedCode, useHighlighter } from '@/lib/agent/highlight'
 import { useTheme } from '@/lib/theme'
 import { Icon } from '@/components/icons'
-import { Badge, Button, Spinner } from '@/components/ui'
+import { Badge, Button, IconButton, Spinner } from '@/components/ui'
 import { compact } from '@/lib/format'
 import { cn } from '@/lib/cn'
 import { treeIndent } from '@/lib/tree'
@@ -359,12 +359,12 @@ function Header({
       onPointerMove={dragProps.onPointerMove}
       onPointerUp={dragProps.onPointerUp}
       className={cn(
-        'flex shrink-0 items-center gap-2 border-b border-border bg-surface-2/70 px-3 py-2',
+        'flex shrink-0 items-center gap-2 border-b border-border bg-surface-2 px-3 py-2',
         mode === 'floating' ? 'cursor-grab active:cursor-grabbing' : 'cursor-default',
       )}
     >
-      <Icon name="layers" size={15} className="shrink-0 text-primary" />
-      <span className="font-display text-[13px] font-semibold text-text">{t('workspace.browse')}</span>
+      <Icon name="layers" size={16} className="shrink-0 text-primary" />
+      <span className="font-display text-sm font-semibold text-text">{t('workspace.browse')}</span>
 
       <div data-no-drag className="ml-2 flex items-center gap-0.5 rounded-lg border border-border bg-surface p-0.5">
         <DockBtn active={mode === 'left'} icon="panel-left" label={t('workspace.dock_left')} onClick={() => setMode('left')} />
@@ -373,14 +373,9 @@ function Header({
       </div>
 
       <div className="flex-1" />
-      <button
-        data-no-drag
-        onClick={onClose}
-        className="flex h-7 w-7 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-3 hover:text-text"
-        aria-label={t('workspace.close')}
-      >
-        <Icon name="close" size={16} />
-      </button>
+      <span data-no-drag>
+        <IconButton icon="close" label={t('workspace.close')} size="sm" onClick={onClose} className="text-muted" />
+      </span>
     </div>
   )
 }
@@ -406,7 +401,7 @@ function DockBtn({
         active ? 'bg-primary/15 text-primary' : 'text-muted hover:text-text',
       )}
     >
-      <Icon name={icon} size={15} />
+      <Icon name={icon} size={16} />
     </button>
   )
 }
@@ -584,7 +579,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: React.Dispa
           onPointerDown={onSplitDown}
           onPointerMove={onSplitMove}
           onPointerUp={onSplitUp}
-          className="absolute top-0 bottom-0 z-10 w-1.5 -translate-x-1/2 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30"
+          className="absolute top-0 bottom-0 z-raised w-1.5 -translate-x-1/2 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30"
           style={{ left: treeW }}
           aria-label={t('workspace.resize_tree')}
         />
@@ -593,9 +588,9 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: React.Dispa
         <div className="flex min-w-0 flex-1 flex-col">
           {activePath ? (
             <>
-              <div className="flex items-center gap-2 border-b border-border bg-surface-2/50 px-3 py-1.5">
+              <div className="flex items-center gap-2 border-b border-border bg-surface-2 px-3 py-1.5">
                 <Icon name={fileIcon(activePath)} size={14} className="shrink-0 text-muted" />
-                <span className="truncate font-mono text-[12px] text-text-2">{activePath}</span>
+                <span className="truncate font-mono text-xs text-text-2">{activePath}</span>
                 {file && (
                   <Badge tone="neutral" className="ml-auto px-1.5 py-0 text-2xs">
                     {compact(file.size)} B
@@ -625,7 +620,7 @@ function BrowserBody({ treeW, setTreeW }: { treeW: number; setTreeW: React.Dispa
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center px-6 text-center text-muted">
               <span className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-surface-2">
-                <Icon name="file" size={22} />
+                <Icon name="file" size={20} />
               </span>
               <p className="text-sm font-medium text-text-2">{t('workspace.select_file')}</p>
               <p className="mt-1 max-w-xs text-xs">{t('workspace.resize_hint')}</p>
@@ -661,7 +656,7 @@ function TreeRow({
       <button
         onClick={() => (isDir ? onToggle(node) : onOpen(node))}
         className={cn(
-          'flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[13px] transition-colors',
+          'flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-sm transition-colors',
           isActive ? 'bg-primary/10 text-primary' : 'text-text-2 hover:bg-surface-2',
         )}
         style={{ paddingLeft: treeIndent(depth) }}
@@ -669,15 +664,15 @@ function TreeRow({
         {isDir ? (
           <>
             {node.loading ? (
-              <Spinner size={11} className="text-muted" />
+              <Spinner size={12} className="text-muted" />
             ) : (
               <Icon
                 name="chevron-right"
-                size={13}
+                size={14}
                 className={cn('shrink-0 text-muted transition-transform', isOpen && 'rotate-90')}
               />
             )}
-            <Icon name={isOpen ? 'folder-open' : 'folder'} size={15} className="shrink-0 text-primary/80" />
+            <Icon name={isOpen ? 'folder-open' : 'folder'} size={16} className="shrink-0 text-primary/80" />
           </>
         ) : (
           <>
@@ -726,13 +721,13 @@ function CodeView({
     <div className="flex min-w-full">
       <pre
         aria-hidden
-        className="select-none border-r border-code-fg/10 px-3 py-3 text-right font-mono text-[12px] leading-[1.55] text-code-fg/50"
+        className="select-none border-r border-code-fg/10 px-3 py-3 text-right font-mono text-xs leading-[1.55] text-code-fg/50"
       >
         {gutter ?? lines.map((_, i) => <div key={i}>{i + 1}</div>)}
       </pre>
       <pre className="flex-1 overflow-x-auto px-3 py-3">
         <code
-          className={cn('font-mono text-[12px] leading-[1.55]', language !== 'plaintext' && `language-${language}`)}
+          className={cn('font-mono text-xs leading-[1.55]', language !== 'plaintext' && `language-${language}`)}
           dangerouslySetInnerHTML={{ __html: body }}
         />
       </pre>

@@ -60,7 +60,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
   return (
     <div className="space-y-2">
       {/* 汇总条 */}
-      <div className="flex items-center justify-between rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-2xs">
+      <div className="card-inset flex items-center justify-between px-2.5 py-1.5 text-2xs">
         <span className="text-muted">
           {t('monitor.active')} <span className="tabular font-semibold text-text">{running}</span> · {t('monitor.done')}{' '}
           <span className="tabular font-semibold text-success">{done}</span> · {t('monitor.failed')}{' '}
@@ -78,7 +78,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
         return (
           <div
             key={a.id}
-            className="rounded-lg border border-border bg-surface-2/40 p-2.5 transition-colors hover:border-border/80"
+            className="card-inset p-2.5 transition-colors hover:border-border/80"
           >
             {/* 头：阶段 + 标签 */}
             <div className="mb-1.5 flex items-center gap-2">
@@ -118,7 +118,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
               )}
               {a.current_activity && (
                 <span className="flex min-w-0 items-center gap-1 text-info">
-                  <Icon name="activity" size={10} />
+                  <Icon name="activity" size={12} />
                   <span className="truncate">{a.current_activity}</span>
                 </span>
               )}
@@ -127,7 +127,7 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
             {/* 错误 */}
             {a.error && (
               <p className="mt-1.5 flex items-start gap-1 text-2xs text-danger">
-                <Icon name="alert" size={11} className="mt-px shrink-0" />
+                <Icon name="alert" size={12} className="mt-px shrink-0" />
                 <span className="break-all">{a.error}</span>
               </p>
             )}
@@ -139,11 +139,11 @@ export function SubAgentMonitor({ agents }: { agents: SubAgentStatus[] }) {
                   onClick={() => toggle(a.id)}
                   className="flex items-center gap-1 text-2xs text-muted transition-colors hover:text-text-2"
                 >
-                  <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={11} />
+                  <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} />
                   {t('inspector.logs_count', { n: a.logs.length })}
                 </button>
                 {isOpen && (
-                  <pre className="mt-1 max-h-32 overflow-y-auto rounded bg-surface-3/60 p-1.5 font-mono text-2xs leading-relaxed">
+                  <pre className="mt-1 max-h-32 overflow-y-auto rounded bg-surface-3 p-1.5 font-mono text-2xs leading-relaxed">
                     {a.logs.map((l, i) => (
                       <div key={i} className={cn('whitespace-pre-wrap break-all', LOG_COLOR[l.level])}>
                         {l.text}
