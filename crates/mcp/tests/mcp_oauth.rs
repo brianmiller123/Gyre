@@ -346,6 +346,7 @@ async fn transport_proactive_refresh_and_401_retry() {
             headers: Default::default(),
             timeout_ms: Some(5_000),
             oauth: None,
+            transport: agent_config::McpHttpTransport::default(),
         }),
         &config_dir,
     )
@@ -398,6 +399,7 @@ async fn transport_proactive_refresh_and_401_retry() {
             headers: Default::default(),
             timeout_ms: Some(5_000),
             oauth: None,
+            transport: agent_config::McpHttpTransport::default(),
         }),
         &config_dir,
     )

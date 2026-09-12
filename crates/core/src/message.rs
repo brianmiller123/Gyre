@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::llm::AssistantEvent;
+use crate::session_event::SessionEvent;
 use crate::tool::{SoftToolRequirement, ToolResult};
 
 /// 智能体执行状态机（移植 Zoo-Code 五态机）。
@@ -600,6 +601,10 @@ pub enum AgentEvent {
         /// 是否为错误结果。
         is_error: bool,
     },
+
+    /// 会话级结构化事件（压缩 / 重试 / 模型回退；与 [`AgentEvent::Say`] 双通道——
+    /// 展示文本见 [`SessionEvent::to_status`]，此处携带可编程消费的结构化字段）。
+    Session(SessionEvent),
 }
 
 #[cfg(test)]

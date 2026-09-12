@@ -255,6 +255,33 @@ pub fn resolve_runtime_api_key(
         )
         .unwrap_or_default();
     };
+    fresh_or_refreshed(client, config_dir, provider, &creds)
+}
+
+/// **只**从 OAuth 凭据存储解析访问令牌（`auth = "oauth"` 专用）。
+///
+/// 与 [`resolve_runtime_api_key`] 的区别：不看 config / auth.toml / env——没有该 provider
+/// 的 OAuth 条目时返回 `None`，由调用方给出明确错误（而不是静默回退到别的凭据段，
+/// 那会让「声明了 oauth 却拿 env key 发请求」变得不可见）。
+#[must_use]
+pub fn resolve_oauth_only(
+    client: &reqwest::Client,
+    config_dir: &std::path::Path,
+    provider: &str,
+) -> Option<String> {
+    let creds = agent_config::load_oauth(config_dir)
+        .get(provider)
+        .cloned()?;
+    Some(fresh_or_refreshed(client, config_dir, provider, &creds))
+}
+
+/// `creds` 未过期则直接用，否则先刷新再用（刷新失败 WARN + 旧 token 尝试）。
+fn fresh_or_refreshed(
+    client: &reqwest::Client,
+    config_dir: &std::path::Path,
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> String {
     if !creds.is_expired(now_ms()) {
         return creds.access.clone();
     }
@@ -262,7 +289,7 @@ pub fn resolve_runtime_api_key(
     let attempt = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::try_current()
             .ok()
-            .map(|h| h.block_on(ensure_fresh(client, config_dir, provider, &creds)))
+            .map(|h| h.block_on(ensure_fresh(client, config_dir, provider, creds)))
     });
     match attempt {
         Some(Ok(access)) => access,
@@ -277,6 +304,43 @@ pub fn resolve_runtime_api_key(
             tracing::warn!(provider, error = %err, "OAuth 刷新失败，先用现有 token 尝试请求");
             creds.access.clone()
         }
+    }
+}
+
+/// 按模型 profile 的鉴权模式解析最终 API key（H24：`api_key` / `none` / `oauth`）。
+///
+/// - `AuthMode::None` → `Ok(None)`（适配器不发送内置鉴权头）；
+/// - `AuthMode::OAuth` → 只用 OAuth 存储；缺失即 `Err`（含修复提示）；
+/// - `AuthMode::ApiKey` → 既有分层链（config → oauth → auth.toml → env）。
+///
+/// # Errors
+/// `auth = "oauth"` 但该 provider 没有 OAuth 凭据时返回错误消息。
+pub fn resolve_profile_api_key(
+    client: &reqwest::Client,
+    config_dir: &std::path::Path,
+    auth: agent_core::AuthMode,
+    provider: &str,
+    profile_id: &str,
+    config_key_empty: bool,
+    config_key: &str,
+) -> Result<Option<String>, String> {
+    match auth {
+        agent_core::AuthMode::None => Ok(None),
+        agent_core::AuthMode::OAuth => resolve_oauth_only(client, config_dir, provider)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "模型 profile `{profile_id}` 声明 auth = \"oauth\"，但 OAuth 凭据存储中没有 `{provider}` \
+                     的令牌；请先运行 `agent auth login`，或改用 auth = \"api_key\""
+                )
+            }),
+        agent_core::AuthMode::ApiKey => Ok(Some(resolve_runtime_api_key(
+            client,
+            config_dir,
+            provider,
+            config_key_empty,
+            config_key,
+        ))),
     }
 }
 
@@ -342,6 +406,53 @@ mod tests {
             resolve_runtime_api_key(&client, &dir, "zai", false, "sk-config"),
             "sk-config"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H24：`auth = "none"` 不解析任何凭据（返回 `None`）；`oauth` 缺凭据时给出可操作错误。
+    #[test]
+    fn profile_api_key_follows_auth_mode() {
+        let dir = std::env::temp_dir().join(format!("gyre-oauth-authmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = reqwest::Client::new();
+
+        let none = resolve_profile_api_key(
+            &client,
+            &dir,
+            agent_core::AuthMode::None,
+            "openai-completions",
+            "m",
+            false,
+            "sk-config",
+        )
+        .expect("auth=none 不应报错");
+        assert_eq!(none, None, "auth=none 即使有 config key 也不返回凭据");
+
+        let api_key = resolve_profile_api_key(
+            &client,
+            &dir,
+            agent_core::AuthMode::ApiKey,
+            "openai-completions",
+            "m",
+            false,
+            "sk-config",
+        )
+        .unwrap();
+        assert_eq!(api_key.as_deref(), Some("sk-config"));
+
+        let err = resolve_profile_api_key(
+            &client,
+            &dir,
+            agent_core::AuthMode::OAuth,
+            "openai-completions",
+            "m",
+            true,
+            "",
+        )
+        .expect_err("auth=oauth 但无凭据应报错");
+        assert!(err.contains("oauth") && err.contains("auth login"), "{err}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

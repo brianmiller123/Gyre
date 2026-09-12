@@ -125,33 +125,33 @@ fn parse_decision(line: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl Hook for ShellHook {
-    /// 观察事件：`after_tool` / `stop` 通知型触发（命令输出忽略）；
-    /// `before_tool` 经 [`Hook::before_tool_intercept`] 通道处理，此处跳过以免同一命令触发两次。
+    /// 观察事件（H20）：**按事件名匹配**规则——`tool_call` 经
+    /// [`Hook::before_tool_intercept`] 通道处理（此处跳过以免同一命令触发两次）；
+    /// 其余事件（生命周期 / 会话级结构化事件）走通知通道，stdin 收到事件负载 JSON。
     async fn on_event(&self, event: &HookEvent) {
-        let payload = match event {
-            HookEvent::BeforeTool { .. } => return,
-            HookEvent::AfterTool { tool, result } => {
-                if self.rule.event != HookEventKind::AfterTool || !self.rule.matches_tool(tool) {
-                    return;
-                }
-                json!({ "event": "after_tool", "tool": tool, "result": result })
+        let expected = self.rule.event.as_str();
+        if event.name() != expected {
+            return;
+        }
+        // 工具前事件由拦截通道处理（那里能返回决定），避免重复触发同一命令。
+        if matches!(event, HookEvent::BeforeTool { .. }) {
+            return;
+        }
+        // 工具过滤只对工具类事件有意义（其余事件无 `tool` 字段）。
+        if let HookEvent::AfterTool { tool, .. } = event {
+            if !self.rule.matches_tool(tool) {
+                return;
             }
-            HookEvent::Stop { success } => {
-                if self.rule.event != HookEventKind::Stop {
-                    return;
-                }
-                json!({ "event": "stop", "success": success })
-            }
-        };
-        self.run_first_line(&payload.to_string()).await;
+        }
+        self.run_first_line(&event.to_payload().to_string()).await;
     }
 
     /// 工具执行前拦截：`deny` 决策 → `Some(reason)` 阻止执行；其余一律放行。
     async fn before_tool_intercept(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
-        if self.rule.event != HookEventKind::BeforeTool || !self.rule.matches_tool(tool) {
+        if self.rule.event != HookEventKind::ToolCall || !self.rule.matches_tool(tool) {
             return None;
         }
-        let payload = json!({ "event": "before_tool", "tool": tool, "args": args });
+        let payload = json!({ "event": "tool_call", "tool": tool, "args": args });
         self.run_first_line(&payload.to_string())
             .await
             .and_then(|line| parse_decision(&line))
@@ -187,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn deny_decision_blocks() {
         let h = ShellHook::new(rule(
-            HookEventKind::BeforeTool,
+            HookEventKind::ToolCall,
             "echo '{\"decision\":\"deny\",\"reason\":\"不许跑\"}'",
             Some(5),
         ));
@@ -207,7 +207,7 @@ mod tests {
             "echo '{}'",
             "true", // 无输出（EOF）
         ] {
-            let h = ShellHook::new(rule(HookEventKind::BeforeTool, cmd, Some(5)));
+            let h = ShellHook::new(rule(HookEventKind::ToolCall, cmd, Some(5)));
             let reason = h
                 .before_tool_intercept("shell", &serde_json::json!({}))
                 .await;
@@ -215,12 +215,61 @@ mod tests {
         }
     }
 
+    /// H20：命名事件按名匹配触发，且 stdin 负载带 `event` 字段（真实 shell 校验）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_event_matches_by_name_and_writes_payload() {
+        // 命令把 stdin 原样写到文件，供断言负载形状。
+        let out = std::env::temp_dir().join(format!("gyre-hook-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let hook = ShellHook::new(rule(
+            HookEventKind::TurnStart,
+            &format!("cat > {}", out.display()),
+            Some(5),
+        ));
+        // 名字不匹配 → 不触发。
+        hook.on_event(&HookEvent::named("agent_start", serde_json::json!({})))
+            .await;
+        assert!(!out.exists(), "不匹配的事件不应触发命令");
+        // 名字匹配 → 触发并写入负载。
+        hook.on_event(&HookEvent::named(
+            "turn_start",
+            serde_json::json!({"turn": 2}),
+        ))
+        .await;
+        let text = std::fs::read_to_string(&out).expect("命令应写入 stdin 负载");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["event"], "turn_start");
+        assert_eq!(v["turn"], 2);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// H20：`tool_call` 只走拦截通道（`on_event` 不重复触发命令）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_call_event_does_not_double_fire() {
+        let out = std::env::temp_dir().join(format!("gyre-hook-tc-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let hook = ShellHook::new(rule(
+            HookEventKind::ToolCall,
+            &format!("echo hit >> {}", out.display()),
+            Some(5),
+        ));
+        // on_event（观察通道）不得触发；否则「拦截 + 通知」会各跑一次。
+        hook.on_event(&HookEvent::BeforeTool {
+            tool: "shell".into(),
+            args: serde_json::json!({}),
+        })
+        .await;
+        assert!(!out.exists(), "tool_call 不应经 on_event 触发");
+        let _ = std::fs::remove_file(&out);
+    }
     // 命令不存在（shell 内部 127）→ 放行。
     #[cfg(unix)]
     #[tokio::test]
     async fn command_failure_passes_through() {
         let h = ShellHook::new(rule(
-            HookEventKind::BeforeTool,
+            HookEventKind::ToolCall,
             "/nonexistent-bin-xyz",
             Some(5),
         ));
@@ -235,7 +284,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_passes_through_and_kills() {
-        let h = ShellHook::new(rule(HookEventKind::BeforeTool, "sleep 30", Some(1)));
+        let h = ShellHook::new(rule(HookEventKind::ToolCall, "sleep 30", Some(1)));
         let t = std::time::Instant::now();
         let reason = h
             .before_tool_intercept("shell", &serde_json::json!({}))
@@ -253,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn tool_filter_gates_trigger() {
         let mut r = rule(
-            HookEventKind::BeforeTool,
+            HookEventKind::ToolCall,
             "echo '{\"decision\":\"deny\",\"reason\":\"x\"}'",
             Some(5),
         );
@@ -280,7 +329,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("gyre-hook-after-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cmd = format!("echo fired >> {}", path.display());
-        let h = ShellHook::new(rule(HookEventKind::AfterTool, &cmd, Some(5)));
+        let h = ShellHook::new(rule(HookEventKind::ToolResult, &cmd, Some(5)));
         h.on_event(&HookEvent::AfterTool {
             tool: "shell".into(),
             result: agent_core::ToolResult::text("ok"),
@@ -310,7 +359,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("gyre-hook-skip-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cmd = format!("echo fired >> {}", path.display());
-        let h = ShellHook::new(rule(HookEventKind::BeforeTool, &cmd, Some(5)));
+        let h = ShellHook::new(rule(HookEventKind::ToolCall, &cmd, Some(5)));
         h.on_event(&HookEvent::BeforeTool {
             tool: "shell".into(),
             args: serde_json::json!({}),

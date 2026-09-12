@@ -12,11 +12,12 @@ use std::sync::Arc;
 
 use agent_core::{
     AgentEvent, AgentMessage, AgentRunSummary, AgentState, ApprovalDecision, ApprovalPolicy,
-    AskKind, AskMessage, AskResponse, AssistantEvent, AssistantMessage, CompactionStrategy,
-    CompletionRequest, ContentBlock, ContextManager, Hook, HookEvent, LlmProvider, MemoryStore,
-    Mode, ProviderCallContext, ResourceResolver, SoftToolRequirement, StatusKind, StatusMessage,
-    StopReason, ThinkingConfig, ThinkingPolicy, ToolChoice, ToolChoiceDirective, ToolResult,
-    ToolResultMessage, Usage, Workspace, WriteEffect,
+    AskKind, AskMessage, AskResponse, AssistantEvent, AssistantMessage, CompactionAction,
+    CompactionReason, CompactionStage, CompactionStrategy, CompletionRequest, ContentBlock,
+    ContextManager, Hook, HookEvent, LlmProvider, MemoryStore, Mode, ProviderCallContext,
+    ResourceResolver, SessionEvent, SoftToolRequirement, StatusKind, StatusMessage, StopReason,
+    ThinkingConfig, ThinkingPolicy, ToolChoice, ToolChoiceDirective, ToolResult, ToolResultMessage,
+    Usage, Workspace, WriteEffect,
 };
 use agent_prompt::PromptCatalog;
 use agent_skills::{SkillCatalog, render_skills_section};
@@ -29,11 +30,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// GPT-5 Harmony-header 泄漏检测与恢复（移植 oh-my-pi `harmony-leak`）。
+pub mod agent_def;
+pub mod goal;
 mod harmony;
 pub mod keywords;
 mod pause;
 mod schema_check;
+pub mod stream_guards;
 mod task_tool;
+pub use agent_def::{
+    AgentDefinition, AgentSource, discover_agents, find_agent, render_agent_catalog,
+};
+pub use goal::{
+    DEFAULT_MAX_CONTINUATIONS, GoalBudget, GoalSnapshot, GoalState, GoalStatus, GoalTool,
+    PromptKind, goal_file, load_goal, save_goal,
+};
 pub use pause::PauseGate;
 pub use schema_check::{extract_json, validate_json_schema};
 pub use task_tool::{ContextFactory, TaskTool};
@@ -41,163 +52,70 @@ pub use task_tool::{ContextFactory, TaskTool};
 /// P1-L：advisor 评审触发周期（每 N 轮一次；评审本身是独立 LLM 调用，太频繁会拖慢主循环）。
 const ADVISOR_EVERY_N_TURNS: usize = 4;
 
-/// P0-3：goals 目标预算配置（cli 从 `[goals]` 映射）。
-#[derive(Debug, Clone)]
-pub struct GoalBudget {
-    /// token 累计上限（记账口径 input + `cache_write` + output；`0` = 不限）。
-    pub token_budget: u64,
-    /// 墙钟上限（`Duration::ZERO` = 不限）。
-    pub time_budget: std::time::Duration,
-    /// 超限后硬停（`true`：下一停止边界直接结束；`false`：注入提醒后续跑一轮让模型收尾）。
-    pub hard_stop: bool,
+/// H28：todo 循环的 eager prelude 触发模式（`[todo] eager`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TodoEager {
+    /// 关闭（`off` / `default`）：不注入 prelude。
+    #[default]
+    Off,
+    /// 注入提醒，但不强制 `todo` 工具选择（`preferred`）。
+    Preferred,
+    /// 注入提醒并在首轮强制 `tool_choice=todo`（`always`）。
+    Always,
 }
 
-impl GoalBudget {
-    /// 空预算（不限）。
+impl TodoEager {
+    /// 解析配置字符串（未知值回落 `off`，不阻断启动）。
     #[must_use]
-    pub const fn unlimited() -> Self {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "preferred" | "prefer" => Self::Preferred,
+            "always" | "force" | "forced" => Self::Always,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// H28：todo 循环配置（eager prelude + 完成提醒续跑）。
+#[derive(Debug, Clone, Copy)]
+pub struct TodoLoopConfig {
+    /// eager prelude 模式（首轮「先规划再动手」）。
+    pub eager: TodoEager,
+    /// 停止边界是否对未完成待办注入提醒并续跑。
+    pub reminders: bool,
+    /// 单轮 prompt 内提醒次数上限（0 = 不限制）。
+    pub reminders_max: usize,
+    /// H28：中途对账 nudge——连续多次「变更类工具」调用仍未触碰 `todo` 时注入一次提醒
+    /// （每次 run 上限 2 次；移植 omp `takeMidRunNudge`）。默认开启。
+    pub mid_run_nudge: bool,
+}
+
+impl Default for TodoLoopConfig {
+    fn default() -> Self {
         Self {
-            token_budget: 0,
-            time_budget: std::time::Duration::ZERO,
-            hard_stop: false,
+            eager: TodoEager::Off,
+            reminders: true,
+            reminders_max: 3,
+            mid_run_nudge: true,
         }
     }
 }
 
-/// P0-3：goals 记账状态（跨 Agent 重建共享；宿主可经 [`Agent::goal_state`] 查看/调整预算）。
-#[derive(Debug)]
-pub struct GoalState {
-    /// 当前预算（`/goal` 可运行时调整）。
-    pub budget: GoalBudget,
-    /// 已注入过超限提醒（一次性，防「注入→超限→再注入」无限续跑循环）。
-    pub notified: bool,
-    /// 首次用量时间（记账起点）。
-    pub start: Option<std::time::Instant>,
-    /// 累计用量。
-    pub usage: agent_core::Usage,
-}
-
-impl GoalState {
-    /// 新状态。
+impl TodoLoopConfig {
+    /// 从配置字段构造（`eager` 为 TOML 字符串）。
     #[must_use]
-    pub fn new(budget: GoalBudget) -> Self {
+    pub fn from_config(
+        eager: Option<&str>,
+        reminders: bool,
+        reminders_max: usize,
+        mid_run_nudge: bool,
+    ) -> Self {
         Self {
-            budget,
-            notified: false,
-            start: None,
-            usage: agent_core::Usage::default(),
+            eager: eager.map_or(TodoEager::Off, TodoEager::parse),
+            reminders,
+            reminders_max,
+            mid_run_nudge,
         }
-    }
-
-    /// 记账口径：input + `cache_write` + `output（cache_read` 为折扣价不计，同 oh-my-pi `GoalRuntime`）。
-    #[must_use]
-    pub const fn billed(&self) -> u64 {
-        self.usage.input_tokens + self.usage.cache_write_tokens + self.usage.output_tokens
-    }
-
-    /// 当前是否超限（token 或墙钟）。
-    #[must_use]
-    pub fn exceeded(&self) -> bool {
-        if self.budget.token_budget > 0 && self.billed() >= self.budget.token_budget {
-            return true;
-        }
-        if !self.budget.time_budget.is_zero()
-            && let Some(start) = self.start
-            && start.elapsed() >= self.budget.time_budget
-        {
-            return true;
-        }
-        false
-    }
-
-    /// 累计本轮用量；返回「本次首次超限」（已提醒过返回 `false`，防重复注入）。
-    pub fn note_usage(&mut self, usage: &agent_core::Usage) -> bool {
-        if self.start.is_none() {
-            self.start = Some(std::time::Instant::now());
-        }
-        self.usage.add(usage);
-        if self.notified {
-            return false;
-        }
-        if self.exceeded() {
-            self.notified = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 人类可读状态摘要（`/goal` 显示与预算提醒注入共用）。
-    #[must_use]
-    pub fn summary(&self) -> String {
-        let mut parts = vec![format!("token {}", self.billed())];
-        if self.budget.token_budget > 0 {
-            parts.push(format!("/{}", self.budget.token_budget));
-        }
-        if let Some(start) = self.start {
-            parts.push(format!("时间 {}s", start.elapsed().as_secs()));
-            if !self.budget.time_budget.is_zero() {
-                parts.push(format!("/{}s", self.budget.time_budget.as_secs()));
-            }
-        }
-        parts.join("，")
-    }
-}
-
-#[cfg(test)]
-mod goal_tests {
-    use super::*;
-
-    fn usage(input: u64, out: u64, cr: u64, cw: u64) -> agent_core::Usage {
-        agent_core::Usage {
-            input_tokens: input,
-            output_tokens: out,
-            cache_read_tokens: cr,
-            cache_write_tokens: cw,
-            cost_usd: 0.0,
-        }
-    }
-
-    #[test]
-    fn billed_counts_input_cache_write_output() {
-        let mut s = GoalState::new(GoalBudget::unlimited());
-        s.note_usage(&usage(100, 50, 200, 25));
-        // 记账口径：input + cache_write + output（cache_read 折扣价不计）。
-        assert_eq!(s.billed(), 175);
-    }
-
-    #[test]
-    fn note_usage_reports_exceed_once() {
-        let mut s = GoalState::new(GoalBudget {
-            token_budget: 100,
-            ..GoalBudget::unlimited()
-        });
-        assert!(!s.note_usage(&usage(60, 0, 0, 0)), "未超限不触发");
-        assert!(
-            s.note_usage(&usage(50, 0, 0, 0)),
-            "累计 110 ≥ 100 首次超限触发"
-        );
-        assert!(
-            !s.note_usage(&usage(50, 0, 0, 0)),
-            "已提醒过不再重复触发（防无限续跑循环）"
-        );
-    }
-
-    #[test]
-    fn token_budget_zero_means_unlimited() {
-        let mut s = GoalState::new(GoalBudget::unlimited());
-        assert!(!s.note_usage(&usage(1_000_000, 0, 0, 0)));
-        assert!(!s.exceeded());
-    }
-
-    #[test]
-    fn hard_stop_flag_preserved() {
-        let s = GoalState::new(GoalBudget {
-            token_budget: 10,
-            hard_stop: true,
-            ..GoalBudget::unlimited()
-        });
-        assert!(s.budget.hard_stop, "硬停标记供停止边界分支消费");
     }
 }
 
@@ -313,7 +231,6 @@ pub struct Agent {
     max_turns: usize,
     /// 运行时限（wall-clock）；`None` 不限制。超过则在下一轮顶部优雅停止。
     deadline: Option<std::time::Duration>,
-    context_guard: f32,
     max_output_tokens: usize,
     temperature: Option<f32>,
     thinking: Option<ThinkingConfig>,
@@ -383,6 +300,8 @@ pub struct Agent {
     /// `read_file` 记录的版本对 `apply_hashline` stale-hash 恢复可见）。`None` 时
     /// `ToolContext::snapshots = None`（read 不记录）。
     snapshot_store: Option<std::sync::Arc<std::sync::RwLock<agent_tools::InMemorySnapshotStore>>>,
+    /// H5 流式守卫配置（见 [`AgentBuilder::stream_guards`]）。
+    stream_guards: agent_config::StreamGuardsConfig,
     /// P2：模型 fallback 链（主模型失败且错误可重试时依序尝试的备用模型）。
     fallbacks: Vec<agent_core::Model>,
     /// P2：API key 轮换环（model id → key 环；`runtime_overrides` 命中时优先，跳过轮换）。
@@ -390,6 +309,16 @@ pub struct Agent {
     /// 会话级密钥脱敏器（`None` = 关闭）。engine 在 provider 边界出向脱敏、
     /// assistant 最终化后入向还原（见 `engine::run_loop` 接线点注释）。
     secrets: Option<Arc<agent_core::SecretsObfuscator>>,
+    /// H28：待办清单只读源（eager prelude / 完成提醒；与 `todo` 工具共享同一实例）。
+    todo_loop: Option<Arc<dyn agent_core::TodoLoopSource>>,
+    /// H28：todo 循环配置（eager 模式 / 提醒开关 / 提醒上限）。
+    todo_loop_cfg: TodoLoopConfig,
+    /// H28：异步唤醒探测（有后台作业在途时不注入完成提醒）。
+    async_wake: Option<Arc<dyn agent_core::AsyncWakeProbe>>,
+    /// H26：自动压缩触发策略（绝对阈值 / 预留余量 / 百分比）。
+    compaction_policy: agent_core::CompactionPolicy,
+    /// H40：追加到 system prompt 末尾的定制文本（`--append-system-prompt`）。
+    append_system_prompt: Option<String>,
 }
 
 impl Agent {
@@ -438,7 +367,13 @@ impl Agent {
             compaction_backend: agent_core::CompactionBackend::Summarize,
             compaction_max_frames: agent_snapcompact::DEFAULT_MAX_FRAMES,
             snapshot_store: None,
+            stream_guards: agent_config::StreamGuardsConfig::default(),
             secrets: None,
+            todo_loop: None,
+            todo_loop_cfg: TodoLoopConfig::default(),
+            async_wake: None,
+            compaction_policy: agent_core::CompactionPolicy::default(),
+            append_system_prompt: None,
         }
     }
 
@@ -591,11 +526,23 @@ pub struct AgentBuilder {
     compaction_max_frames: usize,
     /// 会话级文本快照存储（可选；read_file 记录 / apply_hashline stale-hash 恢复）。
     snapshot_store: Option<std::sync::Arc<std::sync::RwLock<agent_tools::InMemorySnapshotStore>>>,
+    /// H5 流式守卫配置（生成文件拦截 / 编辑解析预检 / 工具循环 / Gemini 标题连跑）。
+    stream_guards: agent_config::StreamGuardsConfig,
     /// 密钥脱敏装配：`None`（未设置）= 默认装配（env `GYRE_SECRETS=off` 门控的
     /// per-install key）；`Some(None)` = 显式关闭；`Some(Some(arc))` = 注入自定义实例。
     /// 三态语义有意为之（区分「未设置走默认」与「显式关闭」），定向豁免 option_option。
     #[allow(clippy::option_option)]
     secrets: Option<Option<Arc<agent_core::SecretsObfuscator>>>,
+    /// H28：待办清单只读源（与 `todo` 工具共享同一实例）。
+    todo_loop: Option<Arc<dyn agent_core::TodoLoopSource>>,
+    /// H28：todo 循环配置。
+    todo_loop_cfg: TodoLoopConfig,
+    /// H28：异步唤醒探测。
+    async_wake: Option<Arc<dyn agent_core::AsyncWakeProbe>>,
+    /// H26：自动压缩触发策略。
+    compaction_policy: agent_core::CompactionPolicy,
+    /// H40：追加到 system prompt 末尾的定制文本。
+    append_system_prompt: Option<String>,
 }
 
 impl AgentBuilder {
@@ -622,6 +569,12 @@ impl AgentBuilder {
         self
     }
 
+    /// H5 流式守卫配置（缺省 = [`agent_config::StreamGuardsConfig::default`]：
+    /// 生成文件拦截 / 编辑解析预检 / 工具循环守卫 / Gemini 标题连跑全部启用）。
+    pub fn stream_guards(mut self, cfg: agent_config::StreamGuardsConfig) -> Self {
+        self.stream_guards = cfg;
+        self
+    }
     /// 注入 steering 接收端（外部经返回的发送端中途打断）。
     pub fn steer_rx(mut self, rx: tokio::sync::mpsc::UnboundedReceiver<AgentMessage>) -> Self {
         self.steer_rx = Some(rx);
@@ -823,6 +776,44 @@ impl AgentBuilder {
     /// 设置上下文窗口占用阈值。
     pub const fn context_guard(mut self, g: f32) -> Self {
         self.context_guard = g;
+        // 未显式给绝对阈值/余量时，guard 即压缩百分比（既有语义）。
+        if self.compaction_policy.threshold_tokens.is_none()
+            && self.compaction_policy.reserve_tokens.is_none()
+        {
+            self.compaction_policy.guard = g;
+        }
+        self
+    }
+
+    /// H26：从配置三件套构造压缩策略（`[agent]` 的 guard / threshold / reserve）。
+    ///
+    /// 前端只需调用本函数，避免三处各自组装时优先级漂移。
+    #[must_use]
+    pub const fn compaction_policy_from_config(
+        guard: f32,
+        threshold_tokens: Option<u64>,
+        reserve_tokens: Option<u64>,
+    ) -> agent_core::CompactionPolicy {
+        agent_core::CompactionPolicy {
+            threshold_tokens: match threshold_tokens {
+                Some(t) => Some(t as usize),
+                None => None,
+            },
+            reserve_tokens: match reserve_tokens {
+                Some(r) => Some(r as usize),
+                None => None,
+            },
+            guard,
+        }
+    }
+
+    /// H26：自动压缩触发策略（绝对阈值 / 预留余量 / 百分比；见
+    /// [`agent_core::CompactionPolicy`]）。
+    ///
+    /// 未显式设置时与 [`Self::context_guard`] 组合：`context_guard` 决定百分比兜底，
+    /// 本方法可把策略整体替换为绝对阈值或预留余量。
+    pub const fn compaction_policy(mut self, policy: agent_core::CompactionPolicy) -> Self {
+        self.compaction_policy = policy;
         self
     }
     /// 设置最大输出 token。
@@ -866,6 +857,36 @@ impl AgentBuilder {
         self
     }
 
+    /// H28：注入待办清单只读源（与 `TodoTool` 共享同一 `Arc<TodoState>`）。
+    ///
+    /// 引擎据此在首轮注入 eager prelude、在停止边界对未完成待办注入提醒并续跑。
+    /// 未注入时两项行为均不发生（零 Token 开销，向后兼容）。
+    pub fn todo_loop_source(mut self, source: Arc<dyn agent_core::TodoLoopSource>) -> Self {
+        self.todo_loop = Some(source);
+        self
+    }
+
+    /// H28：todo 循环配置（eager 模式 / 提醒开关 / 提醒上限）。
+    pub const fn todo_loop_config(mut self, cfg: TodoLoopConfig) -> Self {
+        self.todo_loop_cfg = cfg;
+        self
+    }
+
+    /// H28：注入异步唤醒探测（有后台作业在途时不在停止边界注入 todo 完成提醒）。
+    pub fn async_wake(mut self, probe: Arc<dyn agent_core::AsyncWakeProbe>) -> Self {
+        self.async_wake = Some(probe);
+        self
+    }
+
+    /// H40：在 system prompt 末尾追加定制文本（`--append-system-prompt` / 配置）。
+    ///
+    /// 追加在所有章节（行为四段 / 项目约定 / 记忆 / skills）之后：它是宿主的最终
+    /// 覆盖指令，位置越靠后越贴近模型当前决策（对齐 omp `appendPrompt` 的块位置）。
+    pub fn append_system_prompt(mut self, text: impl Into<String>) -> Self {
+        self.append_system_prompt = Some(text.into());
+        self
+    }
+
     /// 压缩后端（P2：`summarize` 默认 / `snapcompact` 图像化压缩——要求视觉模型）。
     pub const fn compaction_backend(mut self, backend: agent_core::CompactionBackend) -> Self {
         self.compaction_backend = backend;
@@ -897,7 +918,6 @@ impl AgentBuilder {
             max_mistakes: self.max_mistakes,
             max_turns: self.max_turns,
             deadline: self.deadline,
-            context_guard: self.context_guard,
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
             thinking: self.thinking,
@@ -917,10 +937,16 @@ impl AgentBuilder {
             compaction_backend: self.compaction_backend,
             compaction_max_frames: self.compaction_max_frames,
             goal: self.goals,
+            todo_loop: self.todo_loop,
+            todo_loop_cfg: self.todo_loop_cfg,
+            async_wake: self.async_wake,
+            compaction_policy: self.compaction_policy,
+            append_system_prompt: self.append_system_prompt,
             goal_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conflicts: Arc::new(std::sync::Mutex::new(agent_tools::ConflictHistory::new())),
             pending_rewrites: Arc::new(std::sync::Mutex::new(Vec::new())),
             snapshot_store: self.snapshot_store,
+            stream_guards: self.stream_guards,
             soft_requirement: Arc::new(std::sync::Mutex::new(self.soft_requirement)),
             steer_rx: tokio::sync::Mutex::new(self.steer_rx),
             steer_tx: self.steer_tx,
@@ -995,6 +1021,26 @@ const MAX_HARMONY_ABORT_RETRY: usize = 2;
 /// 但面向**不经事件流**的程序化 hook（审计 / 指标 / memory 更新 / telemetry span 等）。
 /// 事件消费者（如 server 的 `to_server_frame`）已能从 `TurnEnd` 事件观测；本钩子供 agent
 /// 内部 / 装配层注入的程序化副作用使用。移植 oh-my-pi `onTurnEnd`。
+/// H20：发射一个命名 hook 事件（负载自动补 `event` 字段）。
+pub(crate) async fn fire_named_hooks(
+    hooks: &[Arc<dyn Hook>],
+    event: &str,
+    payload: serde_json::Value,
+) {
+    let ev = HookEvent::named(event, payload);
+    for h in hooks {
+        h.on_event(&ev).await;
+    }
+}
+
+/// H20：把会话级结构化事件镜像为同名 hook 事件（`auto_compaction_start` 等）。
+pub(crate) async fn fire_hook_session(hooks: &[Arc<dyn Hook>], ev: &agent_core::SessionEvent) {
+    let hook_ev = ev.to_hook_event();
+    for h in hooks {
+        h.on_event(&hook_ev).await;
+    }
+}
+
 async fn fire_on_turn_end(
     hooks: &[Arc<dyn Hook>],
     message: &AssistantMessage,
@@ -2250,6 +2296,326 @@ mod tests {
         );
         assert_eq!(done_success, Some(true), "退避重试后应自然完成");
         assert!(saw_429_status, "退避等待前应发出 429 状态消息");
+    }
+
+    /// 收集一轮事件流中的结构化会话事件，并断言「双通道同源」：
+    /// 每条带展示投影的 `Session` 事件，其后的 `Say` 文本逐字等于 `to_status()`。
+    async fn collect_session_events(agent: &Agent) -> Vec<agent_core::SessionEvent> {
+        let mut sessions = Vec::new();
+        let mut pending: Option<agent_core::SessionEvent> = None;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Session(s) => {
+                    if let Some(prev) = pending.take() {
+                        assert!(
+                            prev.to_status().is_none(),
+                            "上一条结构化事件应已紧跟展示文本：{prev:?}"
+                        );
+                    }
+                    pending = Some(s.clone());
+                    sessions.push(s);
+                }
+                AgentEvent::Say(sm) => {
+                    if let Some(prev) = pending.take() {
+                        let expected = prev.to_status().expect("带展示投影的事件后应紧跟 Say");
+                        assert_eq!(sm.text, expected.text, "展示文本必须由结构化字段派生");
+                        assert_eq!(sm.kind, expected.kind);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(pending) = pending {
+            assert!(
+                pending.to_status().is_none(),
+                "结构化事件缺少配对展示文本：{pending:?}"
+            );
+        }
+        sessions
+    }
+
+    /// H6：429 退避重试同时产出结构化事件（AutoRetryStart×2 + AutoRetryEnd 成功收尾）。
+    #[tokio::test]
+    async fn rate_limit_retry_emits_structured_session_events() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut model = agent_core::Model::with_defaults(
+            "rate-limit",
+            "rate-limit",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(RateLimitThenDoneProvider {
+                calls: calls.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::new(InMemoryContext::new(vec![])))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .max_turns(5)
+            .build();
+
+        let sessions = collect_session_events(&agent).await;
+        assert_eq!(
+            sessions.len(),
+            3,
+            "两次退避重试 + 一次成功收尾：{sessions:?}"
+        );
+        for (i, s) in sessions.iter().take(2).enumerate() {
+            match s {
+                agent_core::SessionEvent::AutoRetryStart {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    error_message,
+                    model,
+                } => {
+                    assert_eq!(*attempt, (i + 1) as u32, "重试序号 1-based");
+                    assert_eq!(*max_attempts, 2, "重试预算 = 单模型调用上限 − 1");
+                    assert_eq!(*delay_ms, 1);
+                    assert!(error_message.contains("速率限制"), "{error_message}");
+                    assert_eq!(model, "rate-limit");
+                }
+                other => panic!("期望 AutoRetryStart，得到 {other:?}"),
+            }
+        }
+        assert_eq!(
+            sessions[2],
+            agent_core::SessionEvent::AutoRetryEnd {
+                success: true,
+                attempt: 2,
+                final_error: None,
+            }
+        );
+    }
+
+    /// H6：模型 fallback 链产出 `retry_fallback_applied` / `retry_fallback_succeeded`。
+    #[tokio::test]
+    async fn model_fallback_emits_structured_session_events() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &["primary"],
+            hard_fail_id: None,
+        });
+        let primary =
+            agent_core::Model::with_defaults("primary", "p", agent_core::Api::AnthropicMessages);
+        let backup =
+            agent_core::Model::with_defaults("backup", "p", agent_core::Api::OpenAiCompletions);
+        let agent = probe_agent(probe, primary, vec![backup], Default::default()).build();
+
+        let sessions = collect_session_events(&agent).await;
+        assert_eq!(sessions.len(), 2, "回退 + 回退成功：{sessions:?}");
+        assert_eq!(
+            sessions[0],
+            agent_core::SessionEvent::RetryFallbackApplied {
+                from: "primary".into(),
+                to: "backup".into(),
+            }
+        );
+        assert_eq!(
+            sessions[1],
+            agent_core::SessionEvent::RetryFallbackSucceeded {
+                model: "backup".into(),
+            }
+        );
+    }
+
+    /// H26：绝对阈值 / 预留余量优先于百分比——大窗口下百分比本不会触发，阈值 1 必须触发。
+    #[tokio::test]
+    async fn absolute_compaction_threshold_overrides_percent() {
+        use agent_core::CompactionPolicy;
+        // 对照组：窗口 1M，只给 99% 百分比 → 微上下文不触发压缩。
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: None,
+        });
+        let mut model =
+            agent_core::Model::with_defaults("big", "p", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 1_000_000;
+        let percent_only = probe_agent(probe, model.clone(), vec![], Default::default())
+            .compaction_policy(CompactionPolicy::percent(0.99))
+            .build();
+        assert!(
+            collect_session_events(&percent_only).await.is_empty(),
+            "99% 百分比下微上下文不应触发压缩"
+        );
+
+        // 绝对阈值 1：同一窗口必然触发压缩级联（阈值优先于百分比）。
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: None,
+        });
+        let absolute = probe_agent(probe, model.clone(), vec![], Default::default())
+            .compaction_policy(CompactionPolicy {
+                threshold_tokens: Some(1),
+                reserve_tokens: None,
+                guard: 0.99,
+            })
+            .build();
+        let sessions = collect_session_events(&absolute).await;
+        assert_eq!(
+            sessions.len(),
+            2,
+            "绝对阈值应触发一次压缩级联：{sessions:?}"
+        );
+        assert!(matches!(
+            sessions[0],
+            agent_core::SessionEvent::AutoCompactionStart { .. }
+        ));
+
+        // 预留余量 = 窗口 - 1 → 阈值 1，同样触发（次优先级生效）。
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: None,
+        });
+        let reserve = probe_agent(probe, model, vec![], Default::default())
+            .compaction_policy(CompactionPolicy {
+                threshold_tokens: None,
+                reserve_tokens: Some(999_999),
+                guard: 0.99,
+            })
+            .build();
+        assert_eq!(
+            collect_session_events(&reserve).await.len(),
+            2,
+            "预留余量模式应触发压缩"
+        );
+    }
+
+    /// H26：provider 上报的上一轮 prompt token 是压缩判定下限——
+    /// 即便本地估算偏小（出向压缩/脱敏），超过阈值仍必须触发。
+    #[tokio::test]
+    async fn provider_reported_prompt_tokens_floor_the_trigger() {
+        use agent_core::CompactionPolicy;
+        // 桩 Provider 每轮上报 100_000 prompt token（input 部分），本地估算远小于该值。
+        struct BigUsageProbe {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            reported: u64,
+        }
+        #[async_trait]
+        impl agent_core::LlmProvider for BigUsageProbe {
+            fn id(&self) -> &'static str {
+                "big-usage"
+            }
+            fn supports(&self) -> &[agent_core::Api] {
+                &[]
+            }
+            async fn stream(
+                &self,
+                _request: agent_core::CompletionRequest,
+                _ctx: &agent_core::ProviderCallContext,
+            ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                // 第 1 轮：调用未知工具（空注册表 → 工具错误 → 循环继续到第 2 轮），
+                // 同时上报巨大 prompt；第 2 轮才是压缩判定点（provider 下限生效）。
+                let content = if n == 0 {
+                    vec![agent_core::ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                        signature: None,
+                    }]
+                } else {
+                    vec![agent_core::ContentBlock::Text {
+                        text: format!("turn {n}"),
+                    }]
+                };
+                let msg = agent_core::AssistantMessage {
+                    content,
+                    usage: agent_core::Usage {
+                        input_tokens: self.reported,
+                        ..agent_core::Usage::default()
+                    },
+                    model: "big-usage".into(),
+                    stop_reason: Some(agent_core::StopReason::Stop),
+                    stop_details: None,
+                };
+                Ok(Box::pin(futures::stream::iter(vec![
+                    agent_core::AssistantEvent::TextDelta(format!("turn {n}")),
+                    agent_core::AssistantEvent::MessageEnd(msg),
+                ])))
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut model =
+            agent_core::Model::with_defaults("big", "p", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(BigUsageProbe {
+                calls: Arc::clone(&calls),
+                reported: 100_000,
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::new(InMemoryContext::new(vec!["sys".into()])))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            // 阈值 90k：本地估算（几百 token）达不到，只有 provider 上报的 100k 能达到。
+            .compaction_policy(CompactionPolicy {
+                threshold_tokens: Some(90_000),
+                reserve_tokens: None,
+                guard: 0.99,
+            })
+            .build();
+        let sessions = collect_session_events(&agent).await;
+        assert!(
+            !sessions.is_empty(),
+            "provider 上报的 prompt token 应作为下限触发压缩"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "压缩触发后应继续完成该轮"
+        );
+    }
+
+    /// H6：接近上下文上限触发压缩时产出 `auto_compaction_start` / `_end`（阶段按序记录）。
+    #[tokio::test]
+    async fn near_limit_emits_structured_compaction_events() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let probe = Arc::new(FallbackProbe {
+            calls: Arc::clone(&calls),
+            fail_ids: &[],
+            hard_fail_id: None,
+        });
+        let mut model =
+            agent_core::Model::with_defaults("tiny", "p", agent_core::Api::OpenAiCompletions);
+        // 窗口上限 1 token：任何上下文都越过守卫阈值 → 必定触发压缩级联。
+        model.max_input_tokens = 1;
+        let agent = probe_agent(probe, model, vec![], Default::default()).build();
+
+        let sessions = collect_session_events(&agent).await;
+        assert_eq!(sessions.len(), 2, "压缩开始 + 压缩结束：{sessions:?}");
+        assert_eq!(
+            sessions[0],
+            agent_core::SessionEvent::AutoCompactionStart {
+                reason: agent_core::CompactionReason::Threshold,
+                action: agent_core::CompactionAction::ContextFull,
+            }
+        );
+        match &sessions[1] {
+            agent_core::SessionEvent::AutoCompactionEnd {
+                action,
+                stages,
+                ok,
+                error,
+            } => {
+                assert_eq!(*action, agent_core::CompactionAction::ContextFull);
+                assert_eq!(stages[0], agent_core::CompactionStage::Shake, "先 shake");
+                assert!(stages.len() >= 2, "仍超限应继续 summarize：{stages:?}");
+                assert!(*ok && error.is_none(), "级联应全部成功：{error:?}");
+            }
+            other => panic!("期望 AutoCompactionEnd，得到 {other:?}"),
+        }
     }
 
     /// 桩 Provider：恒返回 429 RateLimit。验证重试超限后的停机路径。
@@ -4425,6 +4791,122 @@ mod tests {
         );
     }
 
+    // ── H20：hook 事件面（命名事件 + 会话事件镜像）────────────────────────────
+
+    /// 记录全部 hook 事件名的测试钩子。
+    struct NamedEventRecorder {
+        names: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Hook for NamedEventRecorder {
+        async fn on_event(&self, event: &HookEvent) {
+            self.names.lock().unwrap().push(event.name().to_string());
+        }
+    }
+
+    /// H20：一次两轮运行应发出完整生命周期命名事件，并把会话级结构化事件镜像为 hook 事件。
+    #[tokio::test]
+    async fn named_hook_events_cover_lifecycle_and_session_events() {
+        let names: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let mut reg = DefaultToolRegistry::new();
+        reg.register(Box::new(ProbeTool {
+            name: "probe".into(),
+            cap: CapabilityTier::ReadOnly,
+            ms: 0,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        }));
+        let tools: Arc<dyn ToolRegistry> = Arc::new(reg);
+        let mut model =
+            agent_core::Model::with_defaults("h20", "h20", agent_core::Api::OpenAiCompletions);
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(TwoTurnProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }))
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .hooks(vec![Arc::new(NamedEventRecorder {
+                names: Arc::clone(&names),
+            })])
+            .build();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let seen = names.lock().unwrap().clone();
+        let has = |n: &str| seen.iter().any(|s| s == n);
+        for expected in [
+            "before_agent_start",
+            "agent_start",
+            "turn_start",
+            "turn_end",
+            "tool_call",
+            "tool_result",
+            "stop",
+            "agent_end",
+        ] {
+            assert!(has(expected), "缺少事件 {expected}：{seen:?}");
+        }
+        // 轮次事件按轮数成对出现（两轮）。
+        assert_eq!(
+            seen.iter().filter(|s| *s == "turn_start").count(),
+            2,
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|s| *s == "turn_end").count(),
+            2,
+            "{seen:?}"
+        );
+        // 生命周期顺序：before_agent_start → agent_start → turn_start … → stop → agent_end。
+        let pos = |n: &str| seen.iter().position(|s| s == n).unwrap();
+        assert!(pos("before_agent_start") < pos("agent_start"));
+        assert!(pos("agent_start") < pos("turn_start"));
+        assert!(pos("turn_start") < pos("tool_call"));
+        assert!(pos("stop") < pos("agent_end"), "{seen:?}");
+    }
+
+    /// H20：`SessionEvent` → hook 事件名与 serde `type` 判别字段一致（不漂移）。
+    #[test]
+    fn session_event_maps_to_same_named_hook_event() {
+        let ev = agent_core::SessionEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 100,
+            error_message: "rate_limit".into(),
+            model: "m".into(),
+        };
+        let hook_ev = ev.to_hook_event();
+        assert_eq!(hook_ev.name(), "auto_retry_start");
+        let payload = hook_ev.to_payload();
+        assert_eq!(payload["event"], "auto_retry_start");
+        assert_eq!(payload["attempt"], 1);
+        // 其余变体同样对齐。
+        for (event, expected) in [
+            (
+                agent_core::SessionEvent::AutoCompactionStart {
+                    reason: agent_core::CompactionReason::Threshold,
+                    action: agent_core::CompactionAction::ContextFull,
+                },
+                "auto_compaction_start",
+            ),
+            (
+                agent_core::SessionEvent::AutoCompactionEnd {
+                    action: agent_core::CompactionAction::ContextFull,
+                    stages: Vec::new(),
+                    ok: true,
+                    error: None,
+                },
+                "auto_compaction_end",
+            ),
+        ] {
+            assert_eq!(event.to_hook_event().name(), expected);
+        }
+    }
     // ── 记忆注入（P0-3）：`<mental_models>` 在前、`<memories>` 在后 ───────────────
 
     /// 带 mental_models + summary 的假记忆（验证注入顺序与格式）。
@@ -5815,5 +6297,691 @@ mod tests {
             !turn1.contains("<secret:"),
             "off 路径不得出现占位符: {turn1}"
         );
+    }
+
+    // ── H28/H29（todo 循环续跑 + goal loop）────────────────────────────────
+
+    /// 固定快照的待办源（H28 测试用）。
+    struct StubTodo {
+        entries: Vec<(&'static str, &'static str)>,
+        incomplete: usize,
+    }
+
+    impl agent_core::TodoLoopSource for StubTodo {
+        fn snapshot(&self) -> agent_core::TodoLoopSnapshot {
+            agent_core::TodoLoopSnapshot {
+                entries: self
+                    .entries
+                    .iter()
+                    .map(|(c, p)| agent_core::TodoLoopEntry {
+                        content: (*c).into(),
+                        phase: (*p).into(),
+                        blocker: None,
+                    })
+                    .collect(),
+                incomplete: self.incomplete,
+            }
+        }
+    }
+
+    /// 每次调用返回一个独立临时工作区（`<tmp>/gyre-test-<tag>-<pid>-<n>`）。
+    fn temp_workspace(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gyre-test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        ))
+    }
+
+    fn stub_todo(
+        entries: Vec<(&'static str, &'static str)>,
+        incomplete: usize,
+    ) -> Arc<dyn agent_core::TodoLoopSource> {
+        Arc::new(StubTodo {
+            entries,
+            incomplete,
+        })
+    }
+
+    /// 记录每轮请求 `tool_choice` 的 Provider（H28 `always` 强制选择断言用）。
+    struct ChoiceProvider {
+        calls: Arc<AtomicUsize>,
+        hard_todo: Arc<parking_lot::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl agent_core::LlmProvider for ChoiceProvider {
+        fn id(&self) -> &'static str {
+            "choice-prov"
+        }
+        fn supports(&self) -> &[agent_core::Api] {
+            &[]
+        }
+        async fn stream(
+            &self,
+            req: agent_core::CompletionRequest,
+            _ctx: &agent_core::ProviderCallContext,
+        ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+            let forced = matches!(
+                req.tool_choice,
+                Some(ToolChoiceDirective::Hard(ToolChoice::Function { ref name })) if name == "todo"
+            );
+            self.hard_todo.lock().push(forced);
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                AssistantEvent::MessageEnd(text_stop_msg(&format!("reply {n}"))),
+            ])))
+        }
+    }
+
+    /// 可编排 loop 行为的 Agent 构造器（H28/H29 测试共用）。
+    #[allow(clippy::too_many_arguments)]
+    fn loop_agent(
+        provider: Arc<dyn LlmProvider>,
+        tools: Arc<dyn ToolRegistry>,
+        todo: Option<Arc<dyn agent_core::TodoLoopSource>>,
+        todo_cfg: TodoLoopConfig,
+        goal: Option<Arc<std::sync::Mutex<GoalState>>>,
+        ctx: Arc<dyn ContextManager>,
+    ) -> Agent {
+        let mut model = agent_core::Model::with_defaults(
+            "loop-prov",
+            "loop-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        let mut b = Agent::builder(model)
+            .provider(provider)
+            .tools(tools)
+            .context(ctx)
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            // 每例一个临时工作区：goal 持久化（H29）会写 `<cwd>/.gyre/goal.json`，
+            // 不能落到仓库目录里。
+            .workspace(Arc::new(Workspace::new(temp_workspace("loop"))))
+            .todo_loop_config(todo_cfg);
+        if let Some(t) = todo {
+            b = b.todo_loop_source(t);
+        }
+        if let Some(g) = goal {
+            b = b.goals_state(g);
+        }
+        b.build()
+    }
+
+    fn todo_tool_registry() -> Arc<dyn ToolRegistry> {
+        let state = agent_tools::TodoState::in_memory().shared();
+        Arc::new(DefaultToolRegistry::new().with(Box::new(agent_tools::TodoTool::new(state))))
+    }
+
+    /// H28：模型在仍有未完成待办时停止 → 注入提醒并续跑，达上限后停止。
+    #[tokio::test]
+    async fn todo_reminder_continues_up_to_max() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        // 第 1 轮纯文本 → 提醒 #1；第 2 轮有工具调用（实质动作，解除静默）；
+        // 第 3 轮纯文本 → 提醒 #2；第 4 轮纯文本 → 达上限停止。
+        let tool_call = AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "t1".into(),
+                name: "todo".into(),
+                arguments: serde_json::json!({"op": "get"}),
+                signature: None,
+            }],
+            usage: Usage::default(),
+            model: "scripted-prov".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            stop_details: None,
+        };
+        let agent = loop_agent(
+            Arc::new(ScriptedProvider {
+                script: vec![
+                    text_stop_msg("先到这里"),
+                    tool_call,
+                    text_stop_msg("又停了"),
+                    text_stop_msg("仍然停"),
+                ],
+                calls: calls.clone(),
+            }),
+            todo_tool_registry(),
+            Some(stub_todo(vec![("写测试", "pending")], 1)),
+            TodoLoopConfig {
+                eager: TodoEager::Off,
+                reminders: true,
+                reminders_max: 2,
+                mid_run_nudge: false,
+            },
+            None,
+            Arc::clone(&ctx),
+        );
+        let mut reminders = 0usize;
+        let mut done = false;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Say(s) if s.text.contains("未完成待办提醒") => reminders += 1,
+                AgentEvent::Done(_) => done = true,
+                _ => {}
+            }
+        }
+        assert!(done, "最终应正常结束");
+        assert_eq!(reminders, 2, "同一提醒未获实质动作前静默，有动作后可再提醒");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "首轮 + 工具轮 + 2 次续跑 = 4 次 provider 调用"
+        );
+        // 提醒文本进入上下文（模型可见），且带计数。
+        let nodes = ctx.snapshot_nodes().await;
+        let injected = nodes
+            .iter()
+            .filter_map(|n| match &n.message {
+                AgentMessage::User(u) => Some(
+                    u.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            agent_core::UserContent::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .filter(|t| t.contains("未完成待办"))
+            .count();
+        assert_eq!(injected, 2, "两条提醒都应入上下文");
+    }
+
+    /// H28：无未完成待办 / 末轮向用户提问 → 不注入提醒。
+    #[tokio::test]
+    async fn todo_reminder_skips_clear_list_and_user_question() {
+        // 清单已清空 → 不提醒。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = loop_agent(
+            Arc::new(ScriptedProvider {
+                script: vec![text_stop_msg("完成")],
+                calls: calls.clone(),
+            }),
+            Arc::new(DefaultToolRegistry::new()),
+            Some(stub_todo(vec![("做完", "completed")], 0)),
+            TodoLoopConfig {
+                eager: TodoEager::Off,
+                reminders: true,
+                reminders_max: 3,
+                mid_run_nudge: false,
+            },
+            None,
+            Arc::new(InMemoryContext::new(vec![])),
+        );
+        let mut reminders = 0usize;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev
+                && s.text.contains("未完成待办提醒")
+            {
+                reminders += 1;
+            }
+        }
+        assert_eq!(reminders, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 末轮是向用户提问 → 视为等待输入，不打断。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = loop_agent(
+            Arc::new(ScriptedProvider {
+                script: vec![text_stop_msg("要继续吗？请确认后我再动手")],
+                calls: calls.clone(),
+            }),
+            Arc::new(DefaultToolRegistry::new()),
+            Some(stub_todo(vec![("写测试", "pending")], 1)),
+            TodoLoopConfig {
+                eager: TodoEager::Off,
+                reminders: true,
+                reminders_max: 3,
+                mid_run_nudge: false,
+            },
+            None,
+            Arc::new(InMemoryContext::new(vec![])),
+        );
+        let mut reminders = 0usize;
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev
+                && s.text.contains("未完成待办提醒")
+            {
+                reminders += 1;
+            }
+        }
+        assert_eq!(reminders, 0, "等待用户输入时不注入提醒");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// H28：eager prelude 仅在首轮注入一次；`always` 首轮强制 `tool_choice=todo`。
+    #[tokio::test]
+    async fn eager_todo_prelude_injects_once_and_forces_first_tool_choice() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let forced = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ctx: Arc<dyn ContextManager> = Arc::new(InMemoryContext::new(vec![]));
+        let agent = loop_agent(
+            Arc::new(ChoiceProvider {
+                calls: calls.clone(),
+                hard_todo: Arc::clone(&forced),
+            }),
+            todo_tool_registry(),
+            Some(stub_todo(vec![], 0)),
+            TodoLoopConfig {
+                eager: TodoEager::Always,
+                reminders: false,
+                reminders_max: 0,
+                mid_run_nudge: false,
+            },
+            None,
+            Arc::clone(&ctx),
+        );
+        // 第一次 run：注入 prelude + 首轮强制 todo。
+        let mut preludes = 0usize;
+        let stream = agent.run("实现 H28");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev
+                && s.text.contains("eager prelude")
+            {
+                preludes += 1;
+            }
+        }
+        assert_eq!(preludes, 1, "首轮应注入 eager prelude");
+        // 第二次 run：上下文已有用户消息 → 不再注入。
+        let stream = agent.run("继续");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            if let AgentEvent::Say(s) = &ev
+                && s.text.contains("eager prelude")
+            {
+                preludes += 1;
+            }
+        }
+        assert_eq!(preludes, 1, "第二个 run 不重复注入");
+        assert_eq!(
+            *forced.lock(),
+            vec![true, false],
+            "仅首轮请求强制 tool_choice=todo（第二 run 不强制）"
+        );
+    }
+
+    /// H40：`append_system_prompt` 注入到 system 段末尾（宿主最终覆盖指令可见）。
+    #[tokio::test]
+    async fn append_system_prompt_reaches_provider_system() {
+        let captured: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        struct SysProvider(Arc<parking_lot::Mutex<Vec<String>>>);
+        #[async_trait]
+        impl agent_core::LlmProvider for SysProvider {
+            fn id(&self) -> &'static str {
+                "sys-prov"
+            }
+            fn supports(&self) -> &[agent_core::Api] {
+                &[]
+            }
+            async fn stream(
+                &self,
+                req: agent_core::CompletionRequest,
+                _ctx: &agent_core::ProviderCallContext,
+            ) -> Result<agent_core::AssistantEventStream, agent_core::LlmError> {
+                self.0.lock().push(req.system.join("\n\n"));
+                Ok(Box::pin(futures::stream::iter(vec![
+                    AssistantEvent::MessageEnd(text_stop_msg("ok")),
+                ])))
+            }
+        }
+        let mut model = agent_core::Model::with_defaults(
+            "sys-prov",
+            "sys-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(SysProvider(Arc::clone(&captured))))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::new(InMemoryContext::new(vec![])))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .append_system_prompt("宿主追加指令：只用中文回答")
+            .build();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        let systems = captured.lock();
+        assert_eq!(systems.len(), 1);
+        assert!(
+            systems[0].contains("宿主追加指令：只用中文回答"),
+            "追加段应进入 system: {}",
+            systems[0]
+        );
+        // 位置：在基础 system prompt 之后（末尾）。
+        assert!(
+            systems[0]
+                .trim_end()
+                .ends_with("宿主追加指令：只用中文回答"),
+            "追加段应在末尾: {}",
+            systems[0]
+        );
+    }
+
+    /// H28 尾项：后台作业在途时不注入完成提醒（它们会经投递/hub 唤醒循环）。
+    #[tokio::test]
+    async fn todo_reminder_skipped_while_async_jobs_in_flight() {
+        struct Pending(bool);
+        impl agent_core::AsyncWakeProbe for Pending {
+            fn has_pending_async(&self) -> bool {
+                self.0
+            }
+        }
+        let run = |pending: bool| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut model = agent_core::Model::with_defaults(
+                "loop-prov",
+                "loop-prov",
+                agent_core::Api::OpenAiCompletions,
+            );
+            model.max_input_tokens = 200_000;
+            let agent = Agent::builder(model)
+                .provider(Arc::new(ScriptedProvider {
+                    script: vec![text_stop_msg("先到这里")],
+                    calls: Arc::clone(&calls),
+                }))
+                .tools(Arc::new(DefaultToolRegistry::new()))
+                .context(Arc::new(InMemoryContext::new(vec![])))
+                .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+                .approval(Arc::new(YoloApproval))
+                .workspace(Arc::new(Workspace::new(".")))
+                .todo_loop_source(stub_todo(vec![("写测试", "pending")], 1))
+                .todo_loop_config(TodoLoopConfig {
+                    eager: TodoEager::Off,
+                    reminders: true,
+                    reminders_max: 3,
+                    mid_run_nudge: false,
+                })
+                .async_wake(Arc::new(Pending(pending)))
+                .build();
+            (agent, calls)
+        };
+        let collect = async |agent: &Agent| {
+            let mut reminders = 0usize;
+            let stream = agent.run("go");
+            tokio::pin!(stream);
+            while let Some(ev) = stream.next().await {
+                if let AgentEvent::Say(s) = &ev
+                    && s.text.contains("未完成待办提醒")
+                {
+                    reminders += 1;
+                }
+            }
+            reminders
+        };
+        // 有在途作业 → 静默（等唤醒，不重复催办）。
+        let (agent, calls) = run(true);
+        assert_eq!(collect(&agent).await, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "不提醒即不续跑");
+        // 无在途作业 → 正常提醒并续跑。
+        let (agent, calls) = run(false);
+        assert_eq!(collect(&agent).await, 1);
+        assert!(calls.load(Ordering::SeqCst) >= 2, "提醒后应续跑");
+    }
+
+    /// H28 尾项：连续 12 次变更类工具调用且未触碰 todo → 注入中途对账提醒（上限 2）。
+    #[tokio::test]
+    async fn mid_run_nudge_fires_after_mutating_tools_without_todo_touch() {
+        struct WriteTool;
+        #[async_trait]
+        impl agent_tools::Tool for WriteTool {
+            fn name(&self) -> &'static str {
+                "write_file"
+            }
+            fn description(&self) -> &'static str {
+                "dummy write"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn capability(&self) -> agent_core::CapabilityTier {
+                agent_core::CapabilityTier::Write
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &agent_tools::ToolContext<'_>,
+            ) -> Result<agent_core::ToolResult, agent_core::ToolError> {
+                Ok(agent_core::ToolResult::text("ok"))
+            }
+        }
+        // 首轮一次模型调用里抛 12 个 write_file（同一轮就跨过阈值），随后停止。
+        let mut calls = Vec::new();
+        let mut content = Vec::new();
+        for i in 0..12 {
+            content.push(ContentBlock::ToolCall {
+                id: format!("w{i}"),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": format!("f{i}"), "content": "x"}),
+                signature: None,
+            });
+        }
+        calls.push(AssistantMessage {
+            content,
+            usage: Usage::default(),
+            model: "loop-prov".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            stop_details: None,
+        });
+        calls.push(text_stop_msg("干完了"));
+        let registry: Arc<dyn ToolRegistry> =
+            Arc::new(DefaultToolRegistry::new().with(Box::new(WriteTool)));
+        let run = |mid_run_nudge: bool| {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let mut model = agent_core::Model::with_defaults(
+                "loop-prov",
+                "loop-prov",
+                agent_core::Api::OpenAiCompletions,
+            );
+            model.max_input_tokens = 200_000;
+            let agent = Agent::builder(model)
+                .provider(Arc::new(ScriptedProvider {
+                    script: calls.clone(),
+                    calls: Arc::clone(&counter),
+                }))
+                .tools(Arc::clone(&registry))
+                .context(Arc::new(InMemoryContext::new(vec![])))
+                .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+                .approval(Arc::new(YoloApproval))
+                .workspace(Arc::new(Workspace::new(".")))
+                .todo_loop_source(stub_todo(vec![("写测试", "pending")], 1))
+                .todo_loop_config(TodoLoopConfig {
+                    eager: TodoEager::Off,
+                    reminders: false,
+                    reminders_max: 0,
+                    mid_run_nudge,
+                })
+                .build();
+            (agent, counter)
+        };
+        let collect = async |agent: &Agent| {
+            let mut nudges = 0usize;
+            let stream = agent.run("go");
+            tokio::pin!(stream);
+            while let Some(ev) = stream.next().await {
+                if let AgentEvent::Say(s) = &ev
+                    && s.text.contains("中途待办对账提醒")
+                {
+                    nudges += 1;
+                }
+            }
+            nudges
+        };
+        // 开启：一次 nudge（12 次变更后注入），诊断文案带计数。
+        let (agent, counter) = run(true);
+        assert_eq!(collect(&agent).await, 1);
+        assert!(counter.load(Ordering::SeqCst) >= 2, "注入后应继续下一轮");
+        // 关闭：不注入（本次 run 仍只有 1 次模型调用之后的收尾轮）。
+        let (agent, _) = run(false);
+        assert_eq!(collect(&agent).await, 0);
+    }
+
+    /// H29：目标活跃 → 停止边界注入续跑提示直至达到上限。
+    #[tokio::test]
+    async fn goal_continuation_runs_until_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let goal = Arc::new(std::sync::Mutex::new({
+            let mut g = GoalState::new(GoalBudget::unlimited());
+            g.create("把 H29 做完", None).unwrap();
+            g.max_continuations = 2;
+            g
+        }));
+        let agent = loop_agent(
+            Arc::new(ScriptedProvider {
+                script: vec![text_stop_msg("仍在推进")],
+                calls: calls.clone(),
+            }),
+            Arc::new(DefaultToolRegistry::new()),
+            None,
+            TodoLoopConfig::default(),
+            Some(Arc::clone(&goal)),
+            Arc::new(InMemoryContext::new(vec![])),
+        );
+        let mut continuations = 0usize;
+        let mut capped = false;
+        let stream = agent.run("开始");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::Say(s) if s.text.contains("目标续跑提示") => continuations += 1,
+                AgentEvent::Say(s) if s.text.contains("续跑达上限") => capped = true,
+                _ => {}
+            }
+        }
+        assert_eq!(continuations, 2, "续跑提示次数应等于 max_continuations");
+        assert!(capped, "达上限应明确停止原因");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "首轮 + 2 次续跑");
+        assert_eq!(goal.lock().unwrap().continuations, 2);
+    }
+
+    /// H29：模型经 `goal` 工具 complete 后不再续跑（目标状态机端到端）。
+    #[tokio::test]
+    async fn goal_complete_via_tool_stops_continuation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let goal = Arc::new(std::sync::Mutex::new({
+            let mut g = GoalState::new(GoalBudget::unlimited());
+            g.create("做完即停", None).unwrap();
+            g.max_continuations = 5;
+            g
+        }));
+        let tools: Arc<dyn ToolRegistry> =
+            Arc::new(DefaultToolRegistry::new().with(Box::new(GoalTool::new(Arc::clone(&goal)))));
+        let goal_call = AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "g1".into(),
+                name: "goal".into(),
+                arguments: serde_json::json!({"op": "complete"}),
+                signature: None,
+            }],
+            usage: Usage::default(),
+            model: "loop-prov".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            stop_details: None,
+        };
+        let agent = loop_agent(
+            Arc::new(ScriptedProvider {
+                script: vec![goal_call, text_stop_msg("已汇报")],
+                calls: calls.clone(),
+            }),
+            tools,
+            None,
+            TodoLoopConfig::default(),
+            Some(Arc::clone(&goal)),
+            Arc::new(InMemoryContext::new(vec![])),
+        );
+        let mut continuations = 0usize;
+        let mut goal_events: Vec<agent_core::SessionEvent> = Vec::new();
+        let mut event_status: Option<String> = None;
+        let stream = agent.run("开始");
+        tokio::pin!(stream);
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                AgentEvent::Say(s) if s.text.contains("目标续跑提示") => continuations += 1,
+                AgentEvent::Session(e) => goal_events.push(e.clone()),
+                _ => {}
+            }
+            // H29：结构化事件与展示文本必须成对（双通道同源）。
+            if let AgentEvent::Session(agent_core::SessionEvent::GoalUpdated { status, .. }) = &ev {
+                event_status = Some(status.clone());
+            }
+            if let AgentEvent::Say(s) = &ev
+                && s.text.contains("目标已更新")
+            {
+                assert_eq!(
+                    event_status.as_deref(),
+                    Some("complete"),
+                    "展示文本必须由结构化事件派生：{s:?}"
+                );
+            }
+        }
+        assert_eq!(continuations, 0, "complete 后不再续跑");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "工具轮 + 收尾轮");
+        assert_eq!(goal.lock().unwrap().status, GoalStatus::Complete);
+        // H29：状态变更发 `goal_updated`（objective + 续跑数 + 状态齐全）。
+        let updated = goal_events
+            .iter()
+            .find_map(|e| match e {
+                agent_core::SessionEvent::GoalUpdated {
+                    status,
+                    objective,
+                    continuations,
+                } => Some((status.clone(), objective.clone(), *continuations)),
+                _ => None,
+            })
+            .expect("应发出 goal_updated 会话事件");
+        assert_eq!(updated.0, "complete");
+        assert_eq!(updated.1.as_deref(), Some("做完即停"));
+    }
+
+    /// H29：用户中断 → 活跃目标转 paused（不静默丢弃目标）。
+    #[tokio::test]
+    async fn goal_pauses_on_cancel() {
+        let goal = Arc::new(std::sync::Mutex::new({
+            let mut g = GoalState::new(GoalBudget::unlimited());
+            g.create("会被中断", None).unwrap();
+            g
+        }));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut model = agent_core::Model::with_defaults(
+            "loop-prov",
+            "loop-prov",
+            agent_core::Api::OpenAiCompletions,
+        );
+        model.max_input_tokens = 200_000;
+        let agent = Agent::builder(model)
+            .provider(Arc::new(ScriptedProvider {
+                script: vec![text_stop_msg("never")],
+                calls: calls.clone(),
+            }))
+            .tools(Arc::new(DefaultToolRegistry::new()))
+            .context(Arc::new(InMemoryContext::new(vec![])))
+            .prompts(Arc::new(agent_prompt::PromptCatalog::new()))
+            .approval(Arc::new(YoloApproval))
+            .workspace(Arc::new(Workspace::new(".")))
+            .goals_state(Arc::clone(&goal))
+            .cancel(cancel)
+            .build();
+        let stream = agent.run("go");
+        tokio::pin!(stream);
+        while stream.next().await.is_some() {}
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "取消后不应调用 provider");
+        assert_eq!(goal.lock().unwrap().status, GoalStatus::Paused);
     }
 }

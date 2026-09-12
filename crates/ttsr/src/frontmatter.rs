@@ -103,7 +103,7 @@ fn parse_fields(fm: &str, out: &mut BTreeMap<String, Vec<String>>) {
         if let Some(items) = parse_inline_array(value) {
             out.entry(key).or_default().extend(items);
         } else {
-            out.entry(key).or_default().push(unquote(value).to_string());
+            out.entry(key).or_default().push(unquote(value));
         }
         i += 1;
     }
@@ -116,7 +116,7 @@ fn collect_block_items(lines: &[&str], i: &mut usize) -> Vec<String> {
     while j < lines.len() {
         let line = lines[j].trim();
         if let Some(rest) = line.strip_prefix('-') {
-            items.push(unquote(rest.trim()).to_string());
+            items.push(unquote(rest.trim()));
             j += 1;
         } else if line.is_empty() {
             j += 1;
@@ -138,31 +138,70 @@ fn parse_inline_array(value: &str) -> Option<Vec<String>> {
     if inner.trim().is_empty() {
         return Some(Vec::new());
     }
-    Some(
-        inner
-            .split(',')
-            .map(|s| unquote(s.trim()).to_string())
-            .collect(),
-    )
+    Some(inner.split(',').map(|s| unquote(s.trim())).collect())
 }
 
-/// 去除首尾配对的引号（单/双）。
-fn unquote(s: &str) -> &str {
+/// 去除首尾配对的引号（单/双）并按 YAML 语义解转义。
+///
+/// - 双引号：`\\` → `\`、`\"` → `"`、`\n`/`\t`/`\r` 转义为控制字符；
+///   未知转义（如正则里的 `\b`/`\d`）**原样保留**（宽松：宁可让正则看到反斜杠，
+///   也不吞字符）。omp 的规则文件普遍写成 `condition: "import\\("`，即 YAML
+///   双引号里的 `\\` 表示正则的反斜杠——不解转义会让正则编译失败（H44 内置规则集实测）。
+/// - 单引号：YAML 里 `''` 表示一个字面单引号，其余原样。
+fn unquote(s: &str) -> String {
     let t = s.trim();
     let bytes = t.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        &t[1..t.len() - 1]
-    } else {
-        t
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        return unescape_double_quoted(&t[1..t.len() - 1]);
     }
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        return t[1..t.len() - 1].replace("''", "'");
+    }
+    t.to_string()
+}
+
+/// YAML 双引号标量转义（未知转义原样保留）。
+fn unescape_double_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('/') => out.push('/'),
+            Some('0') => out.push('\0'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H44：YAML 双引号标量必须解转义（omp 内置规则写 `condition: "import\\("`）。
+    #[test]
+    fn double_quoted_scalars_unescape_yaml_escapes() {
+        let content =
+            "---\ncondition: \"import\\\\(\"\nother: \"\\\\bfoo\\\\b\"\nsingle: 'it''s'\n---\nbody";
+        let (fields, _) = parse_frontmatter(content);
+        assert_eq!(fields["condition"], vec!["import\\(".to_string()]);
+        // 未知转义（正则 `\b`）原样保留。
+        assert_eq!(fields["other"], vec!["\\bfoo\\b".to_string()]);
+        assert_eq!(fields["single"], vec!["it's".to_string()]);
+    }
 
     #[test]
     fn parses_scalar_and_array_fields() {

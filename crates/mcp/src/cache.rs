@@ -1,19 +1,33 @@
-//! MCP 工具清单磁盘缓存：server 连接失败时回填上一次成功拉取的工具列表。
+//! MCP 工具清单磁盘缓存：连接成功时快照，启动预算内未完成握手的 server 用快照
+//! 立即注册 Deferred 工具（元信息可见 + 连接就绪后可执行）。
 //!
 //! 布局：`<cache_dir>/mcp-cache/<server>.json`。写入走「临时文件 + 原子 rename」，
 //! 读取对缺失/畸形内容容错（→ [`None`]），保证消费方永不因缓存损坏而失败。
 //! 缓存纯 best-effort：任何读写失败都不影响 MCP 主流程。
 //!
-//! 装配见 [`crate::registry`]（连接成功快照 / 失败回填）。
+//! 适用性（[`load_applicable`]，对齐 omp `tool-cache.ts`）：版本 + 配置指纹
+//! （[`config_fingerprint`]）+ TTL（[`CACHE_TTL_MS`]）三者全中才算可用——配置改了
+//! 或快照过期的清单不再回填（否则会把早已不存在的工具摆给模型）。
+//!
+//! 装配见 [`crate::tool`]（注册表读写缓存，调用方无需自行落盘）。
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use agent_config::{McpHttpTransport, McpServerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::tool::fnv1a_base36;
+
 /// 缓存子目录名（位于 `<cache_dir>` 下）。
 const CACHE_SUBDIR: &str = "mcp-cache";
+
+/// 缓存格式版本（字段或指纹语义变更即 +1；版本不符的旧缓存视为不可用）。
+pub const CACHE_VERSION: u32 = 1;
+
+/// 缓存有效期（30 天，对齐 omp `CACHE_TTL_MS`）。
+pub const CACHE_TTL_MS: u128 = 30 * 24 * 60 * 60 * 1000;
 
 /// 单个缓存工具的元信息（对标 `tools/list` 返回的 name / description / inputSchema）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,8 +48,71 @@ pub struct CachedTools {
     pub server: String,
     /// 缓存的工具列表。
     pub tools: Vec<CachedTool>,
-    /// 快照时间（Unix 毫秒；用于装配层标注 stale）。
+    /// 快照时间（Unix 毫秒；同时用于 TTL 判定与展示）。
     pub cached_at_ms: u128,
+    /// 写入时的配置指纹（[`config_fingerprint`]）；与当前配置不符即失效。
+    /// 缺省空串：旧格式缓存（无此字段）一律视为不可用。
+    #[serde(default)]
+    pub config_hash: String,
+    /// 写入时的缓存格式版本（[`CACHE_VERSION`]）；不符即失效。
+    #[serde(default)]
+    pub version: u32,
+}
+
+/// 配置指纹：按固定序拼接影响工具清单的字段后取 FNV-1a 64 → base36（跨进程稳定）。
+///
+/// 只覆盖语义字段（传输类型 / 端点 / 命令与参数 / 环境 / 额外头 / OAuth 授权面）：
+/// `timeout_ms` 等不影响清单内容的可调项不参与——调超时不应让缓存失效。
+/// 手动拼接（而非序列化整个配置）是刻意的：指纹必须只随语义变化，不随 JSON
+/// 书写风格或字段新增而漂移。
+#[must_use]
+pub fn config_fingerprint(cfg: &McpServerConfig) -> String {
+    /// 有序 map 的 `k=v` 拼接（键排序，保证同内容同指纹）。
+    fn push_sorted_map(out: &mut String, map: &std::collections::HashMap<String, String>) {
+        let mut entries: Vec<(&String, &String)> = map.iter().collect();
+        entries.sort();
+        for (k, v) in entries {
+            out.push('\x1f');
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+        }
+    }
+    let mut s = String::new();
+    match cfg {
+        McpServerConfig::Stdio(c) => {
+            s.push_str("stdio");
+            s.push('\x1f');
+            s.push_str(&c.command);
+            for a in &c.args {
+                s.push('\x1f');
+                s.push_str(a);
+            }
+            push_sorted_map(&mut s, &c.env);
+        }
+        McpServerConfig::Http(c) => {
+            s.push_str(match c.transport {
+                McpHttpTransport::Streamable => "http",
+                McpHttpTransport::Sse => "sse",
+            });
+            s.push('\x1f');
+            s.push_str(&c.url);
+            push_sorted_map(&mut s, &c.headers);
+            if let Some(o) = &c.oauth {
+                s.push('\x1f');
+                s.push_str(o.client_id.as_deref().unwrap_or(""));
+                s.push('\x1f');
+                s.push_str(o.client_secret.as_deref().unwrap_or(""));
+                s.push('\x1f');
+                s.push_str(o.scope.as_deref().unwrap_or(""));
+                s.push('\x1f');
+                s.push_str(o.redirect_uri.as_deref().unwrap_or(""));
+                s.push('\x1f');
+                s.push_str(o.resource.as_deref().unwrap_or(""));
+            }
+        }
+    }
+    fnv1a_base36(&s)
 }
 
 /// server 名可安全用作缓存文件名：非空、非 `.`/`..`、不含路径分隔符与 NUL
@@ -49,8 +126,9 @@ fn cache_path(cache_dir: &Path, server: &str) -> PathBuf {
     cache_dir.join(CACHE_SUBDIR).join(format!("{server}.json"))
 }
 
-/// 当前 Unix 时间（毫秒）。时钟早于 epoch 时返回 0（仅影响 stale 展示，不影响功能）。
-pub(crate) fn now_ms() -> u128 {
+/// 当前 Unix 时间（毫秒）。时钟早于 epoch 时返回 0（仅影响 TTL 判定与展示，不影响功能）。
+#[must_use]
+pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -80,6 +158,36 @@ pub fn load(cache_dir: &Path, server: &str) -> Option<CachedTools> {
             None
         }
     }
+}
+
+/// 读取 server 的缓存快照并校验适用性：版本 + 配置指纹 + TTL 任一不符即 [`None`]
+/// （记 `debug!` 说明原因）。返回的快照可直接用于注册 Deferred 工具。
+#[must_use]
+pub fn load_applicable(
+    cache_dir: &Path,
+    server: &str,
+    cfg: &McpServerConfig,
+) -> Option<CachedTools> {
+    let cached = load(cache_dir, server)?;
+    if cached.version != CACHE_VERSION {
+        tracing::debug!(
+            server,
+            version = cached.version,
+            "MCP 工具缓存版本不符，忽略"
+        );
+        return None;
+    }
+    let expected = config_fingerprint(cfg);
+    if cached.config_hash != expected {
+        tracing::debug!(server, "MCP server 配置已变更，工具缓存失效");
+        return None;
+    }
+    let age = now_ms().saturating_sub(cached.cached_at_ms);
+    if age > CACHE_TTL_MS {
+        tracing::debug!(server, age_ms = age, "MCP 工具缓存超过 TTL，忽略");
+        return None;
+    }
+    Some(cached)
 }
 
 /// `read_to_string` 的容错包装：任何 I/O 错误（含缺失）都视为无缓存。
@@ -172,22 +280,33 @@ mod tests {
         std::env::temp_dir().join(format!("gyre-mcp-cache-{tag}-{n}"))
     }
 
+    fn stdio_cfg(command: &str) -> McpServerConfig {
+        McpServerConfig::Stdio(agent_config::McpStdioConfig {
+            command: command.to_string(),
+            args: vec![],
+            env: Default::default(),
+            timeout_ms: None,
+        })
+    }
+
     fn sample(server: &str) -> CachedTools {
         CachedTools {
             server: server.to_string(),
             tools: vec![
                 CachedTool {
-                    name: format!("mcp__{server}_echo"),
+                    name: "echo".to_string(),
                     description: "回声".to_string(),
                     input_schema: json!({"type": "object", "properties": {}}),
                 },
                 CachedTool {
-                    name: format!("mcp__{server}_fetch"),
+                    name: "fetch".to_string(),
                     description: "抓取".to_string(),
                     input_schema: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
                 },
             ],
-            cached_at_ms: 1_700_000_000_000,
+            cached_at_ms: now_ms(),
+            config_hash: config_fingerprint(&stdio_cfg("npx")),
+            version: CACHE_VERSION,
         }
     }
 
@@ -274,5 +393,124 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "缓存文件应为 0600，实际 {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 适用性三闸门：配置指纹变、版本变、超 TTL 都不得把快照当成可用元信息。
+    #[test]
+    fn applicable_requires_matching_hash_version_and_ttl() {
+        let dir = tmp_dir("applicable");
+        let cfg = stdio_cfg("npx");
+        store(&dir, &sample("srv")).unwrap();
+        assert!(
+            load_applicable(&dir, "srv", &cfg).is_some(),
+            "配置未变故且未超期 → 可用"
+        );
+
+        // 1) 配置变了（换命令）→ 指纹不符 → 不可用。
+        assert!(
+            load_applicable(&dir, "srv", &stdio_cfg("uvx")).is_none(),
+            "配置变更后旧快照必须失效"
+        );
+
+        // 2) 版本不符 → 不可用。
+        let mut c = sample("srv");
+        c.version = CACHE_VERSION + 1;
+        store(&dir, &c).unwrap();
+        assert!(
+            load_applicable(&dir, "srv", &cfg).is_none(),
+            "版本不符必须失效"
+        );
+
+        // 3) 超过 TTL → 不可用。
+        let mut c = sample("srv");
+        c.cached_at_ms = now_ms().saturating_sub(CACHE_TTL_MS + 1);
+        store(&dir, &c).unwrap();
+        assert!(
+            load_applicable(&dir, "srv", &cfg).is_none(),
+            "超期快照必须失效"
+        );
+
+        // 4) 旧格式（无版本/指纹字段）落盘 → 一律不可用。
+        let cache_dir = dir.join("mcp-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("legacy.json"),
+            serde_json::to_string(&json!({
+                "server": "legacy",
+                "tools": [],
+                "cached_at_ms": now_ms()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_applicable(&dir, "legacy", &cfg).is_none(),
+            "旧格式缓存必须失效（缺指纹与版本）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 指纹只随语义字段变化：调超时不失效，换端点/参数/环境/授权面即失效。
+    #[test]
+    fn fingerprint_tracks_semantics_only() {
+        let base = stdio_cfg("npx");
+        assert_eq!(
+            config_fingerprint(&base),
+            config_fingerprint(&base),
+            "同配置指纹稳定"
+        );
+
+        let mut timeout_only = stdio_cfg("npx");
+        if let McpServerConfig::Stdio(c) = &mut timeout_only {
+            c.timeout_ms = Some(5_000);
+        }
+        assert_eq!(
+            config_fingerprint(&base),
+            config_fingerprint(&timeout_only),
+            "超时不影响工具清单，不应让缓存失效"
+        );
+
+        let mut other_args = stdio_cfg("npx");
+        if let McpServerConfig::Stdio(c) = &mut other_args {
+            c.args = vec!["-y".to_string(), "server-filesystem".to_string()];
+        }
+        assert_ne!(
+            config_fingerprint(&base),
+            config_fingerprint(&other_args),
+            "参数变化必须换指纹"
+        );
+
+        let mut env_a = stdio_cfg("npx");
+        let mut env_b = stdio_cfg("npx");
+        if let McpServerConfig::Stdio(c) = &mut env_a {
+            c.env.insert("A".into(), "1".into());
+            c.env.insert("B".into(), "2".into());
+        }
+        if let McpServerConfig::Stdio(c) = &mut env_b {
+            c.env.insert("B".into(), "2".into());
+            c.env.insert("A".into(), "1".into());
+        }
+        assert_eq!(
+            config_fingerprint(&env_a),
+            config_fingerprint(&env_b),
+            "环境变量插入顺序不影响指纹"
+        );
+
+        let http = McpServerConfig::Http(agent_config::McpHttpConfig {
+            url: "http://127.0.0.1:3000/mcp".to_string(),
+            headers: Default::default(),
+            timeout_ms: None,
+            oauth: None,
+            transport: McpHttpTransport::Streamable,
+        });
+        let mut sse = http.clone();
+        if let McpServerConfig::Http(c) = &mut sse {
+            c.transport = McpHttpTransport::Sse;
+        }
+        assert_ne!(
+            config_fingerprint(&http),
+            config_fingerprint(&sse),
+            "传输模式变化必须换指纹"
+        );
     }
 }

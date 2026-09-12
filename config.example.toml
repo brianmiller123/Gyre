@@ -1,5 +1,10 @@
 # 复制本文件为 .agent/config.toml（项目级）或 ~/.config/agent/config.toml（用户级）
 # 项目级覆盖用户级（深度合并）。
+#
+# 环境变量：${VAR} / ${VAR:-default}（POSIX :- 语义：未设置或为空时取默认值）。
+# 另外会自动加载 .env（优先级：$GYRE_ENV_FILE > <cwd>/.env > <cwd>/.agent/.env >
+# <config_dir>/.env > $HOME/.env；同名键先到先得，真实 shell 环境变量永远优先）。
+# 关闭：GYRE_DOTENV=off。
 
 # 界面语言（CLI 与 Web）：en / zh / ru / ja。省略则自动跟随系统语言
 # （CLI 读 LANG/LC_*；Web 读 navigator.languages）。新增语言见 crates/i18n/locales。
@@ -16,8 +21,13 @@ api              = "openai-completions"   # 决定 Provider 路由
 base_url         = "https://api.openai.com/v1"
 api_key          = "${OPENAI_API_KEY}"     # 支持 ${ENV} 展开，永不进日志
 temperature      = 0.2
-max_input_tokens  = 128000                 # 上下文窗口大小，达 context_window_guard% 触发压缩；留空回退 128000
+max_input_tokens  = 128000                 # 上下文窗口大小，达 context_window_guard% 触发压缩；
+                                           # 留空时按内置模型目录（H25，`agent models catalog`）补缺，未收录模型回退 128000
 max_output_tokens = 4096
+# tokenizer 家族（H26，可选）：o200k | cl100k | heuristic[:chars_per_token]
+# 缺省按模型 id 推断；非 OpenAI provider 建议用近似比（CJK 语料约 1.5，英文约 4），
+# 让上下文压缩触发更贴近真实分词密度。
+# tokenizer = "heuristic:1.5"
 
 # 额外模型 profile，运行时 `agent --model ds` 切换
 [[models]]
@@ -45,6 +55,31 @@ api_key   = "ollama"            # Ollama 不校验，任意非空即可
 # base_url  = "http://localhost:8000/v1"
 # api_key   = "EMPTY"
 # extra_body = { chat_template_kwargs = { thinking = true } }
+#
+# 自定义请求头（H24）：同名头覆盖内置鉴权头；值支持 ${ENV} 展开。
+# [default_model.headers]
+# "HTTP-Referer" = "https://my.app"      # OpenRouter 归因
+# "X-Api-Version" = "2024-10-01"
+# Authorization = "Bearer ${MY_TOKEN}"   # 网关的非标准鉴权方案
+#
+# 兼容开关（H24）：仅当网关明确拒绝某参数时开启（默认全关 = 标准 wire）。
+# [default_model.quirks]
+# omit_stream_options = true   # 不认 stream_options 的网关
+# omit_temperature   = true    # 拒绝 temperature 的推理模型
+# omit_tool_choice   = true    # 拒绝 tool_choice 的网关
+# omit_reasoning     = true    # 拒绝 reasoning_effort 的网关
+# max_tokens_field   = "max_completion_tokens"  # 只认 max_completion_tokens 的网关
+#
+# 鉴权模式（H24）：api_key（默认，分层解析）| none（不发鉴权头）| oauth（只认 OAuth 令牌）
+# auth = "none"     # 本地 vLLM / Ollama / 免鉴权网关
+#
+# omp 风格 compat 段（H24）：与 quirks 取并集；字段名沿用 oh-my-pi 的 camelCase。
+# 仅收录 Gyre 实际生效的旗标（未收录的 omp 旗标会被忽略，并在 `agent config check` 中提示）。
+# [default_model.compat]
+# supportsUsageInStreaming = false   # → 省略 stream_options
+# supportsToolChoice      = false    # → 省略 tool_choice
+# supportsReasoningEffort = false    # → 省略 reasoning_effort
+# maxTokensField          = "max_completion_tokens"
 
 # OpenRouter（单 key 访问 200+ 模型，走 OpenAI 兼容）
 [[models]]
@@ -73,10 +108,38 @@ mode                 = "code"            # code | architect | ask | debug（code
 approval_mode        = "always-ask"      # always-ask | write | yolo。yolo 为判定链最高优先级，压过所有 ask/prompt（仅留 deny 黑名单）
 max_mistakes         = 3
 context_window_guard = 0.8               # token 占用达 80% 触发压缩
+# H26 自动压缩触发策略（三级优先：绝对阈值 > 预留余量 > 百分比 context_window_guard）：
+# compaction_threshold_tokens = 180000    # 绝对 token 阈值（最高优先级，钳到 [1, 窗口-1]）
+# compaction_reserve_tokens   = 20000     # 预留余量：阈值 = 窗口 - 余量；余量 ≥ 窗口时按 15% 兜底
 # 思考模式（reasoning/thinking）
 enable_thinking      = false             # 启用后由支持思考的模型消费（如 deepseek-reasoner）
 reasoning_budget     = 16000             # 思考 token 预算（可选）
 max_turns            = 10000             # agent 最大循环次数（默认 1000；0 = 不限制）
+# H40：追加到 system prompt 末尾的定制文本（也可用 --append-system-prompt，flag 优先）。
+# CLI flag 取值「含换行 = 字面文本，否则先当文件路径读取」；此处为字面文本。
+# append_system_prompt = "始终用中文回答，并在回答末尾列出未验证的假设。"
+
+# H3 异步后台执行（对齐 oh-my-pi `async.enabled` / `async.maxJobs`）：
+# run_command 的 `async: true` 参数把命令放入后台作业（立即返回作业 id），
+# 完成结果自动投回会话；hub 的 jobs / wait ids / cancel 可查询/等待/取消。
+# async_max_jobs 为运行中上限（排队态不占槽位；达上限时后台请求被拒绝）。
+async_enabled        = true
+async_max_jobs       = 15
+
+# H5 流式守卫（对齐 oh-my-pi stream-guards / auto-generated-guard，全部默认启用）：
+# - block_auto_generated：apply_hashline 命中生成文件（zz_generated.* / *.pb.go /
+#   *_pb2.py / @generated 头注释等）即流中提前中断 + 执行前拦截。
+# - edit_parse_guard：apply_hashline 流式结束时试解析，语法必败即中断本轮让模型修正。
+# - tool_loop_guard / tool_loop_threshold / tool_loop_exempt_tools：跨轮同参工具循环
+#   检测（连续 N 次参数等价的单工具调用即注入重定向；hub 默认豁免）。
+# - gemini_header_guard：Gemini 系模型思考标题连跑 ≥24 行即中断并注入工具提醒。
+#[agent.stream_guards]
+# block_auto_generated   = true
+# edit_parse_guard       = true
+# tool_loop_guard        = true
+# tool_loop_threshold    = 5
+# tool_loop_exempt_tools = ["hub"]
+# gemini_header_guard    = true
 
 # 逐工具审批覆盖（优先于 write/always-ask 模式与能力分级；yolo 模式会压过这里的 ask/prompt，
 # 仅 deny 仍生效）。code/debug 模式下写类（write_file / str_replace / apply_diff 等）默认已自动
@@ -159,6 +222,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 [mcp.servers.remote]
 url = "http://127.0.0.1:3000/mcp"
 timeout_ms = 30000   # 单请求超时（毫秒）；0 = 不限制，缺省 30000
+# 传输模式 `type`：`"http"`（默认，Streamable HTTP）或 `"sse"`（2024-11-05 规范前的
+# legacy HTTP+SSE 存量 server，对齐 oh-my-pi）；`transport = ...` 为等价别名。
+# type = "sse"
 [mcp.servers.remote.headers]
 Authorization = "Bearer ${MCP_TOKEN}"
 
@@ -174,8 +240,24 @@ Authorization = "Bearer ${MCP_TOKEN}"
 # prompt = ""                # `""` 强制省略；缺省仅 offline_access 时补 consent
 # resource = "https://..."   # RFC 8707 资源指示（缺省自动发现，兜底 server URL）
 
+# 外部 MCP 配置源（Claude/Cursor 风格 JSON，对齐 oh-my-pi discovery）：
+#   user    <config_dir>/agent/mcp.json
+#   project <cwd>/.agent/mcp.json → <cwd>/mcp.json → <cwd>/.mcp.json（后者优先）
+# 形状：{ "mcpServers": { "<name>": { "command": ..., "args": [...], "env": {...} }
+#                        | { "url": ..., "headers": {...}, "type": "http"|"sse" } },
+#        "disabledServers": ["<name>", ...] }
+# 同名冲突时上面的 [mcp.servers] 条目胜出；disabledServers 与每 server 的
+# "enabled": false 一律剔除（拒绝名单压过一切来源）。
+# 增删与启停：`agent mcp add|remove|enable|disable|list|status`（REPL 内为
+# `/mcp add|remove|enable|disable|list|status`）；`--project` 写项目级文件，
+# 缺省写 user 级。启动预算（250ms）外未完成握手的 server 转后台连接：有上次
+# 成功清单快照（版本 + 配置指纹 + 30 天 TTL 全中）时先以「延迟连接」工具注册。
+
 # 跨会话长期记忆（按 cwd 项目作用域；启动注入摘要 + 后端按需合并）
 [memory]
+# H30 合并执行方式：false（默认）= 停止边界内联等待 LLM 沉淀；
+# true = 放入后台任务（停止边界不被阻塞），并发由租约互斥。
+# background_consolidate = true
 enabled = false          # 默认关；启用后跨会话积累技术决策/惯例/已踩坑
 # 后端：local（默认，MEMORY.md + notes.jsonl + LLM 合并）|
 #       structured（records.jsonl + 向量融合检索；L2 语义嵌入需以 --features vec-embed 编译，
@@ -202,7 +284,7 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 # lsp      = true    # 诊断/定义/引用/重命名（需工作区可发现语言服务器）
 # image    = true    # read_image / image_gen（后者需 IMAGE_API_KEY/OPENAI_API_KEY）
 # hashline = false   # 关闭 apply_hashline（默认启用：行锚定批量编辑，多文件多区间）
-# pty      = true    # run_pty_command（TTY 依赖命令：top/vim/交互式 REPL）
+# pty      = true    # run_pty_command 工具 + run_command 的 `pty:true`（TTY 依赖命令）
 # debug    = true    # debug 工具（DAP 调试器：自动探测 lldb-dap/dlv/debugpy，14 动作）
 # ssh      = true    # ssh 工具（解析 ~/.ssh/config，远程命令执行；BatchMode 非交互）
 # browser  = true    # browser 工具（CDP 驱动 chromium：navigate/evaluate/screenshot/click/text/scroll）
@@ -211,7 +293,9 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 # 控制 task 工具开关、并发护栏、是否继承父 temperature/thinking、独立 token 预算。
 [ttsr]
 # enabled = true          # 缺省：存在规则即启用；false 关闭
-# disabled_rules = ["no-box-leak"]   # 按规则名禁用
+# disabled_rules = ["no-box-leak"]   # 按规则名禁用（对内置规则同样生效）
+# builtin_rules = true    # 随二进制的 27 条内置规则（Go/Rust/TS 约定，只提醒不打断）；
+#                         # false 时只加载 .gyre/rules/*.md 中的规则
 
 # goals 目标预算：累计记账（input + cache_write + output）与墙钟超限后注入提醒/硬停。
 # 软模式（默认）超限后在停止边界注入提醒并续跑一轮，模型自行收尾；硬模式直接停止。
@@ -219,6 +303,25 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 # token_budget = 200000    # 累计 token 上限（0 = 不限）
 # time_budget_secs = 1800  # 墙钟上限（秒，0 = 不限）
 # hard_stop = false        # 超限硬停（true 停止；false 注入提醒后继续）
+
+# todo 循环（H28）：eager prelude 与完成提醒续跑。
+# eager = "off"（默认，不注入）| "preferred"（首轮提醒先规划）| "always"（提醒并强制首轮先调用 todo）
+# reminders = true（默认）：模型在仍有未完成待办时停止 → 注入提醒并续跑
+# reminders_max = 3：单轮 prompt 内提醒次数上限（0 = 不限）
+[todo]
+# eager = "preferred"
+# reminders = false
+# reminders_max = 5
+# mid_run_nudge = true   # 连续 12 次变更类工具调用未触碰 todo 时，中途提醒对账（每次 run 上限 2）
+
+# H5 键位覆盖（可选）：键为动作名（/hotkeys 可见），值为键位（ctrl-y / alt-enter / f5 …）。
+# 未知动作或非法键位只告警并忽略（非法值回退默认键）。可绑定动作：
+#   app.interrupt / app.clear / app.exit / app.history.search / app.complete
+#   app.message.dequeue / app.retry / app.session.new / app.command.queueList / app.command.settings
+# [keybindings]
+# "app.message.dequeue" = "alt-d"
+# "app.clear" = "f5"
+# "app.retry" = "ctrl-t"
 
 # [compaction]
 # backend       = "summarize"  # summarize（本地 LLM handoff 摘要，默认）| snapcompact（本地 PNG 帧渲染，要求视觉模型）
@@ -233,6 +336,8 @@ allow_write = false   # 另允许 create_pr/merge_pr/comment（提升至更高�
 # python = "python3"        # 解释器路径
 # idle_timeout_secs = 300   # 内核空闲回收（秒）
 [subagent]
+# H41 名册容量：子代理在册上限（0 = 不限；不含父 agent）。达上限后 task 在派生前拒绝。
+# max_registry = 8
 enabled            = true      # 总开关：false 则不注册 task 工具，且 /swarm 拒绝执行
 max_concurrent     = 4         # 同波/并行子 Agent 最大并发数（信号量护栏，防触发上游速率限制）
 inherit_parent     = true      # 子 Agent 是否继承父 temperature / thinking（消除「父思考、子不思考」割裂）

@@ -13,6 +13,10 @@ agent-advisor = { workspace = true }
 agent-iso    = { workspace = true }
 agent-supervisor = { workspace = true }
 agent-tools  = { workspace = true }
+agent-hashline = { workspace = true }
+agent-config = { workspace = true }
+thiserror.workspace = true
+dirs = "6"
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }
 # P2：snapcompact 帧数预算常量（DEFAULT_MAX_FRAMES）。
@@ -23,6 +27,7 @@ futures      = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 serde_json   = { workspace = true }
+serde        = { workspace = true }
 tracing      = { workspace = true }
 # Harmony 泄漏检测（多信号正则融合）+ 审计摘要（GPT-5/Codex）
 regex        = { workspace = true }
@@ -35,6 +40,8 @@ agent-context = { workspace = true }
 parking_lot = "0.12"
 # 基准门：TTSR 匹配延迟基准（benches/ttsr.rs）
 criterion = { workspace = true }
+# 目标持久化测试用临时目录。
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

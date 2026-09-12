@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Agent Client Protocol (ACP) server: standard protocol for agent runtime ↔ client communication"
 
 [dependencies]
+agent-context = { workspace = true }
 agent-core   = { workspace = true }
 agent-server = { workspace = true }
 tokio        = { workspace = true }

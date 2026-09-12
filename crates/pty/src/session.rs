@@ -223,20 +223,44 @@ impl PtyShell {
             poisoned: Arc::new(AtomicBool::new(false)),
         };
 
-        // 初始化：关回声 + 同步点
-        let init = "stty -echo 2>/dev/null\nprintf '\\n__AGENT_PTY_READY_0_\\n'\n";
+        // 初始化：关回声 + 清提示符（避免交互式 shell 的 PS1 污染输出）+ 同步点。
+        let init = "stty -echo 2>/dev/null\nPS1=''\nPROMPT_COMMAND=''\nprintf '\\n__AGENT_PTY_READY_0_\\n'\n";
         {
             let mut w = shell.writer.lock().await;
             w.write_all(init.as_bytes())?;
             w.flush()?;
         }
-        shell.read_until_marker("__AGENT_PTY_READY_0_").await?;
+        let _ = shell.read_until_marker("__AGENT_PTY_READY_0_").await?;
 
         Ok(shell)
     }
 
     /// 执行一条命令，返回输出与退出码（跨命令保持状态）。
+    ///
+    /// # Errors
+    /// 会话失效或底层读写失败。
     pub async fn run(&self, command: &str) -> Result<PtyResult, io::Error> {
+        self.run_with_timeout(command, None).await
+    }
+
+    /// 会话是否已失效（此前命令超时被杀，需重建）。
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// [`PtyShell::run`] 的显式超时变体（`None` = 默认 [`PTY_RUN_TIMEOUT`]）。
+    ///
+    /// 超时即杀掉持久 shell 并置失效标记（fail-closed）——调用方应丢弃本会话并重建，
+    /// 而不是继续复用（reader 锁可能仍被阻塞读持有）。
+    ///
+    /// # Errors
+    /// 会话失效或底层读写失败。
+    pub async fn run_with_timeout(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> Result<PtyResult, io::Error> {
         // 失效会话不可复用：此前命令超时杀 shell 后 reader 锁可能仍被旧阻塞读持有，
         // 继续调用将死锁——直接 fail-fast。
         if self.poisoned.load(Ordering::SeqCst) {
@@ -254,8 +278,11 @@ impl PtyShell {
         }
         // 墙钟超时：防止交互式命令（vim/top/挂起）永久阻塞读线程。
         // 超时即杀掉持久 shell（fail-closed），会话随后不可复用，需新建 PtyShell。
-        let (cleaned, exit) = if let Ok(res) =
-            tokio::time::timeout(PTY_RUN_TIMEOUT, self.read_until_marker(&marker)).await
+        let (cleaned, mut exit, found) = if let Ok(res) = tokio::time::timeout(
+            timeout.unwrap_or(PTY_RUN_TIMEOUT),
+            self.read_until_marker(&marker),
+        )
+        .await
         {
             res?
         } else {
@@ -270,6 +297,15 @@ impl PtyShell {
                 timed_out: true,
             });
         };
+        if !found {
+            // 未读到 marker：两种可能——
+            // (a) shell 已退出（`exit N`）：PTY master 读到 EOF，此时向子进程回收真实退出码；
+            // (b) 输出超过 PTY_MAX_OUTPUT 上限：shell 仍活着但流已失步（残余输出会被下一条
+            //     命令误读为自己的输出）。
+            // 两者都必须置失效（fail-closed），区别仅在 (a) 能报出真实退出码。
+            exit = self.reap_exit_code().or(exit);
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
         Ok(PtyResult {
             output: normalize_output(&cleaned),
             exit_code: exit,
@@ -277,19 +313,50 @@ impl PtyShell {
         })
     }
 
-    /// 读到 marker 出现即返回（不等到 EOF）；返回 (正文, 退出码)。
-    async fn read_until_marker(&self, marker: &str) -> Result<(String, Option<i32>), io::Error> {
+    /// 回收持久 shell 子进程的退出码（仅在已读到 EOF 时调用）。
+    ///
+    /// EOF 表示 slave 端已关闭，但子进程可能尚未被 wait 到，故做有界重试（约 100ms）。
+    fn reap_exit_code(&self) -> Option<i32> {
+        let mut child = self._child.lock().ok()?;
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status.exit_code() as i32),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    tracing::warn!(target: "pty", "回收持久 shell 退出码失败: {e}");
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// 读到 marker 出现即返回（不等到 EOF）；返回 `(正文, 退出码, 是否命中 marker)`。
+    ///
+    /// `found == false` 意味着在读到 marker 前就退出循环（EOF 或输出超限），调用方必须据此
+    /// 判定会话失效，见 [`PtyShell::run_with_timeout`]。
+    async fn read_until_marker(
+        &self,
+        marker: &str,
+    ) -> Result<(String, Option<i32>, bool), io::Error> {
         let reader = Arc::clone(&self.reader);
         let marker_owned = marker.to_string();
         let bytes = tokio::task::spawn_blocking(move || {
             // 字节级滑动窗口搜索：仅在「新增区段 + marker 长度重叠」内查找，
             // 复杂度 O(总字节 × marker 长度)，避免旧实现对整段 acc 反复 from_utf8_lossy +
             // contains 的 O(n²) 退化（大输出时 CPU 打满、耗时数十秒）。
-            let m = marker_owned.as_bytes();
+            // 匹配「行首 marker」（`\n` + marker）：真实 marker 前有 printf 输出的换行，
+            // 而**回显的命令行**里 marker 前缀只会出现在 `printf '\n<marker>...` 中间，
+            // 前面是空格而非换行——按行首匹配即可避免把回显误判为完成（持久 shell 的
+            // `stty -echo` 在某些 shell/终端组合下不生效，必须对回显免疫）。
+            let mut m = Vec::with_capacity(marker_owned.len() + 1);
+            m.push(b'\n');
+            m.extend_from_slice(marker_owned.as_bytes());
             let mlen = m.len();
             let mut acc: Vec<u8> = Vec::new();
             let mut tmp = [0u8; 4096];
             let mut r = reader.blocking_lock();
+            let mut found = false;
             loop {
                 let prev_len = acc.len();
                 match r.read(&mut tmp) {
@@ -302,8 +369,9 @@ impl PtyShell {
                             let start = prev_len.saturating_sub(mlen.saturating_sub(1));
                             let end = acc.len().saturating_sub(mlen);
                             // start > end 时 range 为空，.any() 返回 false（安全）。
-                            let found = (start..=end).any(|i| &acc[i..i + mlen] == m);
-                            if found || acc.len() >= PTY_MAX_OUTPUT {
+                            let hit = (start..=end).any(|i| acc[i..i + mlen] == m[..]);
+                            if hit || acc.len() >= PTY_MAX_OUTPUT {
+                                found = hit;
                                 break;
                             }
                         } else if acc.len() >= PTY_MAX_OUTPUT {
@@ -317,14 +385,15 @@ impl PtyShell {
                     }
                 }
             }
-            acc
+            (acc, found)
         })
         .await
         .map_err(|e| io::Error::other(format!("read join: {e}")))?;
 
+        let (bytes, found) = bytes;
         let raw = String::from_utf8_lossy(&bytes);
         let (cleaned, exit) = strip_marker(&raw, marker);
-        Ok((cleaned, exit))
+        Ok((cleaned, exit, found))
     }
 }
 
@@ -500,6 +569,21 @@ mod tests {
         assert_eq!(out, "a\nbc\nd");
         assert!(!out.contains('\u{1b}'));
         assert!(!out.contains('\r'));
+    }
+
+    /// H45：`exit N` 结束持久 shell 时，必须从子进程回收**真实**退出码并置失效，
+    /// 而不是因缺 marker 而退化为 `None`（-1），更不能让后续 run 在 reader 锁上死锁。
+    #[tokio::test]
+    async fn shell_exit_reports_child_code_and_poisons() {
+        let Ok(shell) = PtyShell::spawn(None).await else {
+            eprintln!("skipping: pty unavailable");
+            return;
+        };
+        let res = shell.run("exit 7").await.expect("run");
+        assert_eq!(res.exit_code, Some(7), "应回收子进程退出码: {res:?}");
+        assert!(shell.is_poisoned(), "shell 退出后会话必须置失效");
+        // 失效会话必须 fail-fast（报错），而不是死锁或静默复用。
+        assert!(shell.run("echo hi").await.is_err(), "失效会话应拒绝复用");
     }
 
     #[tokio::test]

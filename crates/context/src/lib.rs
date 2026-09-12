@@ -72,6 +72,8 @@ struct Inner {
     model_limit: usize,
     /// 最近一次 `build_provider_context` 的 model id（供 `token_usage()` 同步选对 BPE 编码）。
     last_model_id: String,
+    /// H26：最近一次 build 的 tokenizer 声明（`[models] tokenizer`；`None` = 按 id 推断）。
+    last_tokenizer: Option<String>,
     /// StablePrefix 追踪：上次 `build_provider_context` 发送的 ProviderMessage digest 序列。
     ///
     /// 下次 build 时据此计算最长字节稳定前缀（[`stable_prefix_len`](agent_core::ProviderContext::stable_prefix_len)），
@@ -226,6 +228,7 @@ impl InMemoryContext {
                 shake_sink: None,
                 model_limit: 0,
                 last_model_id: String::new(),
+                last_tokenizer: None,
                 prefix_digests: Vec::new(),
             }),
             counter,
@@ -248,6 +251,7 @@ impl InMemoryContext {
                 shake_sink: None,
                 model_limit: 0,
                 last_model_id: String::new(),
+                last_tokenizer: None,
                 prefix_digests: Vec::new(),
             }),
             counter,
@@ -341,10 +345,12 @@ impl InMemoryContext {
     /// （移植 oh-my-pi `collectEntriesForBranchSummary`）。
     ///
     /// 流程：收集 old_leaf→公共祖先 的独有节点 → 经 [`compaction::SummaryProvider`]
-    /// 生成摘要 → 切到 new_leaf 并追加摘要为用户消息（续写点落在摘要节点）。无摘要器
-    /// 或无独有后缀时退化为纯切换（不报错）。
+    /// 生成摘要 → 切到 new_leaf 并追加摘要为用户消息（续写点落在摘要节点）。
+    /// 无独有后缀（无事可摘要）时退化为纯切换；有独有后缀但未注入摘要器时显式
+    /// 报错——静默降级会让用户误以为离支进展已交接（对齐 oh-my-pi fail-fast 语义）。
     ///
     /// # Errors
+    /// 有独有后缀但无摘要器返回 [`ContextError::BranchSummaryUnavailable`]；
     /// 摘要生成失败返回 [`ContextError::Compaction`]。
     pub async fn switch_branch_with_handoff(&self, new_leaf: &str) -> Result<bool, ContextError> {
         // 阶段一（锁内）：校验 + 收集独有后缀 + 取出 summarizer。
@@ -373,7 +379,11 @@ impl InMemoryContext {
                 drop(inner);
                 Some(result.map_err(ContextError::Compaction)?)
             }
-            _ => None,
+            // 有摘要器但无独有后缀：无事可摘要 → 纯切换。
+            Some(_) => None,
+            // 无摘要器：仅当确有独有后缀待折叠时报错（不做静默降级）。
+            None if entries.is_empty() => None,
+            None => return Err(ContextError::BranchSummaryUnavailable),
         };
         // 阶段三（锁内）：切换 + 追加 handoff 消息。
         let mut inner = self.inner.lock().await;
@@ -459,11 +469,15 @@ impl ContextManager for InMemoryContext {
         // 缓存模型窗口上限 + model id，供 token_usage() 同步返回正确值与 BPE 编码。
         inner.model_limit = model.max_input_tokens;
         inner.last_model_id = model.id.clone();
+        inner.last_tokenizer = model.tokenizer.clone();
         // P2-F：按 model 族选 BPE（gpt-4o/o 系列 o200k_base，其余 cl100k_base），
         // 精确计数直接影响压缩触发时机（near_limit）与 shake 保护窗口。
-        let current = self
-            .counter
-            .count_context_for(&inner.system, &messages, &model.id);
+        let current = self.counter.count_context_with_family(
+            &inner.system,
+            &messages,
+            &model.id,
+            model.tokenizer.as_deref(),
+        );
 
         // P0-A：计算与上次发送序列的最长字节稳定前缀。digest 命中 ⇒ ProviderMessage
         // 逻辑内容相同 ⇒ provider 端序列化字节相同 ⇒ 前缀缓存可命中到此索引。移植 oh-my-pi
@@ -618,10 +632,11 @@ impl ContextManager for InMemoryContext {
     fn token_usage(&self) -> TokenUsage {
         match self.inner.try_lock() {
             Ok(inner) => TokenUsage {
-                current: self.counter.count_context_for(
+                current: self.counter.count_context_with_family(
                     &inner.system,
                     &convert_to_llm(&inner.active_path_messages()),
                     &inner.last_model_id,
+                    inner.last_tokenizer.as_deref(),
                 ),
                 limit: inner.model_limit,
             },
@@ -1077,6 +1092,7 @@ mod tests {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         };
         ctx.build_provider_context(&model, &[]).await.unwrap();
         // build 后 limit 应反映模型窗口
@@ -1501,6 +1517,36 @@ mod tests {
             "末尾应为 handoff 摘要: {:?}",
             texts
         );
+    }
+    /// 无摘要器时 handoff 的边界：有独有后缀 → 显式报错且不切换；无独有后缀 → 纯切换。
+    #[tokio::test]
+    async fn switch_branch_without_summarizer_fails_fast() {
+        let ctx = InMemoryContext::with_counter(vec![], token::TokenCounter::heuristic());
+        // 公共：a → b；B 独有 b1；C 独有 c1。
+        ctx.append(AgentMessage::user_text("a")).await;
+        ctx.append(AgentMessage::user_text("b")).await;
+        let b = ctx.active_leaf().await.unwrap();
+        ctx.append(AgentMessage::user_text("b1")).await;
+        let leaf_b1 = ctx.active_leaf().await.unwrap();
+        ctx.set_active_leaf(&b).await;
+        ctx.append(AgentMessage::user_text("c1")).await;
+        let leaf_c1 = ctx.active_leaf().await.unwrap();
+        // 不注入摘要器：当前在 c1（被离开分支有独有后缀）→ 显式报错，且不切换。
+        let err = ctx
+            .switch_branch_with_handoff(&leaf_b1)
+            .await
+            .expect_err("无摘要器 + 有独有后缀应显式报错");
+        assert!(err.to_string().contains("摘要器"), "实际: {err}");
+        assert_eq!(
+            ctx.active_leaf().await.as_deref(),
+            Some(leaf_c1.as_str()),
+            "报错路径不得切换活跃叶子"
+        );
+        // 被离开分支无独有后缀（b 是 b1 的祖先）：无事可摘要 → 纯切换成功。
+        ctx.set_active_leaf(&b).await;
+        let ok = ctx.switch_branch_with_handoff(&leaf_b1).await.unwrap();
+        assert!(ok);
+        assert_eq!(ctx.active_leaf().await.as_deref(), Some(leaf_b1.as_str()));
     }
 
     /// `snapshot_nodes` / `restore_nodes` 往返：分支结构完整保留。

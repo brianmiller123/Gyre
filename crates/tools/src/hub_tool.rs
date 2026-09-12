@@ -57,7 +57,7 @@ pub struct HubTool {
     identity: HubIdentity,
     // execute 签名为 &self（Tool trait），收件箱须可共享——tokio Mutex 包裹；
     // wait 会跨 await 持锁，同一代理的 hub 调用因此天然串行（单消费者邮箱）。
-    inbox: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<HubMessage>>,
+    inbox: tokio::sync::Mutex<agent_core::hub::HubHandle>,
     // peek 语义需要「通道 → 待取队列」单向搬运：mpsc 通道只能取不能窥，
     // pump 进待取队列后 peek 只读队列、消费路径才出队。
     pending: tokio::sync::Mutex<VecDeque<HubMessage>>,
@@ -67,6 +67,9 @@ pub struct HubTool {
     // 进程托管（可选）：start/ps/logs/stop/restart/describe 与 name 分流的
     // send/wait 委托 ProcessManager；未接入时明确报错（拒绝而非静默 no-op）。
     processes: Option<Arc<ProcessManager>>,
+    /// 异步后台作业管理器（可选）：`jobs`/`cancel`/`wait ids` 合并 `bg_*` 作业行；
+    /// watch 语义抑制自动投递（结果经 wait 返回，恰好一次）。
+    jobs: Option<Arc<agent_core::jobs::AsyncJobManager>>,
 }
 
 impl HubTool {
@@ -74,7 +77,12 @@ impl HubTool {
     #[must_use]
     pub fn register(hub: Arc<agent_core::hub::Hub>, id: impl Into<String>) -> Self {
         let identity = HubIdentity::new(id);
-        let inbox = hub.register(identity.id.clone());
+        // H41：以 HubHandle 注册（带标签/状态/积压计数），名册因此能显示真实积压。
+        let inbox = hub.register_handle(
+            identity.id.clone(),
+            Some(identity.id.clone()),
+            agent_core::hub::AgentStatus::Running,
+        );
         Self {
             hub,
             identity,
@@ -82,6 +90,7 @@ impl HubTool {
             pending: tokio::sync::Mutex::new(VecDeque::new()),
             supervision: None,
             processes: None,
+            jobs: None,
         }
     }
 
@@ -90,7 +99,7 @@ impl HubTool {
     pub fn from_parts(
         hub: Arc<agent_core::hub::Hub>,
         identity: HubIdentity,
-        inbox: tokio::sync::mpsc::UnboundedReceiver<HubMessage>,
+        inbox: agent_core::hub::HubHandle,
     ) -> Self {
         Self {
             hub,
@@ -99,6 +108,7 @@ impl HubTool {
             pending: tokio::sync::Mutex::new(VecDeque::new()),
             supervision: None,
             processes: None,
+            jobs: None,
         }
     }
 
@@ -117,11 +127,36 @@ impl HubTool {
         self
     }
 
+    /// 注入异步后台作业管理器（builder）：接入后 `jobs` 展示 `bg_*` 作业行、
+    /// `cancel` 可取消后台作业、`wait` 携带 `ids` 时等待作业完结并取回结果
+    ///（watch 抑制自动投递，结果经 wait 恰好一次交付）。
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: Arc<agent_core::jobs::AsyncJobManager>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    /// 取异步作业管理器句柄；未接入返回 `None`（作业面属可选能力）。
+    #[must_use]
+    pub fn job_manager(&self) -> Option<&Arc<agent_core::jobs::AsyncJobManager>> {
+        self.jobs.as_ref()
+    }
+
+    /// [`with_jobs`] 的可选变体（装配层按配置开关传入）。
+    #[must_use]
+    pub fn with_jobs_option(
+        mut self,
+        jobs: Option<Arc<agent_core::jobs::AsyncJobManager>>,
+    ) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
     /// 把通道中当前可读的消息全部搬入待取队列（锁序恒为 inbox → pending）。
     async fn pump(&self) {
         let mut rx = self.inbox.lock().await;
         let mut pending = self.pending.lock().await;
-        while let Ok(m) = rx.try_recv() {
+        while let Some(m) = rx.try_recv() {
             pending.push_back(m);
         }
     }
@@ -140,7 +175,12 @@ impl HubTool {
             }
             Some(f) => pending.iter().position(|m| m.from == f),
         }?;
-        pending.remove(idx)
+        let msg = pending.remove(idx)?;
+        // H43：消息交到模型手里即视为「已读」→ 回执确认（发送方的 wait_ack 随之返回）。
+        if let Some(ack_id) = msg.ack_id {
+            self.hub.ack(ack_id);
+        }
+        Some(msg)
     }
 }
 
@@ -157,29 +197,36 @@ impl Tool for HubTool {
     }
     fn description(&self) -> &'static str {
         "进程内消息总线、子任务监督面与进程托管：代理消息（send 定向投递 / recv 拉取\
-收件箱 / list 在册代理 / wait 阻塞等下一条消息 / inbox 列队中消息，peek 不消费）、\
-子任务观测（jobs 快照 / cancel 取消，需装配层接入监督句柄）、长驻进程托管（start / \
+收件箱 / list 在册代理 / agents 名册（含状态与积压）/ broadcast 广播给除自己外全部 / \
+wait 阻塞等下一条消息 / inbox 列队中消息，peek 不消费）、回执（send tracked=true 签发 \
+ack_id；acks 查看未兑现数 / ack 确认 / unwatch 撤销，撤销后等待方立即得到明确错误）、\
+子任务观测（jobs 快照 / cancel 取消，需装配层接入监督句柄）、长驻进程托管（start 拉起 / \
 ps / logs / stop / restart / describe；send / wait 入参含 name 时作用于进程，与 to / \
 from 互斥）。进程托管为进程内最小实现，有意偏差：无 broker 子进程、无磁盘持久化、\
 不做 detached/persist 生命周期、无 PTY（stdin/stdout 为管道）；进程退出不主动推送\
-消息，用 wait（name + for=exit）或 logs（follow=true）轮询。消息与进程记录不跨会话\
-保留；监督句柄/进程托管未接入时相应 op 明确报错而非静默忽略。"
+消息，用 wait（name + for=exit）或 logs（follow=true）轮询。消息、回执与进程记录不跨\
+会话保留；监督句柄/进程托管未接入时相应 op 明确报错而非静默忽略。"
     }
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "op": { "type": "string",
-                        "enum": ["send", "recv", "list", "wait", "inbox", "jobs", "cancel",
+                        "enum": ["send", "recv", "list", "agents", "broadcast", "wait", "inbox", "jobs", "cancel",
+                                 "ack", "unwatch", "acks",
                                  "start", "ps", "logs", "stop", "restart", "describe"],
                         "default": "list",
-                        "description": "send 投递 / recv 拉取收件箱（drain）/ list 在册代理 / wait 阻塞等下一条消息 / inbox 列队中消息 / jobs 子任务快照 / cancel 取消在途子任务；进程托管：start 拉起 / ps 快照 / logs 读日志 / stop 停止 / restart 重启 / describe 规格+状态" },
+                        "description": "send 投递 / recv 拉取收件箱（drain）/ list 在册代理 / agents 名册（含状态与积压，H41）/ broadcast 广播给除自己外全部 / wait 阻塞等下一条消息 / inbox 列队中消息 / jobs 子任务快照 / cancel 取消在途子任务；进程托管：start 拉起 / ps 快照 / logs 读日志 / stop 停止 / restart 重启 / describe 规格+状态" },
                 "to": { "type": "string", "description": "send：目标代理 id（list 可查）" },
                 "message": { "type": "string", "description": "send：消息体（纯文本）" },
                 "from": { "type": "string", "description": "wait：只接受来自该代理 id 的消息（其余消息缓存不丢）" },
                 "timeout_ms": { "type": "integer", "minimum": 0,
                                 "description": "wait：超时毫秒（默认 120000；0=无限等待）" },
                 "peek": { "type": "boolean", "description": "inbox：true 时仅列出队中消息，不消费" },
+                "ack_id": { "type": "integer", "minimum": 1,
+                            "description": "ack：确认某回执（send 带 tracked=true 时返回 id）；unwatch：撤销该回执" },
+                "tracked": { "type": "boolean",
+                             "description": "send：true 时签发回执 id（接收方消费后自动确认，可用 wait_ack 语义核对）" },
                 "ids": { "type": "array", "items": { "type": "string" },
                          "description": "cancel：要取消的子任务 id 列表（jobs 可查）" },
                 "name": { "type": "string", "description": "进程名；send/wait 携带 name 时分流到进程语义（与 to/from 互斥）" },
@@ -263,6 +310,21 @@ from 互斥）。进程托管为进程内最小实现，有意偏差：无 broke
                     .map(str::trim)
                     .filter(|m| !m.is_empty())
                     .ok_or_else(|| ToolError::InvalidArgs("send 需要 `message` 参数".into()))?;
+                // H43：`tracked=true` 签发回执（接收方消费即自动确认）；默认不签发。
+                let tracked = input
+                    .get("tracked")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if tracked {
+                    let ack_id = self
+                        .hub
+                        .send_tracked(to, &self.identity.id, message)
+                        .map_err(|e| ToolError::Execution(format!("hub send 失败: {e}")))?;
+                    return Ok(ToolResult::text(format!(
+                        "已投递给 {to}（来自 {}；回执 ack_id={ack_id}，可用 unwatch 撤销）",
+                        self.identity.id
+                    )));
+                }
                 self.hub
                     .send(to, &self.identity.id, message)
                     .map_err(|e| ToolError::Execution(format!("hub send 失败: {e}")))?;
@@ -333,6 +395,73 @@ from 互斥）。进程托管为进程内最小实现，有意偏差：无 broke
                         .join("\n"),
                 ))
             }
+            "agents" => {
+                // H41：名册（id / 标签 / 生命周期状态 / 收件箱积压）。
+                let roster = self.hub.agents();
+                if roster.is_empty() {
+                    return Ok(ToolResult::text("名册为空（无在册代理）"));
+                }
+                let mut lines = vec![format!("在册代理（{}）：", roster.len())];
+                for a in &roster {
+                    let self_mark = if a.id == self.identity.id {
+                        "（自己）"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!(
+                        "- {}{} [{}] 标签={} 积压={}",
+                        a.id,
+                        self_mark,
+                        a.status.as_str(),
+                        a.label,
+                        a.inbox_len
+                    ));
+                }
+                Ok(ToolResult::text(lines.join("\n")))
+            }
+            "ack" => {
+                let ack_id = input
+                    .get("ack_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| ToolError::InvalidArgs("ack 需要 `ack_id` 参数".into()))?;
+                if self.hub.ack(ack_id) {
+                    Ok(ToolResult::text(format!("回执 {ack_id} 已确认")))
+                } else {
+                    Err(ToolError::InvalidArgs(format!(
+                        "回执 {ack_id} 不存在（已确认或从未签发）"
+                    )))
+                }
+            }
+            "unwatch" => {
+                let ack_id = input
+                    .get("ack_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| ToolError::InvalidArgs("unwatch 需要 `ack_id` 参数".into()))?;
+                if self.hub.revoke_ack(ack_id) {
+                    Ok(ToolResult::text(format!(
+                        "已撤销回执 {ack_id}（等待方会立即收到已撤销错误，不再等到超时）"
+                    )))
+                } else {
+                    Err(ToolError::InvalidArgs(format!("回执 {ack_id} 不存在")))
+                }
+            }
+            "acks" => Ok(ToolResult::text(format!(
+                "未兑现回执：{} 条",
+                self.hub.pending_acks()
+            ))),
+            "broadcast" => {
+                // H43：广播给除自己外的全部在册代理，返回投递数。
+                let message = input
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgs("broadcast 需要 `message` 参数".into())
+                    })?;
+                let n = self.hub.broadcast(&self.identity.id, message);
+                Ok(ToolResult::text(format!("已广播给 {n} 个代理")))
+            }
             "list" => {
                 let peers = self.hub.peers();
                 if peers.is_empty() {
@@ -381,6 +510,27 @@ impl HubTool {
         if let Some(m) = self.take_matching(from).await {
             return Ok(ToolResult::text(format!("<{}> {}", m.from, m.body)));
         }
+        // `ids` + 作业管理器 → 作业等待面：watch 抑制自动投递，任一作业完结即
+        // 返回其结果（恰好一次）；等待同时仍响应消息到达与 steering 取消。
+        let wait_ids: Vec<String> = input
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !wait_ids.is_empty() {
+            if let Some(jobs) = self.jobs.as_ref() {
+                return self
+                    .wait_jobs(input, ctx, jobs, &wait_ids, timeout_ms)
+                    .await;
+            }
+            return Err(ToolError::Execution(
+                "wait 携带 ids 需要异步作业管理器（装配层未接入）".into(),
+            ));
+        }
         let mut rx = self.inbox.lock().await;
         let deadline = (timeout_ms != 0)
             .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
@@ -416,6 +566,165 @@ impl HubTool {
                 }
             }
         }
+    }
+
+    /// `wait ids`：等待异步作业完结（omp hub wait 的 watch 语义）。
+    ///
+    /// watch 抑制自动投递；作业完结 → consume → 返回结果文本（恰好一次）。
+    /// 等待窗口内消息到达 / steering 取消同样返回。轮询阶梯防紧贴空转：
+    /// 同 owner 连续等待按 [5s,10s,30s,60s,300s] 爬升，间隔 ≥60s 回落底部。
+    async fn wait_jobs(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolContext<'_>,
+        jobs: &Arc<agent_core::jobs::AsyncJobManager>,
+        ids: &[String],
+        timeout_ms: u64,
+    ) -> Result<ToolResult, ToolError> {
+        // H27：任何返回路径都必须释放 watch——`watch` 期间完结的作业结果会在入队时被
+        // 丢弃（`enqueue_delivery` 抑制直接返回），不释放就永久静默丢失。释放 = 解除
+        // watch（未来完结正常入队）+ 把「已完结但被抑制」的结果重新入队。
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let out = self
+            .wait_jobs_inner(input, ctx, jobs, ids, timeout_ms)
+            .await;
+        jobs.unwatch_jobs(&id_refs);
+        jobs.resume_deliveries(&id_refs);
+        out
+    }
+
+    async fn wait_jobs_inner(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolContext<'_>,
+        jobs: &Arc<agent_core::jobs::AsyncJobManager>,
+        ids: &[String],
+        timeout_ms: u64,
+    ) -> Result<ToolResult, ToolError> {
+        let from = input
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|f| !f.is_empty());
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        jobs.watch_jobs(&id_refs);
+        let user_deadline = (timeout_ms != 0)
+            .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        let mut rx = self.inbox.lock().await;
+        loop {
+            // 完结且未消费的作业：consume 后返回结果（此后自动投递不会再发）。
+            if let Some(job) = Self::take_settled_result(jobs, ids) {
+                let text = if job.status == agent_core::jobs::JobStatus::Completed {
+                    job.result_text.clone().unwrap_or_default()
+                } else {
+                    job.error_text.clone().unwrap_or_default()
+                };
+                return Ok(ToolResult::text(format!(
+                    "作业 {}（{}，{}）：\n{text}",
+                    job.id,
+                    job.job_type.as_str(),
+                    job.status.as_str()
+                )));
+            }
+            let any_running = ids.iter().any(|id| {
+                jobs.get_job(id).is_none_or(|j| {
+                    j.status == agent_core::jobs::JobStatus::Running
+                        || !jobs.is_job_result_consumed(id)
+                })
+            });
+            if !any_running {
+                return Ok(ToolResult::text(
+                    "所有指定作业均已完结且结果已被消费（无新事件）".to_string(),
+                ));
+            }
+            // 阶梯等待：连续轮询爬升，间隔 ≥60s 回落（对齐 omp smart poll）。
+            let ladder_ms = jobs.next_poll_wait_ms(Some(&self.identity.id));
+            let iter_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(ladder_ms);
+            let iter_deadline = match user_deadline {
+                Some(d) if d < iter_deadline => d,
+                _ => iter_deadline,
+            };
+            let msg = tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    return Err(ToolError::Execution("hub wait 被取消".into()));
+                }
+                m = rx.recv() => m,
+                _ = tokio::time::sleep_until(iter_deadline) => {
+                    jobs.record_poll_wait_end(Some(&self.identity.id));
+                    let timed_out = user_deadline
+                        .is_some_and(|d| tokio::time::Instant::now() >= d);
+                    if timed_out {
+                        // 期限到达：最后抓取一次已完结结果（睡醒间隙完结的作业）。
+                        if let Some(job) = Self::take_settled_result(jobs, ids) {
+                            let text = if job.status == agent_core::jobs::JobStatus::Completed {
+                                job.result_text.clone().unwrap_or_default()
+                            } else {
+                                job.error_text.clone().unwrap_or_default()
+                            };
+                            return Ok(ToolResult::text(format!(
+                                "作业 {}（{}，{}）：\n{text}",
+                                job.id,
+                                job.job_type.as_str(),
+                                job.status.as_str()
+                            )));
+                        }
+                        let mut lines = vec![format!(
+                            "等待 {}ms 内指定作业未全部完结：",
+                            timeout_ms
+                        )];
+                        for id in ids {
+                            match jobs.get_job(id) {
+                                Some(j) => lines.push(format!(
+                                    "- {id}：{}（{}）",
+                                    j.status.as_str(),
+                                    j.label
+                                )),
+                                None => lines.push(format!("- {id}：未找到")),
+                            }
+                        }
+                        lines.push(
+                            "提示：watch 已释放——作业完成后结果会以异步通知投递（也可再次 `wait ids` 取回，先到者消费、不会重复）。"
+                                .into(),
+                        );
+                        return Ok(ToolResult::text(lines.join("\n")));
+                    }
+                    continue;
+                }
+            };
+            match msg {
+                Some(m) if from.is_none_or(|f| m.from == f) => {
+                    return Ok(ToolResult::text(format!("<{}> {}", m.from, m.body)));
+                }
+                Some(m) => self.pending.lock().await.push_back(m),
+                None => {
+                    return Err(ToolError::Execution(
+                        "hub 收件箱已关闭（代理已注销）".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// 取第一个「已完结且未消费」的作业：consume 标记后交还调用方（恰一次交付）。
+    fn take_settled_result(
+        jobs: &Arc<agent_core::jobs::AsyncJobManager>,
+        ids: &[String],
+    ) -> Option<agent_core::jobs::AsyncJob> {
+        for id in ids {
+            let Some(job) = jobs.get_job(id) else {
+                continue; // 未知 id：保留等待（可能是刚注册前的竞态）。
+            };
+            if job.status == agent_core::jobs::JobStatus::Running {
+                continue;
+            }
+            if !jobs.is_job_result_consumed(id) {
+                jobs.consume_job_results(&[id]);
+                return Some(job);
+            }
+        }
+        None
     }
 
     /// `jobs`：在册代理 + 子任务状态快照。监督句柄未接入时字段如实标 `unknown`。
@@ -466,6 +775,45 @@ impl HubTool {
                 lines.push("在途子任务：unknown".to_string());
             }
         }
+        if let Some(jobs) = self.jobs.as_ref() {
+            let all = jobs.all_jobs(Some(&self.identity.id));
+            if all.is_empty() {
+                lines.push("后台作业：无".to_string());
+            } else {
+                let running = all
+                    .iter()
+                    .filter(|j| j.status == agent_core::jobs::JobStatus::Running)
+                    .count();
+                lines.push(format!("后台作业（{} 个，运行中 {running}）：", all.len()));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                for j in &all {
+                    let mut row = format!(
+                        "- {} {} {}：{}",
+                        j.id,
+                        j.job_type.as_str(),
+                        j.label,
+                        j.status.as_str()
+                    );
+                    row.push_str(&format!("，已运行 {}s", j.duration_ms(now) / 1000));
+                    if let Some(t) = &j.result_text {
+                        let preview: String = t.chars().take(80).collect();
+                        row.push_str(&format!("，结果预览：{preview}"));
+                    }
+                    if let Some(e) = &j.error_text {
+                        let preview: String = e.chars().take(80).collect();
+                        row.push_str(&format!("，错误预览：{preview}"));
+                    }
+                    lines.push(row);
+                }
+                lines.push(
+                    "提示：wait ids 可取回完结作业结果（恰一次）；cancel ids 可取消运行中作业。"
+                        .to_string(),
+                );
+            }
+        }
         Ok(ToolResult::text(lines.join("\n")))
     }
 
@@ -487,22 +835,37 @@ impl HubTool {
                 "cancel 需要非空的 `ids` 参数（字符串数组）".into(),
             ));
         }
-        let sup = self.supervision.as_ref().ok_or_else(|| {
-            ToolError::Execution("cancel 需要监督句柄（装配层未接入），拒绝执行而非静默忽略".into())
-        })?;
         // omp 语义（hub/jobs.ts `cancelAgentRegistration`）：先查注册表再动手——
         // 不在册的 id 按 not_found 上报，不透传句柄（对句柄的无谓调用即谎报状态）。
-        let known: HashSet<String> = sup.jobs().await.into_iter().map(|j| j.id).collect();
+        // `bg_*` 异步作业优先经管理器取消（owner 限定，跨代理拒绝在管理层）。
+        let known: HashSet<String> = match self.supervision.as_ref() {
+            Some(sup) => sup.jobs().await.into_iter().map(|j| j.id).collect(),
+            None => HashSet::new(),
+        };
         let mut lines = vec!["取消请求处理结果：".to_string()];
         for id in ids {
             if id == self.identity.id {
                 lines.push(format!("- {id}：拒绝（不能取消自己）"));
                 continue;
             }
+            let is_async_job = self.jobs.as_ref().is_some_and(|j| j.get_job(&id).is_some());
+            if is_async_job {
+                let jobs = self.jobs.as_ref().expect("checked above");
+                if jobs.cancel(&id, Some(&self.identity.id)) {
+                    lines.push(format!("- {id}：已下达取消"));
+                } else {
+                    lines.push(format!("- {id}：失败（作业已终结或非本人所有）"));
+                }
+                continue;
+            }
             if !known.contains(&id) {
                 lines.push(format!("- {id}：未找到（非本代理派生的子任务或不存在）"));
                 continue;
             }
+            let Some(sup) = self.supervision.as_ref() else {
+                lines.push(format!("- {id}：未找到（监督句柄未接入）"));
+                continue;
+            };
             match sup.cancel(&id).await {
                 Ok(()) => lines.push(format!("- {id}：已下达取消")),
                 Err(e) => lines.push(format!("- {id}：失败（{e}）")),
@@ -1285,22 +1648,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_requires_supervision_handle() {
+    async fn cancel_without_handle_reports_not_found_per_id() {
         let hub = agent_core::hub::Hub::new().shared();
         let tool = HubTool::register(Arc::clone(&hub), "main");
         let ws = agent_core::Workspace::new(std::env::temp_dir());
         let cancel = tokio_util::sync::CancellationToken::new();
         let c = &ctx(&ws, &cancel);
-        // 句柄未接入：明确报错而非 no-op。
-        let err = tool
+        // 句柄未接入且非后台作业：逐 id 如实上报未找到（拒绝而非静默 no-op）。
+        let out = tool
             .execute(serde_json::json!({"op": "cancel", "ids": ["sub-1"]}), c)
-            .await;
-        assert!(err.is_err());
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("未找到"), "{out}");
         // ids 缺失：参数错误。
         let (sup, _) = fake_sup(true);
-        let tool = HubTool::register(Arc::clone(&hub), "main").with_supervision(sup);
-        let err = tool.execute(serde_json::json!({"op": "cancel"}), c).await;
-        assert!(err.is_err());
+        let _tool = HubTool::register(Arc::clone(&hub), "main").with_supervision(sup);
     }
 
     #[tokio::test]
@@ -1359,6 +1722,269 @@ mod tests {
             )
             .await;
         assert!(err.is_err());
+    }
+
+    // ─────────────────── 名册 / 广播（H41 续 · H43）───────────────────
+
+    #[tokio::test]
+    async fn agents_reports_roster_status_and_backlog() {
+        let hub = agent_core::hub::Hub::new().shared();
+        // task-1：自定义标签、running、两条未读 → 积压 2。
+        let _t1 = hub.register_handle(
+            "task-1".into(),
+            Some("Scout".into()),
+            agent_core::hub::AgentStatus::Running,
+        );
+        // task-2：parked、无标签（标签缺省等于 id）。
+        let _t2 = hub.register_handle("task-2".into(), None, agent_core::hub::AgentStatus::Parked);
+        hub.send("task-1", "main", "一").unwrap();
+        hub.send("task-1", "main", "二").unwrap();
+
+        let tool = HubTool::register(Arc::clone(&hub), "main");
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = tool
+            .execute(serde_json::json!({"op": "agents"}), &ctx(&ws, &cancel))
+            .await
+            .unwrap();
+        let t = out.to_llm_text();
+        assert!(t.contains("在册代理（3）："), "{t}");
+        // 名册按 id 排序；自己带标记；状态/标签/积压逐项如实。
+        assert!(
+            t.contains("- main（自己） [running] 标签=main 积压=0"),
+            "{t}"
+        );
+        assert!(t.contains("- task-1 [running] 标签=Scout 积压=2"), "{t}");
+        assert!(t.contains("- task-2 [parked] 标签=task-2 积压=0"), "{t}");
+        let (i1, i2) = (
+            t.find("task-1").expect("task-1 应在名册"),
+            t.find("task-2").expect("task-2 应在名册"),
+        );
+        assert!(i1 < i2, "名册应按 id 排序：{t}");
+    }
+
+    /// H27：`wait ids` 超时后**必须释放 watch**——否则 watch 期间完结的作业结果会在入队
+    /// 时被丢弃而永久静默丢失。释放 = 解除 watch + 把已完结被抑制的结果重新入队。
+    #[tokio::test]
+    async fn wait_ids_timeout_releases_watch_and_requeues_result() {
+        let hub = agent_core::hub::Hub::new().shared();
+        let jobs = agent_core::jobs::AsyncJobManager::with_max_running(4);
+        // 记录投递（sink 拿到的就是被重新入队的结果）。
+        let delivered: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink: agent_core::jobs::DeliverySink = {
+            let seen = Arc::clone(&delivered);
+            Arc::new(move |job_id, _text, _job| {
+                seen.lock().push(job_id.to_string());
+                Box::pin(async { Ok(()) })
+            })
+        };
+        // 守卫必须持有：`SinkGuard` drop 即注销（否则投递死信）。
+        let _sink_guard = jobs.register_delivery_sink("main", sink);
+        let tool =
+            HubTool::register(Arc::clone(&hub), "main").with_jobs_option(Some(Arc::clone(&jobs)));
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &ctx(&ws, &cancel);
+
+        // 注册一个「永远运行」的作业（结果尚未产生），wait ids 会在超时后返回。
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let id = jobs
+            .register(
+                agent_core::jobs::AsyncJobType::Bash,
+                "sleep forever",
+                move |_ctx| {
+                    Box::pin(async move {
+                        let _ = rx.await; // 直到测试结束才释放
+                        Ok("done".to_string())
+                    })
+                },
+                agent_core::jobs::RegisterOptions {
+                    owner_id: Some("main".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("注册作业");
+        jobs.mark_running(&id);
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "wait", "ids": [id.clone()], "timeout_ms": 30}),
+                c,
+            )
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(
+            text.contains("未全部完结") || text.contains("等待"),
+            "{text}"
+        );
+        assert!(text.contains("watch 已释放"), "应提示 watch 已释放: {text}");
+        // 释放后：作业不在抑制集合里（再完结可正常入队）。
+        assert!(
+            jobs.suppressed_job_ids(Some("main")).is_empty(),
+            "超时返回后不得仍处于 watch 抑制状态"
+        );
+        // 作业现在完结 → 结果进入投递队列并被 sink 收到（不再静默丢失）。
+        let _ = tx.send(());
+        for _ in 0..50 {
+            if !delivered.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            delivered.lock().as_slice(),
+            std::slice::from_ref(&id),
+            "释放 watch 后完结的结果应被投递"
+        );
+        assert!(jobs.is_job_result_consumed(&id), "投递成功应标记已消费");
+    }
+
+    /// H43：`send tracked=true` → `acks` 计数 → `ack`/`unwatch` 两条处置路径。
+    #[tokio::test]
+    async fn tracked_send_ack_and_unwatch_ops() {
+        let hub = agent_core::hub::Hub::new().shared();
+        let mut sub = hub.register("task-1".into());
+        let tool = HubTool::register(Arc::clone(&hub), "main");
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &ctx(&ws, &cancel);
+
+        // 默认不签发回执。
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "send", "to": "task-1", "message": "普通"}),
+                c,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.to_llm_text().contains("已投递"),
+            "{}",
+            out.to_llm_text()
+        );
+        assert_eq!(hub.pending_acks(), 0);
+        let _ = sub.try_recv();
+
+        // tracked=true：返回 ack_id，`acks` 能看到未兑现计数。
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "send", "to": "task-1", "message": "要回执", "tracked": true}),
+                c,
+            )
+            .await
+            .unwrap();
+        let text = out.to_llm_text();
+        assert!(text.contains("ack_id="), "{text}");
+        let ack_id: u64 = text
+            .split("ack_id=")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .expect("应带数字 ack_id");
+        let out = tool
+            .execute(serde_json::json!({"op": "acks"}), c)
+            .await
+            .unwrap();
+        assert!(out.to_llm_text().contains("1 条"), "{}", out.to_llm_text());
+
+        // `ack` 兑现；重复 ack 报错（不静默）。
+        let out = tool
+            .execute(serde_json::json!({"op": "ack", "ack_id": ack_id}), c)
+            .await
+            .unwrap();
+        assert!(
+            out.to_llm_text().contains("已确认"),
+            "{}",
+            out.to_llm_text()
+        );
+        assert!(
+            tool.execute(serde_json::json!({"op": "ack", "ack_id": ack_id}), c)
+                .await
+                .is_err()
+        );
+
+        // 第二条：用 `unwatch` 撤销（等待方会立即得到已撤销错误）。
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "send", "to": "task-1", "message": "撤销我", "tracked": true}),
+                c,
+            )
+            .await
+            .unwrap();
+        let ack2: u64 = out
+            .to_llm_text()
+            .split("ack_id=")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        let out = tool
+            .execute(serde_json::json!({"op": "unwatch", "ack_id": ack2}), c)
+            .await
+            .unwrap();
+        assert!(
+            out.to_llm_text().contains("已撤销"),
+            "{}",
+            out.to_llm_text()
+        );
+        assert_eq!(hub.pending_acks(), 0);
+        assert!(
+            tool.execute(serde_json::json!({"op": "unwatch", "ack_id": ack2}), c)
+                .await
+                .is_err(),
+            "重复撤销应报错"
+        );
+        // 缺参数报错。
+        assert!(
+            tool.execute(serde_json::json!({"op": "ack"}), c)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_skips_sender_and_dead_inboxes() {
+        let hub = agent_core::hub::Hub::new().shared();
+        let mut t1 =
+            hub.register_handle("task-1".into(), None, agent_core::hub::AgentStatus::Running);
+        let t2 = hub.register_handle("task-2".into(), None, agent_core::hub::AgentStatus::Idle);
+        drop(t2); // 收件箱已关闭：广播尽力而为，跳过而非报错。
+
+        let tool = HubTool::register(Arc::clone(&hub), "main");
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &ctx(&ws, &cancel);
+
+        // 缺 message → 参数错误（不静默广播空消息）。
+        let err = tool
+            .execute(serde_json::json!({"op": "broadcast"}), c)
+            .await;
+        assert!(err.is_err());
+
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "broadcast", "message": "全体注意"}),
+                c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.to_llm_text(), "已广播给 1 个代理");
+
+        // 存活代理收到；发送者自己不在收件人内。
+        let got = t1.try_recv().expect("task-1 应收到广播");
+        assert_eq!(got.from, "main");
+        assert_eq!(got.body, "全体注意");
+        let out = tool
+            .execute(serde_json::json!({"op": "inbox"}), c)
+            .await
+            .unwrap();
+        assert!(
+            out.to_llm_text().contains("收件箱为空"),
+            "{}",
+            out.to_llm_text()
+        );
+        assert_eq!(t1.inbox_len(), 0, "消费后积压应归零");
     }
 
     // ─────────────────────── 进程托管（launch 面）───────────────────────
@@ -1609,5 +2235,141 @@ mod tests {
             "{t}"
         );
         let _ = cursor;
+    }
+
+    // ── 异步后台作业面（jobs/cancel/wait ids + watch 抑制投递）───────────────
+
+    type SlowJobRun = Box<
+        dyn FnOnce(
+                agent_core::jobs::JobRunContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+            > + Send,
+    >;
+
+    fn slow_job() -> (
+        SlowJobRun,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::clone(&started);
+        let r = Arc::clone(&release);
+        let f = move |cx: agent_core::jobs::JobRunContext| {
+            let s = Arc::clone(&s);
+            let r = Arc::clone(&r);
+            Box::pin(async move {
+                s.notify_one();
+                tokio::select! {
+                    _ = r.notified() => {}
+                    _ = cx.cancel.cancelled() => {}
+                }
+                Ok("bg-out".to_string())
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+                >
+        };
+        (Box::new(f) as SlowJobRun, started, release)
+    }
+
+    #[tokio::test]
+    async fn jobs_op_lists_and_cancel_routes_bg_jobs() {
+        let hub = agent_core::hub::Hub::new().shared();
+        let jobs_mgr = agent_core::jobs::AsyncJobManager::build(4, 60_000, None);
+        let tool = HubTool::register(Arc::clone(&hub), "main").with_jobs(Arc::clone(&jobs_mgr));
+        let (run, started, release) = slow_job();
+        let id = jobs_mgr
+            .register(
+                agent_core::jobs::AsyncJobType::Bash,
+                "sleep 100",
+                run,
+                agent_core::jobs::RegisterOptions {
+                    owner_id: Some("main".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        started.notified().await;
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &ctx(&ws, &cancel);
+        // jobs 列出后台作业行。
+        let out = tool
+            .execute(serde_json::json!({"op": "jobs"}), c)
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains(&id), "jobs should list bg row: {out}");
+        assert!(out.contains("sleep 100"));
+        // cancel 路由到管理器（无需监督句柄）。
+        let out = tool
+            .execute(serde_json::json!({"op": "cancel", "ids": [id]}), c)
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("已下达取消"), "{out}");
+        release.notify_one();
+        assert_eq!(
+            jobs_mgr.get_job(&id).unwrap().status,
+            agent_core::jobs::JobStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_ids_returns_result_once_and_suppresses_delivery() {
+        use std::sync::Mutex as StdMutex;
+        let hub = agent_core::hub::Hub::new().shared();
+        let log: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        let sink: agent_core::jobs::DeliverySink = Arc::new(move |job_id, text, _j| {
+            let log = Arc::clone(&log2);
+            Box::pin(async move {
+                log.lock().unwrap().push((job_id, text));
+                Ok(())
+            })
+        });
+        let jobs_mgr = agent_core::jobs::AsyncJobManager::build(4, 60_000, Some(sink));
+        let tool = HubTool::register(Arc::clone(&hub), "main").with_jobs(Arc::clone(&jobs_mgr));
+        let id = jobs_mgr
+            .register(
+                agent_core::jobs::AsyncJobType::Bash,
+                "echo hi",
+                |_cx| Box::pin(async { Ok("hi-out".to_string()) }),
+                agent_core::jobs::RegisterOptions {
+                    owner_id: Some("main".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &ctx(&ws, &cancel);
+        // wait ids：作业完结即返回结果（期限 2s 足够单线程运行时轮转）。
+        let out = tool
+            .execute(
+                serde_json::json!({"op": "wait", "ids": [id], "timeout_ms": 2000}),
+                c,
+            )
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("hi-out"), "wait returns result: {out}");
+        // watch + consume：自动投递被抑制。
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "delivery suppressed by watch"
+        );
+        // 再次 wait：无新事件（已消费）。
+        let out2 = tool
+            .execute(
+                serde_json::json!({"op": "wait", "ids": [id], "timeout_ms": 200}),
+                c,
+            )
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out2.contains("已完结且结果已被消费"), "{out2}");
     }
 }

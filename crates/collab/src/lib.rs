@@ -23,7 +23,7 @@ pub mod snapshot;
 
 pub use codec::{KEY_LEN, NONCE_LEN, RoomKey, generate_room_key, open, seal};
 pub use error::CollabError;
-pub use frame::WireFrame;
+pub use frame::{PROTO_VERSION, WireFrame, proto_compatible, proto_mismatch_message};
 pub use relay::{CollabClient, Relay, generate_write_token};
 pub use room::{build_share_url, decode_room_key, encode_room_key, parse_share_url, room_id};
 pub use snapshot::{SNAPSHOT_CHUNK_MAX, append_snapshot_log, chunk_snapshot, read_snapshot_log};

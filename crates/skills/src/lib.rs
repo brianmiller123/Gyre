@@ -26,4 +26,4 @@ pub use providers::{
     opencode_provider,
 };
 pub use registry::{SkillCatalog, SkillRegistry, resolve_skill_url};
-pub use render::render_skills_section;
+pub use render::{render_skills_section, sanitize_prompt_text};

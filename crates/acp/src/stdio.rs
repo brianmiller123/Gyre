@@ -27,7 +27,7 @@ use crate::adapter::{is_terminal_frame, server_frame_to_acp};
 use crate::rpc::{
     PendingPermissions, ResolvedPermission, dispatch_rpc, expired_permissions, extract_prompt_text,
     is_rpc_response, parse_error_line, permission_request, permission_timeout_resolution,
-    register_permission, resolve_permission_response, start_prompt,
+    post_dispatch_notifications, register_permission, resolve_permission_response, start_prompt,
 };
 use crate::types::{
     AcpError, JsonRpcError, JsonRpcRequest, JsonRpcResponse, SessionNotification, SessionUpdate,
@@ -75,11 +75,19 @@ pub async fn run_stdio(state: SessionManager) -> Result<(), AcpError> {
                     let resp = JsonRpcResponse {
                         jsonrpc: "2.0".into(),
                         id: Some(id),
-                        result,
+                        result: result.clone(),
                     };
                     write_line(&serde_json::to_string(&resp).unwrap_or_default());
                 }
-                // 通知（无 id）只处理副作用，不返回响应。
+                // H12/H13：`session/new|load|resume|fork` 之后推 bootstrap（+ load 回放）
+                // 通知。**响应先写**，再推通知——omp 明确记录过「通知抢在响应之前会被
+                // 客户端当 unknown session 丢弃」（acp-agent.ts:2053-2064）。
+                for note in post_dispatch_notifications(&state, &method, &result).await {
+                    match serde_json::to_string(&note) {
+                        Ok(json) => write_line(&json),
+                        Err(e) => tracing::warn!(error = %e, "session/update 序列化失败"),
+                    }
+                }
             }
             Err(err) => {
                 if let Some(id) = id {
@@ -193,6 +201,9 @@ where
     let mut cancel_buf = String::new();
     // 待回执权限请求（session/request_permission → 客户端 JSON-RPC 响应）。
     let mut pending = PendingPermissions::new();
+    // H11：终止时用于推断 stopReason 的上下文（最后一个 assistant 消息 + 是否收到 cancel）。
+    let mut cancelled = false;
+    let mut last_assistant: Option<agent_core::AssistantMessage> = None;
 
     loop {
         // 最早到期的权限截止时刻；无待回执时超时分支永久挂起。
@@ -207,27 +218,37 @@ where
                     let request = permission_request(rpc_id, session_id, &ask);
                     write_line(&serde_json::to_string(&request).unwrap_or_default());
                 }
+                // 轮次结束帧携带最终 assistant 消息 → 记录供 stopReason 映射（Length/Aborted/refusal）。
+                Ok(ServerFrame::TurnEnd { message, .. }) => {
+                    last_assistant = Some(message);
+                }
                 Ok(frame) => {
                     if is_terminal_frame(&frame) {
-                        return Ok(crate::rpc::stop_reason(&frame));
+                        return Ok(crate::rpc::stop_reason_with(
+                            &frame,
+                            last_assistant.as_ref(),
+                            cancelled,
+                        ));
                     }
                     if let Some(update) = server_frame_to_acp(frame) {
                         push_update(session_id, update);
                     }
                 }
                 Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return Ok("end_turn"),
+                Err(RecvError::Closed) => {
+                    return Ok(if cancelled { "cancelled" } else { "end_turn" });
+                }
             },
             // 同时监听 stdin：处理 session/cancel 通知与权限回执。
             n = reader.read_line(&mut cancel_buf) => {
                 let n = n.unwrap_or(0);
                 if n == 0 {
                     // stdin EOF：客户端断开，终止 turn。
-                    return Ok("end_turn");
+                    return Ok(if cancelled { "cancelled" } else { "end_turn" });
                 }
                 let trimmed = cancel_buf.trim();
                 if !trimmed.is_empty() {
-                    handle_stdio_line(state, session_id, &mut pending, trimmed).await;
+                    cancelled |= handle_stdio_line(state, session_id, &mut pending, trimmed).await;
                 }
                 cancel_buf.clear();
             }
@@ -253,17 +274,20 @@ async fn permission_deadline(deadline: Option<tokio::time::Instant>) {
 ///
 /// 先识别 JSON-RPC 响应（客户端回答 `session/request_permission`），
 /// 再按请求/通知走既有分发（`session/cancel` 作用于当前 turn 的会话）。
+///
+/// 返回 `true` 表示本行是 `session/cancel`（H11：调用方据此把 stopReason 映射为
+/// `cancelled`，而不是恒 `end_turn`）。
 async fn handle_stdio_line(
     state: &SessionManager,
     session_id: &str,
     pending: &mut PendingPermissions,
     line: &str,
-) {
+) -> bool {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
             write_line(&parse_error_line(e.to_string()));
-            return;
+            return false;
         }
     };
 
@@ -272,17 +296,17 @@ async fn handle_stdio_line(
             Some(resolved) => deliver_resolution(state, resolved).await,
             None => tracing::debug!("收到未知 id 的 JSON-RPC 响应，忽略"),
         }
-        return;
+        return false;
     }
 
     let Ok(req) = serde_json::from_value::<JsonRpcRequest>(value) else {
-        return;
+        return false;
     };
     if req.method == "session/cancel" {
         if let Some(session) = state.get(session_id).await {
             let _ = session.inbound.send(ClientFrame::Cancel);
         }
-        return;
+        return true;
     }
     // 其他请求：立即 dispatch 并写响应，避免消息丢失。
     let id = req.id.clone();
@@ -308,6 +332,7 @@ async fn handle_stdio_line(
             }
         }
     }
+    false
 }
 
 /// 将已解析的权限回执经 `ClientFrame::Respond` 投递到会话 inbound 通道

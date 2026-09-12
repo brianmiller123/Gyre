@@ -17,8 +17,10 @@
 #     发布前以全新生成的文件随 release 分发。
 #   * 校验口径：`cargo deny check licenses`（CI 硬门）通过 ⇒ 本文件 accepted 覆盖
 #     完整；两文件许可集漂移会在 unused-allowed-license/失败报错中暴露。
-#   * 接入 CI（生成 job 或脚本）为后续项：需安装 cargo-about（源码编译 ~2min），
-#     建议挂在 release 汇总 job 之前，产物随 release 资产上传。
+#   * 接入 CI（生成 job 或脚本）：`cargo xtask notices` 已提供**离线、无额外工具链**的
+#     通知生成与漂移门禁（`cargo xtask notices --check`，已挂 lint job 的 release preflight）。
+#     仓库根 `THIRD-PARTY-NOTICES.txt` 由它生成并提交；cargo-about 仍是**发布资产**的
+#     权威生成器（含完整许可文本与 accepted OR 分支解析），两者输出应一致。
 #
 # cargo-about 0.8 按本列表顺序解析 OR 表达式：宽松分支优先，通知文件因此给出
 # 义务最轻的许可证文本；deny.toml 的 clarifications/例外则保留全部 AND 义务。

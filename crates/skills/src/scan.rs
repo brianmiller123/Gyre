@@ -1,8 +1,16 @@
 //! 通用 skill 目录扫描：`<dir>/<name>/SKILL.md`（非递归），供各 provider 复用。
 //!
-//! 解析复用 [`crate::frontmatter::parse_skill_file`] 的宽松规则（缺 name 回退目录名、
-//! 缺 description 置空、未识别键忽略）；严格校验（agentskills.io 命名规范等）为后续项。
+//! 解析复用 [`crate::frontmatter::parse_skill_file`]：缺 name 回退目录名、未识别键忽略。
+//! **严格校验**（对齐 oh-my-pi `discovery/helpers.ts`，H22）：
+//! - `enabled: false` → 跳过（显式停用）；
+//! - 描述缺失/空 → 跳过并告警（omp `requireDescription: true`；无描述的 skill
+//!   无法被模型判断何时加载，进 prompt 只会浪费 token）。
+//!
 //! 单个文件损坏只告警跳过，不拖垮同目录其它 skill。
+//!
+//! ### 关于「必需描述」的行为差异
+//! 本仓库此前的宽松行为是「缺描述则渲染为无冒号条目」。现在改为跳过：与 omp 一致，
+//! 且避免 `<skills>` 段出现无法判读的裸名称。需要临时停用而不删除目录时用 `enabled: false`。
 
 use std::path::Path;
 
@@ -39,7 +47,9 @@ pub(crate) fn scan_dir(
             continue;
         }
         match load_skill_file(&skill_md, level, provider_id) {
-            Ok(skill) => out.push(skill),
+            Ok(Some(skill)) => out.push(skill),
+            // 严格校验拒绝（enabled:false / 缺描述）——非错误，静默跳过。
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
                     target: "agent_skills",
@@ -54,13 +64,19 @@ pub(crate) fn scan_dir(
 }
 
 /// 加载单个 SKILL.md 为 [`Skill`]。
+///
+/// 返回 `Ok(None)` 表示文件合法但被「严格校验」拒绝（`enabled: false` 或缺描述）。
 pub(crate) fn load_skill_file(
     skill_md: &Path,
     level: SkillLevel,
     provider_id: &str,
-) -> Result<Skill, SkillError> {
+) -> Result<Option<Skill>, SkillError> {
     let content = std::fs::read_to_string(skill_md)?;
     let fm = parse_skill_file(&content).frontmatter;
+    // 显式停用（对齐 omp `frontmatter.enabled === false` → 不加载）。
+    if fm.enabled == Some(false) {
+        return Ok(None);
+    }
     let dir_name = skill_md
         .parent()
         .and_then(|p| p.file_name())
@@ -72,10 +88,18 @@ pub(crate) fn load_skill_file(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map_or_else(|| dir_name.to_string(), str::to_string);
+    // 描述必需（omp `requireDescription: true`）：缺失/空 → 拒绝该 skill。
+    let description = fm
+        .description
+        .map(|d| d.trim().to_string())
+        .unwrap_or_default();
+    if description.is_empty() {
+        return Ok(None);
+    }
     let base_dir = skill_md.parent().map(Path::to_path_buf).unwrap_or_default();
-    Ok(Skill {
+    Ok(Some(Skill {
         name,
-        description: fm.description.unwrap_or_default(),
+        description,
         file_path: skill_md.to_path_buf(),
         base_dir,
         source: SkillSource {
@@ -84,5 +108,5 @@ pub(crate) fn load_skill_file(
         },
         hide: fm.hide,
         modes: fm.modes,
-    })
+    }))
 }

@@ -203,6 +203,13 @@ function handle(f) {
       }
       break;
     case "welcome":
+      // H39：协议版本不匹配 → 明确报错并停止交互（不静默降级，避免状态错乱难查）。
+      if (f.proto !== PROTO_VERSION) {
+        setStatus("协议版本不匹配（对端 " + f.proto + " / 本端 " + PROTO_VERSION + "）", "err");
+        sys("协同协议版本不匹配：请刷新页面或升级到同一版本（Gyre 不保证跨版本兼容）。", "err");
+        connected = true;
+        return;
+      }
       setStatus("已连接（proto " + f.proto + (f.read_only ? "，只读" : "，可写") + "）", "on");
       connected = true;
       // host 下发的会话快照分块：entry_count > 0 时先显示加载态，收齐后由
@@ -300,11 +307,13 @@ function sendSealed(frame) {
     .then((b) => ws.send(b))
     .catch((e) => sys("密封失败：" + e.message, "err"));
 }
+// H39：线协议版本（与 Rust 侧 agent_collab::PROTO_VERSION 同步维护；不匹配显式报错）。
+const PROTO_VERSION = 1;
 function sendHello() {
   sendSealed({
     type: "hello",
     client_id: clientId,
-    proto: 1,
+    proto: PROTO_VERSION,
     name: ($("name").value.trim() || "访客"),
     write_token: wt,
     ts: Date.now(),

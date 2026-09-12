@@ -40,6 +40,9 @@ inventory::submit! {
     LlmProviderPlugin::new(|client| Box::new(crate::OpenAiCompletionsAdapter::new(client)))
 }
 inventory::submit! {
+    LlmProviderPlugin::new(|client| Box::new(crate::OpenAiResponsesAdapter::new(client)))
+}
+inventory::submit! {
     LlmProviderPlugin::new(|client| Box::new(crate::AnthropicMessagesAdapter::new(client)))
 }
 inventory::submit! {

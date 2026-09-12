@@ -64,7 +64,41 @@ const READ_ACTIONS: &[&str] = &[
     "list_runs",
     "get_run",
     "get_run_logs",
+    // H32：omp `gh` 只读 op 的对应动作（`repo_view`/`file_read`/`search_*`）。
+    "repo_view",
+    "file_read",
+    "search_issues",
+    "search_prs",
+    "search_code",
+    "search_repos",
 ];
+
+/// omp `gh` 的 op 名 → Gyre action 名别名（H32）。
+///
+/// 仅收录**语义等价**的命名差异；omp 的 `pr_checkout`/`pr_push`/`run_watch` 涉及
+/// worktree 隔离与长驻订阅（属 H18/后续批次），不在此假装支持。
+#[must_use]
+pub fn normalize_action(raw: &str) -> &str {
+    match raw {
+        "pr_create" => "create_pr",
+        other => other,
+    }
+}
+
+/// 读取动作名：`action`（Gyre 原名）优先，其次 omp 的 `op`；两者都做别名归一。
+///
+/// # Errors
+/// 两者都缺或非字符串时返回 [`ToolError::InvalidArgs`]。
+pub fn action_of(input: &Value) -> Result<&str, ToolError> {
+    input
+        .get("action")
+        .or_else(|| input.get("op"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(normalize_action)
+        .ok_or_else(|| ToolError::InvalidArgs("缺少 `action`（omp 别名 `op`）参数".into()))
+}
 
 /// 写动作集合（需 `allow_write`）。`graphql` 用 POST 且可含 mutation，归入写门槛。
 const WRITE_ACTIONS: &[&str] = &["create_pr", "merge_pr", "comment", "graphql"];
@@ -76,11 +110,13 @@ impl Tool for GithubTool {
     }
 
     fn description(&self) -> &'static str {
-        "查询/操作 GitHub PR、issue 与 Actions（CI）。\
-         action ∈ {get_pr,list_prs,get_issue,list_issues,list_runs,get_run,get_run_logs,graphql\
-         ,create_pr,merge_pr,comment}；repo=\"owner/name\"。\
-         get_* 需 number；list_* 可选 limit；graphql 需 query（+可选 variables）；\
-         create_pr 需 title/head/base；comment 需 body；merge_pr 可选 method。\
+        "查询/操作 GitHub PR、issue、仓库文件、搜索与 Actions（CI）。\
+         action（omp 别名 `op`）∈ {get_pr,list_prs,get_issue,list_issues,list_runs,get_run,get_run_logs,\
+         repo_view,file_read,search_issues,search_prs,search_code,search_repos,graphql,\
+         create_pr,merge_pr,comment}；repo=\"owner/name\"（search_repos 可省）。\
+         get_* 需 number；list_* 可选 limit；file_read 需 path（可选 branch）；search_* 需 query；\
+         graphql 需 query（+可选 variables）；create_pr 需 title/head/base；comment 需 body；\
+         merge_pr 可选 method。omp 的 `pr_create` 等价于 `create_pr`。\
          写操作需配置 allow_write。鉴权读取 GH_TOKEN/GITHUB_TOKEN。"
     }
 
@@ -93,7 +129,20 @@ impl Tool for GithubTool {
                 "action": {
                     "type": "string",
                     "enum": actions,
-                    "description": "查询/操作动作"
+                    "description": "查询/操作动作（omp 别名 `op`）"
+                },
+                "op": {
+                    "type": "string",
+                    "enum": actions,
+                    "description": "`action` 的 omp 别名（两者给一个即可，`action` 优先）"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "file_read：仓库内相对路径"
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "file_read：分支/commit（缺省 = 默认分支）"
                 },
                 "repo": {
                     "type": "string",
@@ -122,7 +171,7 @@ impl Tool for GithubTool {
                 "query": { "type": "string", "description": "graphql 动作的 GraphQL 查询" },
                 "variables": { "type": "object", "description": "graphql 动作的变量" }
             },
-            "required": ["action", "repo"]
+            "required": ["action"]
         })
     }
 
@@ -132,10 +181,7 @@ impl Tool for GithubTool {
 
     fn describe<'a>(&'a self, input: &'a serde_json::Value) -> ApprovalRequest<'a> {
         // 写动作提升到 Write 审批门禁；其余为 Network。
-        let is_write = input
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|a| WRITE_ACTIONS.contains(&a));
+        let is_write = action_of(input).is_ok_and(|a| WRITE_ACTIONS.contains(&a));
         ApprovalRequest {
             tool: self.name(),
             capability: if is_write {
@@ -149,15 +195,15 @@ impl Tool for GithubTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `action` 参数".into()))?;
-        let repo = input
-            .get("repo")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `repo` 参数".into()))?;
-        validate_repo(repo)?;
+        let action = action_of(&input)?;
+        // `search_repos` 按 omp 语义忽略 `repo`（作用域用 query 里的 `org:`/`language:` 等限定）。
+        let repo = input.get("repo").and_then(Value::as_str).unwrap_or("");
+        if repo.is_empty() && action != "search_repos" {
+            return Err(ToolError::InvalidArgs("缺少 `repo` 参数".into()));
+        }
+        if !repo.is_empty() {
+            validate_repo(repo)?;
+        }
 
         let number = parse_number(&input);
         let limit = input
@@ -174,7 +220,34 @@ impl Tool for GithubTool {
         let client = build_client()?;
         let req = build_request(action, repo, number, limit, &input, client)?;
         let body = fetch(req, ctx).await?;
+        // H32：`file_read` 走 contents API，文本内容是 base64——解码后直接给纯文本。
+        if action == "file_read" {
+            return Ok(ToolResult::text(decode_contents_body(&body)));
+        }
         Ok(ToolResult::text(body))
+    }
+}
+
+/// 解码 GitHub contents API 响应（`{"encoding":"base64","content":"…"}`）为纯文本；
+/// 目录响应（数组）/ 非 base64（如 `download_url` 大文件）/ 非法 base64 时原样返回。
+fn decode_contents_body(body: &str) -> String {
+    use base64::Engine as _;
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    let Some(obj) = value.as_object() else {
+        return body.to_string();
+    };
+    if obj.get("encoding").and_then(Value::as_str) != Some("base64") {
+        return body.to_string();
+    }
+    let Some(content) = obj.get("content").and_then(Value::as_str) else {
+        return body.to_string();
+    };
+    let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    match base64::engine::general_purpose::STANDARD.decode(compact) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => body.to_string(),
     }
 }
 
@@ -246,6 +319,8 @@ fn endpoint_path(action: &str, repo: &str, number: Option<u64>) -> Result<String
             "/repos/{repo}/actions/runs/{}/logs",
             number.ok_or_else(|| ToolError::InvalidArgs("get_run_logs 需 `number`".into()))?
         )),
+        // H32：omp `gh` 只读 op 对应动作。
+        "repo_view" => Ok(format!("/repos/{repo}")),
         _ => Err(ToolError::InvalidArgs(format!("未知 action `{action}`"))),
     }
 }
@@ -329,6 +404,35 @@ fn build_request(
                 &format!("/repos/{repo}/issues/{n}/comments"),
                 json!({ "body": body_text }),
             ))
+        }
+        // H32：仓库文件读取（contents API；base64 文本由 `fetch` 解码）。
+        "file_read" => {
+            let path = require_str(input, "path", "file_read")?;
+            let mut req = common(&format!("/repos/{repo}/contents/{path}"));
+            if let Some(branch) = input
+                .get("branch")
+                .and_then(Value::as_str)
+                .filter(|b| !b.is_empty())
+            {
+                req = req.query(&[("ref", branch)]);
+            }
+            Ok(req)
+        }
+        // H32：omp `search_*`（GitHub Search API）。`search_repos` 忽略 `repo`。
+        "search_issues" | "search_prs" | "search_code" | "search_repos" => {
+            let query = require_str(input, "query", action)?;
+            let scope = if repo.is_empty() {
+                String::new()
+            } else {
+                format!(" repo:{repo}")
+            };
+            let (path, q) = match action {
+                "search_issues" => ("/search/issues", format!("{query}{scope} is:issue")),
+                "search_prs" => ("/search/issues", format!("{query}{scope} is:pr")),
+                "search_code" => ("/search/code", format!("{query}{scope}")),
+                _ => ("/search/repositories", query.to_string()),
+            };
+            Ok(common(path).query(&[("q", q.as_str()), ("per_page", &limit.to_string())]))
         }
         "list_prs" | "list_issues" | "list_runs" => {
             let path = endpoint_path(action, repo, None)?;
@@ -711,8 +815,64 @@ mod tests {
             "merge_pr",
             "comment",
             "get_run_logs",
+            // H32：omp `gh` 只读 op 对应动作。
+            "repo_view",
+            "file_read",
+            "search_issues",
+            "search_prs",
+            "search_code",
+            "search_repos",
         ] {
             assert!(actions.iter().any(|v| v == a), "缺 action {a}");
         }
+        // omp 的 `op` 别名与 `action` 同枚举；`repo` 不再强制（search_repos 可省）。
+        assert!(schema["properties"]["op"]["enum"].is_array());
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "repo"), "{required:?}");
+    }
+
+    /// H32：omp op 名 → Gyre action 的归一（含 `op` 字段别名）。
+    #[test]
+    fn action_alias_and_op_field() {
+        let parse = |v: serde_json::Value| action_of(&v).map(str::to_string);
+        assert_eq!(
+            parse(serde_json::json!({"action": "pr_create"})).unwrap(),
+            "create_pr",
+            "omp 的 pr_create 等价 create_pr"
+        );
+        assert_eq!(
+            parse(serde_json::json!({"op": "repo_view"})).unwrap(),
+            "repo_view",
+            "omp 用 op 字段"
+        );
+        assert_eq!(
+            parse(serde_json::json!({"action": "get_pr", "op": "repo_view"})).unwrap(),
+            "get_pr",
+            "两个字段都给时 action 优先"
+        );
+        assert!(parse(serde_json::json!({})).is_err());
+        assert!(parse(serde_json::json!({"op": "  "})).is_err());
+        assert_eq!(normalize_action("get_pr"), "get_pr", "未登记的名字原样");
+    }
+
+    /// H32：contents API 的 base64 文本解码（目录/异常响应原样返回）。
+    #[test]
+    fn file_read_decodes_base64_contents() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("hello\n世界");
+        let body = serde_json::json!({
+            "encoding": "base64",
+            "content": format!("{encoded}\n"),  // GitHub 会插入换行
+            "path": "a.txt"
+        })
+        .to_string();
+        assert_eq!(decode_contents_body(&body), "hello\n世界");
+
+        // 目录响应（数组）与非 base64 响应原样返回。
+        let dir = r#"[{"name":"a.txt","type":"file"}]"#;
+        assert_eq!(decode_contents_body(dir), dir);
+        let large = serde_json::json!({"encoding": "none", "content": ""}).to_string();
+        assert_eq!(decode_contents_body(&large), large);
+        assert_eq!(decode_contents_body("not json"), "not json");
     }
 }

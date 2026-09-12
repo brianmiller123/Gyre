@@ -171,6 +171,33 @@ pub struct TodoState {
     path: Option<std::path::PathBuf>,
 }
 
+/// H28：把清单状态暴露给引擎的待办循环端口（eager prelude / 完成提醒）。
+///
+/// 引擎只读快照；工具仍是唯一写入者（单活跃不变量、落盘、id 重排全在工具层），
+/// 因此不存在「引擎与工具各持一份待办」的分叉。
+impl agent_core::TodoLoopSource for TodoState {
+    fn snapshot(&self) -> agent_core::TodoLoopSnapshot {
+        let list = self.snapshot();
+        let entries: Vec<agent_core::TodoLoopEntry> = list
+            .items
+            .iter()
+            .map(|i| agent_core::TodoLoopEntry {
+                content: i.content.clone(),
+                phase: i.phase.as_str().to_string(),
+                blocker: i.blocked_reason.clone(),
+            })
+            .collect();
+        let incomplete = entries
+            .iter()
+            .filter(|e| !agent_core::todo_loop::is_done(&e.phase))
+            .count();
+        agent_core::TodoLoopSnapshot {
+            entries,
+            incomplete,
+        }
+    }
+}
+
 impl TodoState {
     /// 从持久化文件加载（缺失/损坏 → 空清单，不阻断启动）。
     ///
@@ -211,6 +238,29 @@ impl TodoState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .render_markdown()
+    }
+
+    /// 全量替换清单（RPC `set_todos` 用；H7）。
+    ///
+    /// id 一律重排为 `t1..tn`（与工具内全量替换语义一致），随后
+    /// [`TodoList::normalize`]（单活跃不变量）并落盘；返回落盘后的快照。
+    pub fn replace(&self, mut items: Vec<TodoItem>) -> TodoList {
+        for (i, item) in items.iter_mut().enumerate() {
+            item.id = format!("t{}", i + 1);
+        }
+        let mut list = TodoList { items, next_id: 1 };
+        // 与 `todo` 工具 `write` 同规则：多 active 只保留首个，其余降级 pending。
+        list.enforce_single_active();
+        list.normalize();
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = list.clone();
+        }
+        self.persist(&list);
+        list
     }
 
     /// 当前清单快照。
@@ -267,9 +317,9 @@ start 新任务自动闭环旧的。多步任务（≥3 步）开工前先 write
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["view", "write", "start", "update", "complete", "abandon", "block", "unblock", "pending"],
+                    "enum": ["view", "write", "init", "append", "start", "update", "complete", "done", "abandon", "drop", "rm", "remove", "block", "unblock", "pending"],
                     "default": "view",
-                    "description": "view 查看；write 全量替换；start 新任务(自动闭环旧 in_progress)；update 改内容；complete/abandon 收尾；block/unblock 阻塞管理；pending 重新排队"
+                    "description": "view 查看；write/init 全量替换；append 追加；start 新任务(自动闭环旧 in_progress)；update 改内容；complete/done 完成；abandon/drop 放弃；rm/remove 删除条目；block/unblock 阻塞管理；pending 重新排队（omp 别名已对齐，H32）"
                 },
                 "items": {
                     "type": "array",
@@ -309,6 +359,14 @@ start 新任务自动闭环旧的。多步任务（≥3 步）开工前先 write
             .and_then(serde_json::Value::as_str)
             .unwrap_or("view")
             .to_string();
+        // H32：对齐 omp `TodoOperation` 的别名（init/done/drop/rm），并保留 Gyre 原生名。
+        let op = match op.as_str() {
+            "init" => "write".to_string(),
+            "done" => "complete".to_string(),
+            "drop" => "abandon".to_string(),
+            "rm" => "remove".to_string(),
+            other => other.to_string(),
+        };
         let mut list = self
             .state
             .inner
@@ -341,11 +399,13 @@ start 新任务自动闭环旧的。多步任务（≥3 步）开工前先 write
                         })?;
                     let phase = raw
                         .get("phase")
+                        .or_else(|| raw.get("status")) // omp `TodoItem.status` 别名（H32）
                         .and_then(serde_json::Value::as_str)
                         .map_or(Ok(TodoPhase::Pending), parse_phase)
                         .map_err(ToolError::InvalidArgs)?;
                     let blocked_reason = raw
                         .get("blocked_reason")
+                        .or_else(|| raw.get("blocker")) // omp 字段名（H32）
                         .and_then(serde_json::Value::as_str)
                         .map(str::trim)
                         .filter(|r| !r.is_empty())
@@ -360,6 +420,57 @@ start 新任务自动闭环旧的。多步任务（≥3 步）开工前先 write
                 }
                 next.enforce_single_active();
                 list = next;
+                changed = true;
+            }
+            "append" => {
+                // 追加：保留既有条目（含终态历史），新条目接续编号（对齐 omp `append`）。
+                let items = input
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| ToolError::InvalidArgs("append 需要 `items` 数组".into()))?;
+                for (i, raw) in items.iter().enumerate() {
+                    let content = raw
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .ok_or_else(|| {
+                            ToolError::InvalidArgs(format!("items[{i}] 缺少非空 content"))
+                        })?;
+                    let phase = raw
+                        .get("phase")
+                        .or_else(|| raw.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(Ok(TodoPhase::Pending), parse_phase)
+                        .map_err(ToolError::InvalidArgs)?;
+                    let id = format!("t{}", list.next_id);
+                    list.next_id += 1;
+                    list.items.push(TodoItem {
+                        id,
+                        content: truncate_chars(content, 200),
+                        phase,
+                        blocked_reason: raw
+                            .get("blocked_reason")
+                            .or_else(|| raw.get("blocker"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(|r| truncate_chars(r, 200)),
+                    });
+                }
+                list.enforce_single_active();
+                changed = true;
+            }
+            "remove" => {
+                // 删除条目（omp `rm`）：按 id 精确移除；删除后重排编号保持 t1..tn 连续。
+                let id = required_str(&input, "id", "remove")?;
+                let before = list.items.len();
+                list.items.retain(|item| item.id != id);
+                if list.items.len() == before {
+                    return Err(ToolError::InvalidArgs(format!("找不到任务 {id}")));
+                }
+                for (i, item) in list.items.iter_mut().enumerate() {
+                    item.id = format!("t{}", i + 1);
+                }
+                list.next_id = (list.items.len() + 1) as u32;
                 changed = true;
             }
             "start" => {
@@ -625,6 +736,103 @@ mod tests {
         );
     }
 
+    /// H7：RPC `set_todos` 用的全量替换（id 重排 + 单活跃规整 + 落盘）。
+    #[test]
+    fn replace_renumbers_normalizes_and_persists() {
+        let dir = std::env::temp_dir().join(format!("todo-replace-{}", std::process::id()));
+        let path = dir.join("todo.json");
+        let state = TodoState::load(&path);
+        let list = state.replace(vec![
+            TodoItem {
+                id: "zzz".into(),
+                content: "a".into(),
+                phase: TodoPhase::InProgress,
+                blocked_reason: None,
+            },
+            TodoItem {
+                id: "yyy".into(),
+                content: "b".into(),
+                phase: TodoPhase::InProgress,
+                blocked_reason: None,
+            },
+        ]);
+        // id 重排为 t1/t2；单活跃不变量：保留首个 in_progress，其余降级 pending
+        // （与 `todo` 工具 `write` 的 `enforce_single_active` 同规则）。
+        assert_eq!(list.items[0].id, "t1");
+        assert_eq!(list.items[1].id, "t2");
+        assert_eq!(list.items[0].phase, TodoPhase::InProgress);
+        assert_eq!(list.items[1].phase, TodoPhase::Pending);
+        assert_eq!(state.snapshot(), list);
+        // 落盘可回读。
+        let reloaded = TodoState::load(&path).snapshot();
+        assert_eq!(reloaded.items.len(), 2);
+        assert_eq!(reloaded.next_id, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H32：omp `TodoOperation` 别名（init/done/drop/rm）+ `append` / `remove` 新 op + `status`/`blocker` 字段名。
+    #[tokio::test]
+    async fn omp_todo_op_aliases_and_append_remove() {
+        let tool = TodoTool::new(state());
+        // omp `init`（= write）+ `status`/`blocker` 字段名。
+        let out = run(
+            &tool,
+            serde_json::json!({"op":"init","items":[
+                {"content":"a","status":"in_progress"},
+                {"content":"b","status":"blocked","blocker":"等 CI"}
+            ]}),
+        )
+        .await;
+        let text = out.to_llm_text();
+        assert!(text.contains("[~] t1: a"), "{text}");
+        assert!(text.contains("[!] t2: b"), "{text}");
+
+        // `append`：保留既有条目、编号接续。
+        let out = run(
+            &tool,
+            serde_json::json!({"op":"append","items":[{"content":"c"}]}),
+        )
+        .await;
+        let text = out.to_llm_text();
+        assert!(text.contains("t3: c"), "{text}");
+        assert!(text.contains("t1: a"), "append 不得清空既有条目: {text}");
+
+        // omp `done`（= complete）。
+        let out = run(&tool, serde_json::json!({"op":"done","id":"t1"})).await;
+        assert!(
+            out.to_llm_text().contains("[x] t1: a"),
+            "{}",
+            out.to_llm_text()
+        );
+
+        // omp `drop`（= abandon）。
+        let out = run(&tool, serde_json::json!({"op":"drop","id":"t3"})).await;
+        assert!(
+            out.to_llm_text().contains("[-] t3: c"),
+            "{}",
+            out.to_llm_text()
+        );
+
+        // omp `rm`（= remove）：删除并重排编号。
+        let out = run(&tool, serde_json::json!({"op":"rm","id":"t2"})).await;
+        let text = out.to_llm_text();
+        assert!(!text.contains("等 CI"), "被删条目不应残留: {text}");
+        let list = tool.state.snapshot();
+        assert_eq!(list.items.len(), 2, "{list:?}");
+        assert_eq!(list.items[0].id, "t1");
+        assert_eq!(list.items[1].id, "t2", "删除后编号应重排连续");
+        // 删除不存在的 id → 明确错误。
+        let ws2 = ws();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let err = tool
+            .execute(
+                serde_json::json!({"op":"rm","id":"t99"}),
+                &ctx(&ws2, &cancel),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("t99"), "{err}");
+    }
     #[tokio::test]
     async fn view_empty_and_missing_args() {
         let tool = TodoTool::new(state());
@@ -637,5 +845,56 @@ mod tests {
             )
             .await;
         assert!(err.is_err());
+    }
+
+    /// H28：待办端口快照——状态名/阻塞原因/未完成计数与清单一致（引擎提醒据此判定）。
+    #[test]
+    fn loop_source_snapshot_matches_list_state() {
+        let state = TodoState::in_memory();
+        state.replace(vec![
+            TodoItem {
+                id: String::new(),
+                content: "写测试".into(),
+                phase: TodoPhase::Pending,
+                blocked_reason: None,
+            },
+            TodoItem {
+                id: String::new(),
+                content: "等上游".into(),
+                phase: TodoPhase::Blocked,
+                blocked_reason: Some("缺 token".into()),
+            },
+            TodoItem {
+                id: String::new(),
+                content: "读代码".into(),
+                phase: TodoPhase::Completed,
+                blocked_reason: None,
+            },
+        ]);
+        let snap = agent_core::TodoLoopSource::snapshot(&state);
+        // 未完成 = pending + blocked（completed/abandoned 不计）。
+        assert_eq!(snap.incomplete, 2);
+        assert!(snap.has_incomplete());
+        assert!(!snap.is_empty());
+        let rendered = snap.render_incomplete().unwrap();
+        assert!(rendered.contains("- [pending] 写测试"), "{rendered}");
+        assert!(
+            rendered.contains("- [blocked] 等上游（阻塞：缺 token）"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("读代码"),
+            "已完成条目不应出现在提醒里: {rendered}"
+        );
+        // 全部完成 → 无未完成（提醒静默）。
+        state.replace(vec![TodoItem {
+            id: String::new(),
+            content: "读代码".into(),
+            phase: TodoPhase::Completed,
+            blocked_reason: None,
+        }]);
+        let snap = agent_core::TodoLoopSource::snapshot(&state);
+        assert_eq!(snap.incomplete, 0);
+        assert!(snap.render_incomplete().is_none());
     }
 }

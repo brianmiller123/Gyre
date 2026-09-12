@@ -93,17 +93,24 @@ async fn handle_rpc(
     }
 
     match dispatch_rpc(&state, &req).await {
-        Ok(result) => id.map_or_else(
-            || StatusCode::ACCEPTED.into_response(),
-            |id| {
-                Json(JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    id: Some(id),
-                    result,
-                })
-                .into_response()
-            },
-        ),
+        Ok(result) => {
+            // H12/H13：bootstrap（+ load 回放）通知经 SSE 扇出推送。响应体随后返回。
+            for note in crate::rpc::post_dispatch_notifications(&state, &method, &result).await {
+                let sid = note.params.session_id.clone();
+                fanout_push(&sid, note);
+            }
+            id.map_or_else(
+                || StatusCode::ACCEPTED.into_response(),
+                |id| {
+                    Json(JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: Some(id),
+                        result,
+                    })
+                    .into_response()
+                },
+            )
+        }
         Err(err) => Json(JsonRpcError {
             jsonrpc: "2.0".into(),
             id,
@@ -117,6 +124,47 @@ async fn handle_rpc(
 ///
 /// SSE 流发出 `session/request_permission` 时登记；客户端经 `POST /acp/rpc`
 /// 回答（JSON-RPC 响应）或超时任务到期时移除。
+/// ACP 通知扇出（H12/H13）：`POST /acp/rpc` 的 bootstrap/回放通知必须走**对应会话的
+/// SSE 流**，而 `ServerFrame` broadcast（agent-server 类型）不承载 ACP `SessionUpdate`
+/// → 本模块自建 `session_id → 订阅者` 表，每条 SSE 连接登记一个 unbounded sender。
+///
+/// 语义与 omp 一致：**通知只在已有 SSE 订阅时送达**（客户端须先建流再发请求，这是
+/// ACP over HTTP 的既定流程）；无订阅者时丢弃并记 debug（不阻塞请求响应）。
+static SSE_FANOUT: LazyLock<
+    Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<SessionNotification>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 登记一条 SSE 连接的订阅（返回接收端）。
+fn fanout_subscribe(session_id: &str) -> tokio::sync::mpsc::UnboundedReceiver<SessionNotification> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    lock(&SSE_FANOUT)
+        .entry(session_id.to_string())
+        .or_default()
+        .push(tx);
+    rx
+}
+
+/// 向该会话的全部订阅者推送一条通知；已关闭的订阅者就地清理。
+fn fanout_push(session_id: &str, note: SessionNotification) {
+    let mut guard = lock(&SSE_FANOUT);
+    let Some(senders) = guard.get_mut(session_id) else {
+        tracing::debug!(session_id, "无 SSE 订阅，ACP 通知被丢弃");
+        return;
+    };
+    senders.retain(|tx| tx.send(note.clone()).is_ok());
+    if senders.is_empty() {
+        guard.remove(session_id);
+    }
+}
+
+/// 探针：当前是否有该会话的 SSE 订阅（测试用）。
+#[cfg(test)]
+fn fanout_subscriber_count(session_id: &str) -> usize {
+    lock(&SSE_FANOUT)
+        .get(session_id)
+        .map_or(0, std::vec::Vec::len)
+}
+
 static HTTP_PERMISSIONS: LazyLock<Mutex<PendingPermissions>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -226,11 +274,15 @@ async fn handle_http_prompt(
         }
     };
 
+    // H11：跟踪最后一个 assistant 消息，供 stopReason 映射（Length→max_tokens, Aborted→cancelled,
+    // refusal→refusal）。超时不再返回非法的 "timeout"，而是 ACP 合法的 "cancelled"。
+    let mut last_assistant: Option<agent_core::AssistantMessage> = None;
     let stop_reason = tokio::time::timeout(std::time::Duration::from_secs(600), async {
         loop {
             match rx.recv().await {
+                Ok(ServerFrame::TurnEnd { message, .. }) => last_assistant = Some(message),
                 Ok(frame) if is_terminal_frame(&frame) => {
-                    return crate::rpc::stop_reason(&frame);
+                    return crate::rpc::stop_reason_with(&frame, last_assistant.as_ref(), false);
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(_)) => {}
@@ -239,7 +291,7 @@ async fn handle_http_prompt(
         }
     })
     .await
-    .unwrap_or("timeout");
+    .unwrap_or("cancelled");
 
     Json(JsonRpcResponse {
         jsonrpc: "2.0".into(),
@@ -270,12 +322,23 @@ async fn handle_sse(
         return (StatusCode::NOT_FOUND, "会话不存在").into_response();
     };
     let rx = session.broadcast.subscribe();
+    // H12/H13：同时消费该会话的 ACP 通知扇出（bootstrap / 历史回放）。
+    let mut notes = fanout_subscribe(&session_id);
     let sid = session_id;
 
     let stream = async_stream::stream! {
         let mut rx = rx;
         loop {
-            match rx.recv().await {
+            tokio::select! {
+                Some(note) = notes.recv() => {
+                    match serde_json::to_string(&note) {
+                        Ok(json) => yield Ok::<_, Infallible>(
+                            Event::default().event("session/update").data(json),
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "session/update 序列化失败"),
+                    }
+                }
+                frame = rx.recv() => match frame {
                 Ok(frame) => match frame {
                     // 审批/追问：转为 session/request_permission 请求（SSE 事件名即方法名，
                     // data 为完整 JSON-RPC 请求），登记待回执并派生超时任务；
@@ -310,6 +373,7 @@ async fn handle_sse(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 // 通道关闭（会话结束）：结束流。
                 Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     };
@@ -350,4 +414,41 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{SessionNotificationParams, SessionUpdate};
+
+    /// H12/H13：SSE 扇出——订阅者收到通知，未订阅时丢弃且不 panic。
+    #[test]
+    fn fanout_delivers_to_subscribers_only() {
+        let note = |text: &str| SessionNotification {
+            jsonrpc: "2.0".into(),
+            method: "session/update".into(),
+            params: SessionNotificationParams {
+                session_id: "s1".into(),
+                update: SessionUpdate::UserMessageChunk {
+                    content: crate::types::TextContent::new(text),
+                },
+            },
+        };
+        // 无订阅者：不 panic、不残留条目。
+        fanout_push("s1", note("dropped"));
+        assert_eq!(fanout_subscriber_count("s1"), 0);
+
+        let mut rx = fanout_subscribe("s1");
+        assert_eq!(fanout_subscriber_count("s1"), 1);
+        fanout_push("s1", note("hello"));
+        let got = rx.try_recv().expect("订阅者应收到通知");
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(v["params"]["update"]["content"]["text"], "hello");
+
+        // 接收端关闭后推送即清理（不留死 sender）。
+        drop(rx);
+        fanout_push("s1", note("after-close"));
+        assert_eq!(fanout_subscriber_count("s1"), 0);
+    }
 }

@@ -16,7 +16,7 @@ use agent_core::{ContextManager, Mode, Model, SkillLevel, Usage, UserContent};
 use agent_i18n::t;
 use agent_mcp::McpRegistry;
 use agent_skills::SkillCatalog;
-use agent_tools::Tool;
+use agent_tools::{TodoItem, TodoPhase, Tool};
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -30,6 +30,15 @@ pub enum CommandOutcome {
     Handled,
     /// 注入文本作为下一轮任务。
     Inject(String),
+    /// MCP 提示词模板（`/<server>:<prompt>`）：主循环异步 `prompts/get` 后注入结果文本。
+    McpPrompt {
+        /// server 名。
+        server: String,
+        /// 提示词名（server 内唯一）。
+        prompt: String,
+        /// `key=value` 解析后的参数对象。
+        args: serde_json::Value,
+    },
     /// 请求切换模型（alias 或 id）。
     SwitchModel(String),
     /// 请求切换模式。
@@ -112,6 +121,14 @@ pub enum CommandOutcome {
         /// 评审子代理数（1-4；`None` 按 diff 权重自动）。
         reviewers: Option<usize>,
     },
+    /// H34 `/clear`：原地清空对话上下文（保留当前会话与系统提示词）。
+    ///
+    /// 需要 async + 逐条删除，故交回 `main` 执行（`handle_command` 是同步纯函数）。
+    Clear,
+    /// H34 `/context`：上下文占用与消息构成报告（异步取节点快照后打印）。
+    Context,
+    /// H34 `/retry`：重发最近一条用户输入（异步取上下文里最后一条真实 prompt）。
+    Retry,
 }
 
 /// 命令执行所需的只读上下文快照。
@@ -148,8 +165,14 @@ pub struct CommandContext<'a> {
     pub optional: &'a std::collections::HashMap<String, bool>,
     /// goals 目标预算共享状态（`/goal` 查看/调整；未配置时为 `None`）。
     pub goal: Option<Arc<std::sync::Mutex<agent::GoalState>>>,
-    /// todo 清单共享状态（`/todo` 查看当前清单）。
+    /// todo 清单共享状态（`/todo` 查看/编辑清单）。
     pub todo: Arc<agent_tools::TodoState>,
+    /// 异步后台作业管理器（`/jobs` 列表与取消；`[agent] async_enabled=false` 时为 `None`）。
+    pub jobs: Option<&'a Arc<agent_core::jobs::AsyncJobManager>>,
+    /// H4：运行期消息队列（`/queue`；运行中键入的消息在此排队，空闲时取回执行）。
+    pub queue: &'a Arc<std::sync::Mutex<agent_cli::queue::MessageQueue>>,
+    /// H5：生效键位表（`/hotkeys` 展示真实绑定，而非静态文案）。
+    pub keybindings: &'a agent_cli::keybindings::Resolved,
 }
 
 /// 内置命令名（带 `/`），用于补全与帮助。
@@ -160,6 +183,15 @@ pub const fn builtin_commands() -> &'static [&'static str] {
         "/help",
         "/?",
         "/status",
+        "/usage",
+        "/context",
+        "/clear",
+        "/new",
+        "/retry",
+        "/jobs",
+        "/queue",
+        "/settings",
+        "/hotkeys",
         "/todo",
         "/goal",
         "/diff",
@@ -199,6 +231,15 @@ pub const fn builtin_commands() -> &'static [&'static str] {
 const HELP_KEYS: &[&str] = &[
     "help.h",
     "help.status",
+    "help.usage",
+    "help.context",
+    "help.clear",
+    "help.new",
+    "help.retry",
+    "help.jobs",
+    "help.queue",
+    "help.settings",
+    "help.hotkeys",
     "help.todo",
     "help.goal",
     "help.diff",
@@ -257,6 +298,20 @@ pub fn all_command_names(custom: &[CustomCommand]) -> Vec<String> {
     for c in custom {
         out.push(format!("/{}", c.name));
     }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 内置 + 自定义 + MCP 提示词命令名（补全用；提示词随 server 连接/刷新变化，
+/// 调用方每次补全前重建即可拿到最新集合）。
+#[must_use]
+pub fn all_command_names_with_prompts(
+    custom: &[CustomCommand],
+    prompts: &[(String, agent_mcp::McpPromptInfo)],
+) -> Vec<String> {
+    let mut out = all_command_names(custom);
+    out.extend(prompts.iter().map(|(s, p)| format!("/{s}:{}", p.name)));
     out.sort();
     out.dedup();
     out
@@ -334,9 +389,31 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             print_status(ctx);
             CommandOutcome::Handled
         }
+        "/usage" => {
+            print_usage(ctx);
+            CommandOutcome::Handled
+        }
+        "/context" => CommandOutcome::Context,
+        "/clear" => CommandOutcome::Clear,
+        // `/new` = 全新会话（与 `/fresh` 同义；对齐 omp「Start a new session」）。
+        "/new" => CommandOutcome::Fresh,
+        "/retry" => CommandOutcome::Retry,
+        "/jobs" => {
+            handle_jobs(input, ctx);
+            CommandOutcome::Handled
+        }
+        "/queue" => handle_queue(input, ctx),
+        "/settings" => {
+            print_settings(ctx);
+            CommandOutcome::Handled
+        }
+        "/hotkeys" => {
+            print_hotkeys(ctx);
+            CommandOutcome::Handled
+        }
         "/todo" => {
-            // P0：查看当前任务清单（与 todo 工具同一状态；Markdown 直出 stderr）。
-            eprintln!("{}", ctx.todo.render_markdown());
+            // H34：可写清单（add/start/done/drop/rm/clear；无参 = 查看）。
+            handle_todo(input, ctx);
             CommandOutcome::Handled
         }
         "/goal" => {
@@ -345,7 +422,7 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
         }
         "/agents" => CommandOutcome::Agents,
         "/mcp" => {
-            print_mcp(ctx);
+            handle_mcp(input, ctx);
             CommandOutcome::Handled
         }
         "/skill" | "/skills" => {
@@ -370,9 +447,23 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             }
         },
         "/resume" => match input.split_whitespace().nth(1) {
-            Some(id) if !id.is_empty() => CommandOutcome::Resume(id.to_string()),
+            // H34：`/resume <n>` 按 `/sessions` 列表序号选择；否则按会话 id。
+            Some(arg) if !arg.is_empty() => match arg.parse::<usize>() {
+                Ok(n) if n >= 1 => {
+                    let list = ctx.sessions.list();
+                    match list.get(n - 1) {
+                        Some(s) => CommandOutcome::Resume(s.id.clone()),
+                        None => {
+                            eprintln!("{}", t!("resume.bad_index", n = n, count = list.len()));
+                            CommandOutcome::Handled
+                        }
+                    }
+                }
+                _ => CommandOutcome::Resume(arg.to_string()),
+            },
             _ => {
-                eprintln!("{}", t!("resume.usage"));
+                // 无参：列出带序号的候选（选择器），并提示两种用法。
+                print_session_choices(ctx);
                 CommandOutcome::Handled
             }
         },
@@ -459,14 +550,114 @@ pub fn handle_command(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
             let skill_name = &other["/skill:".len()..];
             inject_skill(skill_name, ctx)
         }
-        other => match try_custom_command(other, input, ctx.commands) {
-            Some(text) => CommandOutcome::Inject(text),
-            None => {
-                eprintln!("{}", t!("common.unknown_command", cmd = other));
-                CommandOutcome::Handled
-            }
+        other => match resolve_mcp_prompt(other, input, ctx) {
+            PromptCmd::Ready(outcome) => outcome,
+            // 命中 `server:prompt` 形态但缺必填参数（用法已打印）。
+            PromptCmd::UsageError => CommandOutcome::Handled,
+            PromptCmd::NotPrompt => match try_custom_command(other, input, ctx.commands) {
+                Some(text) => CommandOutcome::Inject(text),
+                None => {
+                    eprintln!("{}", t!("common.unknown_command", cmd = other));
+                    CommandOutcome::Handled
+                }
+            },
         },
     }
+}
+
+/// 解析提示词命令的参数：`key=value` 词元 → JSON 对象 + 缺失的必填项名。
+///
+/// 纯函数（无注册表/IO 依赖）便于测试：无法解析的词元忽略（omp 同款宽容语义），
+/// 必填项缺失只报告、不猜测默认值。
+fn parse_prompt_args(
+    raw: &str,
+    prompt: &agent_mcp::McpPromptInfo,
+) -> (serde_json::Value, Vec<String>) {
+    let mut args = serde_json::Map::new();
+    for tok in raw.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            if !k.is_empty() {
+                args.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+        }
+    }
+    let missing: Vec<String> = prompt
+        .arguments
+        .iter()
+        .filter(|a| a.required && !args.contains_key(&a.name))
+        .map(|a| a.name.clone())
+        .collect();
+    (serde_json::Value::Object(args), missing)
+}
+
+/// 提示词用法的展示形态（必填 `k=<值>`、可选 `[k]=<值>`）。
+fn prompt_usage_args(prompt: &agent_mcp::McpPromptInfo) -> String {
+    prompt
+        .arguments
+        .iter()
+        .map(|a| {
+            if a.required {
+                format!("{}=<值>", a.name)
+            } else {
+                format!("[{}]=<值>", a.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// MCP 提示词命令的解析结果。
+enum PromptCmd {
+    /// 不是 MCP 提示词（含无 `server:prompt` 形态 / server、提示词不存在）。
+    NotPrompt,
+    /// 命中但缺必填参数（用法已打印）。
+    UsageError,
+    /// 命中且参数齐备，交由主循环异步 `prompts/get` 后注入。
+    Ready(CommandOutcome),
+}
+
+/// MCP 提示词命令解析：`/<server>:<prompt> [key=value …]`（对齐 omp
+/// `buildMCPPromptCommands` 的命令名与参数约定）。
+fn resolve_mcp_prompt(cmd_token: &str, full: &str, ctx: &CommandContext<'_>) -> PromptCmd {
+    let token = cmd_token.trim_start_matches('/');
+    let Some((server, prompt_name)) = token.split_once(':') else {
+        return PromptCmd::NotPrompt;
+    };
+    if server.is_empty() || prompt_name.is_empty() {
+        return PromptCmd::NotPrompt;
+    }
+    let Some(prompt) = ctx
+        .mcp
+        .prompts()
+        .into_iter()
+        .find(|(s, p)| s == server && p.name == prompt_name)
+    else {
+        return PromptCmd::NotPrompt;
+    };
+
+    let raw = full
+        .trim_start_matches('/')
+        .strip_prefix(token)
+        .unwrap_or("")
+        .trim();
+    let (args, missing) = parse_prompt_args(raw, &prompt.1);
+    if !missing.is_empty() {
+        eprintln!(
+            "{}",
+            t!(
+                "mcp.prompt_usage",
+                cmd = format!("{server}:{prompt_name}"),
+                args = prompt_usage_args(&prompt.1),
+                missing = missing.join(", ")
+            )
+        );
+        return PromptCmd::UsageError;
+    }
+    PromptCmd::Ready(CommandOutcome::McpPrompt {
+        server: server.to_string(),
+        prompt: prompt_name.to_string(),
+        args,
+    })
 }
 
 // ── 图片粘贴（剪贴板 / 本地文件）──────────────────────────────────────────────
@@ -653,11 +844,589 @@ fn print_status(ctx: &CommandContext<'_>) {
     eprintln!("{}", t!("status.footer"));
 }
 
-/// `/goal [set <tokens> | extend <tokens>]`：查看 / 调整 goals 目标预算。
+/// H34 `/context` 的构成统计（纯函数，便于回归测试）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    /// 活跃路径消息总数。
+    pub total: usize,
+    /// 用户消息数。
+    pub user: usize,
+    /// 助手消息数。
+    pub assistant: usize,
+    /// 工具结果数。
+    pub tool: usize,
+    /// 其它（状态/询问/软需求等）。
+    pub other: usize,
+}
+
+/// 统计活跃路径的消息构成（`/context` 报告用）。
+#[must_use]
+pub fn context_breakdown(nodes: &[agent_core::SessionNode]) -> ContextBreakdown {
+    let mut out = ContextBreakdown::default();
+    for n in nodes {
+        out.total += 1;
+        match n.message {
+            agent_core::AgentMessage::User(_) => out.user += 1,
+            agent_core::AgentMessage::Assistant(_) => out.assistant += 1,
+            agent_core::AgentMessage::ToolResult(_) => out.tool += 1,
+            _ => out.other += 1,
+        }
+    }
+    out
+}
+
+/// H34 `/retry`：取最近一条「真实用户输入」（跳过系统注入的提醒/通知）。
 ///
-/// - 无参数：显示当前预算、累计用量与是否超限。
-/// - `set <tokens>`：把 token 预算设为绝对值（0 = 不限）。
-/// - `extend <tokens>`：在现有预算上追加。
+/// 注入消息（eager prelude / magic-keyword 通知 / 预算提醒 / 压缩提示）都以
+/// `<`、`[system`、`⚠` 等标记开头；重试应回到用户原话，而不是重发一条提醒。
+#[must_use]
+pub fn last_user_prompt(nodes: &[agent_core::SessionNode]) -> Option<String> {
+    let text_of = |m: &agent_core::AgentMessage| -> Option<String> {
+        let agent_core::AgentMessage::User(u) = m else {
+            return None;
+        };
+        let text = u
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    };
+    let is_injected = |t: &str| {
+        let t = t.trim_start();
+        t.starts_with('<') || t.starts_with("[system") || t.starts_with('⚠')
+    };
+    let mut fallback = None;
+    for n in nodes.iter().rev() {
+        let Some(text) = text_of(&n.message) else {
+            continue;
+        };
+        if !is_injected(&text) {
+            return Some(text);
+        }
+        fallback.get_or_insert(text);
+    }
+    fallback
+}
+
+/// H4 `/queue`：运行期消息队列。
+///
+/// - 无参 / `list`：列出排队消息（序号从 1 起）
+/// - `add <文本>` / `enqueue <文本>`：入队（支持 `1. a\n2. b` 顺序列表一次入多条）
+/// - `pop` / `next`：出队头部并**立即作为下一轮任务**执行（空闲时的「取回执行」）
+/// - `undo` / `back`：取回最近一次入队
+/// - `rm <序号>` / `drop <序号>`：按序号删除
+/// - `clear`：清空
+fn handle_queue(input: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let mut parts = input.splitn(3, char::is_whitespace);
+    let _ = parts.next();
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    let Ok(mut q) = ctx.queue.lock() else {
+        eprintln!("队列锁中毒");
+        return CommandOutcome::Handled;
+    };
+    match sub {
+        "" | "list" => {
+            let items = q.list();
+            if items.is_empty() {
+                eprintln!("{}", t!("queue.empty"));
+            } else {
+                eprintln!("{}", t!("queue.title", count = items.len()));
+                for (idx, text) in items {
+                    eprintln!("  {idx}. {}", text.replace('\n', " ⏎ "));
+                }
+            }
+            CommandOutcome::Handled
+        }
+        "add" | "enqueue" => {
+            if rest.is_empty() {
+                eprintln!("{}", t!("queue.usage"));
+                return CommandOutcome::Handled;
+            }
+            let msgs = agent_cli::queue::split_queued_messages(rest);
+            let n = msgs.len();
+            let len = q.enqueue_many(msgs);
+            eprintln!("{}", t!("queue.added", n = n, len = len));
+            CommandOutcome::Handled
+        }
+        "pop" | "next" => match q.pop_front() {
+            Some(text) => {
+                eprintln!("{}", t!("queue.popped", text = text.replace('\n', " ⏎ ")));
+                CommandOutcome::Inject(text)
+            }
+            None => {
+                eprintln!("{}", t!("queue.empty"));
+                CommandOutcome::Handled
+            }
+        },
+        "undo" | "back" => match q.pop_back() {
+            Some(text) => {
+                eprintln!("{}", t!("queue.undone", text = text.replace('\n', " ⏎ ")));
+                CommandOutcome::Handled
+            }
+            None => {
+                eprintln!("{}", t!("queue.empty"));
+                CommandOutcome::Handled
+            }
+        },
+        "rm" | "drop" => match rest.parse::<usize>() {
+            Ok(n) => match q.remove(n) {
+                Some(text) => {
+                    eprintln!(
+                        "{}",
+                        t!("queue.removed", n = n, text = text.replace('\n', " ⏎ "))
+                    );
+                    CommandOutcome::Handled
+                }
+                None => {
+                    eprintln!("{}", t!("queue.bad_index", n = n, len = q.len()));
+                    CommandOutcome::Handled
+                }
+            },
+            Err(_) => {
+                eprintln!("{}", t!("queue.usage"));
+                CommandOutcome::Handled
+            }
+        },
+        "clear" => {
+            let n = q.clear();
+            eprintln!("{}", t!("queue.cleared", n = n));
+            CommandOutcome::Handled
+        }
+        _ => {
+            eprintln!("{}", t!("queue.usage"));
+            CommandOutcome::Handled
+        }
+    }
+}
+
+/// H4：运行中键入的处理（`/queue` 由宿主消费；`->`/`=>` 入队；其余仍即时 steering）。
+///
+/// 返回 `Some(text)` 表示该消息应**立即投递给运行中的 agent**（dequeue 语义）。
+pub fn handle_running_input(
+    line: &str,
+    queue: &Arc<std::sync::Mutex<agent_cli::queue::MessageQueue>>,
+) -> RunningInput {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return RunningInput::Ignored;
+    }
+    // 简写：只入队，不打断当前轮次。
+    if let Some(msg) = agent_cli::queue::parse_queue_shorthand(trimmed) {
+        let len = lock_queue(queue).map_or(0, |mut q| q.enqueue(msg));
+        return RunningInput::Queued(len);
+    }
+    if let Some(rest) = trimmed.strip_prefix("/queue") {
+        let Ok(mut q) = queue.lock() else {
+            return RunningInput::Ignored;
+        };
+        let args: Vec<&str> = rest.split_whitespace().collect();
+        match args.first().copied() {
+            None | Some("list") => {
+                let items = q.list();
+                if items.is_empty() {
+                    eprintln!("{}", t!("queue.empty"));
+                } else {
+                    eprintln!("{}", t!("queue.title", count = items.len()));
+                    for (idx, text) in items {
+                        eprintln!("  {idx}. {}", text.replace('\n', " ⏎ "));
+                    }
+                }
+            }
+            Some("add" | "enqueue") => {
+                let text = rest
+                    .trim_start()
+                    .strip_prefix("add")
+                    .or_else(|| rest.trim_start().strip_prefix("enqueue"))
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty() {
+                    eprintln!("{}", t!("queue.usage"));
+                } else {
+                    let msgs = agent_cli::queue::split_queued_messages(text);
+                    let n = msgs.len();
+                    let len = q.enqueue_many(msgs);
+                    eprintln!("{}", t!("queue.added", n = n, len = len));
+                }
+            }
+            Some("pop" | "next") => match q.pop_front() {
+                Some(text) => {
+                    eprintln!("{}", t!("queue.popped", text = text.replace('\n', " ⏎ ")));
+                    // 运行中取回 = 立刻投递（不等本轮结束）。
+                    return RunningInput::Steer(text);
+                }
+                None => eprintln!("{}", t!("queue.empty")),
+            },
+            Some("undo" | "back") => match q.pop_back() {
+                Some(text) => {
+                    eprintln!("{}", t!("queue.undone", text = text.replace('\n', " ⏎ ")));
+                }
+                None => eprintln!("{}", t!("queue.empty")),
+            },
+            Some("clear") => {
+                let n = q.clear();
+                eprintln!("{}", t!("queue.cleared", n = n));
+            }
+            Some(_) => eprintln!("{}", t!("queue.usage")),
+        }
+        return RunningInput::Ignored;
+    }
+    RunningInput::Steer(trimmed.to_string())
+}
+
+/// 运行中键入的处理结果（H4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningInput {
+    /// 忽略（空行 / `/queue` 已由宿主消费）。
+    Ignored,
+    /// 入队成功（携带入队后长度）。
+    Queued(usize),
+    /// 立即投递给运行中的 agent（普通输入 / 运行中取回）。
+    Steer(String),
+}
+
+/// 取队列锁（中毒时恢复内部数据，不静默丢弃队列）。
+fn lock_queue(
+    queue: &Arc<std::sync::Mutex<agent_cli::queue::MessageQueue>>,
+) -> Option<std::sync::MutexGuard<'_, agent_cli::queue::MessageQueue>> {
+    queue.lock().ok()
+}
+
+/// H34 `/usage`：会话累计用量与上下文占用（只读；数据源同 `/status`，侧重 token/成本口径）。
+fn print_usage(ctx: &CommandContext<'_>) {
+    let usage = ctx.context.token_usage();
+    let pct = if usage.limit > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            usage.current as f64 / usage.limit as f64 * 100.0
+        }
+    } else {
+        0.0
+    };
+    eprintln!("{}", t!("usage.title"));
+    eprintln!(
+        "{}",
+        t!(
+            "usage.tokens",
+            input = ctx.accumulated.input_tokens,
+            out = ctx.accumulated.output_tokens,
+            cr = ctx.accumulated.cache_read_tokens,
+            cw = ctx.accumulated.cache_write_tokens
+        )
+    );
+    let billed = ctx.accumulated.input_tokens
+        + ctx.accumulated.cache_write_tokens
+        + ctx.accumulated.output_tokens;
+    let prompt_total = ctx.accumulated.input_tokens + ctx.accumulated.cache_read_tokens;
+    let rate = if prompt_total > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            ctx.accumulated.cache_read_tokens as f64 / prompt_total as f64 * 100.0
+        }
+    } else {
+        0.0
+    };
+    eprintln!(
+        "{}",
+        t!(
+            "usage.billed",
+            billed = billed,
+            rate = format!("{rate:.1}"),
+            total = prompt_total
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "usage.cost",
+            cost = format!("{:.6}", ctx.accumulated.cost_usd)
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "usage.context",
+            current = usage.current,
+            limit = usage.limit,
+            pct = format!("{pct:.1}")
+        )
+    );
+}
+
+/// H34 `/jobs`：后台作业列表 / `cancel <id>`。
+fn handle_jobs(input: &str, ctx: &CommandContext<'_>) {
+    let Some(jm) = ctx.jobs else {
+        eprintln!("{}", t!("jobs.disabled"));
+        return;
+    };
+    let args: Vec<&str> = input.split_whitespace().collect();
+    match args.get(1).copied() {
+        None | Some("list") => {
+            let jobs = jm.recent_jobs(20, None);
+            if jobs.is_empty() {
+                eprintln!("{}", t!("jobs.none"));
+                return;
+            }
+            eprintln!("{}", t!("jobs.title", count = jobs.len()));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            for j in jobs {
+                let label = preview_text(&j.label, 60);
+                eprintln!(
+                    "{}",
+                    t!(
+                        "jobs.entry",
+                        id = j.id,
+                        kind = j.job_type.as_str(),
+                        status = j.status.as_str(),
+                        ms = j.duration_ms(now),
+                        label = label
+                    )
+                );
+            }
+        }
+        Some("cancel") => match args.get(2).copied() {
+            Some(id) if !id.is_empty() => {
+                if jm.cancel(id, None) {
+                    eprintln!("{}", t!("jobs.cancelled", id = id));
+                } else {
+                    eprintln!("{}", t!("jobs.not_found", id = id));
+                }
+            }
+            _ => eprintln!("{}", t!("jobs.usage")),
+        },
+        Some(_) => eprintln!("{}", t!("jobs.usage")),
+    }
+}
+
+/// H34 `/settings`：当前生效设置摘要（配置 + 运行时开关；只读展示）。
+fn print_settings(ctx: &CommandContext<'_>) {
+    let cfg = ctx.config;
+    let on: Vec<&str> = ctx
+        .optional
+        .iter()
+        .filter_map(|(k, v)| v.then_some(k.as_str()))
+        .collect();
+    eprintln!("{}", t!("settings.title"));
+    eprintln!(
+        "{}",
+        t!(
+            "settings.model",
+            id = ctx.model.id,
+            count = cfg.models.len() + 1
+        )
+    );
+    eprintln!("{}", t!("settings.mode", mode = mode_label(ctx.mode)));
+    eprintln!(
+        "{}",
+        t!(
+            "settings.approval",
+            mode = format!("{:?}", cfg.agent.approval_mode)
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.guard",
+            pct = format!("{:.0}", cfg.agent.context_window_guard * 100.0),
+            turns = cfg.agent.max_turns
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.todo",
+            eager = cfg.todo.eager.as_deref().unwrap_or("off"),
+            reminders = cfg.todo.reminders,
+            max = cfg.todo.reminders_max
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.goals",
+            tokens = cfg.goals.token_budget,
+            secs = cfg.goals.time_budget_secs,
+            mode = if cfg.goals.hard_stop { "hard" } else { "soft" }
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.async",
+            enabled = cfg.agent.async_enabled,
+            max = cfg.agent.async_max_jobs
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.subagent",
+            enabled = cfg.subagent.enabled,
+            conc = cfg.subagent.max_concurrent
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.compaction",
+            backend = format!("{:?}", cfg.compaction.backend)
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.tools",
+            on = if on.is_empty() {
+                "-".to_string()
+            } else {
+                on.join(",")
+            },
+            github = if ctx.github_enabled { "on" } else { "off" },
+            write = if ctx.github_allow_write { "on" } else { "off" }
+        )
+    );
+    eprintln!(
+        "{}",
+        t!(
+            "settings.lang",
+            lang = cfg.language.as_deref().unwrap_or("auto"),
+            ua = cfg.user_agent.as_deref().unwrap_or("default")
+        )
+    );
+    eprintln!("{}", t!("settings.footer"));
+}
+
+/// H5 `/hotkeys`：打印**生效**键位表（默认 + `[keybindings]` 覆盖），并附固定约定。
+fn print_hotkeys(ctx: &CommandContext<'_>) {
+    eprintln!("{}", t!("hotkeys.title"));
+    for line in agent_cli::keybindings::render_table(ctx.keybindings) {
+        eprintln!("{line}");
+    }
+    eprintln!("{}", t!("hotkeys.fixed"));
+    for line in [
+        "  Enter           提交输入（多行粘贴后一次性提交）",
+        "  Up / Down       历史上下浏览",
+        "  Esc             取消当前行 / 关闭选择器",
+    ] {
+        eprintln!("{line}");
+    }
+}
+
+/// H34 `/todo [add|start|done|drop|rm|clear]`：查看与编辑待办清单（与 `todo` 工具同一状态）。
+///
+/// id 采用工具同款 `t<N>`；`replace` 会按位置重排 id，故只改阶段、不重排顺序
+/// （单活跃不变量由 `TodoState::replace` 内部的 `enforce_single_active` 保证）。
+fn handle_todo(input: &str, ctx: &CommandContext<'_>) {
+    let mut parts = input.splitn(3, char::is_whitespace);
+    let _ = parts.next();
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    if sub.is_empty() || sub == "list" || sub == "show" {
+        eprintln!("{}", ctx.todo.render_markdown());
+        return;
+    }
+    let mut items = ctx.todo.snapshot().items;
+    match sub {
+        "add" => {
+            if rest.is_empty() {
+                eprintln!("{}", t!("todo.usage"));
+                return;
+            }
+            items.push(TodoItem {
+                id: String::new(),
+                content: rest.to_string(),
+                phase: TodoPhase::Pending,
+                blocked_reason: None,
+            });
+            let list = ctx.todo.replace(items);
+            eprintln!("{}", t!("todo.added", count = list.items.len()));
+        }
+        "start" | "done" | "drop" | "rm" => {
+            if rest.is_empty() {
+                eprintln!("{}", t!("todo.usage"));
+                return;
+            }
+            let target = normalize_todo_id(rest);
+            let phase = match sub {
+                "start" => TodoPhase::InProgress,
+                "done" => TodoPhase::Completed,
+                _ => TodoPhase::Abandoned,
+            };
+            let Some(item) = items.iter_mut().find(|i| i.id == target) else {
+                eprintln!("{}", t!("todo.unknown_id", id = target));
+                return;
+            };
+            item.phase = phase;
+            if phase != TodoPhase::Blocked {
+                item.blocked_reason = None;
+            }
+            let list = ctx.todo.replace(items);
+            eprintln!(
+                "{}",
+                t!(
+                    "todo.updated",
+                    id = target,
+                    phase = phase.as_str(),
+                    count = list.items.len()
+                )
+            );
+        }
+        "clear" => {
+            ctx.todo.replace(Vec::new());
+            eprintln!("{}", t!("todo.cleared"));
+        }
+        _ => eprintln!("{}", t!("todo.usage")),
+    }
+}
+
+/// 把 `3` / `t3` / `#3` 归一为工具同款 id（`t3`）。
+fn normalize_todo_id(raw: &str) -> String {
+    let t = raw.trim().trim_start_matches(['#', 't']);
+    format!("t{t}")
+}
+
+/// H34 `/resume`（无参）：带序号的会话候选列表（配合 `/resume <n>`）。
+fn print_session_choices(ctx: &CommandContext<'_>) {
+    let list = ctx.sessions.list();
+    if list.is_empty() {
+        eprintln!("{}", t!("sessions.none"));
+        return;
+    }
+    eprintln!("{}", t!("resume.title"));
+    for (idx, s) in list.iter().enumerate() {
+        let cur = if s.id == ctx.session_id {
+            t!("sessions.current_mark")
+        } else {
+            String::new()
+        };
+        let preview = first_user_message_text(&ctx.sessions.path_for(&s.id))
+            .map(|txt| format!("「{}」", preview_text(&txt, 50)))
+            .unwrap_or_else(|| t!("sessions.no_user_msg"));
+        eprintln!(
+            "  {:>2}. {}  {}  {}{}",
+            idx + 1,
+            s.id,
+            format_time(s.mtime),
+            preview,
+            cur
+        );
+    }
+    eprintln!("{}", t!("resume.hint"));
+}
+
+/// `/goal [set <tokens> | extend <tokens> | pause | resume | complete | drop]`：
+/// 查看 / 调整目标状态与预算（H29：目标状态机）。
+///
+/// - 无参数：显示目标状态（objective/续跑计数）与会话预算、累计用量与是否超限。
+/// - `set <tokens>` / `extend <tokens>`：调整 token 预算（0 = 不限）。
+/// - `pause` / `resume` / `complete` / `drop`：目标状态机（与 `goal` 工具同一状态）。
 ///
 /// 预算调整即时生效（共享 `Arc<Mutex<GoalState>>`，无需重建 Agent）；若调整后未超限，
 /// 重置一次性提醒标记，允许后续再次超限时重新注入。
@@ -670,6 +1439,15 @@ fn handle_goal(input: &str, ctx: &CommandContext<'_>) {
     if rest.is_empty() {
         let g = goal.lock().expect("goal 锁中毒");
         eprintln!("{}", t!("goal.title"));
+        eprintln!(
+            "{}",
+            t!(
+                "goal.objective",
+                state = g
+                    .goal_summary()
+                    .unwrap_or_else(|| t!("goal.none").to_string())
+            )
+        );
         eprintln!("{}", t!("goal.status", summary = g.summary()));
         eprintln!(
             "{}",
@@ -687,6 +1465,33 @@ fn handle_goal(input: &str, ctx: &CommandContext<'_>) {
         );
         eprintln!("{}", t!("goal.usage"));
         return;
+    }
+    // H29：状态机子命令（与 `goal` 工具共享同一状态；错误如实回报而非静默）。
+    match rest {
+        "pause" | "resume" | "complete" | "drop" => {
+            let outcome = {
+                let mut g = goal.lock().expect("goal 锁中毒");
+                match rest {
+                    "pause" => g.pause().map(|()| t!("goal.paused").to_string()),
+                    "resume" => g
+                        .resume()
+                        .map(|()| t!("goal.resumed", summary = g.summary()).to_string()),
+                    "complete" => g
+                        .complete()
+                        .map(|()| t!("goal.completed", summary = g.summary()).to_string()),
+                    _ => Ok(g.drop_goal().map_or_else(
+                        || t!("goal.none").to_string(),
+                        |o| t!("goal.dropped", objective = o).to_string(),
+                    )),
+                }
+            };
+            match outcome {
+                Ok(msg) => eprintln!("{msg}"),
+                Err(e) => eprintln!("{}", t!("goal.error", error = e)),
+            }
+            return;
+        }
+        _ => {}
     }
     let tokens: u64 = rest
         .split_whitespace()
@@ -875,20 +1680,68 @@ fn complete_tools_args(typed: &str, prefix: &str) -> Vec<String> {
     }
 }
 
+/// `/mcp [status|list|add|remove|enable|disable]`：无参 = 列出已加载工具（原行为）；
+/// 其余子命令复用 [`agent_cli::manage`] 的路由与实现（CLI / REPL 同一份逻辑，不复制）。
+///
+/// 写操作落盘后「下次启动生效」——运行中的 `McpRegistry` 不在本模块的可变面内。
+fn handle_mcp(input: &str, ctx: &CommandContext<'_>) {
+    let rest = input.strip_prefix("/mcp").unwrap_or("").trim();
+    if rest.is_empty() {
+        print_mcp(ctx);
+        return;
+    }
+    let mut tokens = vec!["mcp".to_owned()];
+    tokens.extend(rest.split_whitespace().map(str::to_owned));
+    let Some(config_dir) = agent_core::platform::config_dir() else {
+        eprintln!("{}", t!("manage.mcp.no_config_dir"));
+        return;
+    };
+    let mut out = std::io::stderr();
+    match agent_cli::manage::route(&tokens) {
+        agent_cli::manage::Route::Run(cmd) => {
+            if let Err(e) = agent_cli::manage::run_mcp_cmd(&cmd, ctx.cwd, &config_dir, &mut out) {
+                eprintln!("{e}");
+            }
+        }
+        agent_cli::manage::Route::Usage(msg) => eprintln!("{msg}"),
+        agent_cli::manage::Route::Help(text) => eprintln!("{text}"),
+        agent_cli::manage::Route::Fallthrough => eprintln!("{}", t!("manage.mcp.usage")),
+    }
+}
+
 fn print_mcp(ctx: &CommandContext<'_>) {
     let tools = ctx.mcp.tools();
     if tools.is_empty() {
         eprintln!("{}", t!("mcp.none"));
-        return;
+    } else {
+        eprintln!("{}", t!("mcp.tools_count", count = tools.len()));
+        for tool in tools {
+            let desc = if tool.description().is_empty() {
+                t!("mcp.no_desc")
+            } else {
+                tool.description().to_string()
+            };
+            // Deferred 工具（server 未连上、元信息来自缓存快照）标注，避免误以为可直接用。
+            let mark = if tool.is_deferred() {
+                t!("mcp.deferred_mark")
+            } else {
+                String::new()
+            };
+            eprintln!("  - {}{}  {}", tool.name(), mark, desc);
+        }
     }
-    eprintln!("{}", t!("mcp.tools_count", count = tools.len()));
-    for tool in tools {
-        let desc = if tool.description().is_empty() {
-            t!("mcp.no_desc")
-        } else {
-            tool.description().to_string()
-        };
-        eprintln!("  - {}  {}", tool.name(), desc);
+    // 提示词模板即斜杠命令：`/<server>:<prompt>`（内容由 server 侧模板生成）。
+    let prompts = ctx.mcp.prompts();
+    if !prompts.is_empty() {
+        eprintln!("{}", t!("mcp.prompts_count", count = prompts.len()));
+        for (server, p) in prompts {
+            let desc = if p.description.is_empty() {
+                t!("mcp.no_desc")
+            } else {
+                p.description
+            };
+            eprintln!("  - /{server}:{}  {}", p.name, desc);
+        }
     }
 }
 
@@ -1516,6 +2369,64 @@ mod tests {
         assert!(names.contains(&"/status".to_string()));
     }
 
+    fn sample_prompt() -> agent_mcp::McpPromptInfo {
+        agent_mcp::McpPromptInfo {
+            name: "review".into(),
+            description: "代码评审".into(),
+            arguments: vec![
+                agent_mcp::McpPromptArg {
+                    name: "path".into(),
+                    required: true,
+                },
+                agent_mcp::McpPromptArg {
+                    name: "lang".into(),
+                    required: false,
+                },
+            ],
+        }
+    }
+
+    /// `key=value` 词元解析 + 必填项缺失报告（不猜默认值）。
+    #[test]
+    fn prompt_args_parse_kv_and_report_missing_required() {
+        let prompt = sample_prompt();
+        let (args, missing) = parse_prompt_args("path=src/a.rs lang=rust 裸词", &prompt);
+        assert_eq!(args["path"], serde_json::json!("src/a.rs"));
+        assert_eq!(args["lang"], serde_json::json!("rust"));
+        assert!(missing.is_empty(), "可选参数不影响必填校验");
+
+        let (args, missing) = parse_prompt_args("lang=rust", &prompt);
+        assert_eq!(args["lang"], serde_json::json!("rust"));
+        assert_eq!(missing, vec!["path".to_string()]);
+
+        // 空参数：必填仍缺。
+        let (_, missing) = parse_prompt_args("", &prompt);
+        assert_eq!(missing, vec!["path".to_string()]);
+
+        // 用法展示区分必填/可选。
+        assert_eq!(prompt_usage_args(&prompt), "path=<值> [lang]=<值>");
+    }
+
+    /// MCP 提示词以 `/<server>:<prompt>` 进入补全命令表（与内置/自定义命令并存）。
+    #[test]
+    fn command_names_include_mcp_prompts() {
+        let custom = vec![CustomCommand {
+            name: "test".into(),
+            description: String::new(),
+            body: String::new(),
+        }];
+        let prompts = vec![("github".to_string(), sample_prompt())];
+        let names = all_command_names_with_prompts(&custom, &prompts);
+        assert!(names.contains(&"/github:review".to_string()));
+        assert!(names.contains(&"/help".to_string()));
+        assert!(names.contains(&"/test".to_string()));
+        // 无提示词时不改变既有命令面。
+        assert_eq!(
+            all_command_names_with_prompts(&custom, &[]),
+            all_command_names(&custom)
+        );
+    }
+
     #[test]
     fn civil_from_days_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -1572,6 +2483,7 @@ mod tests {
             version: CURRENT_SESSION_VERSION,
             created_at_unix: 1_700_000_000,
             agent: "gyre".into(),
+            ..SessionHeader::new("gyre")
         };
         let header_line =
             serde_json::to_string(&agent_context::SessionRecord::Header(header)).unwrap();
@@ -1800,12 +2712,18 @@ mod tests {
         sessions: agent_context::SessionStore,
         optional: std::collections::HashMap<String, bool>,
         usage: agent_core::Usage,
+        queue: Arc<std::sync::Mutex<agent_cli::queue::MessageQueue>>,
+        keybindings: agent_cli::keybindings::Resolved,
     }
 
     impl GoalCtx {
         fn new() -> Self {
             let cfg = agent_config::Config {
                 default_model: agent_config::ModelProfile {
+                    headers: std::collections::BTreeMap::new(),
+                    quirks: agent_core::ProviderQuirks::default(),
+                    auth: agent_core::AuthMode::ApiKey,
+                    compat: agent_config::CompatConfig::default(),
                     id: "m".into(),
                     alias: None,
                     api: agent_core::Api::OpenAiCompletions,
@@ -1815,6 +2733,7 @@ mod tests {
                     fallbacks: vec![],
                     temperature: None,
                     max_output_tokens: None,
+                    tokenizer: None,
                     max_input_tokens: None,
                     extra_body: None,
                 },
@@ -1831,12 +2750,14 @@ mod tests {
                 acp: agent_config::AcpConfig::default(),
                 ttsr: agent_config::TtsrConfig::default(),
                 goals: agent_config::GoalsConfig::default(),
+                todo: agent_config::TodoConfig::default(),
                 eval: agent_config::EvalConfig::default(),
                 compaction: agent_config::CompactionConfig::default(),
                 socks5: agent_config::Socks5Config::default(),
                 user_agent: None,
                 hooks: Vec::new(),
                 models_roles: None,
+                keybindings: agent_config::KeybindingsConfig::default(),
             };
             Self {
                 model: agent_core::Model::with_defaults(
@@ -1845,7 +2766,9 @@ mod tests {
                     agent_core::Api::OpenAiCompletions,
                 ),
                 cfg,
+                keybindings: agent_cli::keybindings::resolve(&std::collections::BTreeMap::new()),
                 inmem: agent_context::InMemoryContext::new(vec![]),
+                queue: Arc::new(std::sync::Mutex::new(agent_cli::queue::MessageQueue::new())),
                 mcp: agent_mcp::McpRegistry::default(),
                 skills: agent_skills::SkillCatalog::default(),
                 sessions: agent_context::SessionStore::default(),
@@ -1876,6 +2799,9 @@ mod tests {
                 optional: &self.optional,
                 goal,
                 todo: agent_tools::TodoState::in_memory().shared(),
+                jobs: None,
+                queue: &self.queue,
+                keybindings: &self.keybindings,
             }
         }
     }
@@ -1932,6 +2858,259 @@ mod tests {
             || after.starts_with(' ')
             || after.starts_with(',')
             || after.starts_with('[')
+    }
+
+    // ── H34：交互命令族（clear/new/retry/context/usage/jobs/settings/hotkeys/todo/resume）──
+
+    #[test]
+    fn h34_new_clear_retry_context_are_outcomes() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        assert!(matches!(
+            handle_command("/clear", &ctx),
+            CommandOutcome::Clear
+        ));
+        assert!(matches!(
+            handle_command("/new", &ctx),
+            CommandOutcome::Fresh
+        ));
+        assert!(matches!(
+            handle_command("/retry", &ctx),
+            CommandOutcome::Retry
+        ));
+        assert!(matches!(
+            handle_command("/context", &ctx),
+            CommandOutcome::Context
+        ));
+        // 只读命令自行处理，不改运行时状态。
+        for cmd in ["/usage", "/settings", "/hotkeys", "/jobs"] {
+            assert!(
+                matches!(handle_command(cmd, &ctx), CommandOutcome::Handled),
+                "{cmd} 应为 Handled"
+            );
+        }
+    }
+
+    #[test]
+    fn h34_todo_is_writable_from_slash_command() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        // add → 清单出现待办（id 由 replace 重排为 t1）。
+        assert!(matches!(
+            handle_command("/todo add 写测试", &ctx),
+            CommandOutcome::Handled
+        ));
+        let items = ctx.todo.snapshot().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "写测试");
+        assert_eq!(items[0].phase, TodoPhase::Pending);
+        // start t1 → in_progress。
+        handle_command("/todo start t1", &ctx);
+        assert_eq!(ctx.todo.snapshot().items[0].phase, TodoPhase::InProgress);
+        // 序号写法 `1` 与 `#1` 等价。
+        handle_command("/todo done 1", &ctx);
+        assert_eq!(ctx.todo.snapshot().items[0].phase, TodoPhase::Completed);
+        // 未知 id 不改状态。
+        handle_command("/todo drop t9", &ctx);
+        assert_eq!(ctx.todo.snapshot().items[0].phase, TodoPhase::Completed);
+        // 非法子命令只打印用法。
+        handle_command("/todo bogus", &ctx);
+        assert_eq!(ctx.todo.snapshot().items.len(), 1);
+        // clear 清空。
+        handle_command("/todo clear", &ctx);
+        assert!(ctx.todo.snapshot().items.is_empty());
+    }
+
+    #[test]
+    fn h34_resume_numeric_selector_maps_to_session_id() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        // 空会话目录：任何序号都超范围 → Handled（不 panic、不产生 Resume）。
+        assert!(matches!(
+            handle_command("/resume 3", &ctx),
+            CommandOutcome::Handled
+        ));
+        // 无参：列出候选（空目录 → sessions.none）。
+        assert!(matches!(
+            handle_command("/resume", &ctx),
+            CommandOutcome::Handled
+        ));
+        // 非数字参数按会话 id 透传。
+        assert!(matches!(
+            handle_command("/resume abc123", &ctx),
+            CommandOutcome::Resume(ref id) if id == "abc123"
+        ));
+    }
+
+    #[test]
+    fn h34_last_user_prompt_skips_injected_reminders() {
+        use agent_core::{AgentMessage, NodeId, SessionNode};
+        let mk = |text: &str| SessionNode {
+            id: NodeId::new(),
+            parent_id: None,
+            message: AgentMessage::user_text(text),
+        };
+        // 注入提醒是最后一条 → 回退到用户原话。
+        let nodes = vec![
+            mk("实现 H34"),
+            mk("<system-reminder>\n继续推进待办\n</system-reminder>"),
+        ];
+        assert_eq!(last_user_prompt(&nodes).as_deref(), Some("实现 H34"));
+        // 正常情况取最后一条用户消息。
+        let nodes = vec![mk("第一个问题"), mk("第二个问题")];
+        assert_eq!(last_user_prompt(&nodes).as_deref(), Some("第二个问题"));
+        // 空上下文 → None（/retry 报「没有可重发的输入」）。
+        assert!(last_user_prompt(&[]).is_none());
+    }
+
+    #[test]
+    fn h34_context_breakdown_counts_roles() {
+        use agent_core::{AgentMessage, AssistantMessage, NodeId, SessionNode, StopReason, Usage};
+        let node = |message: AgentMessage| SessionNode {
+            id: NodeId::new(),
+            parent_id: None,
+            message,
+        };
+        let nodes = vec![
+            node(AgentMessage::user_text("hi")),
+            node(AgentMessage::Assistant(AssistantMessage {
+                content: Vec::new(),
+                usage: Usage::default(),
+                model: "m".into(),
+                stop_reason: Some(StopReason::Stop),
+                stop_details: None,
+            })),
+            node(AgentMessage::ToolResult(agent_core::ToolResultMessage {
+                tool_call_id: "c1".into(),
+                result: agent_core::ToolResult::Text("x".into()),
+            })),
+            node(AgentMessage::Status(agent_core::StatusMessage {
+                text: "note".into(),
+                kind: agent_core::StatusKind::Info,
+            })),
+        ];
+        let b = context_breakdown(&nodes);
+        assert_eq!(
+            (b.total, b.user, b.assistant, b.tool, b.other),
+            (4, 1, 1, 1, 1)
+        );
+        assert_eq!(context_breakdown(&[]), ContextBreakdown::default());
+    }
+
+    // ── H4：运行期消息队列（/queue + 运行中键入路径）──────────────────────────
+
+    #[test]
+    fn h4_queue_command_enqueues_lists_pops_and_clears() {
+        let fixture = GoalCtx::new();
+        let ctx = fixture.ctx(None);
+        // 空队列提示。
+        assert!(matches!(
+            handle_command("/queue", &ctx),
+            CommandOutcome::Handled
+        ));
+        // 顺序列表一次入多条（1. / 2.）。
+        handle_command("/queue add 1. 先跑测试\n2. 再写文档", &ctx);
+        assert_eq!(ctx.queue.lock().unwrap().len(), 2);
+        // 再入一条单消息。
+        handle_command("/queue add 收尾", &ctx);
+        assert_eq!(ctx.queue.lock().unwrap().len(), 3);
+        // pop = 取队首并作为下一轮任务（Inject）。
+        match handle_command("/queue pop", &ctx) {
+            CommandOutcome::Inject(text) => assert_eq!(text, "先跑测试"),
+            _ => panic!("pop 应 Inject 队首"),
+        }
+        assert_eq!(ctx.queue.lock().unwrap().len(), 2, "pop 后应出队");
+        // undo 取回最近一次入队。
+        handle_command("/queue undo", &ctx);
+        assert_eq!(ctx.queue.lock().unwrap().len(), 1, "undo 去掉尾部『收尾』");
+        // 按序号删除 + 越界提示。
+        handle_command("/queue add A", &ctx);
+        handle_command("/queue rm 1", &ctx);
+        assert_eq!(ctx.queue.lock().unwrap().list(), vec![(1, "A")]);
+        handle_command("/queue rm 9", &ctx);
+        assert_eq!(ctx.queue.lock().unwrap().len(), 1, "越界删除不改队列");
+        // clear。
+        handle_command("/queue clear", &ctx);
+        assert!(ctx.queue.lock().unwrap().is_empty());
+        // 非法子命令 / 缺参数只打印用法。
+        handle_command("/queue bogus", &ctx);
+        handle_command("/queue add", &ctx);
+        assert!(ctx.queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn h4_running_input_queues_shorthand_and_steers_plain_text() {
+        let queue = Arc::new(std::sync::Mutex::new(agent_cli::queue::MessageQueue::new()));
+        // 普通输入 → 立即 steering（既有语义不变）。
+        assert_eq!(
+            handle_running_input("看看日志", &queue),
+            RunningInput::Steer("看看日志".into())
+        );
+        // `->` / `=>` 简写 → 只入队。
+        assert_eq!(
+            handle_running_input("-> 等会儿做", &queue),
+            RunningInput::Queued(1)
+        );
+        assert_eq!(
+            handle_running_input("=> 还有这条", &queue),
+            RunningInput::Queued(2)
+        );
+        assert_eq!(queue.lock().unwrap().len(), 2);
+        // 空行忽略。
+        assert_eq!(handle_running_input("   ", &queue), RunningInput::Ignored);
+        // 运行中 `/queue list` 由宿主消费（不投给模型、不改队列）。
+        assert_eq!(
+            handle_running_input("/queue list", &queue),
+            RunningInput::Ignored
+        );
+        assert_eq!(queue.lock().unwrap().len(), 2);
+        // 运行中 `/queue add` 入队且不打断。
+        assert_eq!(
+            handle_running_input("/queue add 第三条", &queue),
+            RunningInput::Ignored
+        );
+        assert_eq!(queue.lock().unwrap().len(), 3);
+        // 运行中 `/queue pop` = 取出并立即投递给运行中的 agent。
+        assert_eq!(
+            handle_running_input("/queue pop", &queue),
+            RunningInput::Steer("等会儿做".into())
+        );
+        assert_eq!(queue.lock().unwrap().len(), 2);
+    }
+
+    // ── H5：可定制键位（/hotkeys 反映生效绑定）───────────────────────────────
+
+    #[test]
+    fn h5_hotkeys_reflects_configured_bindings() {
+        let mut fixture = GoalCtx::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("app.message.dequeue".to_string(), "alt-d".to_string());
+        overrides.insert("app.retry".to_string(), "ctrl-t".to_string());
+        overrides.insert("app.nope".to_string(), "ctrl-k".to_string());
+        fixture.keybindings = agent_cli::keybindings::resolve(&overrides);
+        let ctx = fixture.ctx(None);
+        // 生效表里应是覆盖后的键与显式绑定的插入型动作；未知动作被忽略。
+        let keys: Vec<String> = ctx
+            .keybindings
+            .bindings
+            .iter()
+            .map(|b| agent_cli::keybindings::render_key(&b.key))
+            .collect();
+        assert!(keys.contains(&"Alt-D".to_string()), "{keys:?}");
+        assert!(keys.contains(&"Ctrl-T".to_string()), "{keys:?}");
+        assert!(
+            !keys.contains(&"Ctrl-Y".to_string()),
+            "默认键应被覆盖: {keys:?}"
+        );
+        assert_eq!(
+            ctx.keybindings.unknown_actions,
+            vec!["app.nope".to_string()]
+        );
+        // `/hotkeys` 命令可正常执行（打印生效表 + 固定键位说明）。
+        assert!(matches!(
+            handle_command("/hotkeys", &ctx),
+            CommandOutcome::Handled
+        ));
     }
 
     #[test]

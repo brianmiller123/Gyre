@@ -27,10 +27,10 @@ impl OpenAiCompletionsAdapter {
     }
 }
 
-/// 本适配器实现的是 Chat Completions wire；`Api::OpenAiResponses`（/v1/responses）
-/// 尚无实现，**不得**列入——名义支持会把 Responses 请求静默降级为 chat wire，
-/// Responses 专属能力（reasoning items / encrypted replay / previous_response_id）
-/// 全失且报错误导排障（伪适配，docs/oh-my-pi-gap-analysis-2026-09-05.md H3'）。
+/// 本适配器实现的是 Chat Completions wire；`Api::OpenAiResponses`（`/v1/responses`）
+/// **不得**列入——名义支持会把 Responses 请求静默降级为 chat wire，Responses 专属能力
+/// （reasoning items / encrypted replay）全失且报错误导排障。Responses wire 由
+/// [`crate::OpenAiResponsesAdapter`] 单独承载。
 /// `OllamaChat` 经其 OpenAI 兼容端点（`{base}/v1/chat/completions`）同构，保留。
 const SUPPORTED: &[Api] = &[Api::OpenAiCompletions, Api::OllamaChat];
 
@@ -55,13 +55,15 @@ impl LlmProvider for OpenAiCompletionsAdapter {
             .trim_end_matches('/');
         let url = format!("{base}/chat/completions");
 
-        let body = build_body(&request);
+        let body = build_body_with_quirks(&request, ctx.quirks);
         let model_id = request.model.id.clone();
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(ctx.api_key.as_deref().unwrap_or_default())
+        // H24：`auth = none`（或 key 为空）时不发内置鉴权头，而不是发 `Bearer `。
+        let mut http = self.client.post(&url);
+        if let Some(key) = ctx.builtin_api_key() {
+            http = http.bearer_auth(key);
+        }
+        let resp = crate::apply_custom_headers(http, &ctx.headers)
             .json(&body)
             .send()
             .await
@@ -79,7 +81,16 @@ impl LlmProvider for OpenAiCompletionsAdapter {
 // 请求体构建
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn build_body(req: &CompletionRequest) -> serde_json::Value {
+    build_body_with_quirks(req, agent_core::ProviderQuirks::default())
+}
+
+/// H24：带兼容开关的请求体构建（`build_body` 为其默认开关版本，保持既有调用点）。
+fn build_body_with_quirks(
+    req: &CompletionRequest,
+    quirks: agent_core::ProviderQuirks,
+) -> serde_json::Value {
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
     for sys in &req.system {
@@ -168,13 +179,18 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
         }
     }
 
+    // H24：`max_tokens_field` 决定 wire 字段名（部分网关只认 `max_completion_tokens`）。
     let mut body = serde_json::json!({
         "model": req.model.id,
         "messages": messages,
         "stream": true,
-        "stream_options": { "include_usage": true },
-        "max_tokens": req.max_tokens,
     });
+    let max_tokens_field = quirks.max_tokens_field.unwrap_or_default();
+    body[max_tokens_field.as_str()] = serde_json::json!(req.max_tokens);
+    // H24：`omit_stream_options` 时省略 `stream_options`（部分兼容网关会 400）。
+    if !quirks.omit_stream_options {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
 
     if !req.tools.is_empty() {
         let tools: Vec<serde_json::Value> = req
@@ -193,12 +209,16 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
             .collect();
         body["tools"] = serde_json::Value::Array(tools);
         if let Some(tc) = &req.tool_choice {
-            body["tool_choice"] = map_tool_choice(tc);
+            if !quirks.omit_tool_choice {
+                body["tool_choice"] = map_tool_choice(tc);
+            }
         }
     }
 
     if let Some(temp) = req.temperature {
-        body["temperature"] = serde_json::json!(temp);
+        if !quirks.omit_temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
     }
     // ThinkingConfig：OpenAI 推理模型映射为 reasoning_effort（按预算档位）
     if let Some(thinking) = &req.thinking {
@@ -209,7 +229,9 @@ fn build_body(req: &CompletionRequest) -> serde_json::Value {
         } else {
             "low"
         };
-        body["reasoning_effort"] = serde_json::json!(effort);
+        if !quirks.omit_reasoning {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
     }
     // per-model 额外请求体字段（如 vLLM chat_template_kwargs）合并到顶层
     crate::merge_extra_body(&mut body, req.model.extra_body.as_ref());
@@ -561,8 +583,9 @@ mod tests {
 
     #[test]
     fn supports_excludes_unimplemented_responses_wire() {
-        // 伪适配回归：Responses wire 未实现，SUPPORTED 不得名义包含——
-        // 否则 openai-responses 模型被静默降级为 chat wire（H3'）。
+        // 伪适配回归：本适配器只做 chat wire，SUPPORTED 不得名义包含 Responses——
+        // 否则 openai-responses 模型被静默降级为 chat wire（Responses 由
+        // `OpenAiResponsesAdapter` 承载，见 openai_responses.rs）。
         assert_eq!(
             SUPPORTED,
             &[Api::OpenAiCompletions, Api::OllamaChat],
@@ -708,6 +731,87 @@ mod tests {
         assert!(finalize_stream_interrupt("m", "", &[], &None, &Usage::default()).is_none());
     }
 
+    /// H24：兼容开关逐项生效（默认全关 → 标准 wire 不变）。
+    #[test]
+    fn quirks_omit_parameters_on_demand() {
+        use agent_core::ProviderQuirks;
+        let mut req = CompletionRequest {
+            model: agent_core::Model::with_defaults("m", "openai", Api::OpenAiCompletions),
+            system: vec![],
+            messages: vec![],
+            tools: vec![ToolSpec::new(
+                "t",
+                "d",
+                serde_json::json!({"type": "object"}),
+            )],
+            tool_choice: Some(ToolChoiceDirective::Hard(ToolChoice::Auto)),
+            max_tokens: 16,
+            temperature: Some(0.5),
+            thinking: Some(agent_core::ThinkingConfig::new(16_000)),
+            cache_key: None,
+            stable_prefix_len: 0,
+        };
+        // 默认：标准字段齐全。
+        let base = build_body_with_quirks(&req, ProviderQuirks::default());
+        assert_eq!(base["stream_options"]["include_usage"], true);
+        assert!(base["temperature"].is_number());
+        assert_eq!(base["tool_choice"], "auto");
+        assert_eq!(base["reasoning_effort"], "medium");
+
+        // 全开：四个字段都被省略（网关不认时用）。
+        let q = ProviderQuirks {
+            omit_temperature: true,
+            omit_stream_options: true,
+            omit_tool_choice: true,
+            omit_reasoning: true,
+            max_tokens_field: None,
+        };
+        assert!(!q.is_empty());
+        let trimmed = build_body_with_quirks(&req, q);
+        assert!(trimmed.get("stream_options").is_none());
+        assert!(trimmed.get("temperature").is_none());
+        assert!(trimmed.get("tool_choice").is_none());
+        assert!(trimmed.get("reasoning_effort").is_none());
+        // 核心字段不受影响（兼容开关只删可选参数）。
+        assert_eq!(trimmed["model"], "m");
+        assert_eq!(trimmed["stream"], true);
+        assert_eq!(trimmed["max_tokens"], 16);
+
+        // H24：`max_tokens_field` 切换 wire 字段名（部分网关只认 max_completion_tokens）。
+        let switched = build_body_with_quirks(
+            &req,
+            ProviderQuirks {
+                max_tokens_field: Some(agent_core::MaxTokensField::MaxCompletionTokens),
+                ..Default::default()
+            },
+        );
+        assert_eq!(switched["max_completion_tokens"], 16);
+        assert!(switched.get("max_tokens").is_none(), "旧字段名不应同时出现");
+        assert!(trimmed["tools"].is_array());
+        // `build_body` 保持旧语义（默认开关）。
+        assert_eq!(build_body(&req)["stream_options"]["include_usage"], true);
+        let _ = &mut req;
+    }
+
+    /// H24：自定义头的展开与非法头跳过（真实 reqwest 请求构建）。
+    #[test]
+    fn custom_headers_apply_and_skip_invalid() {
+        let client = reqwest::Client::new();
+        let req = crate::apply_custom_headers(
+            client.post("http://127.0.0.1:9/v1/chat/completions"),
+            &[
+                ("HTTP-Referer".into(), "https://my.app".into()),
+                ("X-Api-Version".into(), "2024-10-01".into()),
+                ("bad header".into(), "x".into()), // 非法名 → 跳过
+            ],
+        )
+        .build()
+        .expect("请求应可构建");
+        assert_eq!(req.headers()["HTTP-Referer"], "https://my.app");
+        assert_eq!(req.headers()["X-Api-Version"], "2024-10-01");
+        // 非法头未进入请求（且不影响其它头）。
+        assert!(req.headers().get("bad header").is_none());
+    }
     #[test]
     fn body_merges_extra_body_into_top_level() {
         let mut model =

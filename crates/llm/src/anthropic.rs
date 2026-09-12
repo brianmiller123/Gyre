@@ -59,21 +59,24 @@ impl LlmProvider for AnthropicMessagesAdapter {
 
         // Claude OAuth 访问令牌（`sk-ant-oat…`）必须走 Bearer + oauth beta 头
         // （x-api-key 是 console API key 专用——omp 同语义）；静态 key 维持原样。
-        let api_key = ctx.api_key.as_deref().unwrap_or_default();
-        let oauth = api_key.starts_with("sk-ant-oat");
+        // H24：`auth = none`（或 key 为空）时两种鉴权头都不加。
         let mut req = self.client.post(&url);
-        req = if oauth {
-            req.bearer_auth(api_key)
-                .header("anthropic-beta", "oauth-2025-04-20")
-        } else {
-            req.header("x-api-key", api_key)
-        };
-        let resp = req
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        if let Some(api_key) = ctx.builtin_api_key() {
+            req = if api_key.starts_with("sk-ant-oat") {
+                req.bearer_auth(api_key)
+                    .header("anthropic-beta", "oauth-2025-04-20")
+            } else {
+                req.header("x-api-key", api_key)
+            };
+        }
+        let resp = crate::apply_custom_headers(
+            req.header("anthropic-version", "2023-06-01"),
+            &ctx.headers,
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Transport(e.to_string()))?;
 
         if !resp.status().is_success() {
             // 429 → RateLimit（含 Retry-After），供执行循环退避重试（Phase 0）。

@@ -94,6 +94,12 @@ impl LocalMemoryStore {
         if notes.is_empty() {
             return Ok(());
         }
+        // H30：合并租约——多会话并发时只允许一个真正做 LLM 合并（另一个直接返回）。
+        let Some(_lease) =
+            crate::lease::acquire(&self.root, "consolidate", crate::lease::DEFAULT_LEASE_TTL)
+        else {
+            return Ok(());
+        };
         let old_memory = read_text(&self.memory_path()).unwrap_or_default();
         let prompt = consolidation_prompt(&notes, &old_memory);
         let req = CompletionRequest {
@@ -124,8 +130,8 @@ impl LocalMemoryStore {
                 memory_md.push_str(&d);
             }
         }
-        // 写 MEMORY.md
-        std::fs::write(self.memory_path(), &memory_md).map_err(|e| e.to_string())?;
+        // 写 MEMORY.md（H30：原子替换，避免读者看到半截文件）
+        crate::atomic::write_atomic(&self.memory_path(), &memory_md).map_err(|e| e.to_string())?;
         // 再用同一次输出裁出简洁 summary（取前 ~2000 字符作为注入摘要；首期为 MEMORY.md 的前缀快照）
         let summary = if memory_md.len() > 2000 {
             // 回退到字符边界，避免切片 panic。
@@ -137,7 +143,7 @@ impl LocalMemoryStore {
         } else {
             memory_md.clone()
         };
-        std::fs::write(self.summary_path(), &summary).map_err(|e| e.to_string())?;
+        crate::atomic::write_atomic(&self.summary_path(), &summary).map_err(|e| e.to_string())?;
         // 清空 raw notes（已吸收）
         let _ = std::fs::remove_file(self.notes_path());
         Ok(())
@@ -180,6 +186,12 @@ impl LocalMemoryStore {
         if current.trim().is_empty() {
             return Ok(());
         }
+        // H30：心智模型合并同样受租约保护（与 MEMORY.md 合并各用一把锁，互不阻塞）。
+        let Some(_lease) =
+            crate::lease::acquire(&self.root, "mental-models", crate::lease::DEFAULT_LEASE_TTL)
+        else {
+            return Ok(());
+        };
         let prompt = mental_model_consolidation_prompt(&current);
         let req = CompletionRequest {
             model: model.clone(),
@@ -209,7 +221,8 @@ impl LocalMemoryStore {
                 output.push_str(&d);
             }
         }
-        std::fs::write(self.mental_models_path(), &output).map_err(|e| e.to_string())?;
+        crate::atomic::write_atomic(&self.mental_models_path(), &output)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -292,14 +305,16 @@ fn append_line(path: &Path, line: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // OS 级 append 原子性：O_APPEND 保证每次 write 追加到文件末尾，
-    // 消除 read-modify-write 竞态。即使多线程/多任务并发也安全。
+    // OS 级 append 原子性：O_APPEND 保证**单次** write 追加到文件末尾。行 + 换行
+    // 必须一次写出（分两次会被并发写交错，两行粘成一行）。
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    file.write_all(buf.as_bytes())?;
     file.flush()
 }
 

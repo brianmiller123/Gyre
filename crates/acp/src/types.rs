@@ -157,6 +157,46 @@ pub enum SessionUpdate {
         /// 上下文窗口上限。
         size: u64,
     },
+    /// 用户消息回放块（H12：`session/load` 历史回放用）。
+    UserMessageChunk {
+        /// 内容块。
+        content: TextContent,
+    },
+    /// 可用斜杠命令清单更新（H13：**推送**而非请求——omp 亦仅在 bootstrap 时推）。
+    AvailableCommandsUpdate {
+        /// 命令清单（ACP `AvailableCommand`）。
+        #[serde(rename = "availableCommands")]
+        available_commands: Vec<AvailableCommand>,
+    },
+    /// 会话元信息更新（标题 / 更新时间；H12 bootstrap）。
+    SessionInfoUpdate {
+        /// 会话标题（`None` 不序列化）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// 最后更新时间（ISO-8601 字符串；`None` 不序列化）。
+        #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
+    },
+}
+
+/// ACP `AvailableCommand`：斜杠命令菜单项。
+#[derive(Debug, Clone, Serialize)]
+pub struct AvailableCommand {
+    /// 命令名（**不带**前导 `/`，客户端自行补——与 omp `buildAvailableSlashCommands` 一致）。
+    pub name: String,
+    /// 描述。
+    pub description: String,
+    /// 输入提示（可选）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<AvailableCommandInput>,
+}
+
+/// ACP `AvailableCommand.input`：输入提示。
+#[derive(Debug, Clone, Serialize)]
+pub struct AvailableCommandInput {
+    /// 提示文本（如 `<file>`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// 标准 ACP `session/update` 通知参数。

@@ -100,14 +100,27 @@ pub async fn list_models(
         base_url.trim_end_matches('/')
     };
 
+    // H24：空 key（如 `auth = "none"`）时不发鉴权头（模型发现端点通常也免鉴权）。
+    let authed = api_key.is_empty();
     let req = match api {
         Api::OpenAiCompletions | Api::DeepSeek => {
-            http.get(format!("{base}/models")).bearer_auth(api_key)
+            let req = http.get(format!("{base}/models"));
+            if authed {
+                req
+            } else {
+                req.bearer_auth(api_key)
+            }
         }
-        Api::AnthropicMessages => http
-            .get(format!("{base}/v1/models"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01"),
+        Api::AnthropicMessages => {
+            let req = http
+                .get(format!("{base}/v1/models"))
+                .header("anthropic-version", "2023-06-01");
+            if authed {
+                req
+            } else {
+                req.header("x-api-key", api_key)
+            }
+        }
         other => return Err(DiscoveryError::Unsupported { api: other }),
     };
 

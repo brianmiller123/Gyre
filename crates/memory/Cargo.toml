@@ -25,6 +25,8 @@ fastembed    = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

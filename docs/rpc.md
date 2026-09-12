@@ -52,6 +52,7 @@ turn 执行期间事件流式输出（同 `id`），最终恰好一条 `done`（
 | `tool_call`      | `{"kind":"tool_call","name":"…","args":{…}}`                                                  | 工具开始（含参数） |
 | `tool_result`    | `{"kind":"tool_result","name":"…","ok":bool}`                                                 | 工具结束（成败） |
 | `status`         | `{"kind":"status","text":"…"}`                                                                | 信息性状态 |
+| `session`        | `{"kind":"session","event":{"type":"auto_retry_start","attempt":1,…}}`                         | 结构化会话事件（压缩 / 重试 / 模型回退；`event.type` 取 `auto_compaction_start`/`auto_compaction_end`/`auto_retry_start`/`auto_retry_end`/`retry_fallback_applied`/`retry_fallback_succeeded`）。展示文本仍在配对的 `status` 事件中。 |
 | `usage`          | `{"kind":"usage","input":N,"output":N,"cache_read":N,"cache_write":N,"cost":f}`               | 用量更新 |
 
 `done` 的 `usage` 同 `usage` 事件形状（`input/output/cache_read/cache_write/cost`）。

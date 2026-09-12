@@ -2,14 +2,15 @@
 
 use super::{
     Agent, AgentEvent, AgentMessage, AgentRunSummary, AgentState, ApprovalDecision, Arc, AskKind,
-    AskMessage, AskResponse, AssistantEvent, AssistantMessage, CancellationToken,
-    CompactionStrategy, CompletionRequest, Concurrency, ContentBlock, ContextManager, Hook,
-    HookEvent, Instrument, InterruptMode, MAX_EMPTY_STOP_RETRIES, MAX_HARMONY_ABORT_RETRY,
-    MAX_HARMONY_TRUNCATE_RESUME, MAX_PAUSED_CONTINUATIONS, MAX_SOFT_TOOL_ESCALATIONS,
-    SoftToolRequirement, StatusKind, StatusMessage, StopReason, StreamExt, ThinkingConfig,
-    ToolChoice, ToolChoiceDirective, ToolContext, ToolRegistry, ToolResult, ToolResultMessage,
-    Usage, approval_prompt, fire_on_turn_end, harmony, keywords, prepend_reminder,
-    render_skills_section,
+    AskMessage, AskResponse, AssistantEvent, AssistantMessage, CancellationToken, CompactionAction,
+    CompactionReason, CompactionStage, CompactionStrategy, CompletionRequest, Concurrency,
+    ContentBlock, ContextManager, Hook, HookEvent, Instrument, InterruptMode,
+    MAX_EMPTY_STOP_RETRIES, MAX_HARMONY_ABORT_RETRY, MAX_HARMONY_TRUNCATE_RESUME,
+    MAX_PAUSED_CONTINUATIONS, MAX_SOFT_TOOL_ESCALATIONS, SessionEvent, SoftToolRequirement,
+    StatusKind, StatusMessage, StopReason, StreamExt, ThinkingConfig, TodoEager, ToolChoice,
+    ToolChoiceDirective, ToolContext, ToolRegistry, ToolResult, ToolResultMessage, Usage,
+    approval_prompt, fire_hook_session, fire_named_hooks, fire_on_turn_end, harmony, keywords,
+    prepend_reminder, render_skills_section, stream_guards,
 };
 
 /// 首轮查询驱动召回的上限（对齐 mnemopi `recallLimit` 默认 8）。
@@ -19,6 +20,123 @@ const MEMORY_RECALL_LIMIT: usize = 8;
 const RATE_LIMIT_MAX_ATTEMPTS: usize = 3;
 /// 单次退避等待上限（对齐 omp oneshot-retry 的单次等待 30s 上限；`retry_after` 超过则截断）。
 const RATE_LIMIT_WAIT_CAP_MS: u64 = 30_000;
+/// H5 流式守卫连续中断上限：超过后守卫静默（不再中断流），降级为工具自身错误反馈。
+/// 与 MAX_EMPTY_STOP_RETRIES 同量级；max_turns 仍是最外层硬上限。
+const MAX_STREAM_GUARD_ABORTS: usize = 3;
+
+/// H26：压缩判定——本地估算与 provider 上报 prompt token 取较大者，再比阈值。
+///
+/// 只用本地估算会让「出向压缩/脱敏后请求变小、provider 上报随之变小」的真实历史
+/// 逃过触发（omp `compactionContextTokens` 同款下限）；阈值 0 表示不限制。
+fn over_compaction_threshold(
+    tokens: &agent_core::TokenUsage,
+    provider_context_tokens: usize,
+    threshold: usize,
+) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    let decision_tokens = tokens.current.max(provider_context_tokens);
+    decision_tokens >= threshold
+}
+
+/// H28：中途对账 nudge 的「变更类工具」集合（写/执行类；移植 omp `MUTATING_TOOLS`）。
+const MUTATING_TOOLS: &[&str] = &[
+    "write_file",
+    "run_command",
+    "run_pty_command",
+    "ast_rewrite",
+    "replace_block",
+    "apply_hashline",
+    "eval",
+    "ssh",
+];
+/// H28：触发中途对账 nudge 的变更阈值（连续多少次变更未触碰 todo）。
+const MID_RUN_NUDGE_THRESHOLD: usize = 12;
+/// H28：单次 run 的中途 nudge 上限。
+const MID_RUN_NUDGE_MAX: usize = 2;
+
+/// H28：中途对账 nudge 文本（`incomplete` 为未完成待办渲染；`count` 为第几次）。
+fn mid_run_nudge_text(incomplete: &str, count: usize, max: usize) -> String {
+    format!(
+        "<system-reminder>\n你已连续做了多次代码/命令变更，但还没有更新待办清单。\n当前未完成：\n{incomplete}\n\n请用 `todo` 把已完成项标记 complete、补充新发现的项，再继续。（中途提醒 {count}/{max}）\n</system-reminder>"
+    )
+}
+
+/// H28：eager todo prelude 文本（首轮注入；`forced` = `[todo] eager = "always"`）。
+fn eager_todo_prelude(forced: bool) -> String {
+    let tail = if forced {
+        "本轮的第一个工具调用必须是 `todo`（op=write/init，列出可执行清单），之后才开始其它工作。"
+    } else {
+        "开始动手前先用 `todo`（op=write/init）建立清单，并在执行中及时更新状态。"
+    };
+    format!(
+        "<system-reminder>\n在处理该请求前，先判断它是否需要多步工作：需要时用 `todo` 工具把任务拆成可执行、可验证的待办清单（每项写清完成条件），再逐步推进。\n{tail}\n- 简单问答、单步查询或纯解释可直接回答，不必建清单。\n</system-reminder>"
+    )
+}
+
+/// H28：未完成待办提醒文本（停止边界注入；`max == 0` 表示不限次）。
+fn todo_reminder_text(incomplete: &str, count: usize, max: usize) -> String {
+    let cap = if max == 0 {
+        "∞".to_string()
+    } else {
+        max.to_string()
+    };
+    format!(
+        "<system-reminder>\n你在仍有未完成待办时停止了：\n{incomplete}\n\n请继续推进这些任务；若确已完成，用 `todo` 把它们标记为 completed（或 abandoned 并说明原因）。\n（提醒 {count}/{cap}）\n</system-reminder>"
+    )
+}
+
+/// H28：判断助手末轮是否在向用户提问/等待输入（此时不注入完成提醒）。
+///
+/// 移植 omp `isAwaitingUserAnswer` 的核心判定：末个非空行以问号结尾且含
+/// 非 ASCII 字符或英文疑问词/称呼；或命中「请确认 / let me know」类响应提示。
+fn is_awaiting_user_answer(assistant: &AssistantMessage) -> bool {
+    let text: String = assistant
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let last = last
+        .trim()
+        .trim_end_matches(['*', '_', '`', ' '])
+        .trim_end();
+    let question = last.ends_with('?') || last.ends_with('？');
+    if question {
+        let non_ascii = !last.is_ascii();
+        let lower = last.to_ascii_lowercase();
+        let english = [
+            "what ", "which ", "when ", "where ", "why ", "how ", "who ", "do ", "does ", "did ",
+            "can ", "could ", "would ", "will ", "should ", "is ", "are ", "may ", "shall ",
+            "you ", "your ",
+        ]
+        .iter()
+        .any(|w| lower.contains(w));
+        return non_ascii || english;
+    }
+    let lower = last.to_ascii_lowercase();
+    [
+        "请确认",
+        "确认后",
+        "等你",
+        "待你",
+        "需要你",
+        "let me know",
+        "please confirm",
+        "reply with",
+        "awaiting your",
+        "waiting for your",
+    ]
+    .iter()
+    .any(|cue| lower.contains(&cue.to_ascii_lowercase()))
+}
 
 /// `执行循环本体（async_stream` 生成器）。
 pub fn run_loop(
@@ -40,7 +158,6 @@ pub fn run_loop(
     let max_turns = agent.max_turns;
     // 运行时限绝对时刻（在 run 起点把 Duration 折算成 Instant，循环内单调时钟比较）。
     let deadline_at = agent.deadline.map(|d| std::time::Instant::now() + d);
-    let guard = agent.context_guard;
     let max_tokens = agent.max_output_tokens;
     let temperature = agent.temperature;
     let thinking = agent.thinking.clone();
@@ -85,6 +202,22 @@ pub fn run_loop(
     let key_rings = Arc::clone(&agent.key_rings);
     // 密钥脱敏器（可选；会话级映射表随 Agent 生命周期，跨 run 复用同一实例）。
     let secrets = agent.secrets.clone();
+    // H5 流式守卫配置（克隆自 Agent；run 内只读）。
+    let stream_guards_cfg = agent.stream_guards.clone();
+    // H28：待办清单只读源 + 循环配置（eager prelude / 完成提醒）。
+    let todo_loop = agent.todo_loop.clone();
+    let todo_cfg = agent.todo_loop_cfg;
+    // H29：goal 状态机（活跃目标 → 常驻提示 + 停止边界续跑）。
+    let goal_state = agent.goal.clone();
+    // H40：追加 system prompt 定制段（宿主的最终覆盖指令，位置最靠后）。
+    let append_system_prompt = agent.append_system_prompt.clone();
+    // H26：自动压缩触发阈值（绝对/余量/百分比三选一解析；0 = 不触发）+
+    // 「provider 上报的上一轮 prompt token」下限（防出向压缩/脱敏让上报值偏小，
+    // 导致真实历史涨到压缩也救不回来——移植 omp `compactionContextTokens`）。
+    // H28：异步唤醒探测（有后台作业在途时不注入 todo 完成提醒）。
+    let async_wake = agent.async_wake.clone();
+    let compaction_policy = agent.compaction_policy;
+    let compaction_threshold = compaction_policy.threshold_for(model.max_input_tokens);
     async_stream::stream! {
         // P1-D：GenAI invoke_agent span（OTel 语义规范）——agent run 的逻辑根 span。
         // async_stream! 内 yield 不能放入嵌套 async block（无法 Instrument 覆盖含 yield 的整段），
@@ -151,7 +284,41 @@ pub fn run_loop(
                 system.push(section);
             }
         }
+        if let Some(extra) = &append_system_prompt {
+            system.push(extra.clone());
+        }
         context.set_system(system, &specs0).await;
+        // H28：eager todo prelude——仅在「本会话尚无用户消息 + 清单为空 + todo 工具在场 +
+        // 首条 prompt 不是提问/感叹」时注入（对齐 omp `createEagerTodoPrelude` 的门控）。
+        // 先建清单再动手，避免长任务边做边丢；简单问答由提示词自身豁免。
+        let eager_todo: Option<String> = if todo_cfg.eager == TodoEager::Off {
+            None
+        } else {
+            let has_todo_tool = specs0.iter().any(|s| s.name == "todo");
+            let prior_user = context.snapshot_nodes().await.iter().any(|n| {
+                matches!(n.message, agent_core::AgentMessage::User(_))
+            });
+            let empty = todo_loop
+                .as_ref()
+                .is_some_and(|t| t.snapshot().is_empty());
+            let trailing = {
+                let t = prompt_text.trim_end();
+                t.ends_with('?') || t.ends_with('？') || t.ends_with('!') || t.ends_with('！')
+            };
+            (has_todo_tool && !prior_user && empty && !trailing)
+                .then(|| eager_todo_prelude(todo_cfg.eager == TodoEager::Always))
+        };
+        // H28：停止边界提醒的每-run 计数（刷新一次 prompt 即重置）。
+        let mut todo_reminder_count: usize = 0;
+        let mut todo_reminder_awaiting = false;
+        // `always` 模式下首轮强制选择 `todo`（消费一次；soft requirement 优先级更高时仍以
+        // 本轮显式指令为准）。`ToolChoice::Function` 由 provider 适配层翻译。
+        let mut eager_tool_choice: Option<ToolChoice> = eager_todo
+            .as_ref()
+            .filter(|_| todo_cfg.eager == TodoEager::Always)
+            .map(|_| ToolChoice::Function {
+                name: "todo".into(),
+            });
         // Magic keywords：散文词命中 → 隐藏系统通知**后于**用户消息注入（对齐 omp
         // agent-session.ts:5797-5801：通知追加在用户消息之后，模型先读用户原话再看
         // steering 提示）；`ultrathink` 额外拉满思考预算（见下方 thinking 解析）。
@@ -163,6 +330,34 @@ pub fn run_loop(
             context
                 .append(agent_core::AgentMessage::user_text(notice.clone()))
                 .await;
+        }
+        // H29：目标仍活跃 → 注入常驻目标上下文（objective/预算/complete 门规）。
+        if let Some(gs) = &goal_state {
+            let prompt = {
+                let g = gs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                g.active_prompt()
+            };
+            if let Some(prompt) = prompt {
+                context
+                    .append(agent_core::AgentMessage::user_text(prompt))
+                    .await;
+                yield AgentEvent::Say(StatusMessage {
+                    text: "已注入目标上下文（goal 模式）".into(),
+                    kind: StatusKind::Info,
+                });
+            }
+        }
+        // H28：eager prelude（隐藏提醒，非用户消息）。
+        if let Some(prelude) = &eager_todo {
+            context
+                .append(agent_core::AgentMessage::user_text(prelude.clone()))
+                .await;
+            yield AgentEvent::Say(StatusMessage {
+                text: "已注入 todo eager prelude（先规划再动手）".into(),
+                kind: StatusKind::Info,
+            });
         }
         yield AgentEvent::StateChanged(AgentState::Running);
 
@@ -214,11 +409,59 @@ pub fn run_loop(
         let mut soft_escalations: usize = 0;
         // P1-L：advisor 评审轮次计数（每 ADVISOR_EVERY_N_TURNS 轮触发一次）。
         let mut advisor_turn_counter: usize = 0;
+        // H5 流式守卫（对齐 oh-my-pi stream-guards；配置见 [agent.stream_guards]）：
+        // - 跨轮同参工具循环检测（跨 run 级状态，轮间累积）。
+        let mut tool_loop_guard = stream_guards_cfg.tool_loop_guard.then(|| {
+            stream_guards::ToolCallLoopGuard::new(
+                stream_guards_cfg.tool_loop_threshold,
+                &stream_guards_cfg.tool_loop_exempt_tools,
+            )
+        });
+        // - Gemini 推理标题连跑检测（仅 gemini 系模型激活；TextDelta/ToolCallStart 重置）。
+        let mut gemini_detector = (stream_guards_cfg.gemini_header_guard
+            && stream_guards::is_gemini_model(&model))
+        .then(stream_guards::GeminiHeaderRunDetector::default);
+        // - apply_hashline 流式预检（生成文件段头拦截 + 结束时解析必败判定）。
+        let mut edit_precheck = stream_guards::EditStreamPrecheck::default();
+        // - 守卫中断计数：连续超过上限后静默守卫（降级为工具自身错误反馈，防循环）。
+        let mut stream_guard_aborts: usize = 0;
+        let mut guard_abort: Option<String> = None;
+        // H26：上一轮 provider 上报的 prompt token（input + cache read/write）。
+        let mut provider_context_tokens: usize = 0;
+        // H28：中途对账 nudge 计数（连续变更数 / 已注入次数）。
+        let mut mutations_since_todo: usize = 0;
+        let mut mid_run_nudges: usize = 0;
+        // H29：上一次已上报的目标状态（变化时才发 `goal_updated` 结构化事件）。
+        let mut last_goal_status: Option<super::GoalStatus> = None;
+
+        // H20：智能体生命周期起点（首个轮次之前）——`before_agent_start` 携带初始提示词，
+        // `agent_start` 标记运行开始。两者都在「预处理完成、即将首轮请求」处发射。
+        fire_named_hooks(
+            &hooks,
+            "before_agent_start",
+            serde_json::json!({ "prompt": prompt_text }),
+        )
+        .await;
+        fire_named_hooks(&hooks, "agent_start", serde_json::json!({})).await;
 
         loop {
             // 取消检查
             if cancel.is_cancelled() {
+                // H29：用户中断 → 活跃目标转 paused（对齐 omp `onTaskAborted`），
+                // 不静默丢弃目标：`goal({op:"resume"})` 或 `/goal resume` 可继续。
+                if let Some(gs) = &goal_state {
+                    let mut g = gs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if g.is_active() {
+                        let _ = g.pause();
+                        if let Err(e) = super::save_goal(&workspace.root(), &g) {
+                            tracing::warn!(error = %e, "目标持久化失败");
+                        }
+                    }
+                }
                 yield AgentEvent::Error("任务被取消".into());
+                fire_named_hooks(&hooks, "agent_end", serde_json::json!({ "success": false, "reason": "cancelled" })).await;
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 return;
             }
@@ -231,12 +474,21 @@ pub fn run_loop(
                 });
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: false }).await;
+                    fire_named_hooks(
+                        &hooks,
+                        "agent_end",
+                        serde_json::json!({ "success": false }),
+                    )
+                    .await;
                 }
                 record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 return;
             }
+
+            // H20：轮次开始。
+            fire_named_hooks(&hooks, "turn_start", serde_json::json!({})).await;
 
             // steering：非阻塞消费中途注入的消息
             {
@@ -346,9 +598,18 @@ pub fn run_loop(
             // 重新评估；仍超限才 summarize（LLM handoff 摘要，贵且可能失败）；再超限才
             // prune（窗口兜底）。shake 能救回时即可省去昂贵的 summarize LLM 请求。
             // 注：每级后都重新 build，确保本轮请求使用压缩后快照（修复「压缩滞后一轮」）。
-            if built.tokens.near_limit(guard) {
-                let mut stages: Vec<&str> = vec!["shake"];
-                let _ = context.compact(CompactionStrategy::Shake).await;
+            if over_compaction_threshold(&built.tokens, provider_context_tokens, compaction_threshold) {
+                let hook_ev = SessionEvent::AutoCompactionStart {
+                    reason: CompactionReason::Threshold,
+                    action: CompactionAction::ContextFull,
+                };
+                fire_hook_session(&hooks, &hook_ev).await;
+                yield AgentEvent::Session(hook_ev);
+                let mut stages: Vec<CompactionStage> = vec![CompactionStage::Shake];
+                let mut compact_error: Option<String> = None;
+                if let Err(e) = context.compact(CompactionStrategy::Shake).await {
+                    compact_error = Some(e.to_string());
+                }
                 built = match context.build_provider_context(&model, &specs).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -357,21 +618,24 @@ pub fn run_loop(
                         return;
                     }
                 };
-                if built.tokens.near_limit(guard) {
-                    stages.push("summarize");
+                if over_compaction_threshold(&built.tokens, provider_context_tokens, compaction_threshold) {
                     // P2：压缩后端选择——snapcompact（本地 PNG 帧）替代 LLM summarize。
                     // 由装配层按配置 + 视觉模型判断注入；非视觉模型请保持 Summarize。
                     let strat = match agent.compaction_backend() {
                         agent_core::CompactionBackend::Snapcompact => {
+                            stages.push(CompactionStage::Snapcompact);
                             CompactionStrategy::Snapcompact {
                                 max_frames: agent.compaction_max_frames(),
                             }
                         }
                         agent_core::CompactionBackend::Summarize => {
+                            stages.push(CompactionStage::Summarize);
                             CompactionStrategy::Summarize { max_tokens: 0 }
                         }
                     };
-                    let _ = context.compact(strat).await;
+                    if let Err(e) = context.compact(strat).await {
+                        compact_error.get_or_insert_with(|| e.to_string());
+                    }
                     built = match context.build_provider_context(&model, &specs).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -380,9 +644,14 @@ pub fn run_loop(
                             return;
                         }
                     };
-                    if built.tokens.near_limit(guard) {
-                        stages.push("prune");
-                        let _ = context.compact(CompactionStrategy::Prune { keep_recent: 8 }).await;
+                    if over_compaction_threshold(&built.tokens, provider_context_tokens, compaction_threshold) {
+                        stages.push(CompactionStage::Prune);
+                        if let Err(e) = context
+                            .compact(CompactionStrategy::Prune { keep_recent: 8 })
+                            .await
+                        {
+                            compact_error.get_or_insert_with(|| e.to_string());
+                        }
                         built = match context.build_provider_context(&model, &specs).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -393,10 +662,18 @@ pub fn run_loop(
                         };
                     }
                 }
-                yield AgentEvent::Say(StatusMessage {
-                    text: format!("上下文接近上限，已触发压缩（{}）", stages.join(" + ")),
-                    kind: StatusKind::Warning,
-                });
+                let end = SessionEvent::AutoCompactionEnd {
+                    action: CompactionAction::ContextFull,
+                    stages,
+                    ok: compact_error.is_none(),
+                    error: compact_error,
+                };
+                let status = end.to_status();
+                fire_hook_session(&hooks, &end).await;
+                yield AgentEvent::Session(end);
+                if let Some(status) = status {
+                    yield AgentEvent::Say(status);
+                }
             }
 
             // P3-A：运行时覆盖（mid-run 热更新，移植 oh-my-pi getReasoning/getDisableReasoning）。
@@ -443,7 +720,11 @@ pub fn run_loop(
                     None => built.messages,
                 },
                 tools: specs.clone(),
-                tool_choice: soft_tool_choice.clone(),
+                // H28：首轮 eager `always` 强制 `todo`，其后回落到软需求/自动。
+                tool_choice: eager_tool_choice
+                    .take()
+                    .map(ToolChoiceDirective::Hard)
+                    .or_else(|| soft_tool_choice.clone()),
                 max_tokens,
                 temperature,
                 thinking: thinking.clone(),
@@ -460,6 +741,12 @@ pub fn run_loop(
             if max_turns > 0 && summary.turns > max_turns as u64 {
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: false }).await;
+                    fire_named_hooks(
+                        &hooks,
+                        "agent_end",
+                        serde_json::json!({ "success": false }),
+                    )
+                    .await;
                 }
                 yield AgentEvent::Error(format!("达到最大轮次 {max_turns}，停止"));
                 yield AgentEvent::StateChanged(AgentState::Idle);
@@ -505,7 +792,24 @@ pub fn run_loop(
             let mut last_err: Option<agent_core::LlmError> = None;
             let mut event_stream = None;
             let mut chain_fatal = false;
-            for (i, m) in std::iter::once(&model).chain(fallbacks.iter()).enumerate() {
+            // 全链重试总次数（AutoRetryEnd 用；0 表示本轮未进过退避重试）。
+            let mut retry_attempts_total: u32 = 0;
+            let chain: Vec<&agent_core::Model> =
+                std::iter::once(&model).chain(fallbacks.iter()).collect();
+            for (i, m) in chain.iter().copied().enumerate() {
+                // i > 0：前序模型可重试失败 → 切换备用模型（omp `retry_fallback_applied`）。
+                if i > 0 {
+                    let applied = SessionEvent::RetryFallbackApplied {
+                        from: chain[i - 1].id.clone(),
+                        to: m.id.clone(),
+                    };
+                    let status = applied.to_status();
+                    fire_hook_session(&hooks, &applied).await;
+                    yield AgentEvent::Session(applied);
+                    if let Some(status) = status {
+                        yield AgentEvent::Say(status);
+                    }
+                }
                 let mut rate_limit_attempts: usize = 0;
                 loop {
                     // mid-run 凭证覆盖（移植 oh-my-pi `getApiKey`）：host 注入的 api_key 优先。
@@ -530,6 +834,24 @@ pub fn run_loop(
                                     "model fallback 成功（第 {} 个模型）",
                                     i + 1
                                 );
+                                let ok = SessionEvent::RetryFallbackSucceeded {
+                                    model: m.id.clone(),
+                                };
+                                let status = ok.to_status();
+                                fire_hook_session(&hooks, &ok).await;
+                                yield AgentEvent::Session(ok);
+                                if let Some(status) = status {
+                                    yield AgentEvent::Say(status);
+                                }
+                            }
+                            if rate_limit_attempts > 0 {
+                                let hook_ev = SessionEvent::AutoRetryEnd {
+                                    success: true,
+                                    attempt: rate_limit_attempts as u32,
+                                    final_error: None,
+                                };
+                                fire_hook_session(&hooks, &hook_ev).await;
+                                yield AgentEvent::Session(hook_ev);
                             }
                             event_stream = Some(s);
                             break;
@@ -548,13 +870,22 @@ pub fn run_loop(
                             };
                             if let Some(ms) = rate_limit_wait_ms {
                                 rate_limit_attempts += 1;
-                                yield AgentEvent::Say(StatusMessage {
-                                    text: format!(
-                                        "429 速率限制：{} ms 后重试 {}（尝试 {}/{}）",
-                                        ms, m.id, rate_limit_attempts + 1, RATE_LIMIT_MAX_ATTEMPTS
-                                    ),
-                                    kind: StatusKind::Warning,
-                                });
+                                retry_attempts_total += 1;
+                                let start = SessionEvent::AutoRetryStart {
+                                    attempt: rate_limit_attempts as u32,
+                                    // omp 语义：maxAttempts = 重试预算。Gyre 常量语义是
+                                    // 单模型上游调用总次数（含首次），故预算 = 上限 − 1。
+                                    max_attempts: RATE_LIMIT_MAX_ATTEMPTS.saturating_sub(1) as u32,
+                                    delay_ms: ms,
+                                    error_message: e.to_string(),
+                                    model: m.id.clone(),
+                                };
+                                let status = start.to_status();
+                                fire_hook_session(&hooks, &start).await;
+                                yield AgentEvent::Session(start);
+                                if let Some(status) = status {
+                                    yield AgentEvent::Say(status);
+                                }
                                 tokio::select! {
                                     biased;
                                     () = cancel.cancelled() => {
@@ -582,10 +913,27 @@ pub fn run_loop(
                 // 主模型必然尝试过 → last_err 必有值。
                 let e = last_err.expect("fallback 链至少尝试了主模型");
                 mistakes += 1;
+                // 重试循环收尾（omp `auto_retry_end`）：本轮进过退避重试才发，
+                // 终局文本由后续 Error 承担，故本事件无展示投影。
+                if retry_attempts_total > 0 {
+                    let hook_ev = SessionEvent::AutoRetryEnd {
+                        success: false,
+                        attempt: retry_attempts_total,
+                        final_error: Some(e.to_string()),
+                    };
+                    fire_hook_session(&hooks, &hook_ev).await;
+                    yield AgentEvent::Session(hook_ev);
+                }
                 yield AgentEvent::Error(format!("LLM 调用失败: {e}"));
                 if mistakes >= max_mistakes {
                     for h in &hooks {
                         h.on_event(&HookEvent::Stop { success: false }).await;
+                    fire_named_hooks(
+                        &hooks,
+                        "agent_end",
+                        serde_json::json!({ "success": false }),
+                    )
+                    .await;
                     }
                     yield AgentEvent::Error(format!("连续错误达到上限 {max_mistakes}，停止"));
                     yield AgentEvent::StateChanged(AgentState::Idle);
@@ -625,6 +973,10 @@ pub fn run_loop(
                     ev = event_stream.next() => match ev {
                         Some(AssistantEvent::TextDelta(d)) => {
                             acc_text.push_str(&d);
+                            // H5：离开推理通道 → Gemini 标题连跑计数重置。
+                            if let Some(det) = gemini_detector.as_mut() {
+                                det.reset();
+                            }
                             // TTSR：文本流实时匹配，命中可中断规则即中断流（丢弃部分输出
                             // 后注入规则重试；违规增量不发射，用户看不到违规内容）。
                             if let Some(t) = &ttsr {
@@ -645,7 +997,49 @@ pub fn run_loop(
                                     break;
                                 }
                             }
+                            // H5：Gemini 推理标题连跑——达到阈值即中断流（丢弃部分
+                            // 输出后注入工具提醒重试）。连续超上限后不再中断（静默）。
+                            if let Some(det) = gemini_detector.as_mut() {
+                                if det.push(&d) && stream_guard_aborts < MAX_STREAM_GUARD_ABORTS {
+                                    let count = det.count();
+                                    yield AgentEvent::Say(StatusMessage {
+                                        text: format!(
+                                            "检测到 {count} 个连续规划标题且无工具调用，已中断并注入提醒"
+                                        ),
+                                        kind: StatusKind::Warning,
+                                    });
+                                    guard_abort = Some(stream_guards::render_gemini_reminder(count));
+                                    break;
+                                }
+                            }
                             yield AgentEvent::ThinkingDelta(d);
+                        }
+                        Some(AssistantEvent::ToolCallStart { id, name }) => {
+                            // H5：编辑预检登记 + 离开推理通道重置 Gemini 计数。
+                            edit_precheck.on_start(&id, &name);
+                            if let Some(det) = gemini_detector.as_mut() {
+                                det.reset();
+                            }
+                        }
+                        Some(AssistantEvent::ToolCallDelta { id, partial_json }) => {
+                            // H5：编辑流式预检——完整段头路径命中生成文件名即中断。
+                            if let Some(violation) = edit_precheck.on_delta(&id, &partial_json) {
+                                if stream_guard_aborts < MAX_STREAM_GUARD_ABORTS {
+                                    guard_abort =
+                                        Some(stream_guards::render_edit_violation(&violation));
+                                    break;
+                                }
+                            }
+                        }
+                        Some(AssistantEvent::ToolCallEnd { id }) => {
+                            // H5：编辑流式预检——参数完整即试解析，必败则中断。
+                            if let Some(violation) = edit_precheck.on_end(&id) {
+                                if stream_guard_aborts < MAX_STREAM_GUARD_ABORTS {
+                                    guard_abort =
+                                        Some(stream_guards::render_edit_violation(&violation));
+                                    break;
+                                }
+                            }
                         }
                         Some(AssistantEvent::Usage(u)) => {
                             usage.add(&u);
@@ -692,6 +1086,28 @@ pub fn run_loop(
                 continue;
             }
 
+            // H5 流式守卫：守卫触发中断（生成文件段头 / 解析必败 / Gemini 标题连跑）。
+            // 与 TTSR 同管线：丢弃部分输出、注入违规详情、同一 run 内自我修正。
+            // （连续中断超 MAX_STREAM_GUARD_ABORTS 后，事件臂不再中断流——守卫静默，
+            //  降级为工具自身错误反馈，防无限循环。）
+            if let Some(text) = guard_abort.take() {
+                stream_guard_aborts += 1;
+                context.append(agent_core::AgentMessage::user_text(text)).await;
+                // P1-E：turn 边界——合成 aborted 消息维持 MessageStart/TurnEnd 配对。
+                yield AgentEvent::TurnEnd {
+                    message: AssistantMessage {
+                        content: Vec::new(),
+                        usage: Usage::default(),
+                        model: model.id.clone(),
+                        stop_reason: Some(StopReason::Aborted),
+                        stop_details: None,
+                    },
+                    tool_results: Vec::new(),
+                    will_continue: true,
+                };
+                continue;
+            }
+
             let Some(assistant) = authoritative else {
                 // 未见 MessageEnd：流异常中断。兜底持久化已生成的部分文本，避免丢失。
                 persist_interrupted(&context, &mut acc_text, &model, &usage).await;
@@ -705,6 +1121,12 @@ pub fn run_loop(
             };
             mistakes = 0;
             summary.usage.add(&assistant.usage);
+            // H26：记下 provider 上报的 prompt token（input + cache read/write），
+            // 作为下一轮压缩判定的下限（出向压缩/脱敏可能让上报值小于真实历史）。
+            provider_context_tokens = (assistant.usage.input_tokens
+                + assistant.usage.cache_read_tokens
+                + assistant.usage.cache_write_tokens)
+                as usize;
             // P0-3：goals 记账——首次超限置位停止边界注入标记（一次性，防重复注入循环）。
             if let Some(goal) = &agent.goal {
                 let newly_exceeded = {
@@ -1038,6 +1460,15 @@ pub fn run_loop(
                 }
                 // P1-E：error/aborted 终止，turn 结束 → 停止（will_continue: false）。
                 fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
+                fire_named_hooks(
+                    &hooks,
+                    "turn_end",
+                    serde_json::json!({
+                        "message": assistant,
+                        "willContinue": false,
+                    }),
+                )
+                .await;
                 yield AgentEvent::TurnEnd {
                     message: assistant.clone(),
                     tool_results: std::mem::take(&mut turn_tool_results),
@@ -1047,6 +1478,12 @@ pub fn run_loop(
                 summary.success = false;
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: false }).await;
+                    fire_named_hooks(
+                        &hooks,
+                        "agent_end",
+                        serde_json::json!({ "success": false }),
+                    )
+                    .await;
                 }
                 record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
@@ -1081,6 +1518,8 @@ pub fn run_loop(
             // 有工具调用 → 真实工作轮，重置暂停计数。
             if !tool_calls.is_empty() {
                 paused_continuations = 0;
+                // H28：模型已有实质动作 → 解除「提醒待响应」静默（允许后续再提醒）。
+                todo_reminder_awaiting = false;
             }
 
             // 无工具调用 → 任务完成（停止边界）。
@@ -1206,9 +1645,141 @@ pub fn run_loop(
                     }
                 }
 
+                // H29：目标状态变化 → 结构化事件 + 展示文本（双通道同源；工具改动在本
+                // 停止边界被一次性捕获），并落盘持久化。
+                if let Some(gs) = &goal_state {
+                    let change = {
+                        let g = gs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if last_goal_status != Some(g.status) {
+                            last_goal_status = Some(g.status);
+                            g.snapshot().map(|s| (s.status, Some(s.objective), s.continuations))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((status, objective, continuations)) = change {
+                        let ev = agent_core::SessionEvent::GoalUpdated {
+                            status: status.clone(),
+                            objective,
+                            continuations,
+                        };
+                        context
+                            .append(agent_core::AgentMessage::user_text(format!(
+                                "<system-reminder>目标状态已变更为 {status}。若目标仍活跃，继续推进；\n若已 complete，请在最终回答中汇报预算使用情况；若已 paused/budget-limited，请收尾。</system-reminder>",
+                            )))
+                            .await;
+                        if let Some(st) = ev.to_status() {
+                            yield AgentEvent::Session(ev);
+                            yield AgentEvent::Say(st);
+                        }
+                    }
+                }
+                // H29：goal 续跑——目标仍活跃时注入 continuation 提示并继续下一轮
+                //（`note_continuation` 设上限，防无限循环；`complete`/`budget-limited`
+                // 后 `is_active()` 为假，自然停止）。
+                if let Some(gs) = &goal_state {
+                    let prompt = {
+                        let g = gs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        g.continuation_prompt()
+                    };
+                    if let Some(prompt) = prompt {
+                        let allowed = {
+                            let mut g = gs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            g.note_continuation()
+                        };
+                        if allowed {
+                            // H29：续跑数变化即落盘（跨重启保留进度）。
+                            if let Ok(g) = gs.lock() {
+                                if let Err(e) = super::save_goal(&workspace.root(), &g) {
+                                    tracing::warn!(error = %e, "目标持久化失败");
+                                }
+                            }
+                            context
+                                .append(agent_core::AgentMessage::user_text(prompt))
+                                .await;
+                            yield AgentEvent::Say(StatusMessage {
+                                text: "已注入目标续跑提示，继续…".into(),
+                                kind: StatusKind::Info,
+                            });
+                            yield AgentEvent::TurnEnd {
+                                message: assistant.clone(),
+                                tool_results: std::mem::take(&mut turn_tool_results),
+                                will_continue: true,
+                            };
+                            continue;
+                        }
+                        yield AgentEvent::Say(StatusMessage {
+                            text: "目标续跑达上限，停止（可用 goal resume 继续）".into(),
+                            kind: StatusKind::Warning,
+                        });
+                    }
+                }
+                // H28：完成提醒——模型在仍有未完成待办时停止 → 注入提醒并续跑
+                //（上限 `reminders_max`；同一提醒未获实质动作前保持静默，避免刷屏；
+                // 末行是向用户提问则视为等待输入，不打断）。
+                // H28：后台作业在途时不提醒——它们完成会经投递/hub 唤醒循环，重复催办会打断
+                // 正常的「等结果 → 继续」节奏（移植 omp `hasPendingAsyncWake` 护栏）。
+                let pending_async = async_wake
+                    .as_ref()
+                    .is_some_and(|w| w.has_pending_async());
+                if todo_cfg.reminders
+                    && !todo_reminder_awaiting
+                    && !pending_async
+                    && (todo_cfg.reminders_max == 0 || todo_reminder_count < todo_cfg.reminders_max)
+                    && let Some(src) = &todo_loop
+                {
+                    let snapshot = src.snapshot();
+                    if let Some(list) = snapshot.render_incomplete()
+                        && !is_awaiting_user_answer(&assistant)
+                    {
+                        todo_reminder_count += 1;
+                        todo_reminder_awaiting = true;
+                        context
+                            .append(agent_core::AgentMessage::user_text(todo_reminder_text(
+                                &list,
+                                todo_reminder_count,
+                                todo_cfg.reminders_max,
+                            )))
+                            .await;
+                        yield AgentEvent::Say(StatusMessage {
+                            text: format!(
+                                "已注入未完成待办提醒（{}/{}），继续…",
+                                todo_reminder_count,
+                                if todo_cfg.reminders_max == 0 {
+                                    "∞".to_string()
+                                } else {
+                                    todo_cfg.reminders_max.to_string()
+                                }
+                            ),
+                            kind: StatusKind::Info,
+                        });
+                        yield AgentEvent::TurnEnd {
+                            message: assistant.clone(),
+                            tool_results: std::mem::take(&mut turn_tool_results),
+                            will_continue: true,
+                        };
+                        continue;
+                    }
+                }
+
                 // P1-E：正常停止，turn 结束 → 停止（will_continue: false）。本轮无工具调用，
                 // turn_tool_results 为空。
                 fire_on_turn_end(&hooks, &assistant, &turn_tool_results, false).await;
+                fire_named_hooks(
+                    &hooks,
+                    "turn_end",
+                    serde_json::json!({
+                        "message": assistant,
+                        "willContinue": false,
+                    }),
+                )
+                .await;
                 yield AgentEvent::TurnEnd {
                     message: assistant.clone(),
                     tool_results: std::mem::take(&mut turn_tool_results),
@@ -1228,6 +1799,17 @@ pub fn run_loop(
                 for h in &hooks {
                     h.on_event(&HookEvent::Stop { success: true }).await;
                 }
+                // H20：智能体运行结束（成功路径）。
+                fire_named_hooks(
+                    &hooks,
+                    "agent_end",
+                    serde_json::json!({
+                        "success": true,
+                        "turns": summary.turns,
+                        "toolCalls": summary.tool_calls,
+                    }),
+                )
+                .await;
                 record_run_end(&invoke_span, &summary, run_start);
                 yield AgentEvent::Done(summary);
                 return;
@@ -1273,6 +1855,12 @@ pub fn run_loop(
                         summary.success = false;
                         for h in &hooks {
                             h.on_event(&HookEvent::Stop { success: false }).await;
+                    fire_named_hooks(
+                        &hooks,
+                        "agent_end",
+                        serde_json::json!({ "success": false }),
+                    )
+                    .await;
                         }
                         record_run_end(&invoke_span, &summary, run_start);
                         yield AgentEvent::Done(summary);
@@ -1318,6 +1906,12 @@ pub fn run_loop(
             let soft_called = soft_tool_name_this_turn
                 .as_deref()
                 .is_none_or(|req| tool_calls.iter().any(|(_, n, _)| n == req));
+            // H28：本轮是否触碰待办清单 + 变更类工具数量（`tool_calls` 随后会被消费）。
+            let touched_todo_this_turn = tool_calls.iter().any(|(_, n, _)| n == "todo");
+            let mutating_this_turn = tool_calls
+                .iter()
+                .filter(|(_, n, _)| MUTATING_TOOLS.contains(&n.as_str()))
+                .count();
 
             // ── 阶段一：审批门禁（串行；Ask 阻塞等待用户，故必须逐个处理）。──
             let mut runnable: Vec<PendingTask> = Vec::new();
@@ -1337,6 +1931,29 @@ pub fn run_loop(
                     yield AgentEvent::Error(msg);
                     continue;
                 };
+
+                // H5 流式守卫（执行侧兜底）：apply_hashline 补丁段头路径（含 fallback
+                // path）命中生成文件判定（文件名模式 + 头部内容 marker）→ 回填可恢复
+                // 错误、跳过执行。流式早拦只覆盖文件名模式（零 IO）；内容 marker 在此
+                // 拦截（对齐 omp assertEditableFile 的完整语义）。
+                if stream_guards_cfg.block_auto_generated && name == "apply_hashline" {
+                    if let Some(err) = check_generated_edit_args(&args, &workspace).await {
+                        context
+                            .append(agent_core::AgentMessage::ToolResult(ToolResultMessage {
+                                tool_call_id: id,
+                                result: ToolResult::Error {
+                                    recoverable: true,
+                                    message: err.clone(),
+                                },
+                            }))
+                            .await;
+                        yield AgentEvent::Say(StatusMessage {
+                            text: format!("已拦截对生成文件的编辑：{err}"),
+                            kind: StatusKind::Warning,
+                        });
+                        continue;
+                    }
+                }
 
                 // 审批门禁
                 let areq = tool.describe(&args);
@@ -1534,6 +2151,30 @@ pub fn run_loop(
                     .await;
             }
 
+            // H5 流式守卫：跨轮同参工具循环检测（对齐 omp LoopGuards.recordTurn——
+            // 注入发生在结果回填后、下一轮推理前，模型下一轮即见重定向）。
+            if let Some(g) = tool_loop_guard.as_mut() {
+                if let Some(detection) = g.record_turn(&assistant, &turn_tool_results) {
+                    tracing::warn!(
+                        tool = %detection.tool_name,
+                        count = detection.count,
+                        "cross-turn tool-call loop detected"
+                    );
+                    yield AgentEvent::Say(StatusMessage {
+                        text: format!(
+                            "检测到跨轮同参工具循环（{} 连续 {} 次），已注入重定向提示",
+                            detection.tool_name, detection.count
+                        ),
+                        kind: StatusKind::Warning,
+                    });
+                    context
+                        .append(agent_core::AgentMessage::user_text(
+                            stream_guards::render_loop_redirect(&detection),
+                        ))
+                        .await;
+                }
+            }
+
             // 软工具需求：本轮未调用所需工具 → 下一轮升级为强制（修复 escalate 死代码）。
             escalate_soft = !soft_called && soft_tool_name_this_turn.is_some();
             // P1-C：合规（调用了所需工具）后重置升级计数，避免累计误中止。
@@ -1552,8 +2193,47 @@ pub fn run_loop(
                 yield AgentEvent::StateChanged(AgentState::Idle);
                 return;
             }
+            // H28：中途对账 nudge——连续多次变更类工具调用仍未触碰 `todo` 时提醒一次
+            // （移植 omp `takeMidRunNudge`：阈值 12、每次 run 上限 2）。提醒在工具结果之后、
+            // 下一次模型调用之前注入，不打断在途工具。
+            if todo_cfg.mid_run_nudge
+                && let Some(src) = &todo_loop
+            {
+                if touched_todo_this_turn {
+                    mutations_since_todo = 0;
+                } else {
+                    mutations_since_todo += mutating_this_turn;
+                    if mutations_since_todo >= MID_RUN_NUDGE_THRESHOLD
+                        && mid_run_nudges < MID_RUN_NUDGE_MAX
+                        && let Some(incomplete) = src.snapshot().render_incomplete()
+                    {
+                        mutations_since_todo = 0;
+                        mid_run_nudges += 1;
+                        context
+                            .append(agent_core::AgentMessage::user_text(mid_run_nudge_text(
+                                &incomplete,
+                                mid_run_nudges,
+                                MID_RUN_NUDGE_MAX,
+                            )))
+                            .await;
+                        yield AgentEvent::Say(StatusMessage {
+                            text: format!(
+                                "已注入中途待办对账提醒（{mid_run_nudges}/{MID_RUN_NUDGE_MAX}）"
+                            ),
+                            kind: StatusKind::Info,
+                        });
+                    }
+                }
+            }
             // P1-E：工具执行完毕，turn 结束 → 继续（工具结果已回填，模型再次推理）。
             fire_on_turn_end(&hooks, &assistant, &turn_tool_results, true).await;
+            // H20：轮次结束（通知型 hook）——与 `on_turn_end` 编程钩子同点发射。
+            fire_named_hooks(
+                &hooks,
+                "turn_end",
+                serde_json::json!({ "message": assistant, "willContinue": true }),
+            )
+            .await;
             yield AgentEvent::TurnEnd {
                 message: assistant.clone(),
                 tool_results: std::mem::take(&mut turn_tool_results),
@@ -1745,6 +2425,36 @@ pub async fn run_batch(
 /// 空停止判定（移植 oh-my-pi `isEmptyAssistantStop`）：`Stop` / 孤立 `ToolUse` 停止却无
 /// 任何可交付内容——文本块全空白、thinking 无签名（不可回放），且无工具调用。其余停止
 /// 原因不算空停止：Length 截断 / 流中断有专属续写路径，Error / Aborted / Pause 各有分支。
+/// H5 流式守卫（执行侧）：解析 apply_hashline 参数并对全部涉及路径做生成文件判定
+///（文件名模式 + 头部内容 marker，对齐 omp `assertEditableFile`）。
+/// 任一路径命中即返回错误文案；无命中 / 参数不可解析（交由工具自身报错）返回 `None`。
+async fn check_generated_edit_args(
+    args: &serde_json::Value,
+    workspace: &agent_core::Workspace,
+) -> Option<String> {
+    let patch = args.get("patch").and_then(serde_json::Value::as_str)?;
+    let mut paths: Vec<String> = match agent_hashline::parse_hashline(patch) {
+        Ok(sections) => sections.into_iter().map(|s| s.path).collect(),
+        // 解析失败不在此拦（edit_parse_guard 流式预检 / 工具自身错误覆盖）。
+        Err(_) => return None,
+    };
+    if let Some(fallback) = args.get("path").and_then(serde_json::Value::as_str) {
+        paths.push(fallback.to_string());
+    }
+    for path in paths {
+        let display = path.clone();
+        let resolved = workspace.resolve(std::path::Path::new(&path));
+        if let Err(err) =
+            agent_tools::generated_guard::assert_editable(&resolved.display().to_string(), &display)
+                .await
+        {
+            return Some(err);
+        }
+    }
+    None
+}
+
+/// 空停止判定（移植 oh-my-pi `isEmptyAssistantStop`）：`Stop` / 孤立 `ToolUse` 停止却无
 fn is_empty_assistant_stop(msg: &AssistantMessage) -> bool {
     if !matches!(
         msg.stop_reason,

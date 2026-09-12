@@ -64,6 +64,11 @@ jobs:
       - name: clippy (deny all warnings)
         run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
+      # H35：发布预检（版本一致性 / CHANGELOG [Unreleased] / 三语 README / NOTICES 与
+      # 依赖图一致）。NOTICES 用 `cargo xtask notices --check` 做漂移门禁：Cargo.lock
+      # 变更后忘记重新生成会在 CI 直接失败。
+      - name: Release preflight (xtask)
+        run: cargo xtask release-check
   # ─── 执法门 2：测试（nextest；retries=0 见 .config/nextest.toml）────────────────
   test:
     name: Test (nextest)
@@ -125,7 +130,7 @@ jobs:
         continue-on-error: true
         run: cargo deny --locked check advisories
 
-  # ─── 构建 + 发布（matrix 5 目标；release 步骤仅在 tag 触发时执行）───────────────
+  # ─── 构建 + 发布（matrix 7 目标；release 步骤仅在 tag 触发时执行）───────────────
   build:
     # ✨ Matrix：Linux gnu/musl(x86_64+aarch64) + macOS arm64 + Windows x86_64
     # 全部 leg 并行，fail-fast=false 保证一个失败不影响另一个继续跑完，便于排查
@@ -177,6 +182,22 @@ jobs:
             tool: cargo
             smoke: native
             experimental: false
+          # ── 补 2 腿（H35）：Intel macOS 与 linux-gnu aarch64 ──
+          - os: macos-15-intel                  # Intel runner：x86_64-apple-darwin 本机构建
+            target: x86_64-apple-darwin         # （旧 macos-13 标签已被 GitHub 下线）
+            binary: agent
+            artifact: agent-darwin-amd64
+            tool: cargo
+            smoke: native
+            experimental: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu   # glibc/aarch64：cross 容器内交叉编译
+            binary: agent
+            artifact: agent-linux-arm64
+            tool: cross
+            # 无 smoke：glibc/aarch64 产物在 x86_64 宿主需 arm64 sysroot + QEMU，
+            # musl leg 的 Alpine 冒烟不适用；保持 experimental 直到运行期验证补齐。
+            experimental: true
 
     runs-on: ${{ matrix.os }}
 
@@ -311,6 +332,8 @@ jobs:
               - Linux x86_64 (musl):   `agent-linux-amd64-musl`   (+ `.sha256`)
               - Linux arm64 (musl):    `agent-linux-arm64-musl`   (+ `.sha256`)
               - macOS arm64 (Apple Silicon): `agent-darwin-arm64` (+ `.sha256`)
+              - macOS x86_64 (Intel):  `agent-darwin-amd64`       (+ `.sha256`)
+              - Linux arm64 (glibc):   `agent-linux-arm64`        (+ `.sha256`)
               - Windows x86_64:        `agent-windows-amd64.exe`  (+ `.sha256`)
           Verify integrity: `sha256sum -c agent-<platform>.sha256`
           Aggregate checksums: `SHA256SUMS.txt` covers every binary above.
@@ -345,7 +368,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          expected="agent-darwin-arm64 agent-linux-amd64 agent-linux-amd64-musl agent-linux-arm64-musl agent-windows-amd64.exe"
+          expected="agent-darwin-amd64 agent-darwin-arm64 agent-linux-amd64 agent-linux-amd64-musl agent-linux-arm64 agent-linux-arm64-musl agent-windows-amd64.exe"
           missing=0
           for f in $expected; do
             test -f "$f" || { echo "❌ release 缺失资产: $f"; missing=1; }

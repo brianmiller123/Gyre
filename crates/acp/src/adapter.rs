@@ -85,7 +85,10 @@ pub fn server_frame_to_acp(frame: ServerFrame) -> Option<SessionUpdate> {
         | ServerFrame::TurnEnd { .. }
         | ServerFrame::MessageStart
         | ServerFrame::MessageEnd { .. }
-        | ServerFrame::Steered { .. } => return None,
+        | ServerFrame::Steered { .. }
+        // 结构化会话事件：展示文本已随配对的 Say 帧并入 agent_message_chunk，
+        // 状态机字段 ACP 无对应 update 类型（与状态帧同策略）。
+        | ServerFrame::Session { .. } => return None,
     })
 }
 
@@ -104,7 +107,7 @@ const TITLE_MAX_CHARS: usize = 120;
 /// 按工具名推断 ACP `ToolKind`（移植 oh-my-pi `mapToolKind`）。
 ///
 /// kind 决定客户端图标与自动审批层级；未识别工具一律 `other`。
-fn tool_kind(name: &str) -> &'static str {
+pub(crate) fn tool_kind(name: &str) -> &'static str {
     match name {
         "read_file" | "read_image" => "read",
         "write_file" | "apply_hashline" | "replace_block" | "ast_rewrite" | "lsp_apply" => "edit",
@@ -125,7 +128,7 @@ fn tool_kind(name: &str) -> &'static str {
 /// 优先级：命令文本（`$ cmd`）最高；其次关键参数主题（path/pattern/query/prompt →
 /// `工具名: 主题`）；最后回退工具名。主题为内部 URI（`skill://…` 等协议限定目标）时
 /// 单独展示——拼工具名前缀会被编辑器当成对不存在路径的文件操作。
-fn tool_title(name: &str, args: &serde_json::Value) -> String {
+pub(crate) fn tool_title(name: &str, args: &serde_json::Value) -> String {
     let field = |key: &str| {
         args.get(key)
             .and_then(serde_json::Value::as_str)

@@ -21,6 +21,8 @@ pub struct ConsolidateReport {
     pub absorbed: usize,
     /// 生成的提炼记录数。
     pub distilled: usize,
+    /// 本轮因**租约被他人持有**而跳过（多会话并发保护；未做任何 LLM 调用）。
+    pub skipped: bool,
 }
 
 /// 单批最多吸收的记录数（超出的留在下轮）。

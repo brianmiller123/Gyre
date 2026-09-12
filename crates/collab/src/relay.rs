@@ -276,6 +276,25 @@ impl CollabClient {
     pub fn decode(&self, sealed: &[u8]) -> Result<WireFrame, CollabError> {
         open(&self.key, sealed)
     }
+
+    /// 解封并做**协议版本校验**（H39）：`Welcome` 携带的 proto 与本端不一致时返回
+    /// [`CollabError::ProtoMismatch`]，调用方据此提示用户刷新/升级，而不是带着错误
+    /// 假设继续渲染。
+    ///
+    /// # Errors
+    /// 解封失败，或对端协议版本不兼容。
+    pub fn decode_checked(&self, sealed: &[u8]) -> Result<WireFrame, CollabError> {
+        let frame = open(&self.key, sealed)?;
+        if let WireFrame::Welcome { proto, .. } = &frame
+            && !crate::frame::proto_compatible(*proto)
+        {
+            return Err(CollabError::ProtoMismatch {
+                remote: *proto,
+                local: crate::frame::PROTO_VERSION,
+            });
+        }
+        Ok(frame)
+    }
 }
 
 fn stamp(frame: &mut WireFrame, client_id: &str) {
@@ -609,6 +628,73 @@ mod tests {
             .await
             .expect("可写客户端应可发");
         assert_eq!(n, 1);
+    }
+
+    /// H39：协议版本不匹配时 `decode_checked` 显式报错（而不是让调用方带着错误假设继续）。
+    #[tokio::test]
+    async fn decode_checked_rejects_incompatible_protocol_version() {
+        let relay = Relay::new();
+        let key = generate_room_key();
+        let host = CollabClient::new(relay.clone(), key, "host".into());
+        let guest = CollabClient::new(relay, key, "guest".into());
+        let mut rx = guest.subscribe().await;
+        // 对端声明 proto=3（omp 当前版本）→ 本端 proto=1 应拒绝。
+        let _ = host
+            .send(WireFrame::Welcome {
+                client_id: "host".into(),
+                proto: 3,
+                read_only: false,
+                entry_count: 0,
+                ts: 0,
+            })
+            .await;
+        let sealed = rx.recv().await.expect("应有帧");
+        // 普通 decode 仍能解出（诊断/日志路径不受影响）。
+        let raw = guest.decode(&sealed).expect("解封应成功");
+        assert!(matches!(raw, WireFrame::Welcome { proto: 3, .. }));
+        // checked 路径给出结构化错误，消息里含两端版本与可执行建议。
+        match guest.decode_checked(&sealed) {
+            Err(CollabError::ProtoMismatch { remote, local }) => {
+                assert_eq!((remote, local), (3, crate::PROTO_VERSION));
+            }
+            other => panic!("应报协议不匹配，得到 {other:?}"),
+        }
+        let msg = crate::proto_mismatch_message(3);
+        assert!(msg.contains("proto=3") && msg.contains("proto=1"), "{msg}");
+
+        // 本端版本的 Welcome 正常通过（兼容路径未被误伤）。
+        let _ = host
+            .send(WireFrame::Welcome {
+                client_id: "host".into(),
+                proto: crate::PROTO_VERSION,
+                read_only: true,
+                entry_count: 2,
+                ts: 0,
+            })
+            .await;
+        let sealed = rx.recv().await.expect("应有帧");
+        assert!(guest.decode_checked(&sealed).is_ok());
+        // 非 Welcome 帧不做版本校验（只有握手帧声明版本）。
+        let _ = host
+            .send(WireFrame::Chat {
+                client_id: "host".into(),
+                text: "hi".into(),
+                ts: 0,
+            })
+            .await;
+        let sealed = rx.recv().await.expect("应有帧");
+        assert!(matches!(
+            guest.decode_checked(&sealed),
+            Ok(WireFrame::Chat { ref text, .. }) if text == "hi"
+        ));
+    }
+
+    #[test]
+    fn proto_compatibility_is_exact_match() {
+        assert!(crate::proto_compatible(crate::PROTO_VERSION));
+        for other in [0, 2, 3, 99] {
+            assert!(!crate::proto_compatible(other), "proto={other} 不应兼容");
+        }
     }
 
     #[tokio::test]

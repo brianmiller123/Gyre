@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Layered TOML config: model profiles + agent approval rules engine"
 
 [dependencies]
+toml_edit    = "0.22"
 agent-core  = { workspace = true }
 agent-skills = { workspace = true }
 serde       = { workspace = true }
@@ -16,9 +17,13 @@ async-trait = { workspace = true }
 thiserror   = { workspace = true }
 glob        = { workspace = true }
 dirs        = { workspace = true }
+regex       = { workspace = true }
 secrecy     = { workspace = true }
 futures     = { workspace = true }
 tracing     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

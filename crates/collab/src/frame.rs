@@ -5,6 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 当前线协议版本（H39 决策：Gyre 保持自有 proto=1，不与 omp proto=3 对齐；
+/// 详见 `docs/adr/0002-collab-protocol.md`）。
+///
+/// `Hello` / `Welcome` 都携带该字段；双方据此做**显式拒绝**而不是静默降级。
+pub const PROTO_VERSION: u32 = 1;
+
+/// 远端协议版本是否兼容。
+///
+/// 兼容策略（有意保守）：**完全相等**才算兼容。协同通道是端到端密封的点对点消息集，
+/// 版本差异意味着消息语义可能不同（新字段被旧端忽略、或旧字段被新端误读），
+/// 静默容忍会让 UI 出现难查的状态错乱；宁可明确报错让用户刷新页面。
+#[must_use]
+pub const fn proto_compatible(remote: u32) -> bool {
+    remote == PROTO_VERSION
+}
+
+/// 版本不匹配的用户可读说明（host 侧 `Error` 帧 / guest 侧横幅共用）。
+#[must_use]
+pub fn proto_mismatch_message(remote: u32) -> String {
+    format!(
+        "协同协议版本不匹配：对端 proto={remote}，本端支持 proto={PROTO_VERSION}。\
+         请刷新页面或升级到同一版本后重试（Gyre 不保证跨版本兼容）。"
+    )
+}
+
 /// 协同会话线协议帧。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

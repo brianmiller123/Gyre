@@ -68,12 +68,16 @@ impl Tool for HashlineTool {
                     "type": "string",
                     "description": "hashline patch 文本，可含多个 [path#hash] 段；段内为 SWAP/DEL/INS/REM/MV 操作"
                 },
+                "input": {
+                    "type": "string",
+                    "description": "`patch` 的别名（对齐 omp `edit` 工具的 patch 模式字段名）"
+                },
                 "path": {
                     "type": "string",
                     "description": "可选：当 patch 不含段头时的回退目标文件路径"
                 }
             },
-            "required": ["patch"]
+            "required": []
         })
     }
     fn capability(&self) -> CapabilityTier {
@@ -85,10 +89,13 @@ impl Tool for HashlineTool {
         input: serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        // H32：omp `edit` 的 patch 模式用 `input` 字段；两者皆收（`patch` 优先）。
         let patch = input
             .get("patch")
+            .or_else(|| input.get("input"))
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `patch`".into()))?;
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs("缺少 `patch`（或别名 `input`）".into()))?;
         let fallback_path = input.get("path").and_then(serde_json::Value::as_str);
 
         let mut sections = parse_hashline(patch).map_err(ToolError::InvalidArgs)?;
@@ -362,5 +369,44 @@ mod tests {
             "ONE\ntwo\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H32：`input` 作为 `patch` 的别名（omp `edit` patch 模式字段名）。
+    #[tokio::test]
+    async fn accepts_input_alias_for_patch() {
+        let dir = tmp_dir();
+        let ws = Workspace::new(&dir);
+        std::fs::write(dir.join("a.txt"), "ONE\n").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext {
+            workspace: &ws,
+            approval: &Allow,
+            cancel: &cancel,
+            skills: None,
+            memory: None,
+            resources: None,
+            write_effect: None,
+            update_tx: None,
+            conflicts: None,
+            pending_rewrites: None,
+            context: None,
+            snapshots: None,
+            tool_call_id: None,
+        };
+        // 直接构造哈希段头（与 read_file 输出同形：`[a.txt#<16 hex>]`）。
+        let text = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let hash = crate::compute_file_hash(&text);
+        let patch = format!("[a.txt#{hash}]\nSWAP 1.=1:\n+TWO\n");
+        let tool = HashlineTool::new();
+        let out = tool
+            .execute(serde_json::json!({"input": patch}), &ctx)
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("a.txt"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "TWO\n");
+        // 两者皆缺 → 明确错误文案含别名提示。
+        let err = tool.execute(serde_json::json!({}), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("input"), "{err}");
     }
 }

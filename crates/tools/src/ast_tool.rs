@@ -117,6 +117,7 @@ impl Tool for AstSearchTool {
             "properties": {
                 "path":       { "type": "string", "description": "源码文件路径" },
                 "pattern":    { "type": "string", "description": "ast-grep 模式，如 `fn $NAME($$$ARGS) { $$$BODY }`" },
+                "pat":        { "type": "string", "description": "`pattern` 的别名（对齐 omp `ast_grep.pat`）" },
                 "lang":       { "type": "string", "enum": ["rust", "python", "javascript", "typescript", "go"],
                                 "description": "语言（可选；省略则按扩展名推断）" },
                 "strictness": { "type": "string", "enum": ["cst", "smart", "ast", "relaxed", "signature", "template"],
@@ -138,10 +139,12 @@ impl Tool for AstSearchTool {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `path`".into()))?;
+        // H32：`pat` 为 omp `ast_grep` 的字段名（`pattern` 优先）。
         let pattern = input
             .get("pattern")
+            .or_else(|| input.get("pat"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `pattern`".into()))?;
+            .ok_or_else(|| ToolError::InvalidArgs("缺少 `pattern`（或别名 `pat`）".into()))?;
 
         let full = ctx.workspace.resolve(Path::new(path));
         let text = tokio::fs::read_to_string(&full)
@@ -222,6 +225,7 @@ impl Tool for AstRewriteTool {
             "properties": {
                 "path":       { "type": "string", "description": "源码文件路径" },
                 "pattern":    { "type": "string", "description": "ast-grep 匹配模式" },
+                "pat":        { "type": "string", "description": "`pattern` 的别名（对齐 omp `ast_edit.ops[].pat`）" },
                 "rewrite":    { "type": "string", "description": "重写模板（可引用 pattern 中的 meta 变量）" },
                 "lang":       { "type": "string", "enum": ["rust", "python", "javascript", "typescript", "go"],
                                 "description": "语言（可选；省略则按扩展名推断）" },
@@ -245,10 +249,12 @@ impl Tool for AstRewriteTool {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `path`".into()))?;
+        // H32：`pat` 别名（omp `ast_edit.ops[].pat`）。
         let pattern = input
             .get("pattern")
+            .or_else(|| input.get("pat"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs("缺少 `pattern`".into()))?;
+            .ok_or_else(|| ToolError::InvalidArgs("缺少 `pattern`（或别名 `pat`）".into()))?;
         let replacement = input
             .get("rewrite")
             .and_then(|v| v.as_str())
@@ -421,6 +427,50 @@ mod tests {
         }
     }
 
+    /// H32：`pat` 作为 `pattern` 的别名（omp `ast_grep.pat` / `ast_edit.ops[].pat`）。
+    #[tokio::test]
+    async fn ast_tools_accept_pat_alias() {
+        let dir = std::env::temp_dir().join(format!("agent-ast-pat-{}", unique()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        let ws = Workspace::new(&dir);
+        let ctx = auto_ctx(&ws);
+        // 搜索：omp 字段名 `pat`。
+        let out = AstSearchTool
+            .execute(
+                serde_json::json!({"path": "m.rs", "pat": "fn beta() {}"}),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("beta"), "`pat` 别名应命中: {out}");
+        // 重写：`pat` 别名同样生效。
+        let out = AstRewriteTool
+            .execute(
+                serde_json::json!({
+                    "path": "m.rs",
+                    "pat": "fn alpha() {}",
+                    "rewrite": "fn renamed() {}"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(!out.is_empty());
+        assert!(
+            std::fs::read_to_string(dir.join("m.rs"))
+                .unwrap()
+                .contains("renamed")
+        );
+        // 两者皆缺 → 错误文案含别名提示。
+        let err = AstSearchTool
+            .execute(serde_json::json!({"path": "m.rs"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pat"), "{err}");
+    }
     #[tokio::test]
     async fn replaces_function_block() {
         let dir = std::env::temp_dir().join(format!("agent-ast-{}", unique()));

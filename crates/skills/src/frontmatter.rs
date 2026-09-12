@@ -20,6 +20,9 @@ pub struct Frontmatter {
     pub description: Option<String>,
     /// 是否对模型隐藏（frontmatter `hide` 或 `disable-model-invocation` 归一）。
     pub hide: bool,
+    /// 显式停用（frontmatter `enabled: false`）→ 发现阶段直接跳过
+    /// （对齐 oh-my-pi `discovery/helpers.ts:399-401`）。
+    pub enabled: Option<bool>,
     /// 限定模式（`None` 或空 = 所有）。
     pub modes: Option<Vec<Mode>>,
     /// 文件 glob（保留，远期按文件类型自动激活）。
@@ -160,11 +163,23 @@ fn apply_scalar(out: &mut Frontmatter, key: &str, value: &str) {
     match key {
         "name" => out.name = Some(value.to_string()),
         "description" => out.description = Some(value.to_string()),
+        "enabled" => out.enabled = parse_bool(value),
         "hide" => out.hide = value.eq_ignore_ascii_case("true"),
         "disable-model-invocation" if value.eq_ignore_ascii_case("true") => {
             out.hide = true;
         }
         _ => {}
+    }
+}
+
+/// 宽松布尔解析：`true/false`（大小写不敏感）、`yes/no`、`1/0`；
+/// 其它值返回 `None`（当未声明处理，不误停用 skill）。
+fn parse_bool(value: &str) -> Option<bool> {
+    let v = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -265,5 +280,39 @@ mod tests {
         let content = "---\nname: x\nbody without close";
         let parsed = parse_skill_file(content);
         assert!(parsed.frontmatter.name.is_none());
+    }
+
+    /// H22：`enabled` 三态解析（未声明 = None，不误停用）。
+    #[test]
+    fn enabled_flag_is_three_state() {
+        assert_eq!(
+            parse_skill_file("---\nenabled: false\n---\nx")
+                .frontmatter
+                .enabled,
+            Some(false)
+        );
+        assert_eq!(
+            parse_skill_file("---\nenabled: \"no\"\n---\nx")
+                .frontmatter
+                .enabled,
+            Some(false)
+        );
+        assert_eq!(
+            parse_skill_file("---\nenabled: true\n---\nx")
+                .frontmatter
+                .enabled,
+            Some(true)
+        );
+        // 未声明 / 垃圾值 → None（当作未声明，skill 仍加载）。
+        assert_eq!(
+            parse_skill_file("---\nname: x\n---\nx").frontmatter.enabled,
+            None
+        );
+        assert_eq!(
+            parse_skill_file("---\nenabled: maybe\n---\nx")
+                .frontmatter
+                .enabled,
+            None
+        );
     }
 }

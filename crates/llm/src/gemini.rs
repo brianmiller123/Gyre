@@ -66,10 +66,12 @@ impl LlmProvider for GeminiProvider {
         let body = build_body(&request);
         let model_id = request.model.id.clone();
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", ctx.api_key.as_deref().unwrap_or_default())
+        // H24：`auth = none`（或 key 为空）时不发 `x-goog-api-key`。
+        let mut http = self.client.post(&url);
+        if let Some(key) = ctx.builtin_api_key() {
+            http = http.header("x-goog-api-key", key);
+        }
+        let resp = crate::apply_custom_headers(http, &ctx.headers)
             .json(&body)
             .send()
             .await

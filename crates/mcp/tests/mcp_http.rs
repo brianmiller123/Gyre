@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_config::{McpHttpConfig, McpServerConfig};
+use agent_config::{McpHttpConfig, McpHttpTransport, McpServerConfig};
 use agent_mcp::McpClient;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -182,6 +182,7 @@ async fn connect_test_client(url: &str) -> McpClient {
         headers,
         timeout_ms: None,
         oauth: None,
+        transport: McpHttpTransport::default(),
     });
     McpClient::connect(&cfg).await.expect("connect")
 }
@@ -246,7 +247,8 @@ async fn http_sse_response_extracts_matching_id() {
         .call_tool("echo", json!({}))
         .await
         .expect("call_tool");
-    assert_eq!(out, "line1\nline2");
+    // 两个 text 块按 omp `formatMCPContent` 语义以空行分隔（H17）。
+    assert_eq!(out, "line1\n\nline2");
 
     let method = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
@@ -289,6 +291,7 @@ async fn http_non_2xx_maps_to_http_error() {
         headers: HashMap::new(),
         timeout_ms: None,
         oauth: None,
+        transport: McpHttpTransport::default(),
     });
     let client = McpClient::connect(&cfg).await.expect("connect");
     let err = client.list_tools().await.expect_err("应 404");

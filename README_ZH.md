@@ -256,6 +256,22 @@ agent --serve 0.0.0.0:8080   # 监听所有网卡
 agent --serve :3000          # 仅端口：取配置 host 补全（→ 127.0.0.1:3000）
 ```
 
+### 📚 参考文档
+
+- **[工具参考](docs/tools.md)** — 全部工具的能力档、启用方式与参数表。由 `cargo xtask docs --tools` 从真实工具面生成（CI 校验漂移）。
+- **[MCP 指南](docs/mcp.md)** — 三种接法（TOML / `mcp.json` / CLI）、传输（stdio / Streamable HTTP / legacy SSE）、能力门控（tools / prompts / resources）、延迟连接与排障。
+- **第三方许可证通知** — [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)，由 `cargo xtask notices` 离线生成（CI 校验漂移）。
+- **发布预检** — `cargo xtask release-check` 校验版本一致性、`CHANGELOG` 的 `[Unreleased]`、三语 README，以及通知/文档生成物是否与当前依赖面与工具面一致。
+
+近期新增能力：
+
+- **目标模式（goal）**：用 `goal` 工具建立持续目标，引擎把目标上下文带进循环并在停止边界自动续跑，直到 `goal({op:"complete"})` 或达续跑上限；`/goal` 可查看与 pause/resume/complete/drop。
+- **todo 循环**：首轮 eager prelude + 未完成待办的完成提醒续跑（`[todo] eager/reminders/reminders_max`）。
+- **配置加载**：自动发现 `.env`（`$GYRE_ENV_FILE` → `<cwd>/.env` → `<cwd>/.agent/.env` → 配置目录 → `$HOME/.env`，真实环境变量优先，`GYRE_DOTENV=off` 关闭），并支持 `${VAR}` / `${VAR:-default}` 展开。
+- **提示词链**：`SYSTEM.md`（项目级覆盖用户级）、上下文文件 `@import`、跨源包含去重、`--append-system-prompt <TEXT|FILE>`。
+- **可定制键位**：`[keybindings]` 覆盖动作表（`app.clear`、`app.message.dequeue`、`app.retry` 等）；`/hotkeys` 展示生效绑定，未知动作/非法键位告警并回退默认。
+- **交互命令**：`/clear`、`/new`、`/retry`、`/context`、`/usage`、`/jobs`、`/queue`（运行期消息队列，`Ctrl-Y` 取回队首到编辑行）、`/settings`、`/hotkeys`、可写 `/todo`、支持序号的 `/resume`。
+
 ### 🔌 ACP 协议与编辑器集成
 
 Gyre 实现了 [Agent Client Protocol (ACP) v1](https://agentclientprotocol.com) 服务端，可将智能体能力暴露给 Zed Editor 等兼容客户端。ACP 与 CLI、Web 前端共享同一套会话管理与审批机制——同一会话甚至可被多客户端同时订阅。

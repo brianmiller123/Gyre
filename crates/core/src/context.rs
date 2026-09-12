@@ -30,6 +30,85 @@ impl TokenUsage {
         let ratio = self.current as f32 / self.limit as f32;
         ratio >= guard
     }
+
+    /// 是否达到绝对 token 阈值（H26：`CompactionPolicy` 解析出的阈值）。
+    ///
+    /// `threshold == 0` 表示「不限制」（窗口未知/为 0），恒 `false`；否则用 `>=`
+    /// 与 [`Self::near_limit`] 保持同一比较语义（阈值取整后不应比百分比更晚触发）。
+    #[must_use]
+    pub const fn reaches(&self, threshold: usize) -> bool {
+        threshold > 0 && self.current >= threshold
+    }
+}
+
+/// 自动压缩触发策略（H26，移植 oh-my-pi `resolveThresholdTokens`）。
+///
+/// 三级优先级：
+/// 1. **绝对阈值** [`threshold_tokens`](Self::threshold_tokens)：设了正数就用它（钳到
+///    `[1, window-1]`），适合「窗口很大但要留固定余量」的场景；
+/// 2. **预留余量** [`reserve_tokens`](Self::reserve_tokens)：阈值 = `window - reserve`
+///    （钳到 `[1, window-1]`）；配置的余量 ≥ 窗口时按窗口 15% 兜底（对齐 omp
+///    `resolveBudgetReserveTokens` 的「不可能默认值」回退），避免阈值退化到 0/负；
+/// 3. **百分比** [`guard`](Self::guard)：阈值 = `floor(window * guard)`，钳到
+///    `[1, window-1]`——Gyre 既有默认（`0.8`），保持向后兼容。
+///
+/// `window == 0`（未知窗口）→ 阈值 `0` = 不触发压缩。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionPolicy {
+    /// 绝对 token 阈值（最高优先级；`None`/0 = 未设置）。
+    pub threshold_tokens: Option<usize>,
+    /// 预留余量（次优先级；`None` = 未设置）。
+    pub reserve_tokens: Option<usize>,
+    /// 百分比阈值（兜底；Gyre 既有 `context_window_guard`）。
+    pub guard: f32,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            threshold_tokens: None,
+            reserve_tokens: None,
+            guard: 0.8,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    /// 仅百分比（既有行为）。
+    #[must_use]
+    pub const fn percent(guard: f32) -> Self {
+        Self {
+            threshold_tokens: None,
+            reserve_tokens: None,
+            guard,
+        }
+    }
+
+    /// 解析出给定上下文窗口的**触发阈值**（token；`0` = 不限制）。
+    #[must_use]
+    pub fn threshold_for(&self, context_window: usize) -> usize {
+        if context_window == 0 {
+            return 0;
+        }
+        let upper = context_window.saturating_sub(1).max(1);
+        if let Some(t) = self.threshold_tokens.filter(|t| *t > 0) {
+            return t.clamp(1, upper);
+        }
+        if let Some(r) = self.reserve_tokens {
+            // 余量 ≥ 窗口：配置不可能成立 → 按窗口 15% 兜底（omp 同款回退）。
+            let reserve = if r >= context_window {
+                (context_window * 15 / 100).max(1)
+            } else {
+                r
+            };
+            return context_window.saturating_sub(reserve).clamp(1, upper);
+        }
+        // 百分比先取整到 [1, 99]（`f32 0.01` 转 `f64` 会略小于 0.01，直接乘会少 1 token）。
+        let percent = f64::from((self.guard.clamp(0.01, 0.99) * 100.0).round());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let t = (context_window as f64 * percent / 100.0).floor() as usize;
+        t.clamp(1, upper)
+    }
 }
 
 /// 组装好的 Provider 上下文（发送给 LLM 前的稳定形态）。
@@ -229,5 +308,84 @@ pub trait ContextManager: Send + Sync {
     /// 某节点的直接子节点 id 列表；默认返回空。
     async fn children_of(&self, _id: &NodeId) -> Vec<NodeId> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod compaction_policy_tests {
+    use super::{CompactionPolicy, TokenUsage};
+
+    #[test]
+    fn absolute_threshold_wins_and_is_clamped_into_window() {
+        let p = CompactionPolicy {
+            threshold_tokens: Some(1000),
+            reserve_tokens: Some(10),
+            guard: 0.5,
+        };
+        assert_eq!(p.threshold_for(100_000), 1000, "绝对阈值优先于余量/百分比");
+        // 超过窗口 → 钳到 window-1（永远留 1 token 余量）。
+        assert_eq!(p.threshold_for(500), 499);
+        // 0 视为未设置 → 落到下一优先级（余量）。
+        let zero = CompactionPolicy {
+            threshold_tokens: Some(0),
+            reserve_tokens: Some(1000),
+            guard: 0.5,
+        };
+        assert_eq!(zero.threshold_for(10_000), 9000);
+        // 窗口未知 → 0 = 不限制。
+        assert_eq!(p.threshold_for(0), 0);
+    }
+
+    #[test]
+    fn reserve_threshold_subtracts_and_falls_back_when_impossible() {
+        let p = CompactionPolicy {
+            threshold_tokens: None,
+            reserve_tokens: Some(3000),
+            guard: 0.8,
+        };
+        assert_eq!(p.threshold_for(10_000), 7000, "window - reserve");
+        // 余量 ≥ 窗口：按窗口 15% 兜底（不可能配置不应把阈值压到 0/负）。
+        let tight = CompactionPolicy {
+            threshold_tokens: None,
+            reserve_tokens: Some(20_000),
+            guard: 0.8,
+        };
+        assert_eq!(tight.threshold_for(10_000), 8500, "15% 兜底余量");
+        // 余量 = 0 → 阈值贴到 window-1。
+        let no_reserve = CompactionPolicy {
+            threshold_tokens: None,
+            reserve_tokens: Some(0),
+            guard: 0.8,
+        };
+        assert_eq!(no_reserve.threshold_for(100), 99);
+    }
+
+    #[test]
+    fn percent_is_the_default_and_never_disables_compaction() {
+        let p = CompactionPolicy::default();
+        assert_eq!(p.threshold_for(100_000), 80_000);
+        // 极小窗口：floor(0.8*1)=0 需被钳到 1（否则等于关闭压缩）。
+        assert_eq!(p.threshold_for(1), 1);
+        // 越界百分比被钳到 [1%, 99%]。
+        let wild = CompactionPolicy::percent(5.0);
+        assert_eq!(wild.threshold_for(1000), 990);
+        let tiny = CompactionPolicy::percent(0.0);
+        assert_eq!(tiny.threshold_for(1000), 10);
+    }
+
+    #[test]
+    fn reaches_uses_inclusive_comparison_and_zero_means_unlimited() {
+        let usage = TokenUsage {
+            current: 100,
+            limit: 200,
+        };
+        assert!(
+            usage.reaches(100),
+            "达到阈值即触发（>=，与 near_limit 同语义）"
+        );
+        assert!(!usage.reaches(101));
+        assert!(!usage.reaches(0), "0 = 不限制");
+        assert!(usage.near_limit(0.5));
+        assert!(!usage.near_limit(0.51));
     }
 }

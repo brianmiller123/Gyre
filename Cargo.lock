@@ -70,8 +70,10 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "agent-advisor",
+ "agent-config",
  "agent-context",
  "agent-core",
+ "agent-hashline",
  "agent-iso",
  "agent-prompt",
  "agent-skills",
@@ -82,11 +84,15 @@ dependencies = [
  "async-stream",
  "async-trait",
  "criterion",
+ "dirs 6.0.0",
  "futures",
  "parking_lot",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -97,6 +103,7 @@ name = "agent-acp"
 version = "0.1.0"
 dependencies = [
  "agent-config",
+ "agent-context",
  "agent-core",
  "agent-server",
  "async-stream",
@@ -171,7 +178,6 @@ dependencies = [
  "agent-context",
  "agent-core",
  "agent-dap",
- "agent-discovery",
  "agent-eval",
  "agent-hashline",
  "agent-i18n",
@@ -181,6 +187,7 @@ dependencies = [
  "agent-prompt",
  "agent-proxy",
  "agent-pty",
+ "agent-sdk",
  "agent-search",
  "agent-server",
  "agent-skills",
@@ -237,11 +244,14 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "glob",
+ "regex",
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
+ "toml_edit",
  "tracing",
 ]
 
@@ -288,6 +298,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -408,6 +419,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
+ "base64 0.22.1",
  "eventsource-stream",
  "futures",
  "parking_lot",
@@ -416,6 +428,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
 ]
@@ -432,6 +445,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -476,7 +490,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "agent-browser",
+ "agent-config",
+ "agent-core",
+ "agent-dap",
+ "agent-discovery",
+ "agent-hashline",
+ "agent-pty",
+ "agent-tools",
+ "tempfile",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -485,6 +516,7 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "ignore",
+ "parking_lot",
  "regex",
  "syntect",
  "tiktoken-rs",
@@ -505,6 +537,8 @@ dependencies = [
  "agent-memory",
  "agent-prompt",
  "agent-proxy",
+ "agent-pty",
+ "agent-sdk",
  "agent-skills",
  "agent-supervisor",
  "agent-tools",
@@ -519,6 +553,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.8.23",
  "tower 0.5.3",
@@ -626,6 +661,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "futures",
+ "parking_lot",
  "regex",
  "reqwest",
  "rusqlite",
@@ -7759,6 +7795,29 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-browser",
+ "agent-config",
+ "agent-context",
+ "agent-core",
+ "agent-dap",
+ "agent-hashline",
+ "agent-memory",
+ "agent-prompt",
+ "agent-pty",
+ "agent-tools",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
 ]
 
 [[package]]

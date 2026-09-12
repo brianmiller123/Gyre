@@ -19,7 +19,9 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::client::{McpError, McpTransport, NotificationHandler, resolve_timeout};
+use crate::client::{
+    McpError, McpTransport, NotificationHandler, ServerRequestHandler, resolve_timeout,
+};
 
 /// 传输层独占的请求头：用户配置中的同名头（大小写不敏感）被剥除，防注入。
 const RESERVED_HEADERS: [&str; 2] = ["mcp-session-id", "mcp-protocol-version"];
@@ -46,6 +48,8 @@ pub(crate) struct HttpTransport {
     protocol_version: Mutex<Option<String>>,
     /// server→client 通知处理器槽（SSE 流内夹带的通知经此分发）。
     notifications: Mutex<Option<NotificationHandler>>,
+    /// server→client **请求**处理器槽（H16：SSE 流内夹带的请求即时应答并 POST 回端点）。
+    server_requests: Mutex<Option<ServerRequestHandler>>,
     /// OAuth 凭据态（配置了 `headers.Authorization` 时不装载——显式头优先）。
     auth: Option<McpAuthRuntime>,
     next_id: AtomicU64,
@@ -71,23 +75,7 @@ impl HttpTransport {
         cfg: &McpHttpConfig,
         config_dir: &std::path::Path,
     ) -> Result<Self, McpError> {
-        let mut extra_headers = reqwest::header::HeaderMap::new();
-        for (k, v) in &cfg.headers {
-            if RESERVED_HEADERS.iter().any(|r| k.eq_ignore_ascii_case(r)) {
-                continue;
-            }
-            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
-                .map_err(|e| McpError::Http(format!("非法请求头名 {k:?}: {e}")))?;
-            // 头值支持 `${ENV}` 展开（对齐 api_key / socks5.password 的敏感字段惯例，
-            // 避免 token 明文落盘）。
-            let expanded = agent_config::expand_env(v);
-            let value = reqwest::header::HeaderValue::from_str(&expanded)
-                .map_err(|e| McpError::Http(format!("非法请求头值 {k:?}: {e}")))?;
-            extra_headers.insert(name, value);
-        }
-        let http = reqwest::Client::builder()
-            .user_agent(agent_core::platform::default_llm_user_agent())
-            .build()?;
+        let (http, extra_headers) = build_http_parts(cfg)?;
         // OAuth 凭据装载：配置头已含 Authorization → 跳过（显式头优先，omp
         // `hasMcpAuthorizationHeader`）；否则读 oauth.toml 的 `mcp_oauth:<url>` 行。
         // 过期先刷后用（10s 超时）；确定性失败清行，非确定性失败保留旧值硬上。
@@ -104,6 +92,7 @@ impl HttpTransport {
             session: Mutex::new(None),
             protocol_version: Mutex::new(None),
             notifications: Mutex::new(None),
+            server_requests: Mutex::new(None),
             auth,
             next_id: AtomicU64::new(1),
         })
@@ -151,9 +140,9 @@ impl HttpTransport {
 
     /// 从 SSE 响应流中取回 `expected_id` 对应的 JSON-RPC 响应。
     ///
-    /// 流内夹带的 server 通知（有 method 无 id）转发给注册的通知处理器；未注册时
-    /// 仅记 debug 日志。其余消息（其他 id 的响应、server→client 请求）与 stdio
-    /// 读循环行为一致——忽略。
+    /// 流内夹带的 server 通知（有 method 无 id）转发给注册的通知处理器；**server→client
+    /// 请求（有 method 且有 id）即时应答并 POST 回端点**（H16）。其余消息（其他 id 的响应）
+    /// 忽略。
     async fn take_sse_response(
         &self,
         resp: reqwest::Response,
@@ -190,14 +179,44 @@ impl HttpTransport {
                     }
                     return Ok(m.get("result").cloned().unwrap_or(Value::Null));
                 }
-                if m.get("method").is_some() && m.get("id").is_none() {
-                    let name = m.get("method").and_then(Value::as_str).unwrap_or("?");
+                if let Some(name) = m.get("method").and_then(Value::as_str) {
                     let params = m.get("params").cloned().unwrap_or(Value::Null);
-                    match self.notifications.lock().clone() {
-                        Some(h) => h(name, &params),
-                        None => {
-                            tracing::debug!(target: "mcp::http", method = name, "忽略 server 通知")
+                    match m.get("id") {
+                        // H16：server→client 请求——应答并回发（此前静默丢弃 → server 挂起）。
+                        Some(req_id) => {
+                            let answer = match self.server_requests.lock().clone() {
+                                Some(h) => h(req_id, name, &params),
+                                None => Err((
+                                    crate::client::JSONRPC_METHOD_NOT_FOUND,
+                                    format!("Method not found: {name}"),
+                                )),
+                            };
+                            let frame = match answer {
+                                Ok(result) => crate::client::server_request_result(req_id, result),
+                                Err((code, message)) => crate::client::server_request_error(
+                                    req_id,
+                                    code,
+                                    message.as_str(),
+                                ),
+                            };
+                            let body = serde_json::to_vec(&frame).unwrap_or_default();
+                            let req = self
+                                .base_request(reqwest::Method::POST)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .body(body);
+                            // 回发失败只告警：server 侧会自行超时降级，不影响本次请求的结果。
+                            if let Err(e) = req.send().await {
+                                tracing::warn!(target: "mcp::http", error = %e, "回发 server→client 请求响应失败");
+                            }
                         }
+                        None => match self.notifications.lock().clone() {
+                            Some(h) => h(name, &params),
+                            None => tracing::debug!(
+                                target: "mcp::http",
+                                method = name,
+                                "忽略 server 通知"
+                            ),
+                        },
                     }
                 }
             }
@@ -205,6 +224,34 @@ impl HttpTransport {
         // 流结束仍未等到匹配响应——server 提前关流，请求失败。
         Err(McpError::Closed)
     }
+}
+
+/// 按 MCP HTTP 配置构造传输共享部分：剥除传输层独占头后的自定义头 + reqwest 客户端。
+/// Streamable HTTP 与 legacy SSE 两个传输体共用。
+///
+/// # Errors
+/// 配置头非法（非可见 ASCII 值）时返回 [`McpError`]。
+pub(crate) fn build_http_parts(
+    cfg: &McpHttpConfig,
+) -> Result<(reqwest::Client, reqwest::header::HeaderMap), McpError> {
+    let mut extra_headers = reqwest::header::HeaderMap::new();
+    for (k, v) in &cfg.headers {
+        if RESERVED_HEADERS.iter().any(|r| k.eq_ignore_ascii_case(r)) {
+            continue;
+        }
+        let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| McpError::Http(format!("非法请求头名 {k:?}: {e}")))?;
+        // 头值支持 `${ENV}` 展开（对齐 api_key / socks5.password 的敏感字段惯例，
+        // 避免 token 明文落盘）。
+        let expanded = agent_config::expand_env(v);
+        let value = reqwest::header::HeaderValue::from_str(&expanded)
+            .map_err(|e| McpError::Http(format!("非法请求头值 {k:?}: {e}")))?;
+        extra_headers.insert(name, value);
+    }
+    let http = reqwest::Client::builder()
+        .user_agent(agent_core::platform::default_llm_user_agent())
+        .build()?;
+    Ok((http, extra_headers))
 }
 
 /// 从 oauth.toml 装载 `mcp_oauth:<url>` 凭据并做连接期预刷新。
@@ -426,6 +473,10 @@ impl McpTransport for HttpTransport {
 
     fn set_on_notification(&self, handler: NotificationHandler) {
         *self.notifications.lock() = Some(handler);
+    }
+
+    fn set_on_server_request(&self, handler: ServerRequestHandler) {
+        *self.server_requests.lock() = Some(handler);
     }
 
     async fn close(&self) {

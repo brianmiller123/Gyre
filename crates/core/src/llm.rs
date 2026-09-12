@@ -198,6 +198,66 @@ fn truncate_classifier_input(s: &str) -> String {
 }
 
 #[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    /// H24：`auth` 的三种取值（含 omp 的 camelCase 写法）。
+    #[test]
+    fn auth_mode_parses_omp_and_gyre_spellings() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            auth: AuthMode,
+        }
+        let parse = |v: &str| -> AuthMode {
+            serde_json::from_str::<Holder>(&format!("{{\"auth\":\"{v}\"}}"))
+                .map(|h| h.auth)
+                .unwrap()
+        };
+        assert_eq!(parse("api_key"), AuthMode::ApiKey);
+        assert_eq!(parse("apiKey"), AuthMode::ApiKey, "omp 写法（camelCase）");
+        assert_eq!(parse("none"), AuthMode::None);
+        assert_eq!(parse("oauth"), AuthMode::OAuth);
+        assert_eq!(AuthMode::default(), AuthMode::ApiKey);
+    }
+
+    /// H24：`auth = none` 或 key 为空时不发鉴权头（`builtin_api_key() == None`）。
+    #[test]
+    fn builtin_api_key_respects_auth_mode_and_empty_key() {
+        let ctx = |auth: AuthMode, key: Option<&str>| ProviderCallContext {
+            api_key: key.map(str::to_string),
+            auth,
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx(AuthMode::ApiKey, Some("sk-x")).builtin_api_key(),
+            Some("sk-x")
+        );
+        assert_eq!(ctx(AuthMode::ApiKey, Some("")).builtin_api_key(), None);
+        assert_eq!(ctx(AuthMode::ApiKey, None).builtin_api_key(), None);
+        assert_eq!(
+            ctx(AuthMode::None, Some("sk-x")).builtin_api_key(),
+            None,
+            "auth = none 时即使配了 key 也不发"
+        );
+        assert_eq!(
+            ctx(AuthMode::OAuth, Some("tok")).builtin_api_key(),
+            Some("tok")
+        );
+    }
+
+    /// H24：`max_tokens_field` 的 wire 名称。
+    #[test]
+    fn max_tokens_field_names() {
+        assert_eq!(MaxTokensField::default(), MaxTokensField::MaxTokens);
+        assert_eq!(MaxTokensField::MaxTokens.as_str(), "max_tokens");
+        assert_eq!(
+            MaxTokensField::MaxCompletionTokens.as_str(),
+            "max_completion_tokens"
+        );
+    }
+}
+
+#[cfg(test)]
 mod effort_tests {
     use super::*;
 
@@ -316,6 +376,82 @@ pub struct CompletionRequest {
     pub stable_prefix_len: usize,
 }
 
+/// 内置鉴权模式（H24，对齐 oh-my-pi provider `auth`）。
+///
+/// - [`AuthMode::ApiKey`]（默认）：按 `config → oauth.toml → auth.toml → env` 分层解析；
+/// - [`AuthMode::None`]：**不发送**内置鉴权头（本地网关 / 免鉴权端点）；
+/// - [`AuthMode::OAuth`]：只使用 OAuth 凭据存储中的访问令牌（缺失即报错，不回退 env）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AuthMode {
+    /// 使用 API key（默认）。
+    #[default]
+    #[serde(rename = "api_key", alias = "apiKey", alias = "apikey")]
+    ApiKey,
+    /// 不发送内置鉴权头。
+    #[serde(rename = "none")]
+    None,
+    /// 使用 OAuth 凭据存储中的访问令牌。
+    #[serde(rename = "oauth", alias = "OAuth")]
+    OAuth,
+}
+
+/// `max_tokens` 字段名（H24，对齐 oh-my-pi `compat.maxTokensField`）。
+///
+/// 部分 OpenAI 兼容网关只认 `max_completion_tokens`（或反之），默认保持 Gyre 既有 wire
+/// （`max_tokens`），显式配置才切换。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MaxTokensField {
+    /// `max_tokens`（默认）。
+    #[default]
+    #[serde(rename = "max_tokens")]
+    MaxTokens,
+    /// `max_completion_tokens`。
+    #[serde(rename = "max_completion_tokens")]
+    MaxCompletionTokens,
+}
+
+impl MaxTokensField {
+    /// wire 字段名。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+/// 兼容开关（H24）：OpenAI 兼容网关常见的「参数不被接受」问题。
+///
+/// 全部默认关闭（保持标准 wire）；仅当目标网关明确拒绝某参数时才开启——避免为兼容
+/// 而默认削弱请求语义。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderQuirks {
+    /// 省略 `temperature`（部分推理模型/gateway 拒绝该参数）。
+    pub omit_temperature: bool,
+    /// 省略 `stream_options.include_usage`（部分兼容网关不认该字段并报 400）。
+    pub omit_stream_options: bool,
+    /// 省略 `tool_choice`（强制选择会让部分网关 400）。
+    pub omit_tool_choice: bool,
+    /// 省略 `reasoning_effort` / `reasoning`（非 OpenAI 官方推理模型常见拒绝）。
+    pub omit_reasoning: bool,
+    /// `max_tokens` 的 wire 字段名（`None` = 默认 `max_tokens`）。
+    pub max_tokens_field: Option<MaxTokensField>,
+}
+
+impl ProviderQuirks {
+    /// 是否存在任一开关（省去调用方逐项判断）。
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !(self.omit_temperature
+            || self.omit_stream_options
+            || self.omit_tool_choice
+            || self.omit_reasoning)
+            && self.max_tokens_field.is_none()
+    }
+}
+
 /// 单次 Provider 调用的运行时上下文（鉴权、并发限流等）。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCallContext {
@@ -325,6 +461,28 @@ pub struct ProviderCallContext {
     pub base_url: Option<String>,
     /// per-provider 并发上限（in-flight 限流，移植 oh-my-pi lease）。
     pub max_in_flight: Option<usize>,
+    /// 自定义请求头（H24）：模型 profile 的 `headers` 表，`${ENV}` 已展开。
+    ///
+    /// 适配器在**内置鉴权头之后**应用，因此同名头以用户配置为准（网关需要非 Bearer
+    /// 方案时可在 `headers` 里直接给 `Authorization`）。
+    pub headers: Vec<(String, String)>,
+    /// 兼容开关（H24）：网关/本地模型的参数兼容性微调，键见
+    /// [`ProviderQuirks`](crate::ProviderQuirks)。
+    pub quirks: crate::ProviderQuirks,
+    /// 内置鉴权模式（H24）：`none` 时适配器不发送内置鉴权头。
+    pub auth: AuthMode,
+}
+
+impl ProviderCallContext {
+    /// 内置鉴权键：`auth = none` 或键为空时返回 `None`（适配器此时**不加**鉴权头，
+    /// 而不是发送 `Authorization: Bearer `）。
+    #[must_use]
+    pub fn builtin_api_key(&self) -> Option<&str> {
+        if self.auth == AuthMode::None {
+            return None;
+        }
+        self.api_key.as_deref().filter(|key| !key.is_empty())
+    }
 }
 
 /// LLM Provider 端口：具体实现是适配器（OpenAI/Anthropic/...）。

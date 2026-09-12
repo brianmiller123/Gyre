@@ -6,28 +6,110 @@
 use crate::ToolResult;
 use crate::message::{AssistantMessage, ToolResultMessage};
 
+/// Gyre 当前**实际会发射**的 hook 事件名全集（H20）。
+///
+/// 配置面（`[[hooks]] event = "…"`）只接受这些名字——刻意**不**预先声明「有空壳但永不触发」
+/// 的事件（omp 的 26 事件里，依赖扩展宿主 / 会话树 / plan 模式的那些在 Gyre 尚无运行点）。
+/// 已覆盖：会话与智能体生命周期、轮次、工具、自动压缩、自动重试与回退、TTSR、todo 提醒。
+pub const HOOK_EVENT_NAMES: &[&str] = &[
+    // 生命周期
+    "session_start",
+    "session_shutdown",
+    "before_agent_start",
+    "agent_start",
+    "agent_end",
+    "turn_start",
+    "turn_end",
+    "stop",
+    // 工具
+    "tool_call",
+    "tool_result",
+    // 会话级结构化事件（与 [`crate::SessionEvent`] 同名镜像）
+    "auto_compaction_start",
+    "auto_compaction_end",
+    "auto_retry_start",
+    "auto_retry_end",
+    "retry_fallback_applied",
+    "retry_fallback_succeeded",
+    "ttsr_triggered",
+];
+
 /// Hook 事件。
 #[derive(Debug, Clone)]
 pub enum HookEvent {
-    /// 工具执行前。
+    /// 工具执行前（`tool_call`）。
     BeforeTool {
         /// 工具名。
         tool: String,
         /// 工具参数。
         args: serde_json::Value,
     },
-    /// 工具执行后（含成功与错误结果）。
+    /// 工具执行后（含成功与错误结果；`tool_result`）。
     AfterTool {
         /// 工具名。
         tool: String,
         /// 工具结果。
         result: ToolResult,
     },
-    /// 任务结束（成功/失败/取消）。
+    /// 任务结束（成功/失败/取消；`stop`）。
     Stop {
         /// 是否成功完成。
         success: bool,
     },
+    /// 通用命名事件（H20）：`event` 为线协议名（见 [`HOOK_EVENT_NAMES`]），
+    /// `payload` 为结构化负载（已含 `event` 字段，直接作为 hook 命令的 stdin JSON）。
+    ///
+    /// 用单一变体承载扩展事件面，避免为每个生命周期点新增 enum 变体 + 每个 Hook 实现
+    /// 都要跟着改 match（既有实现只需处理自己订阅的名字）。
+    Named {
+        /// 事件名（如 `turn_start` / `auto_retry_start`）。
+        event: String,
+        /// 事件负载（结构化 JSON）。
+        payload: serde_json::Value,
+    },
+}
+
+impl HookEvent {
+    /// 事件名（写进 hook 命令 stdin 的 `event` 字段，亦用于 `[[hooks]] event=` 匹配）。
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::BeforeTool { .. } => "tool_call",
+            Self::AfterTool { .. } => "tool_result",
+            Self::Stop { .. } => "stop",
+            Self::Named { event, .. } => event.as_str(),
+        }
+    }
+
+    /// 构造命名事件（负载自动补 `event` 字段，保证 hook 脚本读到的形状一致）。
+    #[must_use]
+    pub fn named(event: impl Into<String>, mut payload: serde_json::Value) -> Self {
+        let event = event.into();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "event".to_string(),
+                serde_json::Value::String(event.clone()),
+            );
+        } else {
+            payload = serde_json::json!({ "event": event, "data": payload });
+        }
+        Self::Named { event, payload }
+    }
+
+    /// 线协议负载（hook 命令 stdin 的 JSON）。
+    #[must_use]
+    pub fn to_payload(&self) -> serde_json::Value {
+        match self {
+            Self::BeforeTool { tool, args } => {
+                serde_json::json!({ "event": "tool_call", "tool": tool, "args": args })
+            }
+            Self::AfterTool { tool, result } => {
+                serde_json::json!({ "event": "tool_result", "tool": tool, "result": result })
+            }
+            Self::Stop { success } => serde_json::json!({ "event": "stop", "success": success }),
+            Self::Named { payload, .. } => payload.clone(),
+        }
+    }
 }
 
 /// turn 结束钩子上下文：每轮模型响应 + 工具处理完毕后的快照（移植 oh-my-pi `onTurnEnd`）。

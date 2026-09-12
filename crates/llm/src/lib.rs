@@ -14,6 +14,7 @@ pub mod inband;
 mod model_discovery;
 pub mod oauth;
 mod openai;
+mod openai_responses;
 mod plugin;
 mod registry;
 pub mod thinking;
@@ -27,6 +28,7 @@ pub use glm::GlmProvider;
 pub use inband::{InbandProvider, wrap_inband_if};
 pub use model_discovery::{DiscoveredModel, DiscoveryError, list_models};
 pub use openai::OpenAiCompletionsAdapter;
+pub use openai_responses::OpenAiResponsesAdapter;
 pub use plugin::{LlmProviderPlugin, collect_providers};
 pub use registry::ProviderRegistry;
 pub use thinking::LlmThinkingClassifier;
@@ -34,6 +36,25 @@ pub use transform::{
     CacheStrategy, anthropic_apply_cache, anthropic_system_blocks, count_cache_breakpoints,
     inject_ephemeral_cache, normalize_tool_schema,
 };
+
+/// 应用上下文里的自定义请求头（H24）：**在内置鉴权头之后**调用，同名头以用户配置为准。
+///
+/// 非法头名/头值只告警跳过（不因一个坏头让整次请求失败）。
+pub(crate) fn apply_custom_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        match (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(v)) => req = req.header(n, v),
+            _ => tracing::warn!(header = %name, "非法自定义请求头，已跳过"),
+        }
+    }
+    req
+}
 
 /// 读取错误响应体为字符串，限制在 4 KiB 以内（防止异常上游用超大错误体撑爆内存）。
 pub(crate) async fn read_error_body(resp: reqwest::Response) -> String {

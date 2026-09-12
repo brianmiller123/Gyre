@@ -17,8 +17,10 @@
 
 #![deny(unsafe_code)]
 
+mod atomic;
 mod consolidate;
 mod intent;
+mod lease;
 mod mental_models;
 mod mmr;
 mod store;
@@ -27,11 +29,13 @@ mod synonyms;
 mod temporal;
 mod vec_memory;
 
+pub use atomic::{append_line, write_atomic};
 pub use consolidate::{
     CONSOLIDATE_BATCH_MAX, CONSOLIDATE_CHARS_BUDGET, CONSOLIDATE_MIN_RECORDS, CONSOLIDATION_SYSTEM,
     ConsolidateReport, structured_consolidation_prompt,
 };
 pub use intent::{IntentCategory, IntentWeights, QueryIntent, adjust_weights, classify_intent};
+pub use lease::{DEFAULT_LEASE_TTL, LeaseGuard, acquire as acquire_lease};
 pub use mental_models::{
     MENTAL_MODEL_CONSOLIDATION_PROMPT, MentalModelsConfig, SEEDS_JSON, SeedEntry, format_ts,
     load_seeds, mental_model_consolidation_prompt, merge_mental_models,

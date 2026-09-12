@@ -77,6 +77,14 @@ pub struct MemoryRecord {
     pub consolidated_at: Option<u64>,
 }
 
+/// 记录是否已被 `memory_edit invalidate` 标记失效（元数据 `superseded_by`）。
+///
+/// 失效记录**不参与检索**（recall/search 都过滤），但仍在库内可追溯（`stats` 仍计数）。
+#[must_use]
+pub fn is_superseded(record: &MemoryRecord) -> bool {
+    record.metadata.contains_key("superseded_by")
+}
+
 fn default_importance() -> u8 {
     1
 }
@@ -407,6 +415,7 @@ impl StructuredMemoryStore {
             .read_bank(bank)
             .into_iter()
             .filter(|r| r.valid_until.is_none_or(|v| v >= now))
+            .filter(|r| !is_superseded(r))
             .map(|record| {
                 let content_tokens = if opts.use_synonyms {
                     canonicalize_tokens(tokenize(&record.content))
@@ -573,6 +582,7 @@ impl StructuredMemoryStore {
             .read_bank(bank)
             .into_iter()
             .filter(|r| r.valid_until.is_none_or(|v| v >= now))
+            .filter(|r| !is_superseded(r))
             .filter(|r| {
                 filter
                     .source
@@ -618,6 +628,79 @@ impl StructuredMemoryStore {
             &path,
             &remaining.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
         )?;
+        Ok(true)
+    }
+
+    /// 就地更新一条记忆（内容 / 重要性，`None` = 保持）。返回是否找到。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    pub fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        importance: Option<u8>,
+    ) -> std::io::Result<bool> {
+        self.update_in(DEFAULT_BANK, id, content, importance)
+    }
+
+    /// 指定 bank 的就地更新。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    pub fn update_in(
+        &self,
+        bank: &str,
+        id: &str,
+        content: Option<&str>,
+        importance: Option<u8>,
+    ) -> std::io::Result<bool> {
+        let path = self.records_path(bank);
+        let mut records = read_records(&path);
+        let Some(record) = records.iter_mut().find(|r| r.id == id) else {
+            return Ok(false);
+        };
+        if let Some(content) = content {
+            record.content = content.to_string();
+        }
+        if let Some(importance) = importance {
+            record.importance = importance.min(5);
+        }
+        rewrite_records(&path, &records)?;
+        Ok(true)
+    }
+
+    /// 标记一条记忆失效（可选记录替代者 id）。返回是否找到。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    pub fn invalidate(&self, id: &str, replacement_id: Option<&str>) -> std::io::Result<bool> {
+        self.invalidate_in(DEFAULT_BANK, id, replacement_id)
+    }
+
+    /// 指定 bank 的失效标记。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    pub fn invalidate_in(
+        &self,
+        bank: &str,
+        id: &str,
+        replacement_id: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let path = self.records_path(bank);
+        let mut records = read_records(&path);
+        let Some(record) = records.iter_mut().find(|r| r.id == id) else {
+            return Ok(false);
+        };
+        record.metadata.insert(
+            "superseded_by".to_string(),
+            replacement_id.unwrap_or("").to_string(),
+        );
+        record
+            .metadata
+            .insert("superseded_at".to_string(), now_ms().to_string());
+        rewrite_records(&path, &records)?;
         Ok(true)
     }
 
@@ -718,6 +801,16 @@ impl StructuredMemoryStore {
         model: &Model,
         provider_ctx: &ProviderCallContext,
     ) -> Result<ConsolidateReport, String> {
+        // H30：合并租约——多会话并发时只有一个真正做 LLM 沉淀，其它直接跳过
+        //（避免互相覆盖记忆文件与重复付费）。陈旧锁超 TTL 可被抢占。
+        let Some(_lease) =
+            crate::lease::acquire(&self.root, "consolidate", crate::lease::DEFAULT_LEASE_TTL)
+        else {
+            return Ok(ConsolidateReport {
+                skipped: true,
+                ..ConsolidateReport::default()
+            });
+        };
         let mut report = ConsolidateReport::default();
         for bank in self.list_banks() {
             let now = now_ms();
@@ -901,6 +994,34 @@ impl MemoryStore for StructuredMemoryStore {
         Ok(false)
     }
 
+    async fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        importance: Option<u8>,
+    ) -> Result<bool, std::io::Error> {
+        // 同 forget：id 全局唯一，逐 bank 找（未命中不重写）。
+        for bank in self.list_banks() {
+            if self.update_in(&bank, id, content, importance)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn invalidate(
+        &self,
+        id: &str,
+        replacement_id: Option<&str>,
+    ) -> Result<bool, std::io::Error> {
+        for bank in self.list_banks() {
+            if self.invalidate_in(&bank, id, replacement_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn banks(&self) -> Vec<String> {
         self.list_banks()
     }
@@ -1050,9 +1171,6 @@ fn read_records(path: &Path) -> Vec<MemoryRecord> {
 }
 
 fn rewrite_records(path: &Path, records: &[MemoryRecord]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let mut text = String::new();
     for r in records {
         if let Ok(line) = serde_json::to_string(r) {
@@ -1060,20 +1178,13 @@ fn rewrite_records(path: &Path, records: &[MemoryRecord]) -> std::io::Result<()>
             text.push('\n');
         }
     }
-    std::fs::write(path, text)
+    // H30：同目录临时文件 + rename 原子替换——读者不会看到写了一半的 JSONL。
+    crate::atomic::write_atomic(path, &text)
 }
 
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut content = String::new();
-    if path.exists() {
-        content = std::fs::read_to_string(path).unwrap_or_default();
-    }
-    content.push_str(line);
-    content.push('\n');
-    std::fs::write(path, content)
+    // H30：O_APPEND 原子追加（此前是「读全文 + 整体写回」的 RMW，并发 retain 会互相覆盖）。
+    crate::atomic::append_line(path, line)
 }
 
 fn now_ms() -> u64 {
@@ -1201,6 +1312,62 @@ mod tests {
             api_key: None,
             base_url: None,
             max_in_flight: None,
+            headers: Vec::new(),
+            quirks: agent_core::ProviderQuirks::default(),
+            auth: agent_core::AuthMode::ApiKey,
+        }
+    }
+
+    /// H30：合并租约被他人持有时（多会话并发）本会话跳过沉淀——不调用 LLM、不改记录。
+    #[tokio::test]
+    async fn consolidate_skips_when_lease_held_by_another_session() {
+        let s = store();
+        s.retain(rec("用户偏好 Bun", 3)).unwrap();
+        s.retain(rec("依赖升级先跑 minor", 4)).unwrap();
+        // 模拟另一个会话已持有租约。
+        let held = crate::lease::acquire(&s.root, "consolidate", crate::lease::DEFAULT_LEASE_TTL)
+            .expect("测试应先拿到租约");
+        let report = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert!(report.skipped, "租约被持有时应标记 skipped");
+        assert_eq!((report.absorbed, report.distilled), (0, 0));
+        // 记录未被改动（没有标记 consolidated_at，也没有新增提炼记录）。
+        let bank = s.read_bank("default");
+        assert_eq!(bank.len(), 2);
+        assert!(bank.iter().all(|r| r.consolidated_at.is_none()));
+        // 释放后同一进程可正常沉淀。
+        drop(held);
+        let report = s
+            .consolidate(&echo_provider(), &model(), &provider_ctx())
+            .await
+            .unwrap();
+        assert!(!report.skipped && report.absorbed == 2, "{report:?}");
+    }
+
+    /// H30：记录追加走 O_APPEND——并发 retain 不丢记录、文件仍是合法 JSONL。
+    #[tokio::test]
+    async fn concurrent_retain_keeps_all_records_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(StructuredMemoryStore::with_root(dir.path().to_path_buf()));
+        let mut handles = Vec::new();
+        for t in 0..6 {
+            let store = std::sync::Arc::clone(&s);
+            handles.push(tokio::task::spawn_blocking(move || {
+                for i in 0..20 {
+                    store.retain(rec(&format!("并发记录 {t}-{i}"), 3)).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let text = std::fs::read_to_string(s.records_path("default")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 120, "并发追加不得丢记录");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("每行应是完整 JSON");
         }
     }
 

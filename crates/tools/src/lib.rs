@@ -10,8 +10,10 @@ mod ask;
 mod ast_tool;
 mod checkpoint;
 pub mod conflict;
+mod filter;
 mod fs;
 mod fuzzy_match;
+pub mod generated_guard;
 mod github;
 mod hub_tool;
 mod image;
@@ -31,6 +33,8 @@ mod todo;
 mod web_search;
 mod write;
 
+use std::sync::Arc;
+
 use agent_core::{
     ApprovalPolicy, ApprovalRequest, CapabilityTier, ToolResult, ToolSpec, Workspace, WriteEffect,
 };
@@ -39,6 +43,7 @@ pub use ask::AskUserTool;
 pub use ast_tool::{AstRewriteTool, AstSearchTool, PendingRewrite, ReplaceBlockTool};
 pub use checkpoint::{Checkpoint, CheckpointState, CheckpointTool, RewindTool};
 pub use conflict::{ConflictBlock, ConflictHistory, ConflictTarget};
+pub use filter::FilteredRegistry;
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use fuzzy_match::{
     FuzzyOpts, MatchError, MatchMethod, MatchOutcome, find_unique_match, set_fuzzy_opts,
@@ -57,9 +62,10 @@ pub use minimizer::{Minimized, Minimizer, OutputFilter, default_filters, disable
 pub use search::{GlobTool, GrepTool};
 pub use security_scan::{SECURITY_SCAN_PROMPT_SECTION, SecurityScanState, SecurityScanTool};
 pub use shell::RunCommandTool;
+pub use shell::{PtyExecOutcome, PtyExecutor, pty_executor, set_pty_executor};
 pub use snapshot::{InMemorySnapshotStore, Snapshot, compute_file_hash};
 pub use ssh::{SSH_PROMPT_SECTION, SshTool};
-pub use todo::{TodoPhase, TodoState, TodoTool};
+pub use todo::{TodoItem, TodoList, TodoPhase, TodoState, TodoTool};
 pub use web_search::{
     Brave, DuckDuckGoHtml, Recency, Searxng, SitePage, Tavily, WebResult, WebSearchChain,
     WebSearchProvider, WebSearchTool, extract_site,
@@ -185,23 +191,45 @@ pub trait ToolRegistry: Send + Sync {
     /// 所有工具的线 spec（供 LLM 工具列表）。
     fn specs(&self) -> Vec<ToolSpec>;
     /// 按名查找工具。
-    fn get(&self, name: &str) -> Option<&dyn Tool>;
+    ///
+    /// 返回 [`std::sync::Arc`]（而非借用）：工具可在等待期间（审批、钩子、执行）持续持有，
+    /// 且注册表背后可能是每轮实时求值的动态源。
+    fn get(&self, name: &str) -> Option<Arc<dyn Tool>>;
+}
+
+/// 动态工具源：每次 `specs()` / `get()` 实时求值（运行期增删的工具即时可见，对标 MCP
+/// tools/list_changed）。
+pub trait ToolSource: Send + Sync {
+    /// 当前工具清单（每次调用实时求值，勿缓存）。
+    fn tools(&self) -> Vec<Arc<dyn Tool>>;
 }
 
 /// 默认注册表实现。
+///
+/// 静态工具（[`DefaultToolRegistry::register`]）与可选动态源（[`DefaultToolRegistry::with_source`]）
+/// 并存：静态优先（同名动态项被遮蔽并告警），动态源每次求值，不在注册表内缓存。
 pub struct DefaultToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    source: Option<Arc<dyn ToolSource>>,
 }
 
 impl DefaultToolRegistry {
     /// 空注册表。
     #[must_use]
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            source: None,
+        }
     }
 
     /// 注册工具。
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(Arc::from(tool));
+    }
+
+    /// 注册已共享的工具（调用方另持同一实例时可继续观测，避免二次装箱）。
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);
     }
 
@@ -209,6 +237,16 @@ impl DefaultToolRegistry {
     #[must_use]
     pub fn with(mut self, tool: Box<dyn Tool>) -> Self {
         self.register(tool);
+        self
+    }
+
+    /// 构建器：挂接动态工具源。
+    ///
+    /// 源内工具每次 `specs()` / `get()` 实时求值——运行中的 agent 无需重建注册表即可
+    /// 看到新增/移除的工具（MCP `tools/list_changed`）。
+    #[must_use]
+    pub fn with_source(mut self, source: Arc<dyn ToolSource>) -> Self {
+        self.source = Some(source);
         self
     }
 }
@@ -221,17 +259,42 @@ impl Default for DefaultToolRegistry {
 
 impl ToolRegistry for DefaultToolRegistry {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let mut specs: Vec<ToolSpec> = self
+            .tools
             .iter()
             .map(|t| ToolSpec::new(t.name(), t.description(), t.schema()))
-            .collect()
+            .collect();
+        if let Some(source) = &self.source {
+            // 静态优先：同名动态项被遮蔽（每轮 specs 仅一个该名字），逐个告警便于装配层排查
+            // 冲突（如 MCP 服务端工具名与内置工具撞名）。
+            for tool in source.tools() {
+                if specs.iter().any(|s| s.name == tool.name()) {
+                    tracing::warn!(
+                        tool = tool.name(),
+                        "动态工具源条目与既有同名工具冲突，已忽略该动态项"
+                    );
+                    continue;
+                }
+                specs.push(ToolSpec::new(
+                    tool.name(),
+                    tool.description(),
+                    tool.schema(),
+                ));
+            }
+        }
+        specs
     }
 
-    fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
+    fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(tool) = self.tools.iter().find(|t| t.name() == name) {
+            return Some(Arc::clone(tool));
+        }
+        // 动态源实时求值（不做缓存）：运行期增删对下一次调用立即生效。
+        self.source
+            .as_ref()?
+            .tools()
+            .into_iter()
             .find(|t| t.name() == name)
-            .map(Box::as_ref)
     }
 }
 
@@ -246,11 +309,26 @@ impl ToolRegistry for DefaultToolRegistry {
 /// 传 [`disabled`] 即关闭压缩。
 #[must_use]
 pub fn core_tools(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> DefaultToolRegistry {
+    core_tools_with_jobs(intercept, minimizer, None)
+}
+
+/// [`core_tools`] 的作业挂接变体：`jobs` 为 `Some` 时 `run_command` 获得
+/// `async:true` 后台执行能力（owner id 与 hub 身份一致，"main"）。
+#[must_use]
+pub fn core_tools_with_jobs(
+    intercept: Vec<CompiledRule>,
+    minimizer: Minimizer,
+    jobs: Option<std::sync::Arc<agent_core::jobs::AsyncJobManager>>,
+) -> DefaultToolRegistry {
+    let mut run = RunCommandTool::new(intercept, minimizer);
+    if let Some(jobs) = jobs {
+        run = run.with_jobs(jobs, "main");
+    }
     DefaultToolRegistry::new()
         .with(Box::new(ReadFileTool))
         .with(Box::new(WriteFileTool))
         .with(Box::new(ListFilesTool))
-        .with(Box::new(RunCommandTool::new(intercept, minimizer)))
+        .with(Box::new(run))
         .with(Box::new(GrepTool))
         .with(Box::new(GlobTool))
         .with(Box::new(WebSearchTool::new()))
@@ -288,19 +366,44 @@ pub fn lsp_tool(reg: DefaultToolRegistry) -> DefaultToolRegistry {
 /// `minimizer` 透传给 [`core_tools`]（`run_command` 输出压缩）。
 #[must_use]
 pub fn builtin_tools(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> DefaultToolRegistry {
-    let reg = core_tools(intercept, minimizer);
+    builtin_tools_with_jobs(intercept, minimizer, None)
+}
+
+/// [`builtin_tools`] 的作业挂接变体（`run_command` async 能力）。
+#[must_use]
+pub fn builtin_tools_with_jobs(
+    intercept: Vec<CompiledRule>,
+    minimizer: Minimizer,
+    jobs: Option<std::sync::Arc<agent_core::jobs::AsyncJobManager>>,
+) -> DefaultToolRegistry {
+    let reg = core_tools_with_jobs(intercept, minimizer, jobs);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     lsp_tool(reg)
 }
 
 /// 与 [`builtin_tools`] 相同，但额外返回 `LspTool` 的共享 [`LspPool`]（供 `LspWriteEffect` 复用同一套语言服务器）。
+///
+/// 注意（H42）：该函数**无条件**注册 ast/image/lsp，因此不适合直接作为前端装配入口——
+/// CLI/REPL、JSON-RPC、Web server 一律走 `agent_sdk::assemble_builtin_tools`（它按
+/// `[tools].enabled.<key>` 决定注册与提示词，是三个前端的唯一实现）。本函数保留给
+/// 「全可选组」场景与既有调用方。
 #[must_use]
 pub fn builtin_tools_with_pool(
     intercept: Vec<CompiledRule>,
     minimizer: Minimizer,
 ) -> (DefaultToolRegistry, LspPool) {
-    let reg = core_tools(intercept, minimizer);
+    builtin_tools_with_pool_and_jobs(intercept, minimizer, None)
+}
+
+/// [`builtin_tools_with_pool`] 的作业挂接变体。
+#[must_use]
+pub fn builtin_tools_with_pool_and_jobs(
+    intercept: Vec<CompiledRule>,
+    minimizer: Minimizer,
+    jobs: Option<std::sync::Arc<agent_core::jobs::AsyncJobManager>>,
+) -> (DefaultToolRegistry, LspPool) {
+    let reg = core_tools_with_jobs(intercept, minimizer, jobs);
     let reg = ast_tools(reg);
     let reg = image_tools(reg);
     let lsp = LspTool::new();
@@ -456,5 +559,118 @@ mod tests {
                 p.key
             );
         }
+    }
+
+    /// 最小工具桩：仅提供名字与描述（动态源测试用）。
+    struct StubTool(&'static str, &'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.1
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn capability(&self) -> CapabilityTier {
+            CapabilityTier::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext<'_>,
+        ) -> Result<ToolResult, agent_core::ToolError> {
+            Ok(ToolResult::text("stub"))
+        }
+    }
+
+    /// 运行期可变的工具源：注册表构造后 `add`/`clear` 即改变可见工具集
+    /// （对标 MCP `tools/list_changed`）。
+    struct SharedToolSource(std::sync::RwLock<Vec<Arc<dyn Tool>>>);
+
+    impl SharedToolSource {
+        fn new() -> Self {
+            Self(std::sync::RwLock::new(Vec::new()))
+        }
+
+        fn add(&self, name: &'static str, description: &'static str) {
+            self.0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Arc::new(StubTool(name, description)));
+        }
+
+        fn clear(&self) {
+            self.0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    impl ToolSource for SharedToolSource {
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            self.0
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[test]
+    fn dynamic_source_reflects_runtime_additions() {
+        let source = Arc::new(SharedToolSource::new());
+        let reg = DefaultToolRegistry::new()
+            .with(Box::new(StubTool("static_one", "static")))
+            .with_source(Arc::clone(&source) as Arc<dyn ToolSource>);
+
+        // 构造后源为空：动态名不可解析。
+        assert!(reg.get("mcp_late").is_none());
+        assert!(!reg.specs().iter().any(|s| s.name == "mcp_late"));
+
+        // 运行期加入（等价 MCP tools/list_changed）：无需重建注册表，下一轮即可见。
+        source.add("mcp_late", "late-bound");
+        assert!(reg.get("mcp_late").is_some(), "运行期新增的工具应可解析");
+        assert!(
+            reg.specs().iter().any(|s| s.name == "mcp_late"),
+            "specs 实时反映新增工具"
+        );
+
+        // 运行期移除：下一次调用立即不可见（不缓存）。
+        source.clear();
+        assert!(reg.get("mcp_late").is_none(), "移除后不再解析");
+        assert!(!reg.specs().iter().any(|s| s.name == "mcp_late"));
+    }
+
+    #[test]
+    fn static_tools_shadow_same_name_dynamic_entries() {
+        let source = Arc::new(SharedToolSource::new());
+        source.add("dup", "dynamic");
+        let reg = DefaultToolRegistry::new()
+            .with(Box::new(StubTool("dup", "static")))
+            .with_source(Arc::clone(&source) as Arc<dyn ToolSource>);
+
+        let specs = reg.specs();
+        assert_eq!(
+            specs.iter().filter(|s| s.name == "dup").count(),
+            1,
+            "同名动态项不应重复出现"
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|s| s.name == "dup")
+                .map(|s| s.description.as_str()),
+            Some("static"),
+            "静态工具优先"
+        );
+        assert_eq!(
+            reg.get("dup").map(|t| t.description().to_string()),
+            Some("static".to_string()),
+            "get 静态优先"
+        );
     }
 }

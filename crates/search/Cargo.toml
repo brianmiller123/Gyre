@@ -10,6 +10,7 @@ description = "Code search: grep (ripgrep core) + glob, ported from pi-natives"
 ignore     = { workspace = true }
 regex      = { workspace = true }
 globset    = { workspace = true }
+parking_lot = { workspace = true }
 syntect    = { workspace = true }
 tiktoken-rs = { workspace = true }
 tracing    = { workspace = true }

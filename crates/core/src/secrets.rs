@@ -641,6 +641,103 @@ fn collect_hits(text: &str) -> Vec<Hit> {
 // 单测
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// 正则凭据掩码器（不可逆；H45：DAP/LSP 之外的第二套「脱敏」实现收敛到 core）。
+///
+/// 与 [`SecretsObfuscator`] 的区别：后者是**可逆**的 HMAC 占位符（供 provider 消息往返
+/// 还原），本类型是**不可逆**的模式掩码（把命中片段替换为 `<redacted>`），用于把快照/
+/// 上下文喂给外部模型前的最后一道脱敏。
+///
+/// 语义移植 oh-my-pi `SecretObfuscator`：内置高频 pattern（API key / token / AWS /
+/// GitHub PAT / Bearer / 常见 env 导出），并支持调用方追加 pattern。
+pub struct PatternRedactor {
+    patterns: Vec<regex::Regex>,
+}
+
+impl Default for PatternRedactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 内置脱敏 pattern（顺序即应用顺序）。
+const BUILTIN_REDACT_PATTERNS: &[&str] = &[
+    // 形如 `key = value` / `key: value` / `key=value`（引号可选，值 ≥ 8 字符）。
+    r#"(?i)(api[_-]?key|access[_-]?key|secret|password|passwd|token)\s*[:=]\s*["']?[A-Za-z0-9_\-./+]{8,}"#,
+    // OpenAI / Anthropic 风格。
+    r"sk-[A-Za-z0-9_\-]{16,}",
+    r"sk-ant-[A-Za-z0-9_\-]{16,}",
+    // GitHub。
+    r"ghp_[A-Za-z0-9]{20,}",
+    r"github_pat_[A-Za-z0-9_]{20,}",
+    // AWS access key。
+    r"AKIA[0-9A-Z]{16}",
+    // Bearer 头。
+    r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{12,}",
+    // 常见环境变量导出。
+    r#"(?i)(export\s+)?(OPENAI|ANTHROPIC|GEMINI|GITHUB|HUGGINGFACE|GOOGLE|AZURE)_?(API|ACCESS|SECRET|TOKEN|KEY)["']?=["']?[A-Za-z0-9_\-./+]{8,}"#,
+];
+
+impl PatternRedactor {
+    /// 内置 pattern 构造器。
+    ///
+    /// # Panics
+    /// 内置 pattern 为编译期常量，非法即编程错误（与仓库其它 `expect` 一致）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            patterns: BUILTIN_REDACT_PATTERNS
+                .iter()
+                .map(|p| regex::Regex::new(p).expect("内置脱敏 pattern 必须合法"))
+                .collect(),
+        }
+    }
+
+    /// 追加自定义 pattern（用户/仓库级）。
+    pub fn add_pattern(&mut self, re: regex::Regex) {
+        self.patterns.push(re);
+    }
+
+    /// 掩码文本中的凭据（命中片段 → `<redacted>`）。
+    #[must_use]
+    pub fn obfuscate(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for p in &self.patterns {
+            out = p.replace_all(&out, "<redacted>").into_owned();
+        }
+        out
+    }
+}
+
+// ── H45：PatternRedactor（正则脱敏单源）──
+
+#[test]
+fn pattern_redactor_masks_builtin_and_custom_patterns() {
+    let r = PatternRedactor::new();
+    // 键值形态 / 前缀形态 / Bearer / env 导出。
+    for sample in [
+        "api_key = sk-abcdefghijklmnopqrstuvwx",
+        "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "Authorization: Bearer abcdefghijklmnop",
+        "export OPENAI_API_KEY=abcdefghijklmnop",
+        "aws AKIA1234567890ABCDEF",
+    ] {
+        let out = r.obfuscate(sample);
+        assert!(out.contains("<redacted>"), "{sample} 应被掩码，实得 {out}");
+    }
+    // 正常文本不被误伤。
+    assert_eq!(
+        r.obfuscate("let x = 1; // 普通代码"),
+        "let x = 1; // 普通代码"
+    );
+    // 自定义 pattern 追加生效（与 advisor 原实现同语义）。
+    let mut r = PatternRedactor::new();
+    r.add_pattern(regex::Regex::new(r"internal-[0-9]{6}").unwrap());
+    assert!(r.obfuscate("internal-123456").contains("<redacted>"));
+    // 幂等：重复掩码不再变化。
+    let once = r.obfuscate("internal-123456 and sk-abcdefghijklmnopqrstuvwx");
+    assert_eq!(once, r.obfuscate(&once));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

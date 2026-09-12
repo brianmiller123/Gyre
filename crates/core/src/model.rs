@@ -98,6 +98,12 @@ pub struct Model {
     /// ```
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
+    /// H26：tokenizer 家族声明（`o200k` / `cl100k` / `heuristic[:chars_per_token]`）。
+    ///
+    /// 缺省（`None`）= 按 model id 推断（o200k 家族 vs cl100k）。非 OpenAI provider
+    /// 没有公开 BPE 词表，声明 `heuristic:1.5` 这类近似比能让压缩触发更贴近真实分词密度。
+    #[serde(default)]
+    pub tokenizer: Option<String>,
 }
 
 impl Model {
@@ -114,6 +120,7 @@ impl Model {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         }
     }
 }

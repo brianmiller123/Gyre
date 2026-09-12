@@ -208,6 +208,14 @@ macro_rules! t {
 mod tests {
     use super::*;
 
+    /// 进程级 locale 是全局状态：凡是 `init(...)` 的测试都必须串行，否则并行执行下
+    /// 会互相覆盖（曾出现 `init_sets_active_locale` 偶发读到另一个测试设置的 "ja"）。
+    fn locale_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn catalog_loads_all_locales() {
         // 每个声明的语言都应解析成功。
@@ -218,6 +226,7 @@ mod tests {
 
     #[test]
     fn fallback_to_english_then_key() {
+        let _guard = locale_lock();
         // 确保英文存在某 key，激活非英文也能回退到英文值。
         let prev = current_locale();
         init(Some("ja"));
@@ -258,6 +267,7 @@ mod tests {
 
     #[test]
     fn init_sets_active_locale() {
+        let _guard = locale_lock();
         let prev = current_locale();
         init(Some("ru"));
         assert_eq!(current_locale(), "ru");

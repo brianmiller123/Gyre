@@ -20,6 +20,14 @@ pub enum CollabError {
     /// 写入被拒绝：房间受 write token 保护，而本连接未持有效令牌（只读 view 链接）。
     #[error("write forbidden: room requires a write token (read-only view link)")]
     WriteForbidden,
+    /// 协同线协议版本不匹配（H39）：对端 proto 与本端不同，显式拒绝而非静默降级。
+    #[error("{}", crate::frame::proto_mismatch_message(*remote))]
+    ProtoMismatch {
+        /// 对端声明的协议版本。
+        remote: u32,
+        /// 本端支持的协议版本。
+        local: u32,
+    },
     /// 快照分块序列错误（乱序/重复/缺块）。
     #[error("snapshot chunk out of order: expected seq {expected}, got {got}")]
     ChunkOutOfOrder {

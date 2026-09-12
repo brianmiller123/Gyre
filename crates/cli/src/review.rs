@@ -147,7 +147,9 @@ pub async fn run_review(staged: bool, explicit: Option<usize>, env: &ReviewEnv<'
         env.max_concurrent,
     )
     .with_supervisor(env.supervisor.clone())
-    .with_approval(Arc::clone(&env.approval));
+    .with_approval(Arc::clone(&env.approval))
+    // H18：评审子代理走命名定义发现（`/review` 只用 `tasks` 数组，命名可选）。
+    .with_agents(agent::discover_agents(&env.workspace.root()));
 
     let tasks: Vec<String> = chunks
         .iter()

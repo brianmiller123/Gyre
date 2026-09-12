@@ -206,10 +206,15 @@ pub fn parse_rule(name: &str, content: &str) -> Result<Rule, String> {
     let description = first(&fields, "description").map(str::to_string);
 
     // scope：显式 scope 字段；缺省 text。
+    // 兼容 omp 的两种写法：数组（`scope: [text, tool:write_file]`）与**逗号分隔的标量**
+    // （`scope: "tool:edit(*.rs), tool:write(*.rs)"`）。标量按**括号深度 0 的逗号**切分，
+    // 因此 glob 里的 `{ts,tsx}` 不会被误切（H44：内置规则集依赖该写法）。
     let mut scopes: Vec<RuleScope> = Vec::new();
     if let Some(tokens) = fields.get("scope") {
         for t in tokens {
-            scopes.push(RuleScope::parse(t)?);
+            for token in split_scope_tokens(t) {
+                scopes.push(RuleScope::parse(&token)?);
+            }
         }
     } else {
         scopes.push(RuleScope::Text);
@@ -278,6 +283,39 @@ pub fn parse_rule(name: &str, content: &str) -> Result<Rule, String> {
         ));
     }
     Ok(rule)
+}
+
+/// 切分 scope 标量：按**括号深度 0** 的逗号拆分，忽略括号内逗号
+/// （`tool:edit(*.{ts,tsx}), tool:write(*.ts)` → 两个 token）；空白与空段丢弃。
+fn split_scope_tokens(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut cur = String::new();
+    for ch in raw.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth <= 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
 }
 
 fn first<'a>(fields: &'a BTreeMap<String, Vec<String>>, key: &str) -> Option<&'a str> {
@@ -360,6 +398,36 @@ mod tests {
         assert!(r.covers_tool("apply_hashline", Some("src/lib.rs")));
         assert!(!r.covers_tool("apply_hashline", Some("src/lib.py")));
         assert!(!r.covers_tool("grep", Some("src/lib.rs")));
+    }
+
+    /// H44：omp 内置规则用**逗号分隔的标量**写 scope，且 glob 内含 `{a,b}`——
+    /// 切分必须只认括号外的逗号。
+    #[test]
+    fn parses_comma_separated_scope_scalar() {
+        let r =
+            rule("---\nscope: \"tool:edit(*.rs), tool:write(*.rs)\"\ncondition: [leak]\n---\nbody");
+        assert_eq!(r.scopes.len(), 2, "{:?}", r.scopes);
+        assert!(r.covers_tool("edit", Some("src/a.rs")));
+        assert!(r.covers_tool("write", Some("a.rs")));
+        assert!(!r.covers_tool("edit", Some("a.go")));
+
+        // 括号内逗号（glob 列表展开）不得被当作分隔符。
+        let r2 = rule(
+            "---\nscope: \"tool:edit(*.{ts,tsx}), tool:write(**/*.{ts,tsx})\"\ncondition: [x]\n---\nbody",
+        );
+        assert_eq!(r2.scopes.len(), 2, "{:?}", r2.scopes);
+        assert!(r2.covers_tool("edit", Some("a.tsx")));
+        assert!(r2.covers_tool("edit", Some("a.ts")));
+        assert!(r2.covers_tool("write", Some("deep/a.ts")));
+    }
+
+    #[test]
+    fn split_scope_tokens_drops_blanks() {
+        assert_eq!(
+            split_scope_tokens(" text , , tool:write_file "),
+            vec!["text".to_string(), "tool:write_file".to_string()]
+        );
+        assert!(split_scope_tokens("   ").is_empty());
     }
 
     #[test]

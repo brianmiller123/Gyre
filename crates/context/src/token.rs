@@ -1,9 +1,51 @@
 //! Token 计数：tiktoken-rs 精确计数（按 model 族选 BPE：gpt-4o/o 系列 o200k_base，
-//! gpt-4/gpt-3.5 系列 cl100k_base），其它 provider 回退到启发式。
+//! gpt-4/gpt-3.5 系列 cl100k_base）。
+//!
+//! H26：模型可**显式声明 tokenizer 家族**（`[models] tokenizer = "..."`），覆盖按 id 的
+//! 推断——非 OpenAI provider（Claude/Gemini/DeepSeek/Qwen…）没有公开 BPE 词表，用
+//! `heuristic:<chars_per_token>` 声明更贴近真实分词密度（如 CJK 语料 ~1.5 字符/token，
+//! 而不是 cl100k 的近似）。未声明时行为与引入前完全一致（按 model id 推断）。
 
 use tiktoken_rs::CoreBPE;
 
 use agent_core::{ContentBlock, ProviderMessage, UserContent};
+
+/// H26：tokenizer 家族（显式声明或按 model id 推断）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TokenFamily {
+    /// `o200k_base`（GPT-4o / o1 / o3 / o4 系列）。
+    O200k,
+    /// `cl100k_base`（GPT-4 / GPT-3.5 系列；也是非 OpenAI 模型的默认近似）。
+    Cl100k,
+    /// 启发式近似：`chars / chars_per_token`（无 BPE 词表的 provider 用）。
+    Heuristic {
+        /// 每 token 字符数（> 0）。
+        chars_per_token: f32,
+    },
+}
+
+impl TokenFamily {
+    /// 解析声明串：`o200k` / `cl100k` / `heuristic` / `heuristic:<chars_per_token>`。
+    ///
+    /// 未知串返回 `None`（调用方回退按 model id 推断，不因笔误改变计数口径）。
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        let s = spec.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "o200k" | "o200k_base" => Some(Self::O200k),
+            "cl100k" | "cl100k_base" => Some(Self::Cl100k),
+            "heuristic" | "chars" => Some(Self::Heuristic {
+                chars_per_token: 4.0,
+            }),
+            other => other
+                .strip_prefix("heuristic:")
+                .or_else(|| other.strip_prefix("chars:"))
+                .and_then(|n| n.trim().parse::<f32>().ok())
+                .filter(|r| *r > 0.0)
+                .map(|chars_per_token| Self::Heuristic { chars_per_token }),
+        }
+    }
+}
 
 /// token 计数器：按 model 族选用 BPE 词表。
 pub struct TokenCounter {
@@ -54,20 +96,36 @@ impl TokenCounter {
             || l.contains("o4-mini")
     }
 
-    /// 按 model id 选编码器：o200k model → o200k（缺失则回退 cl100k）；其余 → cl100k。
-    fn encoder_for(&self, model_id: &str) -> Option<&CoreBPE> {
+    /// H26：解析「声明优先、id 推断兜底」的 tokenizer 家族。
+    #[must_use]
+    pub fn family_for(model_id: &str, spec: Option<&str>) -> TokenFamily {
+        if let Some(f) = spec.and_then(TokenFamily::parse) {
+            return f;
+        }
         if Self::is_o200k_model(model_id) {
-            self.o200k.as_ref().or(self.cl100k.as_ref())
+            TokenFamily::O200k
         } else {
-            self.cl100k.as_ref()
+            TokenFamily::Cl100k
         }
     }
 
     /// 计算一段文本的 token 数（按 model 族选 BPE）。
     pub fn count_text_for(&self, text: &str, model_id: &str) -> usize {
-        match self.encoder_for(model_id) {
-            Some(enc) => enc.encode_with_special_tokens(text).len(),
-            None => text.chars().count() / 4,
+        self.count_text_with_family(text, model_id, None)
+    }
+
+    /// H26：按**声明优先**的家族计数（`spec` 为配置里的 tokenizer 串）。
+    pub fn count_text_with_family(&self, text: &str, model_id: &str, spec: Option<&str>) -> usize {
+        match Self::family_for(model_id, spec) {
+            TokenFamily::O200k => self.o200k.as_ref().or(self.cl100k.as_ref()).map_or_else(
+                || heuristic_chars(text, 4.0),
+                |enc| enc.encode_with_special_tokens(text).len(),
+            ),
+            TokenFamily::Cl100k => self.cl100k.as_ref().map_or_else(
+                || heuristic_chars(text, 4.0),
+                |enc| enc.encode_with_special_tokens(text).len(),
+            ),
+            TokenFamily::Heuristic { chars_per_token } => heuristic_chars(text, chars_per_token),
         }
     }
 
@@ -83,23 +141,37 @@ impl TokenCounter {
         messages: &[ProviderMessage],
         model_id: &str,
     ) -> usize {
+        self.count_context_with_family(system, messages, model_id, None)
+    }
+
+    /// H26：完整上下文计数 + 显式 tokenizer 声明。
+    pub fn count_context_with_family(
+        &self,
+        system: &[String],
+        messages: &[ProviderMessage],
+        model_id: &str,
+        spec: Option<&str>,
+    ) -> usize {
         let mut total: usize = 0;
         for s in system {
             // 每条 system 加角色开销 ~4 token
-            total += 4 + self.count_text_for(s, model_id);
+            total += 4 + self.count_text_with_family(s, model_id, spec);
         }
         for m in messages {
             total += 4; // 角色标记开销
             match m {
-                ProviderMessage::System(s) => total += self.count_text_for(s, model_id),
+                ProviderMessage::System(s) => {
+                    total += self.count_text_with_family(s, model_id, spec)
+                }
                 ProviderMessage::User { content } => {
                     for c in content {
                         match c {
                             UserContent::Text { text } => {
-                                total += self.count_text_for(text, model_id)
+                                total += self.count_text_with_family(text, model_id, spec)
                             }
                             UserContent::Image { mime, data } => {
-                                total += self.count_text_for(mime, model_id) + data.len() / 4;
+                                total += self.count_text_with_family(mime, model_id, spec)
+                                    + data.len() / 4;
                             }
                         }
                     }
@@ -108,10 +180,10 @@ impl TokenCounter {
                     for b in content {
                         match b {
                             ContentBlock::Text { text } => {
-                                total += self.count_text_for(text, model_id)
+                                total += self.count_text_with_family(text, model_id, spec)
                             }
                             ContentBlock::Thinking { text, .. } => {
-                                total += self.count_text_for(text, model_id);
+                                total += self.count_text_with_family(text, model_id, spec);
                             }
                             ContentBlock::ToolCall {
                                 name, arguments, ..
@@ -123,7 +195,7 @@ impl TokenCounter {
                     }
                 }
                 ProviderMessage::Tool { content, .. } => {
-                    total += self.count_text_for(content, model_id);
+                    total += self.count_text_with_family(content, model_id, spec);
                 }
             }
         }
@@ -135,6 +207,21 @@ impl TokenCounter {
     pub fn count_context(&self, system: &[String], messages: &[ProviderMessage]) -> usize {
         self.count_context_for(system, messages, "gpt-4")
     }
+}
+
+/// 启发式近似：`chars / chars_per_token`（非空文本至少 1 token；空文本 0）。
+fn heuristic_chars(text: &str, chars_per_token: f32) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let n = (chars as f32 / chars_per_token.max(0.1)).ceil() as usize;
+    n.max(1)
 }
 
 #[cfg(test)]
@@ -214,5 +301,90 @@ mod tests {
         let n4 = c.count_context_for(&sys, &msgs, "gpt-4");
         let n4o = c.count_context_for(&sys, &msgs, "gpt-4o");
         assert!(n4 > 0 && n4o > 0);
+    }
+
+    // ── H26：tokenizer 家族声明 ───────────────────────────────────────────────
+
+    #[test]
+    fn token_family_parses_supported_specs() {
+        assert_eq!(TokenFamily::parse("o200k"), Some(TokenFamily::O200k));
+        assert_eq!(TokenFamily::parse(" O200K_base "), Some(TokenFamily::O200k));
+        assert_eq!(TokenFamily::parse("cl100k"), Some(TokenFamily::Cl100k));
+        assert_eq!(
+            TokenFamily::parse("heuristic"),
+            Some(TokenFamily::Heuristic {
+                chars_per_token: 4.0
+            })
+        );
+        assert_eq!(
+            TokenFamily::parse("heuristic:1.5"),
+            Some(TokenFamily::Heuristic {
+                chars_per_token: 1.5
+            })
+        );
+        // 非法：未知串 / 非正比例 / 空。
+        assert_eq!(TokenFamily::parse("gpt2"), None);
+        assert_eq!(TokenFamily::parse("heuristic:0"), None);
+        assert_eq!(TokenFamily::parse("heuristic:abc"), None);
+        assert_eq!(TokenFamily::parse(""), None);
+    }
+
+    #[test]
+    fn declared_family_overrides_id_inference() {
+        // 无声明：按 id 推断（gpt-4o → o200k，claude → cl100k）。
+        assert_eq!(TokenCounter::family_for("gpt-4o", None), TokenFamily::O200k);
+        assert_eq!(
+            TokenCounter::family_for("claude-sonnet-4", None),
+            TokenFamily::Cl100k
+        );
+        // 声明优先：claude 也能声明成 o200k / 启发式（覆盖 id 推断）。
+        assert_eq!(
+            TokenCounter::family_for("claude-sonnet-4", Some("o200k")),
+            TokenFamily::O200k
+        );
+        assert_eq!(
+            TokenCounter::family_for("gpt-4o", Some("cl100k")),
+            TokenFamily::Cl100k
+        );
+        // 非法声明回落 id 推断（笔误不改变计数口径）。
+        assert_eq!(
+            TokenCounter::family_for("gpt-4o", Some("bogus")),
+            TokenFamily::O200k
+        );
+    }
+
+    #[test]
+    fn declared_heuristic_ratio_changes_counting() {
+        let counter = TokenCounter::heuristic();
+        // 12 个字符：4 字符/token → 3；1.5 字符/token（CJK 近似）→ 8。
+        let text = "你好世界你好世界你好世界";
+        assert_eq!(
+            counter.count_text_with_family(text, "m", Some("heuristic:4")),
+            3
+        );
+        assert_eq!(
+            counter.count_text_with_family(text, "m", Some("heuristic:1.5")),
+            8
+        );
+        // 空文本恒 0（不因 ceil 变成 1）。
+        assert_eq!(
+            counter.count_text_with_family("", "m", Some("heuristic:1.5")),
+            0
+        );
+    }
+
+    #[test]
+    fn declared_family_applies_to_context_counting() {
+        let counter = TokenCounter::heuristic();
+        let system = vec!["你好世界你好世界".to_string()];
+        let cl100k_like = counter.count_context_with_family(&system, &[], "m", None);
+        let dense = counter.count_context_with_family(&system, &[], "m", Some("heuristic:1.5"));
+        assert!(
+            dense > cl100k_like,
+            "CJK 近似应给出更多 token：dense={dense} cl100k={cl100k_like}"
+        );
+        // 与逐段计数一致（system 角色开销 4 + 文本 + 尾部 priming 3）。
+        let text_tokens = counter.count_text_with_family(&system[0], "m", Some("heuristic:1.5"));
+        assert_eq!(dense, 4 + text_tokens + 3);
     }
 }

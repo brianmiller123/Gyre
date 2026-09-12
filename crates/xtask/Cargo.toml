@@ -1,0 +1,36 @@
+[package]
+name        = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish     = false
+description = "Workspace automation: third-party notices + release preflight"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# H38：工具参考生成器需要**真实**装配各工具，故直接依赖工具与其宿主 crate。
+agent        = { workspace = true }
+agent-core   = { workspace = true }
+agent-config = { workspace = true }
+agent-context = { workspace = true }
+agent-hashline = { workspace = true }
+agent-memory = { workspace = true }
+agent-prompt = { workspace = true }
+agent-tools  = { workspace = true }
+agent-pty    = { workspace = true }
+agent-browser = { workspace = true }
+agent-dap    = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+toml         = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

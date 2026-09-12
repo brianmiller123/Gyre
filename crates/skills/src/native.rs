@@ -160,4 +160,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// H22：`enabled: false` 显式停用 / 缺描述 → 发现阶段跳过（对齐 omp requireDescription）。
+    #[tokio::test]
+    async fn skips_disabled_and_descriptionless_skills() {
+        let root = unique_skills_root();
+        let disabled = root.join("disabled");
+        std::fs::create_dir_all(&disabled).unwrap();
+        std::fs::write(
+            disabled.join("SKILL.md"),
+            "---\nname: disabled\ndescription: nope\nenabled: false\n---\nbody",
+        )
+        .unwrap();
+        let nodesc = root.join("nodesc");
+        std::fs::create_dir_all(&nodesc).unwrap();
+        std::fs::write(nodesc.join("SKILL.md"), "---\nname: nodesc\n---\nbody").unwrap();
+
+        let provider = NativeSkillProvider::new(std::env::temp_dir());
+        let opts = SkillLoadOptions {
+            enabled: true,
+            custom_directories: vec![root.clone()],
+            ..Default::default()
+        };
+        let skills = provider.discover(&opts).await.unwrap();
+        assert!(
+            skills.iter().all(|s| s.name != "disabled"),
+            "enabled: false 的 skill 不应被发现"
+        );
+        assert!(
+            skills.iter().all(|s| s.name != "nodesc"),
+            "缺描述的 skill 不应被发现"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

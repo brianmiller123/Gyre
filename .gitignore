@@ -27,5 +27,6 @@ vendor/*
 
 problem.txt
 # 运行时 sidecar 状态（SOCKS5 开关 / 审批模式），不入库
+**/.gyre/goal.json
 **/.gyre/socks5.state
 **/.gyre/approval-mode.state

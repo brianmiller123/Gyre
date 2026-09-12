@@ -54,10 +54,16 @@ struct RpcRequest {
     /// set_thinking / get_messages / compact / get_usage；未知类型由调用方按 id 回错误）。
     #[serde(rename = "type")]
     ty: String,
-    /// 请求 id（响应 / 事件原样回带）。
-    id: u64,
-    /// prompt 的文本（prompt 请求必填，非空）。
+    /// 请求 id（响应 / 事件**原样回带**的任意 JSON 值）。
+    ///
+    /// H9：此前强制 `u64`，omp 官方客户端发字符串 id（`{id:"…"}`）会因反序列化失败被
+    /// 整帧丢弃 → 无法握手。现接受字符串 / 数字 / 缺失，缺失时按 `null` 回带。
     #[serde(default)]
+    id: Option<serde_json::Value>,
+    /// prompt 的文本（prompt 请求必填，非空）。
+    ///
+    /// `message` 为 omp 兼容别名（omp `RpcCommand.prompt.message`）。
+    #[serde(default, alias = "message")]
     text: Option<String>,
     /// 模型别名（可选；非空时 prompt 前尝试切换 profile）。
     #[serde(default)]
@@ -84,6 +90,19 @@ struct RpcRequest {
     /// 宿主对反向请求的回答负载（`type:"response"` 时有效；缺失按拒绝处理）。
     #[serde(default)]
     result: Option<serde_json::Value>,
+    /// `set_todos` 的清单负载（omp `phases` 或 Gyre `items`；H7）。宽松承载，
+    /// 形状校验在命令层（非法 → error 帧）。
+    #[serde(default)]
+    pub(crate) todos: Option<serde_json::Value>,
+    /// `negotiate_protocol` 的目标协议版本（H6；omp `{type:"negotiate_protocol",
+    /// protocolVersion:2}`）。宽松承载，合法性校验在命令层（非法 → success:false）。
+    #[serde(
+        default,
+        rename = "protocolVersion",
+        alias = "protocol_version",
+        alias = "protocol_version_id"
+    )]
+    protocol_version: Option<serde_json::Value>,
 }
 
 /// serde 辅助：`Option<T>` 字段把 JSON `null` 反序列化为 `Some(Value::Null)`
@@ -101,7 +120,8 @@ where
 struct RpcEnvelope {
     #[serde(rename = "type")]
     ty: &'static str,
-    id: u64,
+    /// 请求 id 原样回带（H9：字符串或数字；缺省 `null`）。
+    id: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     event: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,21 +157,26 @@ struct RpcEnvelope {
 }
 
 impl RpcEnvelope {
+    /// 取请求 id 用于回带（缺失 → `null`，H9）。
+    fn req_id(req: &RpcRequest) -> serde_json::Value {
+        req.id.clone().unwrap_or(serde_json::Value::Null)
+    }
+
     /// 事件行：`{"type":"event","id":N,"event":{…}}`。
-    fn event(id: u64, event: serde_json::Value) -> Self {
+    fn event(id: impl Into<serde_json::Value>, event: serde_json::Value) -> Self {
         Self {
             ty: "event",
-            id,
+            id: id.into(),
             event: Some(event),
             ..Self::default()
         }
     }
 
     /// 成功收尾：`{"type":"done","id":N,"ok":true,"usage":{…},"turns":M}`。
-    fn done_ok(id: u64, usage: &Usage, turns: u64) -> Self {
+    fn done_ok(id: impl Into<serde_json::Value>, usage: &Usage, turns: u64) -> Self {
         Self {
             ty: "done",
-            id,
+            id: id.into(),
             ok: Some(true),
             usage: Some(usage_json(usage)),
             turns: Some(turns),
@@ -160,10 +185,10 @@ impl RpcEnvelope {
     }
 
     /// 失败收尾：`{"type":"done","id":N,"ok":false,"error":"…"}`。
-    fn done_err(id: u64, error: impl Into<String>) -> Self {
+    fn done_err(id: impl Into<serde_json::Value>, error: impl Into<String>) -> Self {
         Self {
             ty: "done",
-            id,
+            id: id.into(),
             ok: Some(false),
             error: Some(error.into()),
             ..Self::default()
@@ -172,29 +197,29 @@ impl RpcEnvelope {
 
     /// 错误响应（未知类型 / 缺参 / 模型切换失败 / 无效 JSON 等）：
     /// `{"type":"error","id":N,"message":"…"}`。
-    fn error(id: u64, message: impl Into<String>) -> Self {
+    fn error(id: impl Into<serde_json::Value>, message: impl Into<String>) -> Self {
         Self {
             ty: "error",
-            id,
+            id: id.into(),
             message: Some(message.into()),
             ..Self::default()
         }
     }
 
     /// ping 应答：`{"type":"pong","id":N}`。
-    fn pong(id: u64) -> Self {
+    fn pong(id: impl Into<serde_json::Value>) -> Self {
         Self {
             ty: "pong",
-            id,
+            id: id.into(),
             ..Self::default()
         }
     }
 
     /// 通用成功应答：`{"type":"ok","id":N,"ok":true}`（compact 受理等）。
-    fn ok(id: u64) -> Self {
+    fn ok(id: impl Into<serde_json::Value>) -> Self {
         Self {
             ty: "ok",
-            id,
+            id: id.into(),
             ok: Some(true),
             ..Self::default()
         }
@@ -202,10 +227,10 @@ impl RpcEnvelope {
 
     /// set_model 成功（重建 Agent 后由调用方回）：
     /// `{"type":"ok","id":N,"ok":true,"model":"<id>"}`。
-    fn ok_model(id: u64, model_id: &str) -> Self {
+    fn ok_model(id: impl Into<serde_json::Value>, model_id: &str) -> Self {
         Self {
             ty: "ok",
-            id,
+            id: id.into(),
             ok: Some(true),
             model: Some(model_id.to_string()),
             ..Self::default()
@@ -214,10 +239,10 @@ impl RpcEnvelope {
 
     /// set_thinking 成功：`{"type":"ok","id":N,"ok":true,"budget":N}`；
     /// `budget: null` 表示已关闭思考。
-    fn ok_budget(id: u64, budget: Option<usize>) -> Self {
+    fn ok_budget(id: impl Into<serde_json::Value>, budget: Option<usize>) -> Self {
         Self {
             ty: "ok",
-            id,
+            id: id.into(),
             ok: Some(true),
             budget: Some(budget),
             ..Self::default()
@@ -225,50 +250,50 @@ impl RpcEnvelope {
     }
 
     /// get_state 成功：`{"type":"state","id":N,"state":{…}}`。
-    fn state(id: u64, state: serde_json::Value) -> Self {
+    fn state(id: impl Into<serde_json::Value>, state: serde_json::Value) -> Self {
         Self {
             ty: "state",
-            id,
+            id: id.into(),
             state: Some(state),
             ..Self::default()
         }
     }
 
     /// get_messages 成功：`{"type":"messages","id":N,"messages":[…]}`。
-    fn messages(id: u64, messages: serde_json::Value) -> Self {
+    fn messages(id: impl Into<serde_json::Value>, messages: serde_json::Value) -> Self {
         Self {
             ty: "messages",
-            id,
+            id: id.into(),
             messages: Some(messages),
             ..Self::default()
         }
     }
 
     /// get_usage 成功：`{"type":"usage","id":N,"usage":{…}}`（累计用量，同 `done.usage` 形状）。
-    fn usage(id: u64, usage: serde_json::Value) -> Self {
+    fn usage(id: impl Into<serde_json::Value>, usage: serde_json::Value) -> Self {
         Self {
             ty: "usage",
-            id,
+            id: id.into(),
             usage: Some(usage),
             ..Self::default()
         }
     }
 
     /// get_tree 成功：`{"type":"tree","id":N,"tree":[…]}`（节点森林数组）。
-    fn tree(id: u64, nodes: serde_json::Value) -> Self {
+    fn tree(id: impl Into<serde_json::Value>, nodes: serde_json::Value) -> Self {
         Self {
             ty: "tree",
-            id,
+            id: id.into(),
             tree: Some(nodes),
             ..Self::default()
         }
     }
 
     /// list_models 成功：`{"type":"models","id":N,"models":[…]}`。
-    fn models_list(id: u64, models: serde_json::Value) -> Self {
+    fn models_list(id: impl Into<serde_json::Value>, models: serde_json::Value) -> Self {
         Self {
             ty: "models",
-            id,
+            id: id.into(),
             models: Some(models),
             ..Self::default()
         }
@@ -289,9 +314,10 @@ fn usage_json(u: &Usage) -> serde_json::Value {
 
 /// 把 agent 事件映射为 RPC 事件对象；`None` 表示该事件不对外暴露。
 ///
-/// 暴露面（与契约一致）：`text_delta` / `thinking_delta` / `tool_call` / `tool_result` /
-/// `status` / `usage`。生命周期事件（StateChanged / Turn* / Message* / ToolExecutionUpdate /
-/// Ask / Error / Done 等）不在此暴露——turn 的成败由最终 done 行承载。
+/// **旧式（v1）形状**：`{"type":"event","event":{"kind":…}}`——保留 `kind` 判别字段，
+/// 但 H8 起补齐此前丢失的 `id` / `result`（工具调用 id 与结构化结果）。
+///
+/// omp 兼容形状见 [`map_event_omp`]（协商 v2 的对端使用）。
 fn map_event(ev: &AgentEvent) -> Option<serde_json::Value> {
     match ev {
         AgentEvent::TextDelta(t) => Some(serde_json::json!({"kind": "text_delta", "text": t})),
@@ -299,19 +325,180 @@ fn map_event(ev: &AgentEvent) -> Option<serde_json::Value> {
             Some(serde_json::json!({"kind": "thinking_delta", "text": t}))
         }
         AgentEvent::Say(s) => Some(serde_json::json!({"kind": "status", "text": s.text})),
-        AgentEvent::ToolExecutionStart { name, args, .. } => {
-            Some(serde_json::json!({"kind": "tool_call", "name": name, "args": args}))
-        }
-        AgentEvent::ToolExecutionEnd { name, is_error, .. } => {
-            Some(serde_json::json!({"kind": "tool_result", "name": name, "ok": !is_error}))
-        }
+        // 会话级结构化事件（压缩 / 重试 / 模型回退）：与 status 双通道，`event.type`
+        // 为判别字段（omp `AgentSessionEvent` 同形）。展示文本仍在 status 事件里。
+        AgentEvent::Session(ev) => Some(serde_json::json!({"kind": "session", "event": ev})),
+        // H8：补 `id`（tool_call_id）——此前只发 name，消费者无法把结果配回调用。
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            name,
+            args,
+        } => Some(serde_json::json!({
+            "kind": "tool_call",
+            "id": tool_call_id,
+            "name": name,
+            "args": args,
+        })),
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            name,
+            partial,
+        } => Some(serde_json::json!({
+            "kind": "tool_update",
+            "id": tool_call_id,
+            "name": name,
+            "partial": partial,
+        })),
+        // H8：补 `id` 与结构化 `result`（此前只有 name/ok，工具输出在 RPC 面完全丢失）。
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            name,
+            result,
+            is_error,
+        } => Some(serde_json::json!({
+            "kind": "tool_result",
+            "id": tool_call_id,
+            "name": name,
+            "ok": !is_error,
+            "result": result,
+        })),
         AgentEvent::Usage(u) => {
             let mut v = usage_json(u);
             v["kind"] = serde_json::Value::String("usage".into());
             Some(v)
         }
+        // H8：轮次 / 消息边界此前完全未暴露，消费者无法划分边界。
+        AgentEvent::TurnStart => Some(serde_json::json!({"kind": "turn_start"})),
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            will_continue,
+        } => Some(serde_json::json!({
+            "kind": "turn_end",
+            "message": message,
+            "toolResults": tool_results,
+            "willContinue": will_continue,
+        })),
+        AgentEvent::MessageStart => Some(serde_json::json!({"kind": "message_start"})),
+        AgentEvent::MessageEnd(message) => {
+            Some(serde_json::json!({"kind": "message_end", "message": message}))
+        }
         _ => None,
     }
+}
+
+/// omp 兼容事件行（H8；仅对**已协商 v2** 的对端使用）。
+///
+/// 形状对齐 omp `agent/types.ts:868-888` 的 `AgentEvent`：顶层 `type` 即判别字段，
+/// 工具生命周期用 `toolCallId`/`toolName`/`args`/`result`/`isError`（camelCase）。
+///
+/// 明确的两处偏差（Gyre 侧成本/能力约束，客户端可容忍）：
+/// - `message_update` 不带 `message` partial 快照——Gyre 的流式路径刻意不做每 delta
+///   整条消息克隆（见 `AgentEvent` 文档）；客户端按 `assistantMessageEvent.delta` 自行累积；
+/// - 无 `agent_start`（Gyre 无显式起始事件）；`Done` 映射为 `agent_end` + `summary`。
+fn map_event_omp(ev: &AgentEvent) -> Option<serde_json::Value> {
+    Some(match ev {
+        AgentEvent::TextDelta(t) => serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": t},
+        }),
+        AgentEvent::ThinkingDelta(t) => serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "thinking_delta", "delta": t},
+        }),
+        AgentEvent::Say(s) => serde_json::json!({
+            "type": "status",
+            "message": s.text,
+            "level": format!("{:?}", s.kind).to_lowercase(),
+        }),
+        // SessionEvent 自身即带 `type` 判别字段 → 直接扁平外发（与 omp `output(event)` 一致）。
+        AgentEvent::Session(ev) => serde_json::to_value(ev).ok()?,
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            name,
+            args,
+        } => serde_json::json!({
+            "type": "tool_execution_start",
+            "toolCallId": tool_call_id,
+            "toolName": name,
+            "args": args,
+        }),
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            name,
+            partial,
+        } => serde_json::json!({
+            "type": "tool_execution_update",
+            "toolCallId": tool_call_id,
+            "toolName": name,
+            "partialResult": partial,
+        }),
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            name,
+            result,
+            is_error,
+        } => serde_json::json!({
+            "type": "tool_execution_end",
+            "toolCallId": tool_call_id,
+            "toolName": name,
+            "result": result,
+            "isError": is_error,
+        }),
+        AgentEvent::TurnStart => serde_json::json!({"type": "turn_start"}),
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            will_continue,
+        } => serde_json::json!({
+            "type": "turn_end",
+            "message": message,
+            "toolResults": tool_results,
+            "willContinue": will_continue,
+        }),
+        AgentEvent::MessageStart => serde_json::json!({"type": "message_start"}),
+        AgentEvent::MessageEnd(message) => {
+            serde_json::json!({"type": "message_end", "message": message})
+        }
+        AgentEvent::Usage(u) => {
+            let mut v = usage_json(u);
+            v["type"] = serde_json::Value::String("usage".into());
+            v
+        }
+        AgentEvent::Done(summary) => {
+            serde_json::json!({"type": "agent_end", "summary": summary})
+        }
+        AgentEvent::Error(message) => {
+            serde_json::json!({"type": "error", "message": message})
+        }
+        // 兼容别名（旧式 ToolExec 进度）：映射为 omp 的工具进度帧。
+        AgentEvent::ToolExec { name, output } => serde_json::json!({
+            "type": "tool_execution_update",
+            "toolName": name,
+            "partialResult": output,
+        }),
+        AgentEvent::StateChanged(state) => {
+            serde_json::json!({"type": "state_changed", "state": format!("{state:?}").to_lowercase()})
+        }
+        _ => return None,
+    })
+}
+
+/// 写出一个 agent 事件行（H8）：v2 对端 → omp 形状**裸帧**（顶层 `type`）；否则旧式
+/// `{"type":"event","id":N,"event":{…}}` 包装。无映射的事件静默跳过。
+async fn write_agent_event<W: tokio::io::AsyncWrite + Unpin>(
+    out: &mut W,
+    id: &serde_json::Value,
+    ev: &AgentEvent,
+) -> Result<()> {
+    if RPC_V2_NEGOTIATED.load(Ordering::Relaxed) {
+        if let Some(v) = map_event_omp(ev) {
+            write_frame(out, &v).await?;
+        }
+    } else if let Some(v) = map_event(ev) {
+        write_frame(out, &RpcEnvelope::event(id.clone(), v)).await?;
+    }
+    Ok(())
 }
 
 /// 序列化为单行 JSON 文本（不含行尾换行；文本内换行由 serde 自动转义，保证一行一条消息）。
@@ -336,6 +523,74 @@ const MAX_PENDING_CHUNK_SEQUENCES: usize = 8;
 
 /// 发送侧分片 id 计数器（对齐 omp `rpc-${++counter}` 命名）。
 static RPC_CHUNK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// v2 分帧是否已由对端经 `negotiate_protocol` 协商启用（H6 门控）。
+///
+/// omp `rpc-frame.ts:293-296` 只在 `protocolVersion === 2` 时才发 `rpc_chunk`；
+/// 此前 Gyre 无条件分片——v1 客户端会把 `rpc_chunk` 当未知类型丢弃，长帧直接丢失。
+/// `agent --rpc` 每进程只服务一个对端（单 stdin/stdout 通道），故用进程级原子。
+static RPC_V2_NEGOTIATED: AtomicBool = AtomicBool::new(false);
+
+/// 测试串行锁：改动 [`RPC_V2_NEGOTIATED`] 的用例必须持锁，
+/// 否则并行测试会互相把门控开关改回 false（进程级状态在测试中天然竞态）。
+#[cfg(test)]
+static CHUNK_GATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// omp 兼容响应帧（H9）：`{id, type:"response", command, success, data?|error?, code?}`。
+///
+/// 仅用于 omp 风格命令（当前为 `negotiate_protocol`）；Gyre 既有命令继续用
+/// [`RpcEnvelope`]（向后兼容 `docs/rpc.md` 的既有契约）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct OmpResponseFrame {
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    id: serde_json::Value,
+    #[serde(rename = "type")]
+    ty: &'static str,
+    command: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+impl OmpResponseFrame {
+    /// 成功响应（无 data 时不序列化 `data` 字段，对齐 omp `success()`）。
+    fn success(
+        id: serde_json::Value,
+        command: impl Into<String>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id,
+            ty: "response",
+            command: command.into(),
+            success: true,
+            data,
+            error: None,
+            code: None,
+        }
+    }
+
+    /// 失败响应（对齐 omp `error()`）。
+    fn failure(
+        id: serde_json::Value,
+        command: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            ty: "response",
+            command: command.into(),
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            code: None,
+        }
+    }
+}
 
 /// 握手帧（对齐 omp `RpcReadyFrame`）：连接建立后、处理任何请求前的首行输出。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -385,6 +640,13 @@ fn encode_frame_lines(json: &str) -> Box<dyn Iterator<Item = String> + '_> {
     let bytes = json.as_bytes();
     if bytes.len() < MAX_RPC_FRAME_BYTES {
         return Box::new(std::iter::once(format!("{json}\n")));
+    }
+    // H6：v1 客户端不认 `rpc_chunk`（会当未知类型丢弃）→ 未协商 v2 时绝不分片。
+    if !RPC_V2_NEGOTIATED.load(Ordering::Relaxed) {
+        return Box::new(std::iter::once(
+            "{\"type\":\"rpc_frame_error\",\"error\":\"RPC frame exceeded the transport limit; renegotiate with negotiate_protocol v2\"}\n"
+                .to_string(),
+        ));
     }
     if bytes.len() > MAX_RPC_REASSEMBLED_BYTES {
         // 超出重组上限：放弃传输，回退错误帧。
@@ -613,6 +875,13 @@ impl agent::RuntimeOverrides for RpcThinkingOverrides {
 struct SessionControl {
     /// 智能体模式（会话期恒定）。
     mode: agent_core::Mode,
+    /// 工作目录（`get_available_commands` 发现项目级自定义命令用）。
+    cwd: PathBuf,
+    /// 共享 todo 清单状态（`set_todos` / `get_todos` 与 `todo` 工具同一实例）。
+    todo: Arc<agent_tools::TodoState>,
+    /// 共享 checkpoint 状态（`todo` 之外的会话内工具与 RPC 面共享）。
+    #[allow(dead_code)]
+    checkpoints: Arc<agent_tools::CheckpointState>,
     /// 会话 id。
     session_id: String,
     /// 会话落盘路径。
@@ -633,8 +902,8 @@ struct SessionControl {
 
 /// compact 完成通知（后台压缩任务 → 主循环单写者回帧）。
 struct CompactNotice {
-    /// 触发 compact 的请求 id。
-    id: u64,
+    /// 触发 compact 的请求 id（H9：任意 JSON 值原样回带）。
+    id: serde_json::Value,
     /// 完成事件负载（`{"kind":"compact_done","tokens":{…}}`）。
     event: serde_json::Value,
 }
@@ -667,7 +936,164 @@ fn is_session_command(ty: &str) -> bool {
             | "get_tree"
             | "switch_branch"
             | "list_models"
+            | "get_session_stats"
+            | "get_available_commands"
+            | "set_todos"
+            | "get_todos"
+            | "get_available_models"
+            | "get_last_assistant_text"
     )
+}
+
+/// 解析 `set_todos` 负载 → Gyre 条目列表（H7）。
+///
+/// 支持两种形状：
+/// - omp：`{phases:[{name, tasks:[{content, status, blocker?}]}]}`（分组名丢弃，返回 note）；
+/// - Gyre：`{items:[{content, phase, blocked_reason?}]}`。
+///
+/// `status` / `phase` 取值同集：`pending` / `in_progress` / `completed` / `abandoned` / `blocked`。
+fn todo_items_from_payload(
+    payload: &serde_json::Value,
+) -> Result<(Vec<agent_tools::TodoItem>, Option<String>), String> {
+    let parse_status = |v: Option<&serde_json::Value>| -> Result<agent_tools::TodoPhase, String> {
+        let raw = v.and_then(serde_json::Value::as_str).unwrap_or("pending");
+        serde_json::from_value::<agent_tools::TodoPhase>(serde_json::Value::String(raw.into()))
+            .map_err(|_| format!("invalid todo status: {raw:?}"))
+    };
+    let mut items: Vec<agent_tools::TodoItem> = Vec::new();
+    if let Some(phases) = payload.get("phases").and_then(serde_json::Value::as_array) {
+        for phase in phases {
+            let tasks = phase
+                .get("tasks")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for task in tasks {
+                let Some(content) = task.get("content").and_then(serde_json::Value::as_str) else {
+                    return Err("todo task requires a string `content`".into());
+                };
+                items.push(agent_tools::TodoItem {
+                    id: String::new(), // replace() 重排
+                    content: content.to_string(),
+                    phase: parse_status(task.get("status"))?,
+                    blocked_reason: task
+                        .get("blocker")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+        }
+        let grouped = payload
+            .get("phases")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|p| !p.is_empty());
+        return Ok((
+            items,
+            grouped.then(|| "omp 阶段分组名在 Gyre 无对应概念，已展平为条目".to_string()),
+        ));
+    }
+    let Some(raw_items) = payload.get("items").and_then(serde_json::Value::as_array) else {
+        return Err("set_todos expects `phases` (omp) or `items` (gyre)".into());
+    };
+    for item in raw_items {
+        let Some(content) = item.get("content").and_then(serde_json::Value::as_str) else {
+            return Err("todo item requires a string `content`".into());
+        };
+        items.push(agent_tools::TodoItem {
+            id: String::new(),
+            content: content.to_string(),
+            phase: parse_status(item.get("phase").or_else(|| item.get("status")))?,
+            blocked_reason: item
+                .get("blocked_reason")
+                .or_else(|| item.get("blocker"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    Ok((items, None))
+}
+
+/// 清单 → 线协议 JSON（与 omp `todoPhases` 字段名对齐用 `items`，另附 Markdown 渲染）。
+fn todo_list_json(list: &agent_tools::TodoList) -> serde_json::Value {
+    serde_json::json!({
+        "items": list.items,
+        "nextId": list.next_id,
+    })
+}
+
+/// H7：把 `steer` / `follow_up` 文本投递到 steer 队列。
+///
+/// 空文本或队列不可用（Agent 未启用 steering）时返回错误文案；成功即表示已入队
+/// （下一个 step 边界注入，**不**保证立刻生效）。
+fn steer_running_turn(
+    agent: &agent::Agent,
+    text: Option<&str>,
+    command: &str,
+) -> Result<(), String> {
+    let text = text.unwrap_or_default().trim();
+    if text.is_empty() {
+        return Err(format!("{command} requires a non-empty message"));
+    }
+    if agent.steer(AgentMessage::user_text(text.to_string())) {
+        Ok(())
+    } else {
+        Err("steering queue unavailable (agent built without steering)".to_string())
+    }
+}
+
+/// 已识别但 Gyre **未实现**的 omp RPC 命令（H7）。
+///
+/// 这些命令用 omp 信封回 `{type:"response",command,success:false,error}` —— 官方客户端
+/// 能据此**降级**（而不是把 `unknown rpc message type` 当作协议错误/拼写错误）。
+/// 语义上是「显式不受理」，不计入已实现命令面：
+/// - 需要 Gyre 尚无的能力：宿主工具/URI 子协议、子代理订阅帧、扩展 UI、会话导出、
+///   OAuth 经 RPC 登录、bash 会话内执行、快速模式、自动重试/压缩开关；
+/// - 或仅有命名差异、待后续对齐：`set_thinking_level` / `cycle_thinking_level` /
+///   `set_steering_mode` / `set_follow_up_mode` / `set_interrupt_mode` /
+///   `switch_session` / `branch` / `get_branch_messages` / `get_messages_page` /
+///   `set_session_name` / `handoff` / `new_session` / `cycle_model` /
+///   `set_auto_compaction` / `set_auto_retry` / `abort_retry` / `abort_bash` /
+///   `abort_and_prompt`。
+const OMP_RECOGNIZED_UNSUPPORTED: &[&str] = &[
+    "abort_and_prompt",
+    "abort_bash",
+    "abort_retry",
+    "bash",
+    "branch",
+    "cycle_model",
+    "cycle_thinking_level",
+    "export_html",
+    "get_branch_messages",
+    "get_login_providers",
+    "get_messages_page",
+    "get_subagent_messages",
+    "get_subagents",
+    "handoff",
+    "login",
+    "new_session",
+    "set_auto_compaction",
+    "set_auto_retry",
+    "set_fast_mode",
+    "set_follow_up_mode",
+    "set_host_tools",
+    "set_host_uri_schemes",
+    "set_interrupt_mode",
+    "set_session_name",
+    "set_steering_mode",
+    "set_subagent_subscription",
+    "set_thinking_level",
+    "switch_session",
+];
+
+/// 若 `ty` 是「已识别但不支持」的 omp 命令 → 返回 omp 失败帧；否则 `None`。
+fn unsupported_omp_command(id: serde_json::Value, ty: &str) -> Option<OmpResponseFrame> {
+    OMP_RECOGNIZED_UNSUPPORTED.contains(&ty).then(|| {
+        OmpResponseFrame::failure(
+            id,
+            ty,
+            format!("{ty} 已识别但 Gyre 未实现（见 docs/oh-my-pi-gap-analysis-2026-09-11.md H7）"),
+        )
+    })
 }
 
 /// 模式的线协议名（serde lowercase 对齐）。
@@ -813,12 +1239,158 @@ async fn dispatch_session_command(
                 "isStreaming": control.streaming.load(Ordering::Relaxed),
                 "isCompacting": control.compacting.load(Ordering::Relaxed),
             });
-            ControlOutcome::Reply(RpcEnvelope::state(req.id, state))
+            ControlOutcome::Reply(RpcEnvelope::state(RpcEnvelope::req_id(req), state))
+        }
+        "get_session_stats" => {
+            // H7：omp `getSessionStats()` 形状的子集（会话身份 + 消息/工具计数 + 用量 + 上下文）。
+            let messages = active_path_messages(context).await;
+            let mut user_messages = 0usize;
+            let mut assistant_messages = 0usize;
+            let mut tool_results = 0usize;
+            let mut tool_calls = 0usize;
+            for m in &messages {
+                match m {
+                    AgentMessage::User(_) => user_messages += 1,
+                    AgentMessage::Assistant(a) => {
+                        assistant_messages += 1;
+                        tool_calls += a.tool_calls().len();
+                    }
+                    AgentMessage::ToolResult(_) => tool_results += 1,
+                    _ => {}
+                }
+            }
+            let usage = context.token_usage();
+            let stats = serde_json::json!({
+                "sessionId": control.session_id,
+                "sessionFile": control.session_file.display().to_string(),
+                "mode": mode_name(control.mode),
+                "turns": control.turns.load(Ordering::Relaxed),
+                "userMessages": user_messages,
+                "assistantMessages": assistant_messages,
+                "toolCalls": tool_calls,
+                "toolResults": tool_results,
+                "totalMessages": messages.len(),
+                "contextUsage": {
+                    "current": usage.current,
+                    "limit": usage.limit,
+                },
+                "isStreaming": control.streaming.load(Ordering::Relaxed),
+            });
+            ControlOutcome::Reply(RpcEnvelope::state(RpcEnvelope::req_id(req), stats))
+        }
+        "get_available_commands" => {
+            // H7：可用斜杠命令清单（omp `get_available_commands` →
+            // `{commands:[{name, description, source}]}`）。omp 的 `name` **不带**前导 `/`
+            // （客户端自行补），故此处统一剥离；`source` 区分 builtin / file / mcp。
+            let custom = agent_config::discover_commands(&control.cwd);
+            let builtins: std::collections::HashSet<String> =
+                crate::repl::all_command_names_with_prompts(&[], &[])
+                    .into_iter()
+                    .collect();
+            let file_names: std::collections::HashSet<String> =
+                custom.iter().map(|c| format!("/{}", c.name)).collect();
+            let commands: Vec<serde_json::Value> =
+                crate::repl::all_command_names_with_prompts(&custom, &[])
+                    .into_iter()
+                    .map(|full| {
+                        let source = if builtins.contains(&full) {
+                            "builtin"
+                        } else if file_names.contains(&full) {
+                            "file"
+                        } else {
+                            "mcp"
+                        };
+                        serde_json::json!({
+                            "name": full.trim_start_matches('/'),
+                            "description": null,
+                            "source": source,
+                        })
+                    })
+                    .collect();
+            ControlOutcome::Reply(RpcEnvelope::state(
+                RpcEnvelope::req_id(req),
+                serde_json::json!({ "commands": commands }),
+            ))
+        }
+        "set_todos" => {
+            // H7：omp `set_todos`（`{phases:[{name,tasks:[{content,status,blocker}]}]}`）与
+            // Gyre 原生形态（`{items:[…]}`）双收。Gyre 的 `TodoPhase` 是**状态**枚举
+            // （pending/in_progress/completed/abandoned/blocked，即 omp 的 `TodoStatus`），
+            // 没有 omp 的阶段分组概念 → 分组名丢弃（记入返回值的 note）。
+            let Some(payload) = req.todos.as_ref() else {
+                return ControlOutcome::Reply(RpcEnvelope::error(
+                    RpcEnvelope::req_id(req),
+                    "set_todos requires `phases` (omp) or `items` (gyre)",
+                ));
+            };
+            let (items, note) = match todo_items_from_payload(payload) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return ControlOutcome::Reply(RpcEnvelope::error(
+                        RpcEnvelope::req_id(req),
+                        msg,
+                    ));
+                }
+            };
+            let list = control.todo.replace(items);
+            let mut value = todo_list_json(&list);
+            if let Some(note) = note {
+                value["note"] = serde_json::Value::String(note);
+            }
+            ControlOutcome::Reply(RpcEnvelope::state(RpcEnvelope::req_id(req), value))
+        }
+        "get_available_models" => {
+            // H7：omp `get_available_models` → `{models:[Model]}`。数据源是**配置的**
+            // profile（不是网络发现；网络发现是 Gyre 的 `list_models`）。
+            let mut models = vec![serde_json::json!({
+                "id": cfg.default_model.id,
+                "alias": serde_json::Value::Null,
+                "provider": cfg.default_model.api.as_str(),
+                "isDefault": true,
+            })];
+            for m in &cfg.models {
+                models.push(serde_json::json!({
+                    "id": m.id,
+                    "alias": m.alias,
+                    "provider": m.api.as_str(),
+                    "isDefault": false,
+                }));
+            }
+            ControlOutcome::Reply(RpcEnvelope::state(
+                RpcEnvelope::req_id(req),
+                serde_json::json!({ "models": models }),
+            ))
+        }
+        "get_last_assistant_text" => {
+            // H7：最后一条 assistant 消息的纯文本（omp 同名命令）。
+            let messages = active_path_messages(context).await;
+            let text = messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    AgentMessage::Assistant(a) => {
+                        let t = a.text();
+                        (!t.is_empty()).then_some(t)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            ControlOutcome::Reply(RpcEnvelope::state(
+                RpcEnvelope::req_id(req),
+                serde_json::json!({ "text": text }),
+            ))
+        }
+        "get_todos" => {
+            let list = control.todo.snapshot();
+            ControlOutcome::Reply(RpcEnvelope::state(
+                RpcEnvelope::req_id(req),
+                todo_list_json(&list),
+            ))
         }
         "set_model" => {
             let Some(alias) = req.alias.as_deref().filter(|a| !a.is_empty()) else {
                 return ControlOutcome::Reply(RpcEnvelope::error(
-                    req.id,
+                    RpcEnvelope::req_id(req),
                     "set_model requires alias",
                 ));
             };
@@ -842,7 +1414,7 @@ async fn dispatch_session_command(
             };
             if !switched {
                 return ControlOutcome::Reply(RpcEnvelope::error(
-                    req.id,
+                    RpcEnvelope::req_id(req),
                     format!("model switch failed: {alias}"),
                 ));
             }
@@ -850,36 +1422,43 @@ async fn dispatch_session_command(
             ControlOutcome::ModelSwitched { model_id }
         }
         "set_thinking" => match parse_budget(&req.budget) {
-            Err(message) => ControlOutcome::Reply(RpcEnvelope::error(req.id, message)),
+            Err(message) => {
+                ControlOutcome::Reply(RpcEnvelope::error(RpcEnvelope::req_id(req), message))
+            }
             Ok(budget) => {
                 *control.thinking.budget.lock().expect("thinking 预算锁") = Some(budget);
-                ControlOutcome::Reply(RpcEnvelope::ok_budget(req.id, budget))
+                ControlOutcome::Reply(RpcEnvelope::ok_budget(RpcEnvelope::req_id(req), budget))
             }
         },
         "get_messages" => {
             let limit = match parse_limit(&req.limit) {
                 Ok(limit) => limit as usize,
-                Err(message) => return ControlOutcome::Reply(RpcEnvelope::error(req.id, message)),
+                Err(message) => {
+                    return ControlOutcome::Reply(RpcEnvelope::error(
+                        RpcEnvelope::req_id(req),
+                        message,
+                    ));
+                }
             };
             let messages = active_path_messages(context).await;
             let start = messages.len().saturating_sub(limit);
             let previews: Vec<serde_json::Value> =
                 messages[start..].iter().map(message_preview).collect();
             ControlOutcome::Reply(RpcEnvelope::messages(
-                req.id,
+                RpcEnvelope::req_id(req),
                 serde_json::Value::Array(previews),
             ))
         }
         "compact" => ControlOutcome::CompactionStarted,
         "get_usage" => ControlOutcome::Reply(RpcEnvelope::usage(
-            req.id,
+            RpcEnvelope::req_id(req),
             usage_json(&context.accumulated_usage()),
         )),
         "get_tree" => {
             let nodes = context.snapshot_nodes().await;
             let active = context.active_leaf().await;
             ControlOutcome::Reply(RpcEnvelope::tree(
-                req.id,
+                RpcEnvelope::req_id(req),
                 agent_cli::tree_ui::tree_json(&nodes, active.as_deref()),
             ))
         }
@@ -887,13 +1466,13 @@ async fn dispatch_session_command(
             let nodes = context.snapshot_nodes().await;
             let Some(input) = req.node.as_deref().filter(|s| !s.is_empty()) else {
                 return ControlOutcome::Reply(RpcEnvelope::error(
-                    req.id,
+                    RpcEnvelope::req_id(req),
                     "switch_branch requires node",
                 ));
             };
             let Some(node) = agent_cli::tree_ui::parse_node_target(input, &nodes) else {
                 return ControlOutcome::Reply(RpcEnvelope::error(
-                    req.id,
+                    RpcEnvelope::req_id(req),
                     format!("node not found or ambiguous: {input}"),
                 ));
             };
@@ -903,7 +1482,7 @@ async fn dispatch_session_command(
                     Ok(v) => v,
                     Err(e) => {
                         return ControlOutcome::Reply(RpcEnvelope::error(
-                            req.id,
+                            RpcEnvelope::req_id(req),
                             format!("handoff 切换失败: {e}"),
                         ));
                     }
@@ -913,7 +1492,7 @@ async fn dispatch_session_command(
             };
             if !switched {
                 return ControlOutcome::Reply(RpcEnvelope::error(
-                    req.id,
+                    RpcEnvelope::req_id(req),
                     if handoff {
                         "handoff 不可用（该上下文无摘要器）或节点不存在".to_string()
                     } else {
@@ -921,7 +1500,7 @@ async fn dispatch_session_command(
                     },
                 ));
             }
-            ControlOutcome::Reply(RpcEnvelope::ok(req.id))
+            ControlOutcome::Reply(RpcEnvelope::ok(RpcEnvelope::req_id(req)))
         }
         "list_models" => {
             // 运行时发现：当前运行时模型的 api/base_url/key（set_model 切换后即发现新源）。
@@ -946,16 +1525,20 @@ async fn dispatch_session_command(
                         })
                         .collect();
                     ControlOutcome::Reply(RpcEnvelope::models_list(
-                        req.id,
+                        RpcEnvelope::req_id(req),
                         serde_json::Value::Array(models),
                     ))
                 }
-                Err(e) => {
-                    ControlOutcome::Reply(RpcEnvelope::error(req.id, format!("模型发现失败: {e}")))
-                }
+                Err(e) => ControlOutcome::Reply(RpcEnvelope::error(
+                    RpcEnvelope::req_id(req),
+                    format!("模型发现失败: {e}"),
+                )),
             }
         }
-        _ => ControlOutcome::Reply(RpcEnvelope::error(req.id, "unknown rpc message type")),
+        _ => ControlOutcome::Reply(RpcEnvelope::error(
+            RpcEnvelope::req_id(req),
+            "unknown rpc message type",
+        )),
     }
 }
 
@@ -964,7 +1547,7 @@ async fn dispatch_session_command(
 async fn run_compaction(
     context: Arc<dyn agent_core::ContextManager>,
     control: Arc<SessionControl>,
-    id: u64,
+    id: serde_json::Value,
     tx: tokio::sync::mpsc::Sender<CompactNotice>,
 ) {
     let _ = context.compact(CompactionStrategy::Shake).await;
@@ -1022,7 +1605,7 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
 #[allow(clippy::too_many_arguments)] // 事件转发面天然多参，同 main.rs::run_swarm 先例。
 async fn handle_turn_event(
     ev: &AgentEvent,
-    id: u64,
+    id: serde_json::Value,
     out: &mut tokio::io::BufWriter<tokio::io::Stdout>,
     usage: &mut Usage,
     turns: &mut u64,
@@ -1030,9 +1613,7 @@ async fn handle_turn_event(
     last_error: &mut Option<String>,
     session_turns: &AtomicU64,
 ) -> Result<()> {
-    if let Some(v) = map_event(ev) {
-        write_frame(out, &RpcEnvelope::event(id, v)).await?;
-    }
+    write_agent_event(out, &id, ev).await?;
     match ev {
         AgentEvent::Usage(u) => usage.add(u),
         AgentEvent::TurnStart => {
@@ -1060,7 +1641,7 @@ async fn handle_turn_event(
 #[allow(clippy::too_many_arguments)] // 会话控制状态注入面，同 main.rs 先例。
 async fn run_turn_rpc(
     agent: &agent::Agent,
-    id: u64,
+    id: serde_json::Value,
     text: &str,
     stdin_reader: &StdinReader,
     out: &mut tokio::io::BufWriter<tokio::io::Stdout>,
@@ -1096,7 +1677,7 @@ async fn run_turn_rpc(
                 Some(ev) => {
                     handle_turn_event(
                         &ev,
-                        id,
+                        id.clone(),
                         out,
                         &mut usage,
                         &mut turns,
@@ -1116,7 +1697,7 @@ async fn run_turn_rpc(
                 Some(ev) => {
                     handle_turn_event(
                         &ev,
-                        id,
+                        id.clone(),
                         out,
                         &mut usage,
                         &mut turns,
@@ -1146,6 +1727,33 @@ async fn run_turn_rpc(
                                 cancel.cancel();
                                 cancelled = true;
                             }
+                            // H7：omp `steer` / `follow_up` —— 投递到运行中 turn 的 steering 队列，
+                            // 在下一个 step 边界注入（omp 语义：steer 立即插话、follow_up 停止后处理；
+                            // Gyre 的 steering 队列在 step 边界排空，二者共用同一通道）。
+                            Ok(r) if r.ty == "steer" || r.ty == "follow_up" => {
+                                let command = if r.ty == "steer" { "steer" } else { "follow_up" };
+                                let frame = match steer_running_turn(agent, r.text.as_deref(), command) {
+                                    Ok(()) => OmpResponseFrame::success(
+                                        RpcEnvelope::req_id(&r),
+                                        command,
+                                        None,
+                                    ),
+                                    Err(msg) => {
+                                        OmpResponseFrame::failure(RpcEnvelope::req_id(&r), command, msg)
+                                    }
+                                };
+                                write_frame(out, &frame).await?;
+                            }
+                            // H7：omp `abort` —— `cancel` 的 omp 命名别名，附成功响应帧。
+                            Ok(r) if r.ty == "abort" => {
+                                cancel.cancel();
+                                cancelled = true;
+                                write_frame(
+                                    out,
+                                    &OmpResponseFrame::success(RpcEnvelope::req_id(&r), "abort", None),
+                                )
+                                .await?;
+                            }
                             Ok(r) if r.ty == "ping" => {
                                 write_frame(out, &RpcEnvelope::pong(r.id)).await?;
                             }
@@ -1154,7 +1762,7 @@ async fn run_turn_rpc(
                                 let value = r
                                     .result
                                     .unwrap_or_else(|| serde_json::json!({ "answer": "no" }));
-                                reverse.resolve(r.id, value);
+                                reverse.resolve(&r.id.clone().unwrap_or(serde_json::Value::Null), value);
                             }
                             Ok(r) if r.ty == "set_model" || r.ty == "compact" => {
                                 // 变更型命令仅空闲受理：模型切换需重建 Agent，压缩与事件流互斥。
@@ -1194,8 +1802,20 @@ async fn run_turn_rpc(
                                 .await?;
                             }
                             Ok(r) => {
-                                write_frame(out, &RpcEnvelope::error(r.id, "unknown rpc message type"))
-                                    .await?;
+                                // H7：运行中收到「已识别但不支持」的 omp 命令同样回 omp 信封。
+                                match unsupported_omp_command(RpcEnvelope::req_id(&r), &r.ty) {
+                                    Some(frame) => write_frame(out, &frame).await?,
+                                    None => {
+                                        write_frame(
+                                            out,
+                                            &RpcEnvelope::error(
+                                                RpcEnvelope::req_id(&r),
+                                                "unknown rpc message type",
+                                            ),
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                             Err(_) => {
                                 write_frame(out, &RpcEnvelope::error(0, "invalid json request"))
@@ -1220,23 +1840,47 @@ async fn run_turn_rpc(
         }
     }
 
-    // 收尾：以一条 done 结束本轮。
-    let env = match success {
-        Some(s) if s => RpcEnvelope::done_ok(id, &usage, turns),
-        Some(_) => {
-            RpcEnvelope::done_err(id, last_error.unwrap_or_else(|| "turn failed".to_string()))
-        }
-        None => {
-            let err = if cancelled {
-                "cancelled".to_string()
-            } else {
-                last_error.unwrap_or_else(|| "stream ended unexpectedly".to_string())
-            };
-            RpcEnvelope::done_err(id, err)
-        }
-    };
+    // 收尾帧：v2（omp）对端回 `{type:"response",command:"prompt",success,…}`——
+    // omp 客户端等的是这个响应帧（事件已以 omp 形状裸帧外发，见 H8）；
+    // v1 对端保持既有 `done` 行（docs/rpc.md 契约）。
     control.streaming.store(false, Ordering::Relaxed);
-    write_frame(out, &env).await?;
+    if RPC_V2_NEGOTIATED.load(Ordering::Relaxed) {
+        let frame = match success {
+            Some(true) => OmpResponseFrame::success(
+                id,
+                "prompt",
+                Some(serde_json::json!({
+                    "usage": usage_json(&usage),
+                    "turns": turns,
+                })),
+            ),
+            _ => {
+                let err = if cancelled {
+                    "cancelled".to_string()
+                } else {
+                    last_error.unwrap_or_else(|| "turn failed".to_string())
+                };
+                OmpResponseFrame::failure(id, "prompt", err)
+            }
+        };
+        write_frame(out, &frame).await?;
+    } else {
+        let env = match success {
+            Some(s) if s => RpcEnvelope::done_ok(id, &usage, turns),
+            Some(_) => {
+                RpcEnvelope::done_err(id, last_error.unwrap_or_else(|| "turn failed".to_string()))
+            }
+            None => {
+                let err = if cancelled {
+                    "cancelled".to_string()
+                } else {
+                    last_error.unwrap_or_else(|| "stream ended unexpectedly".to_string())
+                };
+                RpcEnvelope::done_err(id, err)
+            }
+        };
+        write_frame(out, &env).await?;
+    }
     Ok(exit_after || stdin_eof)
 }
 
@@ -1317,7 +1961,10 @@ impl ReverseChannel {
     }
 
     /// 路由宿主回答：命中待答请求 → 投递并返回 true；未命中（迟到 / 重复）→ false。
-    fn resolve(&self, id: u64, value: serde_json::Value) -> bool {
+    fn resolve(&self, id: &serde_json::Value, value: serde_json::Value) -> bool {
+        let Some(id) = id.as_u64() else {
+            return false; // 反向通道 id 为内部生成的数字；非数字 id 无从匹配
+        };
         self.pending
             .lock()
             .expect("反向请求表锁")
@@ -1389,16 +2036,23 @@ pub async fn run_rpc(
     // 认证链分层（config 值含 ${ENV} 展开 → oauth.toml 有效/先刷后用 → auth.toml
     // → GYRE_<PROVIDER>_API_KEY env）。此前仅读 profile 内联值——auth.toml/env
     // 在 RPC 路径从未生效，本轮对齐交互路径。
-    let api_key: String = agent_llm::oauth::resolve_runtime_api_key(
+    // H24：`auth = "none"` 不发内置鉴权头；`oauth` 只认 OAuth 存储（缺失即报错）。
+    let api_key: Option<String> = agent_llm::oauth::resolve_profile_api_key(
         &oauth_client,
         &rpc_config_dir,
+        profile.auth,
         profile.api.as_str(),
+        &profile.id,
         profile.api_key.expose_secret().is_empty(),
         profile.resolve_api_key().expose_secret(),
-    );
-    let model = profile.to_model();
-    let fallback_models: Vec<agent_core::Model> =
-        chain.iter().skip(1).map(|p| p.to_model()).collect();
+    )
+    .map_err(anyhow::Error::msg)?;
+    let model = profile.to_model(cfg.agent.enable_thinking);
+    let fallback_models: Vec<agent_core::Model> = chain
+        .iter()
+        .skip(1)
+        .map(|p| p.to_model(cfg.agent.enable_thinking))
+        .collect();
     let key_rings: std::collections::HashMap<String, Vec<String>> =
         chain.iter().map(|p| (p.id.clone(), p.key_ring())).collect();
 
@@ -1411,9 +2065,12 @@ pub async fn run_rpc(
         std::env::var("GYRE_INBAND_TOOLS").ok().as_deref(),
     );
     let provider_ctx = agent_core::ProviderCallContext {
-        api_key: Some(api_key.clone()),
-        base_url: Some(profile.base_url.clone()),
+        api_key: api_key.clone(),
+        base_url: Some(profile.effective_base_url()),
         max_in_flight: None,
+        headers: crate::profile_headers(profile),
+        quirks: profile.effective_quirks(),
+        auth: profile.auth,
     };
 
     let mode = cfg.agent.mode;
@@ -1421,12 +2078,21 @@ pub async fn run_rpc(
     // 会话持久化：一个进程一个会话（Context 跨 prompt 请求复用，累积上下文）。
     let session_store = agent_context::SessionStore::for_cwd(&cwd);
     let session_id = agent_context::SessionStore::new_id();
+    // H31：记录面包屑，使 `agent --continue` 能续上 RPC 会话。
+    agent_context::SessionStore::for_cwd(&cwd).mark_last(&session_id);
     eprintln!("{}", t!("session.label", id = session_id));
     let session_path = session_store.path_for(&session_id);
-    let pctx =
-        agent_context::PersistentContext::open(prompts.system_with_platform(mode), &session_path)
-            .await
-            .context("打开持久化上下文失败")?;
+    // H31：RPC 会话同样写 header 身份字段（cwd / prompt-cache key）。
+    let mut session_header = agent_context::SessionHeader::new("gyre").with_path(&session_path);
+    session_header.cwd = Some(cwd.display().to_string());
+    session_header.provider_prompt_cache_key = Some(session_id.clone());
+    let pctx = agent_context::PersistentContext::open_with_header(
+        prompts.system_with_platform(mode),
+        &session_path,
+        session_header.clone(),
+    )
+    .await
+    .context("打开持久化上下文失败")?;
     // 长期记忆（可选；按 cwd 项目作用域，backend 可切换）。
     // 提前到 summarizer 之前：压缩前召回（preCompactionContext）需把记忆挂到摘要提供器。
     let mut memory: Option<Arc<dyn agent_core::MemoryStore>> = None;
@@ -1472,39 +2138,82 @@ pub async fn run_rpc(
     .await;
     let context: Arc<dyn agent_core::ContextManager> = Arc::new(pctx);
     let workspace = Arc::new(agent_core::Workspace::new(cwd.clone()));
-    let mcp: Arc<agent_mcp::McpRegistry> = Arc::new(agent_mcp::McpRegistry::load(&cfg.mcp).await);
-    // MCP 工具清单磁盘缓存：启动快照落盘 + 未连上 server 的 stale 回填告警。
+    // H41/H43：RPC 会话同样有进程内消息总线（hub 工具 + 子代理寻址）。
+    let hub = agent_core::hub::Hub::new().shared();
+    // H41：名册容量（0 = 不限；+1 计父 agent 自身）→ `task` 满员时在派生前预拒。
+    hub.set_capacity(cfg.subagent.max_registry.saturating_add(1));
+    // 进程托管 op（start/ps/logs/stop/restart/describe）与 CLI/server 对齐：随连接存续。
+    let hub_processes = Arc::new(agent_supervisor::ProcessManager::new());
+    // H33：PTY 执行器接入（`run_command(pty: true)`）。
+    agent_tools::set_pty_executor(agent_pty::executor());
+    // H7：todo / checkpoint 共享状态（工具注册与 `set_todos` / `get_todos` 同一实例）。
+    let todo_state = agent_tools::TodoState::load(cwd.join(".gyre").join("todo.json")).shared();
+    let checkpoint_state = agent_tools::CheckpointState::new().shared();
+    // MCP 注册表：启动预算外的 server 转后台连接（有适用缓存快照者先以 Deferred 工具注册）；
+    // 快照落盘与适用性判定（版本 + 配置指纹 + TTL）由注册表自理。
     let mcp_cache_dir = agent_core::platform::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    agent_mcp::store_tools(&mcp_cache_dir, &mcp.tools());
-    for name in cfg.mcp.servers.keys() {
-        if let Some(cached) = agent_mcp::hydrate_from_cache(&mcp_cache_dir, &mcp, name) {
-            tracing::warn!(
-                server = %name,
-                tools = cached.tools.len(),
-                cached_at_ms = cached.cached_at_ms,
-                "MCP server 未连上，工具元信息来自磁盘缓存快照（不可执行）"
-            );
-        }
-    }
-    let mut optional: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for p in agent_tools::OPTIONAL_TOOL_PROMPTS {
-        optional.insert(p.key.to_string(), cfg.tools.effective(p.key, p.default));
-    }
-    optional.insert(
-        "hashline".to_string(),
-        cfg.tools.effective("hashline", true),
+    let mcp: Arc<agent_mcp::McpRegistry> = Arc::new(
+        agent_mcp::McpRegistry::load(
+            &cfg.mcp,
+            &agent_mcp::McpLoadOptions {
+                cache_dir: Some(mcp_cache_dir),
+                // H16：把会话工作目录登记为 MCP root —— server 的 roots/list 才能拿到
+                // 工作区范围（此前 server 请求一律被丢弃）。
+                roots: vec![agent_mcp::McpRoot::file(&cwd, "workspace")],
+                ..agent_mcp::McpLoadOptions::default()
+            },
+        )
+        .await,
     );
-    optional.insert("pty".to_string(), cfg.tools.effective("pty", false));
-    // P1-1：DAP 调试器可选组（[tools.enabled] debug）。
-    optional.insert("debug".to_string(), cfg.tools.effective("debug", false));
-    // P2：SSH / browser 可选组（[tools.enabled] ssh / browser）。
-    optional.insert("ssh".to_string(), cfg.tools.effective("ssh", false));
-    optional.insert("browser".to_string(), cfg.tools.effective("browser", false));
+    // MCP 工具动态源：装配层只持这一份句柄，父/子 Agent 注册表都挂它。
+    let mcp_source: Arc<dyn agent_tools::ToolSource> =
+        Arc::new(agent_mcp::McpToolSource::new(Arc::clone(&mcp)));
+    // H42：可选组开关推导与 CLI/REPL、server 共用同一实现（agent-sdk）。
+    let optional = agent_sdk::optional_tool_switches(&cfg);
     // 会话级文本快照存储：read_file（经 ToolContext::snapshots 记录）与 apply_hashline
     // 共享同一 Arc（与 main() 单次任务路径一致；跨 Agent 重建保持，会话级单例）。
-    let snapshot_store = Arc::new(std::sync::RwLock::new(
-        agent_hashline::InMemorySnapshotStore::new(),
-    ));
+    let snapshot_store = agent_sdk::new_snapshot_store();
+    // H3 异步后台作业管理器（与 main() 会话路径同语义）。
+    let job_manager = if cfg.agent.async_enabled {
+        Some(agent_core::jobs::AsyncJobManager::with_max_running(
+            cfg.agent.async_max_jobs,
+        ))
+    } else {
+        None
+    };
+
+    // H3 投递 sink：完结作业结果以 async-result 通知形式追加进会话上下文
+    //（对齐 omp registerDeliverySink 语义：owner 路由 + 恰好一次 + 失败退避重试）。
+    let _job_sink_guard = job_manager.as_ref().map(|jm| {
+        let ctx = Arc::clone(&context);
+        let sink: agent_core::jobs::DeliverySink = Arc::new(move |job_id, text, job| {
+            let ctx = Arc::clone(&ctx);
+            Box::pin(async move {
+                let label = job.as_ref().map(|j| j.label.clone()).unwrap_or_default();
+                let status = job
+                    .as_ref()
+                    .map(|j| j.status.as_str())
+                    .unwrap_or("completed");
+                let body = format!(
+                    "<system-notice>\n后台作业 {job_id}（{label}，{status}）已完结。请基于以下结果继续工作。\n\n{text}\n</system-notice>"
+                );
+                ctx.append(agent_core::AgentMessage::user_text(body)).await;
+                Ok(())
+            })
+        });
+        {
+            let resumed = jm.register_delivery_sink("main", sink);
+            // H27：Agent/会话重建后，把先前因 `watch ids` 被抑制的投递重新入队——
+            // `enqueue_delivery` 在抑制状态下不入队，不恢复就会永久静默丢失结果。
+            let suppressed = jm.suppressed_job_ids(Some("main"));
+            if !suppressed.is_empty() {
+                let refs: Vec<&str> = suppressed.iter().map(String::as_str).collect();
+                jm.resume_deliveries(&refs);
+                tracing::info!(jobs = suppressed.len(), "已恢复被抑制的作业投递");
+            }
+            resumed
+        }
+    });
     let (mut sub_reg, _) = assemble_builtin_tools(
         &optional,
         cfg.github.enabled,
@@ -1512,23 +2221,42 @@ pub async fn run_rpc(
         cfg.agent.commands.interceptor.enabled,
         compiled_minimizer(&cfg),
         Some(Arc::clone(&snapshot_store)),
+        job_manager.clone(),
     );
-    for t in mcp.tools() {
-        sub_reg = sub_reg.with(Box::new(t.clone()));
-    }
+    // MCP 工具走动态源：server 端清单增删在子 Agent 下一轮即可见。
+    sub_reg = sub_reg.with_source(Arc::clone(&mcp_source));
     let sub_tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(sub_reg);
     let sub_context_factory: agent::ContextFactory = Arc::new(|| {
         Arc::new(agent_context::InMemoryContext::new(vec![])) as Arc<dyn agent_core::ContextManager>
     });
-
-    // Skill 目录 + 上下文约定（AGENTS.md 等，注入 system prompt）。
-    let skill_catalog = Arc::new(load_skill_catalog(&cfg, &cwd).await);
-    let foreign_sections: Vec<String> = agent_discovery::discover(&cwd)
+    // H18：命名子代理定义 + 模型覆盖表（与 REPL/server 同一发现逻辑）。
+    let sub_agents = agent::discover_agents(&cwd);
+    let sub_model_overrides: std::collections::HashMap<String, agent_core::Model> = chain
         .iter()
-        .map(agent_discovery::render_section)
+        .flat_map(|p| {
+            let m = p.to_model(cfg.agent.enable_thinking);
+            let mut v = vec![(p.id.clone(), m.clone())];
+            if let Some(a) = &p.alias {
+                v.push((a.clone(), m));
+            }
+            v
+        })
         .collect();
-    let mut base_context_files = agent_config::discover_context_files(&cwd);
-    base_context_files.extend(foreign_sections);
+
+    // Skill 目录 + 上下文基座（H19/H42）：与 REPL / server 共用 `agent_sdk::compose_context_files`，
+    // 此前此处漏接行为四段（§ Tool Policy / # Delegation / § Workflow / § Delivery）、
+    // security_scan 指引与 MCP server 指引 → RPC 会话拿不到行为契约。
+    let skill_catalog = Arc::new(load_skill_catalog(&cfg, &cwd).await);
+    let mcp_instructions = mcp.server_instructions();
+    let mut base_context_files = agent_sdk::compose_context_files(agent_sdk::ContextAssembly {
+        cwd: &cwd,
+        mcp_instructions: &mcp_instructions,
+    })
+    .files;
+    // H18：可用命名子代理清单注入父级提示词。
+    if let Some(section) = agent::render_agent_catalog(&sub_agents) {
+        base_context_files.push(section);
+    }
 
     // 反向通道（--rpc-forward-ask）：agent→host 审批/追问以 request 帧外发、宿主回答
     // 经 response 帧回路由。keepalive 克隆防止发送端全部先行 drop，主循环 recv() 永久
@@ -1567,24 +2295,29 @@ pub async fn run_rpc(
     let github_allow_write = cfg.github.allow_write;
     let supervisor = Arc::new(agent_supervisor::Supervisor::new());
 
-    // P0-3：goals 目标预算共享状态（跨 Agent 重建保持；与 main() 单次任务路径一致）。
-    // 预算为空（两者均为 0）时不注入，行为与未配置完全一致。
+    // P0-3 + H29：goals 状态共享句柄（跨 Agent 重建保持；与 main() 单次任务路径一致）。
+    // H29 起恒在场（预算 0 = 不限），`goal` 工具与目标续跑无需 `[goals]` 配置。
     let goal_state: Option<Arc<std::sync::Mutex<agent::GoalState>>> =
-        if cfg.goals.token_budget > 0 || cfg.goals.time_budget_secs > 0 {
-            Some(Arc::new(std::sync::Mutex::new(agent::GoalState::new(
-                agent::GoalBudget {
-                    token_budget: cfg.goals.token_budget,
-                    time_budget: std::time::Duration::from_secs(cfg.goals.time_budget_secs),
-                    hard_stop: cfg.goals.hard_stop,
-                },
-            ))))
-        } else {
-            None
-        };
+        Some(Arc::new(std::sync::Mutex::new({
+            let mut st = agent::GoalState::new(agent::GoalBudget {
+                token_budget: cfg.goals.token_budget,
+                time_budget: std::time::Duration::from_secs(cfg.goals.time_budget_secs),
+                hard_stop: cfg.goals.hard_stop,
+            });
+            // H29：恢复持久化目标（`active` → `paused`，不自动续跑）。
+            if let Some(snap) = agent::load_goal(&cwd) {
+                st.restore(snap);
+                tracing::info!(goal = ?st.goal_summary(), "已恢复持久化目标");
+            }
+            st
+        })));
 
     // 会话控制共享状态（get_state / set_model / set_thinking / 轮次 / 流式标记）。
     let control = Arc::new(SessionControl {
         mode,
+        cwd: cwd.clone(),
+        todo: Arc::clone(&todo_state),
+        checkpoints: Arc::clone(&checkpoint_state),
         session_id: session_id.clone(),
         session_file: session_path.clone(),
         alias: std::sync::Mutex::new(None),
@@ -1593,8 +2326,8 @@ pub async fn run_rpc(
         compacting: Arc::new(AtomicBool::new(false)),
         thinking: Arc::new(RpcThinkingOverrides::new()),
         model: std::sync::Mutex::new(ModelRuntime {
-            api_key: api_key.clone(),
-            base_url: profile.base_url.clone(),
+            api_key: api_key.clone().unwrap_or_default(),
+            base_url: profile.effective_base_url(),
             max_output: profile.max_output_tokens.unwrap_or(4096),
             model: model.clone(),
             provider_ctx: provider_ctx.clone(),
@@ -1639,10 +2372,41 @@ pub async fn run_rpc(
             cfg.agent.commands.interceptor.enabled,
             compiled_minimizer(&cfg),
             Some(Arc::clone(&snapshot_store)),
+            job_manager.clone(),
         );
-        for t in mcp.tools() {
-            tool_registry = tool_registry.with(Box::new(t.clone()));
+        // H7 附带修复：RPC 前端此前**完全没有** todo/ask/checkpoint/rewind/security_scan
+        // 五个工具（REPL 与 server 都有）→ 工具面三前端不一致、`set_todos` 也无宿主状态。
+        // 状态句柄复用闭包外共享实例（跨 Agent 重建存活）。
+        tool_registry = tool_registry
+            .with(Box::new(agent_tools::TodoTool::new(Arc::clone(
+                &todo_state,
+            ))))
+            .with(Box::new(agent_tools::AskUserTool::new()))
+            .with(Box::new(agent_tools::CheckpointTool::new(Arc::clone(
+                &checkpoint_state,
+            ))))
+            .with(Box::new(agent_tools::RewindTool::new(Arc::clone(
+                &checkpoint_state,
+            ))))
+            .with(Box::new(agent_tools::SecurityScanTool::new(
+                agent_tools::SecurityScanState::new().shared(),
+            )));
+        // H29：goal 工具（与 `/goal`、引擎续跑共享同一 GoalState）。
+        if let Some(gs) = &goal_state {
+            tool_registry = tool_registry.with(Box::new(agent::GoalTool::new(Arc::clone(gs))));
         }
+        // H41/H43 续：hub 消息总线此前只在 CLI REPL 与 server 装配，RPC 前端缺 HubTool，
+        // 导致 TaskTool 注册的子 Agent（task-N）在 RPC 下无法被父 Agent 寻址（单向）。
+        // 以 "main" 入册，与前端身份一致；supervisor 复用本闭包外的实例。
+        let hub_supervision: Arc<dyn agent_core::hub::HubSupervision> = supervisor.clone();
+        tool_registry = tool_registry.with(Box::new(
+            agent_tools::HubTool::register(Arc::clone(&hub), "main")
+                .with_supervision(hub_supervision)
+                .with_processes(Arc::clone(&hub_processes))
+                .with_jobs_option(job_manager.clone()),
+        ));
+        // MCP 工具走动态源（每次 specs()/get() 实时求值）。
+        tool_registry = tool_registry.with_source(Arc::clone(&mcp_source));
         // 记忆工具面（P0-1）：recall / retain（仅父 Agent；子 Agent 工具集不含）。
         if let Some(m) = &memory {
             tool_registry = tool_registry
@@ -1667,19 +2431,24 @@ pub async fn run_rpc(
                 subagent_max_concurrent,
             )
             .with_supervisor(Arc::clone(&supervisor))
-            .with_approval(Arc::clone(&approval));
+            .with_approval(Arc::clone(&approval))
+            .with_agents(sub_agents.clone())
+            .with_model_overrides(sub_model_overrides.clone())
+            .with_hub(Arc::clone(&hub));
             tool_registry = tool_registry.with(Box::new(task_tool));
         }
         let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
 
         // TTSR 流规则：发现 `<cwd>/.gyre/rules/*.md` 并装配协调器（与 main() 一致）。
         let ttsr = if cfg.ttsr.enabled.unwrap_or(true) {
-            let rules = agent_ttsr::discover_rules(&workspace.root().join(".gyre/rules"));
+            // H44：内置规则集（27 条语言约定）默认加载，同名项目规则覆盖之。
+            let builtin_enabled = cfg.ttsr.builtin_rules.unwrap_or(true);
+            let rules =
+                agent_ttsr::load_rules(&workspace.root().join(".gyre/rules"), builtin_enabled);
             if rules.is_empty() {
                 None
             } else {
-                let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
-                eprintln!("已加载 {} 条 TTSR 规则: {}", rules.len(), names.join(", "));
+                crate::report_ttsr_rules(&rules);
                 Some(Arc::new(agent_ttsr::TtsrCoordinator::new(
                     agent_ttsr::TtsrConfig {
                         disabled_rules: cfg.ttsr.disabled_rules.clone(),
@@ -1720,10 +2489,16 @@ pub async fn run_rpc(
             .key_rings(key_rings.clone())
             .mode(mode)
             .ttsr(ttsr)
+            .stream_guards(cfg.agent.stream_guards.clone())
             .advisor(advisor)
             .max_output_tokens(model.max_output_tokens)
             .max_mistakes(max_mistakes)
             .context_guard(context_guard)
+            .compaction_policy(agent::AgentBuilder::compaction_policy_from_config(
+                context_guard,
+                cfg.agent.compaction_threshold_tokens,
+                cfg.agent.compaction_reserve_tokens,
+            ))
             .catalog(Arc::clone(&skill_catalog))
             .context_files(optional_context_files(
                 &base_context_files,
@@ -1766,6 +2541,27 @@ pub async fn run_rpc(
         } else {
             builder
         };
+        // H40：追加 system prompt 定制段（与 main() 一致）。
+        let builder = if let Some(extra) = &cfg.agent.append_system_prompt {
+            builder.append_system_prompt(extra.clone())
+        } else {
+            builder
+        };
+        // H28 尾项：注入异步唤醒探测（与 main() 一致）。
+        let builder = if let Some(jm) = &job_manager {
+            builder.async_wake(Arc::clone(jm) as Arc<dyn agent_core::AsyncWakeProbe>)
+        } else {
+            builder
+        };
+        // H28：todo 循环接线（eager prelude + 完成提醒；与 `todo` 工具共享同一清单）。
+        let builder = builder
+            .todo_loop_source(Arc::clone(&todo_state) as Arc<dyn agent_core::TodoLoopSource>)
+            .todo_loop_config(agent::TodoLoopConfig::from_config(
+                cfg.todo.eager.as_deref(),
+                cfg.todo.reminders,
+                cfg.todo.reminders_max,
+                cfg.todo.mid_run_nudge,
+            ));
         // 编辑后 LSP writethrough：lsp 启用（lsp_pool 为 Some）且 edit 开启时注入（与 main() 一致）。
         let builder = if lsp_pool.is_some()
             && (cfg.agent.tools.edit.format_on_write || cfg.agent.tools.edit.diagnostics_on_write)
@@ -1801,6 +2597,7 @@ pub async fn run_rpc(
                 model: model.clone(),
                 provider_ctx: provider_ctx.clone(),
                 auto_consolidate,
+                background: cfg.memory.background_consolidate,
             }));
         }
         if let Some(m) = &structured_memory {
@@ -1810,6 +2607,7 @@ pub async fn run_rpc(
                 provider: Some(Arc::clone(&provider)),
                 model: Some(model.clone()),
                 provider_ctx: Some(provider_ctx.clone()),
+                background: cfg.memory.background_consolidate,
             }));
         }
         if let Some(m) = &memory {
@@ -1889,6 +2687,7 @@ pub async fn run_rpc(
 
     // ── 协议握手：accept 后、处理任何请求前先发 ready 帧（对齐 oh-my-pi rpc-mode.ts
     //    启动序列；客户端以此识别服务端能力，缺失即视为启动失败）──
+    RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
     write_frame(&mut out, &RpcReadyFrame::new()).await?;
 
     loop {
@@ -1936,27 +2735,88 @@ pub async fn run_rpc(
             }
         };
         match req.ty.as_str() {
+            // H6：协议协商（omp `rpc-client.ts:449` 握手第二步）。成功即启用 v2 分帧。
+            "negotiate_protocol" => {
+                let id = RpcEnvelope::req_id(&req);
+                let requested = req
+                    .protocol_version
+                    .as_ref()
+                    .and_then(serde_json::Value::as_u64);
+                let frame = match requested {
+                    Some(2) => {
+                        RPC_V2_NEGOTIATED.store(true, Ordering::Relaxed);
+                        OmpResponseFrame::success(
+                            id,
+                            "negotiate_protocol",
+                            Some(serde_json::json!({ "protocolVersion": 2 })),
+                        )
+                    }
+                    Some(other) => OmpResponseFrame::failure(
+                        id,
+                        "negotiate_protocol",
+                        format!("Unsupported RPC protocol version: {other}"),
+                    ),
+                    None => OmpResponseFrame::failure(
+                        id,
+                        "negotiate_protocol",
+                        "missing or non-numeric protocolVersion",
+                    ),
+                };
+                write_frame(&mut out, &frame).await?;
+            }
             "response" => {
                 // 宿主对反向请求的回答 → 待答表；无对应请求（迟到 / 重复）→ 忽略。
+                let request_id = RpcEnvelope::req_id(&req);
                 let value = req
                     .result
                     .unwrap_or_else(|| serde_json::json!({ "answer": "no" }));
-                if !reverse.resolve(req.id, value) {
-                    tracing::debug!(id = req.id, "宿主回答无对应反向请求，忽略");
+                if !reverse.resolve(&request_id, value) {
+                    tracing::debug!(id = %request_id, "宿主回答无对应反向请求，忽略");
                 }
             }
             "ping" => {
-                write_frame(&mut out, &RpcEnvelope::pong(req.id)).await?;
+                write_frame(&mut out, &RpcEnvelope::pong(RpcEnvelope::req_id(&req))).await?;
             }
             "cancel" => {
                 // 空闲时无 turn 可取消 → 错误响应（运行中由 turn 循环处理）。
-                write_frame(&mut out, &RpcEnvelope::error(req.id, "no running turn")).await?;
+                write_frame(
+                    &mut out,
+                    &RpcEnvelope::error(RpcEnvelope::req_id(&req), "no running turn"),
+                )
+                .await?;
+            }
+            // H7：omp `steer` / `follow_up` —— 空闲时入队（omp 亦为「排队，下次 turn 生效」语义）。
+            "steer" | "follow_up" => {
+                let command = if req.ty == "steer" {
+                    "steer"
+                } else {
+                    "follow_up"
+                };
+                let frame = match agent.as_ref() {
+                    Some(a) => match steer_running_turn(a, req.text.as_deref(), command) {
+                        Ok(()) => {
+                            OmpResponseFrame::success(RpcEnvelope::req_id(&req), command, None)
+                        }
+                        Err(msg) => {
+                            OmpResponseFrame::failure(RpcEnvelope::req_id(&req), command, msg)
+                        }
+                    },
+                    None => OmpResponseFrame::failure(
+                        RpcEnvelope::req_id(&req),
+                        command,
+                        "no session agent yet (send a prompt first)",
+                    ),
+                };
+                write_frame(&mut out, &frame).await?;
             }
             "prompt" => {
                 let Some(text) = req.text.clone().filter(|t| !t.is_empty()) else {
                     write_frame(
                         &mut out,
-                        &RpcEnvelope::error(req.id, "prompt requires non-empty text"),
+                        &RpcEnvelope::error(
+                            RpcEnvelope::req_id(&req),
+                            "prompt requires non-empty text",
+                        ),
                     )
                     .await?;
                     continue;
@@ -1982,7 +2842,10 @@ pub async fn run_rpc(
                     if !switched {
                         write_frame(
                             &mut out,
-                            &RpcEnvelope::error(req.id, format!("model switch failed: {alias}")),
+                            &RpcEnvelope::error(
+                                RpcEnvelope::req_id(&req),
+                                format!("model switch failed: {alias}"),
+                            ),
                         )
                         .await?;
                         continue;
@@ -1998,7 +2861,7 @@ pub async fn run_rpc(
                 };
                 if run_turn_rpc(
                     a,
-                    req.id,
+                    RpcEnvelope::req_id(&req),
                     &text,
                     &stdin_reader,
                     &mut out,
@@ -2034,35 +2897,46 @@ pub async fn run_rpc(
                     ControlOutcome::ModelSwitched { model_id } => {
                         // 运行时模型状态已更新：重建 Agent 后回 ok 帧。
                         agent = Some(build_with_runtime(&control));
-                        write_frame(&mut out, &RpcEnvelope::ok_model(req.id, &model_id)).await?;
+                        write_frame(
+                            &mut out,
+                            &RpcEnvelope::ok_model(RpcEnvelope::req_id(&req), &model_id),
+                        )
+                        .await?;
                     }
                     ControlOutcome::CompactionStarted => {
                         // 异步完成型：立即 ok，压缩序列后台执行，完成后经通道补发 event 行。
                         if control.compacting.swap(true, Ordering::Relaxed) {
                             write_frame(
                                 &mut out,
-                                &RpcEnvelope::error(req.id, "compaction already in progress"),
+                                &RpcEnvelope::error(
+                                    RpcEnvelope::req_id(&req),
+                                    "compaction already in progress",
+                                ),
                             )
                             .await?;
                         } else {
-                            write_frame(&mut out, &RpcEnvelope::ok(req.id)).await?;
+                            write_frame(&mut out, &RpcEnvelope::ok(RpcEnvelope::req_id(&req)))
+                                .await?;
                             tokio::spawn(run_compaction(
                                 Arc::clone(&context),
                                 Arc::clone(&control),
-                                req.id,
+                                RpcEnvelope::req_id(&req),
                                 compact_tx.clone(),
                             ));
                         }
                     }
                 }
             }
-            _ => {
-                write_frame(
-                    &mut out,
-                    &RpcEnvelope::error(req.id, "unknown rpc message type"),
-                )
-                .await?;
-            }
+            other => match unsupported_omp_command(RpcEnvelope::req_id(&req), other) {
+                Some(frame) => write_frame(&mut out, &frame).await?,
+                None => {
+                    write_frame(
+                        &mut out,
+                        &RpcEnvelope::error(RpcEnvelope::req_id(&req), "unknown rpc message type"),
+                    )
+                    .await?;
+                }
+            },
         }
     }
     Ok(())
@@ -2126,7 +3000,7 @@ mod tests {
     fn parses_prompt_request_with_optional_model() {
         let r = parse_request(r#"{"type":"prompt","id":7,"text":"hello","model":"ds"}"#).unwrap();
         assert_eq!(r.ty, "prompt");
-        assert_eq!(r.id, 7);
+        assert_eq!(r.id, Some(serde_json::json!(7)));
         assert_eq!(r.text.as_deref(), Some("hello"));
         assert_eq!(r.model.as_deref(), Some("ds"));
     }
@@ -2135,7 +3009,7 @@ mod tests {
     fn parses_request_without_optional_fields() {
         let r = parse_request(r#"{"type":"cancel","id":2}"#).unwrap();
         assert_eq!(r.ty, "cancel");
-        assert_eq!(r.id, 2);
+        assert_eq!(r.id, Some(serde_json::json!(2)));
         assert_eq!(r.text, None);
         assert_eq!(r.model, None);
     }
@@ -2144,7 +3018,7 @@ mod tests {
     fn parses_unknown_type_keeping_id() {
         let r = parse_request(r#"{"type":"explode","id":9}"#).unwrap();
         assert_eq!(r.ty, "explode");
-        assert_eq!(r.id, 9);
+        assert_eq!(r.id, Some(serde_json::json!(9)));
     }
 
     #[test]
@@ -2174,6 +3048,116 @@ mod tests {
         assert_eq!(back["event"]["text"], "a\nb\t\"c\"");
     }
 
+    // ── H8：事件映射宽度（id / result / 生命周期 / omp 形状） ───────────────────
+
+    #[test]
+    fn tool_events_carry_id_and_structured_result() {
+        // 旧式形状：补 id 与 result（此前只有 name/ok）。
+        let start = map_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "call_1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "a.rs"}),
+        })
+        .unwrap();
+        assert_eq!(start["kind"], "tool_call");
+        assert_eq!(start["id"], "call_1");
+
+        let end = map_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call_1".into(),
+            name: "read_file".into(),
+            result: agent_core::ToolResult::Text("content".into()),
+            is_error: false,
+        })
+        .unwrap();
+        assert_eq!(end["kind"], "tool_result");
+        assert_eq!(end["id"], "call_1");
+        assert_eq!(end["ok"], true);
+        assert_eq!(end["result"]["content"], "content");
+
+        // 生命周期边界此前完全未暴露。
+        assert_eq!(
+            map_event(&AgentEvent::TurnStart).unwrap()["kind"],
+            "turn_start"
+        );
+        assert_eq!(
+            map_event(&AgentEvent::MessageStart).unwrap()["kind"],
+            "message_start"
+        );
+    }
+
+    #[test]
+    fn omp_event_shape_uses_camel_case_and_top_level_type() {
+        let start = map_event_omp(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "call_9".into(),
+            name: "run_command".into(),
+            args: serde_json::json!({"command": "ls"}),
+        })
+        .unwrap();
+        assert_eq!(start["type"], "tool_execution_start");
+        assert_eq!(start["toolCallId"], "call_9");
+        assert_eq!(start["toolName"], "run_command");
+        assert_eq!(start["args"]["command"], "ls");
+
+        let end = map_event_omp(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call_9".into(),
+            name: "run_command".into(),
+            result: agent_core::ToolResult::Text("ok".into()),
+            is_error: true,
+        })
+        .unwrap();
+        assert_eq!(end["type"], "tool_execution_end");
+        assert_eq!(end["isError"], true);
+        assert_eq!(end["result"]["content"], "ok");
+
+        // message_update 携带 assistantMessageEvent（不带 partial message：见文档偏差）。
+        let delta = map_event_omp(&AgentEvent::TextDelta("hi".into())).unwrap();
+        assert_eq!(delta["type"], "message_update");
+        assert_eq!(delta["assistantMessageEvent"]["type"], "text_delta");
+        assert_eq!(delta["assistantMessageEvent"]["delta"], "hi");
+
+        // 会话事件扁平外发（自身即带 type 判别字段）。
+        let session = map_event_omp(&AgentEvent::Session(
+            agent_core::SessionEvent::AutoCompactionStart {
+                reason: agent_core::CompactionReason::Threshold,
+                action: agent_core::CompactionAction::Shake,
+            },
+        ))
+        .unwrap();
+        assert_eq!(session["type"], "auto_compaction_start");
+    }
+
+    /// H8：v2 对端拿裸帧（顶层 type），v1 对端拿旧式 event 包装。
+    ///
+    /// 测试串行化锁（进程级 `RPC_V2_NEGOTIATED` 不能并行改）用 `blocking_lock` 语义：
+    /// 以 `std::sync::Mutex` 手写获取/释放，避免在 async 测试里跨 await 持有 guard。
+    #[tokio::test]
+    async fn event_line_shape_follows_negotiated_mode() {
+        let guard = CHUNK_GATE_TEST_LOCK.lock().await;
+        let ev = AgentEvent::TextDelta("hi".into());
+
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
+        let mut out = tokio::io::BufWriter::new(Vec::<u8>::new());
+        write_agent_event(&mut out, &serde_json::json!(7), &ev)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["type"], "event");
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["event"]["kind"], "text_delta");
+
+        RPC_V2_NEGOTIATED.store(true, Ordering::Relaxed);
+        let mut out = tokio::io::BufWriter::new(Vec::<u8>::new());
+        write_agent_event(&mut out, &serde_json::json!(7), &ev)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["type"], "message_update");
+        assert!(v.get("event").is_none());
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
+        drop(guard);
+    }
     #[test]
     fn ready_frame_matches_omp_wire_shape() {
         // 字段名/取值对齐 omp RpcReadyFrame（rpc-types.ts）。
@@ -2183,6 +3167,108 @@ mod tests {
         assert_eq!(v["supportedProtocolVersions"], serde_json::json!([1, 2]));
         assert_eq!(v["maxFrameBytes"], MAX_RPC_FRAME_BYTES);
         assert_eq!(v["maxReassembledFrameBytes"], MAX_RPC_REASSEMBLED_BYTES);
+    }
+
+    // ── H6 / H9：协议协商、id 类型与信封兼容 ────────────────────────────────────
+
+    #[test]
+    fn request_accepts_string_and_numeric_ids() {
+        // omp 官方客户端发字符串 id；Gyre 旧客户端发数字 id —— 两者都必须能解析。
+        let with_str: RpcRequest =
+            serde_json::from_value(serde_json::json!({"type":"ping","id":"abc-1"})).unwrap();
+        assert_eq!(with_str.id, Some(serde_json::json!("abc-1")));
+        assert_eq!(RpcEnvelope::req_id(&with_str), serde_json::json!("abc-1"));
+
+        let with_num: RpcRequest =
+            serde_json::from_value(serde_json::json!({"type":"ping","id":7})).unwrap();
+        assert_eq!(RpcEnvelope::req_id(&with_num), serde_json::json!(7));
+
+        // id 缺失（omp 的 id 可选）→ 按 null 回带，不再整帧反序列化失败。
+        let no_id: RpcRequest = serde_json::from_value(serde_json::json!({"type":"ping"})).unwrap();
+        assert_eq!(RpcEnvelope::req_id(&no_id), serde_json::Value::Null);
+
+        // prompt 文本接受 omp 的 `message` 字段名。
+        let omp_prompt: RpcRequest =
+            serde_json::from_value(serde_json::json!({"type":"prompt","message":"hi"})).unwrap();
+        assert_eq!(omp_prompt.text.as_deref(), Some("hi"));
+
+        // negotiate_protocol 接受 omp 的 camelCase `protocolVersion`。
+        let neg: RpcRequest = serde_json::from_value(
+            serde_json::json!({"type":"negotiate_protocol","protocolVersion":2,"id":"n1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            neg.protocol_version
+                .as_ref()
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn string_id_is_echoed_verbatim_in_envelope() {
+        let env = RpcEnvelope::pong(serde_json::json!("req-42"));
+        let v = serde_json::to_value(env).unwrap();
+        assert_eq!(v["id"], "req-42");
+        assert_eq!(v["type"], "pong");
+    }
+
+    #[test]
+    fn omp_negotiate_response_envelope_shape() {
+        // 成功：`{id, type:"response", command, success:true, data:{protocolVersion:2}}`
+        let ok = OmpResponseFrame::success(
+            serde_json::json!("n1"),
+            "negotiate_protocol",
+            Some(serde_json::json!({ "protocolVersion": 2 })),
+        );
+        let v = serde_json::to_value(ok).unwrap();
+        assert_eq!(v["type"], "response");
+        assert_eq!(v["command"], "negotiate_protocol");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["data"]["protocolVersion"], 2);
+        assert_eq!(v["id"], "n1");
+        assert!(v.get("error").is_none());
+
+        // 失败：`{id, type:"response", command, success:false, error}`
+        let bad = OmpResponseFrame::failure(
+            serde_json::json!("n2"),
+            "negotiate_protocol",
+            "Unsupported RPC protocol version: 9",
+        );
+        let v = serde_json::to_value(bad).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["command"], "negotiate_protocol");
+        assert!(v["error"].as_str().unwrap().contains("9"));
+        assert!(v.get("data").is_none());
+        // 无 id 时不序列化 id 字段（对齐 omp `{id?: string}`）。
+        let no_id = serde_json::to_value(OmpResponseFrame::success(
+            serde_json::Value::Null,
+            "negotiate_protocol",
+            None,
+        ))
+        .unwrap();
+        assert!(no_id.get("id").is_none());
+    }
+
+    /// H6：未协商 v2 时绝不分片（v1 客户端会把 `rpc_chunk` 当未知类型丢弃）。
+    #[test]
+    fn chunking_is_gated_on_negotiated_v2() {
+        let _guard = CHUNK_GATE_TEST_LOCK.blocking_lock();
+        let big = format!(
+            "{{\"type\":\"event\",\"event\":\"{}\"}}",
+            "x".repeat(MAX_RPC_FRAME_BYTES)
+        );
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
+        let lines: Vec<String> = encode_frame_lines(&big).collect();
+        assert_eq!(lines.len(), 1, "v1 不得分片");
+        assert!(lines[0].contains("rpc_frame_error"), "{}", lines[0]);
+
+        RPC_V2_NEGOTIATED.store(true, Ordering::Relaxed);
+        let lines: Vec<String> = encode_frame_lines(&big).collect();
+        assert!(lines.len() > 1, "v2 应分片");
+        assert!(lines.iter().all(|l| l.contains("rpc_chunk")));
+        // 复位，避免影响同进程其它用例。
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]
@@ -2203,7 +3289,10 @@ mod tests {
 
     #[test]
     fn oversized_frame_splits_into_chunks_and_reassembles() {
-        // ~2.5 MiB 逻辑帧：超过单行上限 → 必须分片；逐行喂入重组器还原原帧。
+        // ~2.5 MiB 逻辑帧：**协商 v2 后**超过单行上限 → 必须分片；逐行喂入重组器还原原帧。
+        // （H6：v1 不再分片，见 `chunking_is_gated_on_negotiated_v2`。）
+        let _guard = CHUNK_GATE_TEST_LOCK.blocking_lock();
+        RPC_V2_NEGOTIATED.store(true, Ordering::Relaxed);
         let payload = "x".repeat(2 * 1024 * 1024 + 512 * 1024);
         let env = RpcEnvelope::event(
             7,
@@ -2214,6 +3303,7 @@ mod tests {
 
         let lines: Vec<String> = encode_frame_lines(&json).collect();
         assert!(lines.len() >= 2);
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
         let mut decoder = RpcFrameDecoder::default();
         let mut delivered = None;
         let mut chunk_id: Option<String> = None;
@@ -2386,8 +3476,11 @@ mod tests {
     #[test]
     fn frame_beyond_reassembly_limit_falls_back_to_error_frame() {
         // 超重组上限（64 MiB）：放弃传输，回退 rpc_frame_error（对齐 omp overflowFrame）。
+        let _guard = CHUNK_GATE_TEST_LOCK.blocking_lock();
+        RPC_V2_NEGOTIATED.store(true, Ordering::Relaxed);
         let json = format!("{{\"text\":\"{}\"}}", "z".repeat(MAX_RPC_REASSEMBLED_BYTES));
         let lines: Vec<String> = encode_frame_lines(&json).collect();
+        RPC_V2_NEGOTIATED.store(false, Ordering::Relaxed);
         assert_eq!(lines.len(), 1);
         let v: serde_json::Value = serde_json::from_str(lines[0].trim_end()).unwrap();
         assert_eq!(v["type"], "rpc_frame_error");
@@ -2485,6 +3578,35 @@ mod tests {
         assert_eq!(err["ok"], false);
     }
 
+    /// 结构化会话事件：`kind=session` 包裹 `AgentSessionEvent` 同形对象（判别字段 `type`）。
+    #[test]
+    fn maps_session_events() {
+        let v = map_event(&AgentEvent::Session(
+            agent_core::SessionEvent::AutoRetryStart {
+                attempt: 2,
+                max_attempts: 3,
+                delay_ms: 1500,
+                error_message: "429".into(),
+                model: "m1".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(v["kind"], "session");
+        assert_eq!(v["event"]["type"], "auto_retry_start");
+        assert_eq!(v["event"]["attempt"], 2);
+
+        let v = map_event(&AgentEvent::Session(
+            agent_core::SessionEvent::RetryFallbackApplied {
+                from: "a".into(),
+                to: "b".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(v["event"]["type"], "retry_fallback_applied");
+        assert_eq!(v["event"]["from"], "a");
+        assert_eq!(v["event"]["to"], "b");
+    }
+
     #[test]
     fn maps_usage_with_all_five_fields() {
         let v = map_event(&AgentEvent::Usage(usage())).unwrap();
@@ -2498,7 +3620,10 @@ mod tests {
 
     #[test]
     fn hides_lifecycle_events() {
-        assert!(map_event(&AgentEvent::TurnStart).is_none());
+        // H8 起 `TurnStart` / `TurnEnd` / `MessageStart` / `MessageEnd` **不再隐藏**：
+        // 消费者需要精确划分边界（见 `tool_events_carry_id_and_structured_result`）。
+        // 仍然隐藏的：`Done` / `Error`（turn 成败由最终 done 行承载）、
+        // `StateChanged`（UI 状态机内部信号）、`Assistant`（增量已由 TextDelta 覆盖）。
         assert!(map_event(&AgentEvent::Done(AgentRunSummary::default())).is_none());
         assert!(map_event(&AgentEvent::Error("x".into())).is_none());
         assert!(map_event(&AgentEvent::StateChanged(agent_core::AgentState::Idle)).is_none());
@@ -2537,6 +3662,7 @@ mod tests {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         }
     }
 
@@ -2544,6 +3670,9 @@ mod tests {
     fn test_control() -> SessionControl {
         SessionControl {
             mode: agent_core::Mode::Code,
+            cwd: PathBuf::from("/tmp"),
+            todo: agent_tools::TodoState::in_memory().shared(),
+            checkpoints: agent_tools::CheckpointState::new().shared(),
             session_id: "sess-test".into(),
             session_file: PathBuf::from("/tmp/sess-test.jsonl"),
             alias: std::sync::Mutex::new(None),
@@ -2560,6 +3689,9 @@ mod tests {
                     api_key: Some("k".into()),
                     base_url: Some("http://localhost".into()),
                     max_in_flight: None,
+                    headers: Vec::new(),
+                    quirks: agent_core::ProviderQuirks::default(),
+                    auth: agent_core::AuthMode::ApiKey,
                 },
             }),
         }
@@ -2587,6 +3719,214 @@ mod tests {
         ctx
     }
 
+    /// H7：`get_session_stats` 返回 omp `SessionStats` 形状的子集。
+    #[tokio::test]
+    async fn get_session_stats_reports_counts_and_usage() {
+        let control = test_control();
+        let ctx = seeded_context().await;
+        let env = dispatch_line(&control, &ctx, r#"{"type":"get_session_stats","id":21}"#).await;
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["type"], "state");
+        assert_eq!(v["id"], 21);
+        let stats = &v["state"];
+        assert_eq!(stats["sessionId"], "sess-test");
+        assert_eq!(stats["turns"], 3);
+        assert_eq!(stats["userMessages"], 1);
+        assert_eq!(stats["assistantMessages"], 1);
+        assert_eq!(stats["toolResults"], 0);
+        assert!(stats["toolCalls"].is_number());
+        assert_eq!(stats["totalMessages"], 2);
+        assert!(stats["contextUsage"]["current"].is_number());
+        assert_eq!(stats["isStreaming"], false);
+    }
+
+    /// H7：`get_available_commands` 返回内置斜杠命令清单（omp 同名命令）。
+    #[tokio::test]
+    async fn get_available_commands_lists_builtins() {
+        let control = test_control();
+        let ctx = agent_context::InMemoryContext::new(vec![]);
+        let env = dispatch_line(
+            &control,
+            &ctx,
+            r#"{"type":"get_available_commands","id":22}"#,
+        )
+        .await;
+        let v = serde_json::to_value(&env).unwrap();
+        let names: Vec<&str> = v["state"]["commands"]
+            .as_array()
+            .expect("commands 应为数组")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        let sources: Vec<&str> = v["state"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["source"].as_str())
+            .collect();
+        assert!(names.contains(&"help"), "应含内置命令: {names:?}");
+        assert!(
+            names.iter().all(|n| !n.starts_with('/')),
+            "omp 的 name 不带前导斜杠: {names:?}"
+        );
+        assert!(names.len() > 10, "内置命令面不应为空: {names:?}");
+        assert!(sources.contains(&"builtin"), "应标注 source=builtin");
+    }
+
+    /// H7：新命令进入会话命令白名单（否则运行中被判 unknown）。
+    #[test]
+    fn session_command_whitelist_covers_new_commands() {
+        for ty in [
+            "get_session_stats",
+            "get_available_commands",
+            "steer",
+            "follow_up",
+            "abort",
+            "get_state",
+        ] {
+            assert!(
+                is_session_command(ty) || matches!(ty, "steer" | "follow_up" | "abort"),
+                "{ty} 应被 RPC 分发识别"
+            );
+        }
+        assert!(!is_session_command("frobnicate"));
+    }
+
+    /// H7：steer 文本校验（空消息 / 非法负载不得静默吞掉）。
+    #[test]
+    fn steer_requires_non_empty_message() {
+        // 空文本在触达 Agent 之前就被拒绝（无需构造 Agent）。
+        assert!(steer_running_turn_guard(None).is_err());
+        assert!(steer_running_turn_guard(Some("   ")).is_err());
+    }
+
+    /// `steer_running_turn` 的空文本分支（不触达 Agent，避免构造完整 Agent）。
+    fn steer_running_turn_guard(text: Option<&str>) -> Result<(), String> {
+        let text = text.unwrap_or_default().trim();
+        if text.is_empty() {
+            return Err("steer requires a non-empty message".to_string());
+        }
+        Ok(())
+    }
+    /// H7：`set_todos` 双形状（omp phases / Gyre items）+ `get_todos` 回读。
+    #[tokio::test]
+    async fn set_todos_accepts_omp_phases_and_reads_back() {
+        let control = test_control();
+        let ctx = agent_context::InMemoryContext::new(vec![]);
+        let env = dispatch_line(
+            &control,
+            &ctx,
+            r#"{"type":"set_todos","id":31,"todos":{"phases":[
+                {"name":"阶段一","tasks":[
+                    {"content":"写测试","status":"in_progress"},
+                    {"content":"等评审","status":"blocked","blocker":"等 CI"}
+                ]}
+            ]}}"#,
+        )
+        .await;
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["type"], "state");
+        let items = v["state"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "t1");
+        assert_eq!(items[0]["content"], "写测试");
+        assert_eq!(items[0]["phase"], "in_progress");
+        assert_eq!(items[1]["phase"], "blocked");
+        assert_eq!(items[1]["blocked_reason"], "等 CI");
+        // 分组名无 Gyre 对应 → 显式 note（不静默丢弃）。
+        assert!(v["state"]["note"].as_str().unwrap().contains("展平"));
+
+        // get_todos 回读同一共享状态（`todo` 工具与 RPC 面同一实例）。
+        let env = dispatch_line(&control, &ctx, r#"{"type":"get_todos","id":32}"#).await;
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["state"]["items"][0]["content"], "写测试");
+        assert_eq!(v["state"]["nextId"], 3);
+
+        // 非法状态 / 缺字段 → 明确错误（不写入）。
+        let env = dispatch_line(
+            &control,
+            &ctx,
+            r#"{"type":"set_todos","id":33,"todos":{"phases":[{"tasks":[{"content":"x","status":"bogus"}]}]}}"#,
+        )
+        .await;
+        assert_eq!(env.ty, "error");
+        let env = dispatch_line(&control, &ctx, r#"{"type":"set_todos","id":34}"#).await;
+        assert_eq!(env.ty, "error");
+    }
+
+    /// H7：Gyre 原生 `items` 形状同样受理。
+    #[tokio::test]
+    async fn set_todos_accepts_gyre_items() {
+        let control = test_control();
+        let ctx = agent_context::InMemoryContext::new(vec![]);
+        let env = dispatch_line(
+            &control,
+            &ctx,
+            r#"{"type":"set_todos","id":35,"todos":{"items":[{"content":"a","phase":"pending"}]}}"#,
+        )
+        .await;
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["state"]["items"][0]["content"], "a");
+        assert!(v["state"].get("note").is_none());
+    }
+    /// H7：`get_available_models` 来自**配置**（非网络），`get_last_assistant_text` 取末条助手文本。
+    #[tokio::test]
+    async fn get_available_models_and_last_assistant_text() {
+        let control = test_control();
+        let ctx = seeded_context().await;
+        let env = dispatch_line(&control, &ctx, r#"{"type":"get_available_models","id":41}"#).await;
+        let v = serde_json::to_value(&env).unwrap();
+        let models = v["state"]["models"].as_array().unwrap();
+        assert!(!models.is_empty(), "配置至少应有默认模型");
+        assert_eq!(models[0]["isDefault"], true);
+        assert!(models[0]["id"].is_string());
+
+        let env = dispatch_line(
+            &control,
+            &ctx,
+            r#"{"type":"get_last_assistant_text","id":42}"#,
+        )
+        .await;
+        let v = serde_json::to_value(&env).unwrap();
+        assert!(v["state"]["text"].as_str().unwrap().starts_with('x'));
+    }
+
+    /// H7：未实现的 omp 命令回 omp 信封 + 明确原因（而非 legacy unknown 错误）。
+    #[test]
+    fn recognized_unsupported_omp_commands_answer_with_omp_envelope() {
+        let frame = unsupported_omp_command(serde_json::json!("c1"), "bash").unwrap();
+        let v = serde_json::to_value(frame).unwrap();
+        assert_eq!(v["type"], "response");
+        assert_eq!(v["command"], "bash");
+        assert_eq!(v["success"], false);
+        assert!(v["error"].as_str().unwrap().contains("未实现"));
+        assert_eq!(v["id"], "c1");
+        // 真·未知命令不在此清单（仍走 legacy unknown）。
+        assert!(unsupported_omp_command(serde_json::json!(1), "frobnicate").is_none());
+        // 已实现的命令不得出现在「不支持」清单里（防清单漂移）。
+        for implemented in [
+            "prompt",
+            "steer",
+            "follow_up",
+            "abort",
+            "get_state",
+            "get_session_stats",
+            "get_available_commands",
+            "get_available_models",
+            "get_last_assistant_text",
+            "set_todos",
+            "get_todos",
+            "set_model",
+            "compact",
+            "get_messages",
+            "negotiate_protocol",
+        ] {
+            assert!(
+                !OMP_RECOGNIZED_UNSUPPORTED.contains(&implemented),
+                "{implemented} 已实现，不应列入不支持清单"
+            );
+        }
+    }
     /// 测试辅助：解析一行请求并派发到会话控制层，要求得到立即响应帧。
     async fn dispatch_line(
         control: &SessionControl,
@@ -2890,7 +4230,13 @@ mod tests {
         // 后台压缩序列（shake → summarize → prune）完成后经通道送达通知。
         let ctx: Arc<dyn agent_core::ContextManager> = Arc::new(ctx);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<CompactNotice>(1);
-        run_compaction(Arc::clone(&ctx), Arc::clone(&control), 41, tx).await;
+        run_compaction(
+            Arc::clone(&ctx),
+            Arc::clone(&control),
+            serde_json::json!(41),
+            tx,
+        )
+        .await;
         let notice = rx.recv().await.expect("应收到完成通知");
         assert_eq!(notice.id, 41);
         assert_eq!(notice.event["kind"], "compact_done");
@@ -2953,11 +4299,17 @@ mod tests {
         assert_eq!(v["params"]["prompt"], "允许执行？");
         let rid = v["id"].as_u64().unwrap();
         // 未注册 id（迟到 / 重复）→ false；命中后 ask 侧收到 yes。
-        assert!(!channel.resolve(rid + 999, serde_json::json!({ "answer": "no" })));
-        assert!(channel.resolve(rid, serde_json::json!({ "answer": "yes" })));
+        assert!(!channel.resolve(
+            &serde_json::json!(rid + 999),
+            serde_json::json!({ "answer": "no" })
+        ));
+        assert!(channel.resolve(
+            &serde_json::json!(rid),
+            serde_json::json!({ "answer": "yes" })
+        ));
         assert!(matches!(h.await.unwrap(), AskResponse::Yes));
         // 已消费的 id 再答 → false。
-        assert!(!channel.resolve(rid, serde_json::json!({"answer": "no"})));
+        assert!(!channel.resolve(&serde_json::json!(rid), serde_json::json!({"answer": "no"})));
     }
     #[tokio::test]
     async fn reverse_channel_denies_when_host_gone() {

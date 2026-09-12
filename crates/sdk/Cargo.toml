@@ -1,0 +1,25 @@
+[package]
+name        = "agent-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Gyre 装配 SDK：behavior 四段 + 项目上下文 + 外来配置 + 可选工具提示 + MCP 指引的单一声明源（对齐 oh-my-pi sdk.ts 的装配收敛）"
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-core.workspace = true
+agent-config.workspace = true
+agent-discovery.workspace = true
+agent-tools.workspace = true
+agent-hashline.workspace = true
+agent-dap.workspace = true
+agent-pty.workspace = true
+agent-browser.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+toml.workspace = true

@@ -1571,6 +1571,7 @@ mod tests {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         };
         LlmSummaryProvider::new(
             Arc::new(FakeStreamProvider {
@@ -1682,6 +1683,7 @@ mod tests {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         };
         let seen = Arc::new(parking_lot::Mutex::new(None));
         let provider = LlmSummaryProvider::new(
@@ -1726,6 +1728,7 @@ mod tests {
             supports_streaming: true,
             supports_thinking: false,
             extra_body: None,
+            tokenizer: None,
         };
         let seen = Arc::new(parking_lot::Mutex::new(None));
         let provider = LlmSummaryProvider::new(

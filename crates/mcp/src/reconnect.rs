@@ -24,12 +24,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use agent_config::McpServerConfig;
+use agent_config::{McpHttpTransport, McpServerConfig};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::client::{McpClient, McpError, McpTransport};
 use crate::http::HttpTransport;
+use crate::sse::SseTransport;
 use crate::stdio::StdioTransport;
 
 /// 重连退避间隔（omp manager.ts:887 `delays`）：首试 + 4 次重试，共 5 次尝试。
@@ -40,15 +41,19 @@ pub(crate) const RECONNECT_BURST_WINDOW_MS: u64 = 30_000;
 /// 判定对齐 omp `recent.length > limit`：窗口内第 6 个周期触发）。
 pub(crate) const RECONNECT_BURST_LIMIT: usize = 5;
 
-/// 每 server 连接状态（供 `/mcp status` 类自省；本版本仅 API 暴露，不接 CLI）。
+/// 每 server 连接状态（供 `/mcp status` 类自省）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpConnState {
+    /// 初次握手进行中（启动预算内未完成，后台继续连接）。
+    Connecting,
     /// 连接健康。
     Connected,
     /// 重连进行中，或重试耗尽后等待下次触发（连接不可用）。
     Reconnecting,
     /// 熔断开启：冷却期内不再尝试，冷却后单次半开探活。
     Open,
+    /// 初次连接失败且无重连通道（启动期快速失败：命令/端点/凭据等配置侧问题）。
+    Failed,
 }
 
 /// server 连接状态快照 + 最近一次错误。
@@ -103,9 +108,14 @@ impl Default for ReconnectOptions {
                         McpServerConfig::Stdio(c) => StdioTransport::spawn(c)
                             .await
                             .map(|t| Box::new(t) as Box<dyn McpTransport>),
-                        McpServerConfig::Http(c) => HttpTransport::connect(c)
-                            .await
-                            .map(|t| Box::new(t) as Box<dyn McpTransport>),
+                        McpServerConfig::Http(c) => match c.transport {
+                            McpHttpTransport::Streamable => HttpTransport::connect(c)
+                                .await
+                                .map(|t| Box::new(t) as Box<dyn McpTransport>),
+                            McpHttpTransport::Sse => SseTransport::connect(c)
+                                .await
+                                .map(|t| Box::new(t) as Box<dyn McpTransport>),
+                        },
                     }
                 })
             }),

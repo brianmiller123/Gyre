@@ -11,6 +11,7 @@ name = "agent"
 path = "src/main.rs"
 
 [dependencies]
+agent-sdk    = { workspace = true }
 agent-core   = { workspace = true }
 agent        = { workspace = true }
 agent-supervisor = { workspace = true }
@@ -21,7 +22,6 @@ agent-context = { workspace = true }
 agent-tools  = { workspace = true }
 agent-ttsr   = { workspace = true }
 agent-advisor = { workspace = true }
-agent-discovery = { workspace = true }
 agent-prompt = { workspace = true }
 agent-skills = { workspace = true }
 agent-mcp    = { workspace = true }
@@ -55,10 +55,10 @@ rustyline    = { workspace = true }
 arboard      = { workspace = true }
 image        = { workspace = true }
 base64       = { workspace = true }
+toml         = { workspace = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }
-toml        = { workspace = true }
 
 [lints]
 workspace = true

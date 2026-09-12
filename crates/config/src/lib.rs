@@ -8,11 +8,18 @@
 #![deny(unsafe_code)]
 
 mod approval;
+pub mod at_imports;
 mod auth;
 mod config;
+pub mod context_files;
+pub mod dotenv;
 mod env;
+mod frontmatter;
+mod mcp_json;
+pub mod model_catalog;
 mod oauth_store;
 mod rules;
+pub mod schema;
 
 pub use approval::ApprovalModeController;
 
@@ -23,17 +30,32 @@ pub use oauth_store::{
     save as save_oauth,
 };
 
+pub use at_imports::{MAX_AT_IMPORT_DEPTH, expand_at_imports};
 pub use config::{
-    AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, Config,
+    AcpConfig, AgentConfig, CommandPattern, CommandRules, CompactionConfig, CompatConfig, Config,
     EditToolsConfig, EvalConfig, GithubConfig, GoalsConfig, HookEventKind, HookRule,
-    InterceptorConfig, McpConfig, McpHttpConfig, McpOAuthConfig, McpServerConfig, McpStdioConfig,
-    MemoryBackend, MemoryConfig, MinimizerConfig, ModelProfile, RolesCfg, ServerConfig,
-    SkillsConfig, Socks5Config, SubagentConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig,
-    TtsrConfig, parse_compaction_backend, wildcard_match,
+    InterceptorConfig, KeybindingsConfig, McpConfig, McpHttpConfig, McpHttpTransport,
+    McpOAuthConfig, McpServerConfig, McpStdioConfig, MemoryBackend, MemoryConfig, MinimizerConfig,
+    ModelProfile, RolesCfg, ServerConfig, SkillsConfig, Socks5Config, StreamGuardsConfig,
+    SubagentConfig, TodoConfig, ToolApproval, ToolsConfig, ToolsSwitchConfig, TtsrConfig,
+    parse_compaction_backend, wildcard_match,
 };
-pub use config::{CustomCommand, discover_commands, discover_context_files};
-pub use env::expand_env;
+pub use config::{
+    CustomCommand, discover_commands, discover_context_files, discover_system_prompt,
+};
+pub use context_files::{ContextFile, collect_context_files, dedupe_contained, system_prompt_file};
+pub use dotenv::{DotEnv, load_dotenv};
+pub use env::{expand_env, expand_env_with};
+pub use frontmatter::{FrontmatterFields, FrontmatterValue, parse_frontmatter};
+pub use mcp_json::{
+    McpJsonLevel, McpJsonLoad, McpJsonSource, load_mcp_json_sources, mcp_json_sources,
+    merge_mcp_json_sources, remove_mcp_server, set_mcp_server_disabled, write_mcp_server,
+};
+pub use model_catalog::{CATALOG, CatalogEntry};
 pub use rules::{RulesApprovalPolicy, RulesEngine};
+pub use schema::{
+    ConfigWarning, KeyInfo, children_of, key_info, key_table, known_keys, unknown_keys,
+};
 
 /// 审批交互回调类型：前端（CLI/Web）注入，决定 `prompt()` 如何等待人工决议。
 pub type PromptResolver = std::sync::Arc<

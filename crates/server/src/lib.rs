@@ -14,8 +14,8 @@ use agent_config::{Config, ModelProfile, RulesEngine, discover_commands};
 use agent_core::{
     AgentEvent, AgentState, ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest,
     AskMessage, AskResponse, AssistantMessage, CompactionStrategy, ContentBlock, ContextManager,
-    LlmProvider, Mode, ProviderCallContext, SkillLevel, ToolError, ToolResult, ToolResultMessage,
-    Usage, UserContent, UserMessage, Workspace,
+    LlmProvider, Mode, ProviderCallContext, SessionEvent, SkillLevel, ToolError, ToolResult,
+    ToolResultMessage, Usage, UserContent, UserMessage, Workspace,
 };
 use agent_supervisor::{SubAgentStatus, Supervisor};
 use agent_tools::Tool;
@@ -181,6 +181,14 @@ pub enum ServerFrame {
     ///    对未知 `type` 返回 null，故本帧被静默忽略，不影响 transcript。
     Heartbeat,
 
+    /// 会话级结构化事件（压缩 / 重试 / 模型回退）。与 [`ServerFrame::Say`] 双通道：
+    /// `Say` 承载展示文本，本帧携带结构化字段供前端状态机消费（重试指示、压缩进度
+    /// 等），无需解析文案。判别字段为 `event.type`（如 `auto_retry_start`）。
+    Session {
+        /// 结构化事件本体。
+        event: SessionEvent,
+    },
+
     // ── 三层生命周期帧（镜像 AgentEvent 的 turn/message/tool_execution）──
     /// 轮次开始。
     TurnStart,
@@ -237,6 +245,7 @@ fn to_server_frame(ev: AgentEvent) -> ServerFrame {
         AgentEvent::TextDelta(d) => ServerFrame::TextDelta { delta: d },
         AgentEvent::ThinkingDelta(d) => ServerFrame::ThinkingDelta { delta: d },
         AgentEvent::Say(s) => ServerFrame::Say { text: s.text },
+        AgentEvent::Session(event) => ServerFrame::Session { event },
         AgentEvent::Ask(a) => ServerFrame::Ask { ask: a },
         AgentEvent::ToolExec { name, output } => ServerFrame::ToolExec { name, output },
         AgentEvent::Usage(u) => ServerFrame::Usage(u),
@@ -385,10 +394,28 @@ pub struct Session {
     pub llm: SessionLlm,
     /// 多模态图片上传句柄表（`POST /upload` 写、`new_task` 的 `ImageRef` 读，消费即清）。
     pub uploads: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// 后台作业管理器（H27；`[agent].async_enabled` 为假时为 `None`）。
+    /// 会话关闭时据此取消在跑作业——否则作业任务会**活过会话**（进程仍在跑、token 继续烧）。
+    pub jobs: Option<Arc<agent_core::jobs::AsyncJobManager>>,
 }
 impl Session {
-    /// 中止驱动与监控转发任务，释放长时运行会话的后台资源（幂等）。
+    /// 中止驱动与监控转发任务，取消在跑后台作业，释放长时运行会话的后台资源（幂等）。
+    ///
+    /// H27：`[[agent].async_enabled]` 下的后台作业**不会**随会话对象析构而停止——
+    /// 任务仍持有取消令牌并在后台跑。此处显式 `cancel_all`，并先对「已完结但未投递」
+    /// 的结果告警（那部分会随之丢失，用户应知晓而非静默）。
     pub async fn shutdown(&self) {
+        if let Some(jobs) = &self.jobs {
+            if jobs.has_pending_deliveries(None) {
+                tracing::warn!(
+                    "会话关闭时仍有未投递的后台作业结果，将被丢弃（可先经 hub `jobs`/`wait` 取回）"
+                );
+            }
+            // 取消 → 等待终结 → 清空（与库内 dispose 路径同一语义；3s 兜底不阻塞关会话）。
+            if !jobs.dispose(Some(std::time::Duration::from_secs(3))).await {
+                tracing::warn!("会话关闭时仍有后台作业未在 3s 内退出（已取消，进程继续回收）");
+            }
+        }
         if let Some(h) = self.driver_handle.lock().await.take() {
             h.abort();
         }
@@ -548,6 +575,8 @@ impl SessionManager {
             agent_context::SessionStore::new_id()
         };
 
+        // H31：记录面包屑（最近使用会话），供 `agent --continue` 精确续接。
+        store.mark_last(&id);
         // 重用已活跃会话：纯 resume（无 mode 覆盖）且目标 id 已是内存中活跃会话时，
         // 直接返回该会话 id——跳过「重建→覆盖」，否则会杀掉该会话正在运行的任务
         // （前端切换会话后原循环停止的核心修复）。mode 覆盖（switchMode 需应用新
@@ -603,9 +632,19 @@ impl SessionManager {
         } else {
             Arc::new(agent_skills::SkillCatalog::default())
         };
-        let mcp: Arc<agent_mcp::McpRegistry> =
-            Arc::new(agent_mcp::McpRegistry::load(&self.config.mcp).await);
-        let (agent, context, llm) = build_agent(
+        let mcp: Arc<agent_mcp::McpRegistry> = Arc::new(
+            agent_mcp::McpRegistry::load(
+                &self.config.mcp,
+                &agent_mcp::McpLoadOptions {
+                    cache_dir: agent_core::platform::config_dir(),
+                    // H16：把会话工作目录登记为 MCP root（server 的 roots/list 才能拿到范围）。
+                    roots: vec![agent_mcp::McpRoot::file(effective_cwd, "workspace")],
+                    ..agent_mcp::McpLoadOptions::default()
+                },
+            )
+            .await,
+        );
+        let (agent, context, llm, job_manager) = build_agent(
             &self.config,
             self.http.clone(),
             effective_cwd,
@@ -655,6 +694,7 @@ impl SessionManager {
             context,
             llm,
             uploads,
+            jobs: job_manager,
         });
         let mut inner = self.inner.lock().await;
         inner.insert(id.clone(), session);
@@ -974,22 +1014,51 @@ async fn build_agent(
     pause_gate: Arc<PauseGate>,
     // 审批模式控制器（共享单例；取其生效值作会话初始档 + 注入原子供运行时切换）。
     approval: &Arc<agent_config::ApprovalModeController>,
-) -> Result<(Agent, Arc<dyn agent_core::ContextManager>, SessionLlm), String> {
+) -> Result<
+    (
+        Agent,
+        Arc<dyn agent_core::ContextManager>,
+        SessionLlm,
+        Option<Arc<agent_core::jobs::AsyncJobManager>>,
+    ),
+    String,
+> {
     // P2：模型 fallback 链（主 profile + `fallbacks` 引用依序展开；跨线协议族亦可）。
     let chain = config.resolve_chain(alias).map_err(|e| e.to_string())?;
     let profile = chain[0];
+    // H41/H43：进程内消息总线（hub 工具与子代理寻址共用同一实例）。
+    let hub = agent_core::hub::Hub::new().shared();
+    // H41：名册容量（0 = 不限；+1 计父 agent 自身）。
+    hub.set_capacity(config.subagent.max_registry.saturating_add(1));
+    // H18：命名子代理定义（项目 `.agent/agents` → 用户 → 内置）与模型别名覆盖表。
+    let sub_agents = agent::discover_agents(cwd);
+    let sub_model_overrides: std::collections::HashMap<String, agent_core::Model> = chain
+        .iter()
+        .flat_map(|p| {
+            let m = p.to_model(config.agent.enable_thinking);
+            let mut v = vec![(p.id.clone(), m.clone())];
+            if let Some(a) = &p.alias {
+                v.push((a.clone(), m));
+            }
+            v
+        })
+        .collect();
     use secrecy::ExposeSecret;
     // 认证链分层（config 值 → oauth.toml 有效/先刷后用 → auth.toml → env）。
     // 同步封装内部 block_in_place：须 multi-thread runtime（server 入口满足）。
     let config_dir =
         agent_core::platform::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let api_key: String = agent_llm::oauth::resolve_runtime_api_key(
+    // H24：`auth = "none"` 不发内置鉴权头；`oauth` 只认 OAuth 存储（缺失即报错）。
+    let api_key: Option<String> = agent_llm::oauth::resolve_profile_api_key(
         &http,
         &config_dir,
+        profile.auth,
         profile.api.as_str(),
+        &profile.id,
         profile.api_key.expose_secret().is_empty(),
         profile.resolve_api_key().expose_secret(),
-    );
+    )
+    .map_err(|e| e.to_string())?;
     let model = agent_core::Model {
         id: profile.id.clone(),
         provider: "openai-compatible".into(),
@@ -1000,6 +1069,7 @@ async fn build_agent(
         supports_streaming: true,
         supports_thinking: config.agent.enable_thinking,
         extra_body: profile.extra_body.clone(),
+        tokenizer: profile.tokenizer.clone(),
     };
     // fallback 链模型 + key 轮换环（model id → key 列表；空 = 单 key 不轮换）。
     let fallback_models: Vec<agent_core::Model> = chain
@@ -1015,6 +1085,7 @@ async fn build_agent(
             supports_streaming: true,
             supports_thinking: config.agent.enable_thinking,
             extra_body: p.extra_body.clone(),
+            tokenizer: p.tokenizer.clone(),
         })
         .collect();
     let key_rings: std::collections::HashMap<String, Vec<String>> =
@@ -1030,9 +1101,16 @@ async fn build_agent(
         std::env::var("GYRE_INBAND_TOOLS").ok().as_deref(),
     );
     let provider_ctx = ProviderCallContext {
-        api_key: Some(api_key),
-        base_url: Some(profile.base_url.clone()),
+        api_key,
+        base_url: Some(profile.effective_base_url()),
         max_in_flight: None,
+        headers: profile
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), agent_config::expand_env(v)))
+            .collect(),
+        quirks: profile.effective_quirks(),
+        auth: profile.auth,
     };
     // 供只读端点（/enhance）直接调用模型，无需经驱动任务。
     let session_llm = SessionLlm {
@@ -1108,6 +1186,7 @@ async fn build_agent(
         Arc::clone(pending),
     ));
     // run_command 命令拦截规则（cat/grep/find/echo-redirect → 专用工具）；按 [agent.commands.interceptor] 开关。
+    // 子 Agent 注册表仍在这里编译一份；父级由 `agent_sdk::assemble_builtin_tools` 按同一开关编译（H42）。
     let intercept = if config.agent.commands.interceptor.enabled {
         agent_tools::intercept::default_compiled()
     } else {
@@ -1115,16 +1194,59 @@ async fn build_agent(
     };
     // 输出最小化器（[agent.commands.minimizer] enabled/max_lines）。
     let minimizer = compiled_minimizer(config);
+    // H3 异步后台作业管理器：bash async:true 后台化 + 完成投递回会话 + hub 作业面。
+    let job_manager = if config.agent.async_enabled {
+        Some(agent_core::jobs::AsyncJobManager::with_max_running(
+            config.agent.async_max_jobs,
+        ))
+    } else {
+        None
+    };
+    // H3 投递 sink：完结作业结果以 async-result 通知形式追加进会话上下文
+    //（owner 路由 + 恰好一次 + 失败退避重试；与 cli 装配同语义）。
+    let _job_sink_guard = job_manager.as_ref().map(|jm| {
+        let ctx = Arc::clone(&context);
+        let sink: agent_core::jobs::DeliverySink = Arc::new(move |job_id, text, job| {
+            let ctx = Arc::clone(&ctx);
+            Box::pin(async move {
+                let label = job.as_ref().map(|j| j.label.clone()).unwrap_or_default();
+                let status = job
+                    .as_ref()
+                    .map(|j| j.status.as_str())
+                    .unwrap_or("completed");
+                let body = format!(
+                    "<system-notice>\n后台作业 {job_id}（{label}，{status}）已完结。请基于以下结果继续工作。\n\n{text}\n</system-notice>"
+                );
+                ctx.append(agent_core::AgentMessage::user_text(body)).await;
+                Ok(())
+            })
+        });
+        {
+            let resumed = jm.register_delivery_sink("main", sink);
+            // H27：Agent/会话重建后，把先前因 `watch ids` 被抑制的投递重新入队——
+            // `enqueue_delivery` 在抑制状态下不入队，不恢复就会永久静默丢失结果。
+            let suppressed = jm.suppressed_job_ids(Some("main"));
+            if !suppressed.is_empty() {
+                let refs: Vec<&str> = suppressed.iter().map(String::as_str).collect();
+                jm.resume_deliveries(&refs);
+                tracing::info!(jobs = suppressed.len(), "已恢复被抑制的作业投递");
+            }
+            resumed
+        }
+    });
     // 子 Agent 工具集（builtin + MCP，不含 task 以防递归）
-    let mut sub_reg = agent_tools::builtin_tools(intercept.clone(), minimizer);
+    let mut sub_reg =
+        agent_tools::builtin_tools_with_jobs(intercept.clone(), minimizer, job_manager.clone());
     if config.github.enabled {
         sub_reg = sub_reg.with(Box::new(agent_tools::GithubTool::new(
             config.github.allow_write,
         )));
     }
-    for t in mcp.tools() {
-        sub_reg = sub_reg.with(Box::new(t.clone()));
-    }
+    // MCP 工具动态源：父/子 Agent 注册表共用同一句柄，server 端清单增删（tools/list_changed、
+    // 后台连接完成、重连恢复）在下一轮 `specs()` 即可见。
+    let mcp_source: Arc<dyn agent_tools::ToolSource> =
+        Arc::new(agent_mcp::McpToolSource::new(Arc::clone(&mcp)));
+    sub_reg = sub_reg.with_source(Arc::clone(&mcp_source));
     let sub_tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(sub_reg);
     // task 工具（委派子 Agent）—— 受 [subagent] 控制：
     //   enabled 开关 / max_concurrent 并发护栏 / inherit_parent 继承父 temperature·thinking /
@@ -1144,20 +1266,49 @@ async fn build_agent(
     } else {
         None
     };
-    // 父 Agent 工具集 = builtin + MCP + task（task 受开关控制）
-    let (mut tool_registry, lsp_pool) =
-        agent_tools::builtin_tools_with_pool(intercept, compiled_minimizer(config));
-    if config.github.enabled {
-        tool_registry = tool_registry.with(Box::new(agent_tools::GithubTool::new(
-            config.github.allow_write,
-        )));
-    }
+    // H42：父 Agent 工具集与 CLI/REPL、JSON-RPC 共用 `agent_sdk::assemble_builtin_tools`
+    // ——同一份 `[tools].enabled` 开关在同一处推导（不再有 server 无条件注册 ast/image/lsp、
+    // 却漏注册 hashline/pty/debug/ssh/browser 的漂移）。task 由下方按 `[subagent]` 追加。
+    let optional = agent_sdk::optional_tool_switches(config);
+    // 会话级文本快照存储：read_file 记录 + apply_hashline stale-hash 回放共享同一实例。
+    let snapshot_store = agent_sdk::new_snapshot_store();
+    let (mut tool_registry, lsp_pool) = agent_sdk::assemble_builtin_tools(
+        &optional,
+        config.github.enabled,
+        config.github.allow_write,
+        config.agent.commands.interceptor.enabled,
+        compiled_minimizer(config),
+        Some(Arc::clone(&snapshot_store)),
+        job_manager.clone(),
+    );
+    // lsp 未启用时共享池为空；写入效果本身也受 `[tools].enabled.lsp` 门控（见 `assemble`）。
+    let lsp_pool = lsp_pool.unwrap_or_default();
     // P0/P1：todo / ask 恒开 + checkpoint / rewind 会话回卷（每会话独立检查点）。
+    // H28：同一 `TodoState` 句柄交给 TodoTool 与引擎（eager prelude / 完成提醒）。
+    let todo_state = agent_tools::TodoState::load(cwd.join(".gyre").join("todo.json")).shared();
     tool_registry = tool_registry
-        .with(Box::new(agent_tools::TodoTool::new(
-            agent_tools::TodoState::load(cwd.join(".gyre").join("todo.json")).shared(),
-        )))
+        .with(Box::new(agent_tools::TodoTool::new(Arc::clone(
+            &todo_state,
+        ))))
         .with(Box::new(agent_tools::AskUserTool::new()));
+    // H29：goals 状态（每会话独立；预算 0 = 不限）+ `goal` 工具。
+    let goal_state: Option<Arc<std::sync::Mutex<agent::GoalState>>> =
+        Some(Arc::new(std::sync::Mutex::new({
+            let mut st = agent::GoalState::new(agent::GoalBudget {
+                token_budget: config.goals.token_budget,
+                time_budget: std::time::Duration::from_secs(config.goals.time_budget_secs),
+                hard_stop: config.goals.hard_stop,
+            });
+            // H29：恢复持久化目标（`active` → `paused`，不自动续跑）。
+            if let Some(snap) = agent::load_goal(cwd) {
+                st.restore(snap);
+                tracing::info!(goal = ?st.goal_summary(), "已恢复持久化目标");
+            }
+            st
+        })));
+    tool_registry = tool_registry.with(Box::new(agent::GoalTool::new(Arc::clone(
+        goal_state.as_ref().expect("H29: goal_state 恒在场"),
+    ))));
     let checkpoint_state = agent_tools::CheckpointState::new().shared();
     tool_registry = tool_registry
         .with(Box::new(agent_tools::CheckpointTool::new(Arc::clone(
@@ -1175,9 +1326,10 @@ async fn build_agent(
     let hub_supervision: Arc<dyn agent_core::hub::HubSupervision> = supervisor.clone();
     let processes = Arc::new(agent_supervisor::ProcessManager::new());
     tool_registry = tool_registry.with(Box::new(
-        agent_tools::HubTool::register(agent_core::hub::Hub::new().shared(), "main")
+        agent_tools::HubTool::register(Arc::clone(&hub), "main")
             .with_supervision(hub_supervision)
-            .with_processes(processes),
+            .with_processes(processes)
+            .with_jobs_option(job_manager.clone()),
     ));
     if config.subagent.enabled {
         let task_tool = agent::TaskTool::new(
@@ -1200,7 +1352,10 @@ async fn build_agent(
             config.subagent.max_concurrent,
         )
         .with_supervisor(supervisor.clone())
-        .with_approval(Arc::clone(&approval));
+        .with_approval(Arc::clone(&approval))
+        .with_agents(sub_agents.clone())
+        .with_model_overrides(sub_model_overrides.clone())
+        .with_hub(Arc::clone(&hub));
         tool_registry = tool_registry.with(Box::new(task_tool));
     }
     // 记忆工具面（P0-1/P0-1b）：recall / retain / reflect + memory_edit / learn
@@ -1213,27 +1368,61 @@ async fn build_agent(
             .with(Box::new(agent_tools::MemoryEditTool::new(Arc::clone(m))))
             .with(Box::new(agent_tools::MemoryLearnTool::new(Arc::clone(m))));
     }
+    // MCP 工具（父 Agent 工具集）：此前只进了子 Agent 注册表，Web/RPC 会话的主 Agent
+    // 拿不到任何 MCP 工具——此处补上动态源（与子 Agent 共用同一句柄）。
+    tool_registry = tool_registry.with_source(Arc::clone(&mcp_source));
     let tools: Arc<dyn agent_tools::ToolRegistry> = Arc::new(tool_registry);
 
-    let mut context_files = agent_config::discover_context_files(cwd);
-    if config.github.enabled {
-        context_files.push(agent_tools::PROMPT_SECTION.to_string());
+    // 上下文基座（H19/H42）：与 REPL / RPC 共用 `agent_sdk::compose_context_files`。
+    // 此前 server 侧漏接行为四段（§ Tool Policy / # Delegation / § Workflow / § Delivery）与
+    // 外来配置继承段 → Web GUI 会话拿不到行为契约，也无法继承 Codex/Cursor 指令。
+    // H42：可选组提示词与注册表同源（`optional_tool_switches`）——启用才注册、才注入，
+    // 与 CLI/RPC 的 `optional_context_files` 完全一致。
+    let mcp_instructions = mcp.server_instructions();
+    let mut context_files = agent_sdk::compose_context_files(agent_sdk::ContextAssembly {
+        cwd,
+        mcp_instructions: &mcp_instructions,
+    })
+    .files;
+    // H18：可用命名子代理清单注入父级提示词。
+    if let Some(section) = agent::render_agent_catalog(&sub_agents) {
+        context_files.push(section);
     }
-    // Phase 0：security_scan 恒开注册 → 使用指引恒注入（与工具注册面一致）。
-    context_files.push(agent_tools::SECURITY_SCAN_PROMPT_SECTION.to_string());
+    context_files.extend(agent_sdk::optional_tool_sections(
+        &optional,
+        config.github.enabled,
+    ));
 
     // 模型的输出 token 预算（来自 profile.max_output_tokens，回退 4096）须下发给
     // Agent 作为每轮请求的 max_tokens；否则 assemble 未设置会回落到硬编码 4096，
     // 长回复被中途截断（finish_reason=length）→ 误报「任务完成」。
     let max_output_tokens = model.max_output_tokens;
+    // H28/H29：todo 循环与 goals 装配（与 CLI/RPC 前端一致）。
+    let todo_loop: Arc<dyn agent_core::TodoLoopSource> = todo_state.clone();
+    let mut builder = Agent::builder(model)
+        .steering()
+        .fallbacks(fallback_models)
+        .key_rings(key_rings)
+        .todo_loop_source(todo_loop)
+        .todo_loop_config(agent::TodoLoopConfig::from_config(
+            config.todo.eager.as_deref(),
+            config.todo.reminders,
+            config.todo.reminders_max,
+            config.todo.mid_run_nudge,
+        ));
+    // H28 尾项：异步唤醒探测（有后台作业在途时不提醒待办）。
+    if let Some(jm) = &job_manager {
+        builder = builder.async_wake(Arc::clone(jm) as Arc<dyn agent_core::AsyncWakeProbe>);
+    }
+    if let Some(gs) = &goal_state {
+        builder = builder.goals_state(Arc::clone(gs));
+    }
     let agent = assemble(
-        Agent::builder(model)
-            .steering()
-            .fallbacks(fallback_models)
-            .key_rings(key_rings),
+        builder,
         provider,
         tools,
         lsp_pool,
+        Some(Arc::clone(&snapshot_store)),
         Arc::clone(&context),
         prompts,
         approval,
@@ -1247,7 +1436,7 @@ async fn build_agent(
         memory,
         pause_gate,
     );
-    Ok((agent, context, session_llm))
+    Ok((agent, context, session_llm, job_manager))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1256,6 +1445,7 @@ fn assemble(
     provider: Arc<dyn LlmProvider>,
     tools: Arc<dyn agent_tools::ToolRegistry>,
     lsp_pool: agent_tools::LspPool,
+    snapshots: Option<agent_sdk::SnapshotStore>,
     context: Arc<dyn agent_core::ContextManager>,
     prompts: Arc<agent_prompt::PromptCatalog>,
     approval: Arc<dyn ApprovalPolicy>,
@@ -1269,6 +1459,11 @@ fn assemble(
     memory: Option<Arc<dyn agent_core::MemoryStore>>,
     pause_gate: Arc<PauseGate>,
 ) -> Agent {
+    let builder = if let Some(extra) = &config.agent.append_system_prompt {
+        builder.append_system_prompt(extra.clone())
+    } else {
+        builder
+    };
     let workspace_root = workspace.root();
     // fuzzy 配置 → 全局覆盖（首次装配 set，OnceLock 幂等；与 CLI 一致）。
     {
@@ -1281,6 +1476,8 @@ fn assemble(
         opts.threshold = config.agent.tools.edit.fuzzy_threshold;
         agent_tools::set_fuzzy_opts(opts);
     }
+    // H33：PTY 执行器接入（`run_command(pty: true)`）。
+    agent_tools::set_pty_executor(agent_pty::executor());
     let builder = builder
         .provider(provider)
         .tools(tools)
@@ -1294,10 +1491,16 @@ fn assemble(
         .max_mistakes(config.agent.max_mistakes)
         .max_turns(config.agent.max_turns)
         .context_guard(config.agent.context_window_guard)
+        .compaction_policy(agent::AgentBuilder::compaction_policy_from_config(
+            config.agent.context_window_guard,
+            config.agent.compaction_threshold_tokens,
+            config.agent.compaction_reserve_tokens,
+        ))
         .catalog(catalog)
         .context_files(context_files)
         .pause_gate(pause_gate)
-        .ttsr(ttsr_for(config, &workspace_root));
+        .ttsr(ttsr_for(config, &workspace_root))
+        .stream_guards(config.agent.stream_guards.clone());
     // 注入思考模式（若 config 启用）—— 与 CLI 一致
     let builder = if config.agent.enable_thinking {
         builder.thinking(agent_core::ThinkingConfig::new(
@@ -1306,6 +1509,8 @@ fn assemble(
     } else {
         builder
     };
+    // H42：会话级文本快照存储注入引擎（read_file 记录 → apply_hashline stale-hash 回放）。
+    let builder = builder.snapshot_store(snapshots);
     // 编辑后 LSP writethrough：lsp 启用且 edit 开启时注入（与 CLI 一致）。
     let builder = if config.tools.effective("lsp", false)
         && (config.agent.tools.edit.format_on_write || config.agent.tools.edit.diagnostics_on_write)
@@ -1348,7 +1553,11 @@ fn ttsr_for(
     if !config.ttsr.enabled.unwrap_or(true) {
         return None;
     }
-    let rules = agent_ttsr::discover_rules(&workspace_root.join(".gyre/rules"));
+    // H44：内置规则集（27 条语言约定）默认加载，同名项目规则覆盖之。
+    let rules = agent_ttsr::load_rules(
+        &workspace_root.join(".gyre/rules"),
+        config.ttsr.builtin_rules.unwrap_or(true),
+    );
     if rules.is_empty() {
         return None;
     }
@@ -3372,7 +3581,7 @@ fn seal_host_welcome(
         &host.key,
         &agent_collab::WireFrame::Welcome {
             client_id: "host".into(),
-            proto: 1,
+            proto: agent_collab::PROTO_VERSION,
             read_only: !writable,
             entry_count,
             ts,
@@ -3514,6 +3723,21 @@ mod tests {
             ServerFrame::TextDelta { delta } => assert_eq!(delta, "hi"),
             _ => panic!("应为 TextDelta"),
         }
+    }
+
+    /// 结构化会话事件透传为 `session` 帧，序列化后 `event.type` 为判别字段
+    /// （前端 `parseFrame` 依此路由维护态）。
+    #[test]
+    fn to_frame_maps_session_event() {
+        let f = to_server_frame(AgentEvent::Session(SessionEvent::RetryFallbackApplied {
+            from: "a".into(),
+            to: "b".into(),
+        }));
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "session");
+        assert_eq!(v["event"]["type"], "retry_fallback_applied");
+        assert_eq!(v["event"]["from"], "a");
+        assert_eq!(v["event"]["to"], "b");
     }
 
     /// `StateChanged` 为 struct variant，序列化后 `state` 字段直接承载 `AgentState` 字符串值，
@@ -3802,6 +4026,7 @@ mod tests {
             version: CURRENT_SESSION_VERSION,
             created_at_unix: 1_700_000_000,
             agent: "gyre".into(),
+            ..SessionHeader::new("gyre")
         };
         let node = SessionNode::root("u1".into(), AgentMessage::user_text("header 后的用户消息"));
         {
@@ -3855,6 +4080,193 @@ mod tests {
         // resume 处理器解除 → 恢复运行。
         let _ = resume_handler(State(mgr.clone())).await;
         assert!(!mgr.pause_gate().paused(), "resume 后应恢复运行");
+    }
+
+    // ── H37：WS 面（鉴权 + 建连快照帧；真实客户端端到端）─────────────────────
+
+    /// 读取下一帧文本并解析为 `ServerFrame` JSON（忽略 ping/pong）。
+    async fn next_frame_json<S>(ws: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use futures::StreamExt;
+        loop {
+            match ws.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                    return serde_json::from_str(&t).expect("服务端帧应为 JSON");
+                }
+                None | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                    panic!("连接在收到期望帧前关闭")
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => panic!("WS 读取失败: {e}"),
+            }
+        }
+    }
+
+    /// WS 鉴权：配置 `auth_token` 后，缺失/错误 token 握手即被拒（401），正确 token 才建连；
+    /// 建连后服务端必须先下发 `usage_snapshot`（前端累计态基线，SET 语义）。
+    #[tokio::test]
+    async fn ws_requires_token_and_sends_usage_snapshot_on_connect() {
+        let mut cfg: Config = toml::from_str(include_str!("../../../config.example.toml"))
+            .expect("示例配置应可解析为 Config");
+        cfg.server.auth_token = Some("s3cret".into());
+        let mgr = SessionManager::new(
+            Arc::new(cfg),
+            reqwest::Client::new(),
+            Arc::from(std::path::PathBuf::from(".")),
+            None,
+        );
+        let sid = mgr
+            .create_session(None, None, None, None, None)
+            .await
+            .expect("测试会话应可创建");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试端口应可绑定");
+        let addr = listener.local_addr().expect("应有本地地址");
+        let serve = tokio::spawn(async move {
+            let _ = axum::serve(listener, app(mgr)).await;
+        });
+        let base = format!("ws://{addr}/ws/{sid}");
+
+        // 缺失 / 错误 token：握手被拒（401）。
+        for url in [base.clone(), format!("{base}?token=nope")] {
+            let err = tokio_tungstenite::connect_async(&url)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{url} 应被拒绝"));
+            let text = err.to_string();
+            assert!(
+                text.contains("401")
+                    || text.contains("Unauthorized")
+                    || text.contains("unexpected status"),
+                "应为 401 握手拒绝: {text}"
+            );
+        }
+
+        // 正确 token：建连成功且首帧为用量快照。
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("{base}?token=s3cret"))
+            .await
+            .expect("正确 token 应建连");
+        let first = next_frame_json(&mut ws).await;
+        assert_eq!(first["type"], "usage_snapshot", "首帧应为用量快照: {first}");
+        // 快照内嵌完整 `Usage`（前端整体替换累计态）：五个计数键必须都在（新会话为 0）。
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cost_usd",
+        ] {
+            assert!(
+                first.get(key).is_some_and(serde_json::Value::is_number),
+                "用量快照缺少 {key}: {first}"
+            );
+        }
+
+        serve.abort();
+    }
+
+    /// 读取响应体（测试辅助）。
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("响应体应可读");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// H37：前端交付契约——SPA 入口 / 内容哈希资源 / SPA 兜底 / 路径穿越防护。
+    #[tokio::test]
+    async fn embedded_frontend_surface_serves_spa_contract() {
+        // 1) 根路径：返回 index.html（no-cache，含挂载点与哈希 bundle 引用）。
+        let idx = serve_embedded("/".parse().expect("合法 URI")).await;
+        assert_eq!(idx.status(), StatusCode::OK);
+        assert_eq!(
+            idx.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap()),
+            Some("text/html")
+        );
+        assert_eq!(
+            idx.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-cache"),
+            "HTML 入口必须回源校验（否则升级后加载旧 bundle）"
+        );
+        let html = body_text(idx).await;
+        assert!(
+            html.contains("<div id=\"root\""),
+            "缺少 SPA 挂载点: {html:.200}"
+        );
+        assert!(
+            html.contains("/assets/index-") && html.contains(".js"),
+            "缺少哈希 bundle 引用: {html:.200}"
+        );
+
+        // 2) 内容哈希资源：immutable 长缓存 + 正确 Content-Type。
+        //    从 index.html 解析**全部** `/assets/...` 引用（内容哈希随构建变化），逐个校验。
+        let mut refs: Vec<String> = Vec::new();
+        let mut rest = html.as_str();
+        while let Some(i) = rest.find("/assets/") {
+            let tail = &rest[i..];
+            let end = tail.find('"').expect("引用应以引号收尾");
+            let r = tail[..end].trim_start_matches('/').to_string();
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+            rest = &tail[end..];
+        }
+        assert!(!refs.is_empty(), "index.html 应引用至少一个 assets 资源");
+        let mut saw_js = false;
+        for asset_path in &refs {
+            let asset = serve_embedded(format!("/{asset_path}").parse().expect("合法 URI")).await;
+            assert_eq!(asset.status(), StatusCode::OK, "资源 {asset_path} 应被内嵌");
+            assert_eq!(
+                asset
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("public, max-age=31536000, immutable"),
+                "{asset_path} 应可永久缓存"
+            );
+            let ctype = asset
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            if asset_path.ends_with(".js") {
+                assert!(
+                    ctype.contains("javascript"),
+                    "{asset_path} 应为 JS: {ctype}"
+                );
+                saw_js = true;
+            } else if asset_path.ends_with(".css") {
+                assert!(ctype.contains("css"), "{asset_path} 应为 CSS: {ctype}");
+            }
+        }
+        assert!(saw_js, "应引用至少一个 JS bundle: {refs:?}");
+
+        // 3) 未知前端路由：SPA 兜底回 index.html（客户端路由接管）。
+        let spa = serve_embedded("/settings/advanced".parse().expect("合法 URI")).await;
+        assert_eq!(spa.status(), StatusCode::OK);
+        assert!(body_text(spa).await.contains("<div id=\"root\""));
+
+        // 4) 路径穿越：不得读到 `web/` 之外的文件（未命中 → SPA 兜底 HTML）。
+        let traverse = serve_embedded("/../Cargo.toml".parse().expect("合法 URI")).await;
+        assert_eq!(traverse.status(), StatusCode::OK);
+        let body = body_text(traverse).await;
+        assert!(
+            body.contains("<div id=\"root\""),
+            "穿越路径不应返回仓库文件"
+        );
+        assert!(!body.contains("[package]"), "路径穿越泄漏了 Cargo.toml");
     }
 
     /// 浏览器 GET `/collab/{room}`（无 WS Upgrade 头）→ 返回 guest 页面（HTML）。

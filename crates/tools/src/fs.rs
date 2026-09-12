@@ -439,8 +439,13 @@ fn file_header(display: &str, full_text: &str, ctx: &ToolContext<'_>) -> String 
 
 /// 工作区相对显示路径（段头/快照键）：剥去工作区根前缀、分隔符统一为 `/`；
 /// 不在根下（沙箱重映射后的怪路径）则原样返回。
-fn display_path(full: &Path, ctx: &ToolContext<'_>) -> String {
-    let rel = full.strip_prefix(ctx.workspace.root()).unwrap_or(full);
+pub(crate) fn display_path(full: &Path, ctx: &ToolContext<'_>) -> String {
+    display_path_in(full, &ctx.workspace.root())
+}
+
+/// [`display_path`] 的无 ctx 变体（spawn_blocking 等无生命周期场景复用同一约定）。
+pub(crate) fn display_path_in(full: &Path, ws_root: &Path) -> String {
+    let rel = full.strip_prefix(ws_root).unwrap_or(full);
     rel.to_string_lossy().replace('\\', "/")
 }
 
@@ -1801,6 +1806,30 @@ impl Tool for WriteFileTool {
 
 #[cfg(test)]
 mod tests {
+    /// H33（复核结论）：omp `readSchema` 只有 `path`（行选择器写在 path 内联后缀），
+    /// Gyre `read_file` 与之对齐——同样只强制 `path`，行选择器走内联语法
+    /// （`:N`/`:N-M`/`:N+K`/`:N-`/`:a-b,c-d`/`:raw`），额外只有可选 `summary`。
+    /// 本用例钉住契约，避免后续误加 `offset`/`limit` 之类的第二套口径。
+    #[test]
+    fn read_schema_matches_omp_path_only_contract() {
+        let schema = super::ReadFileTool.schema();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(required, vec!["path"], "{required:?}");
+        let props = schema["properties"].as_object().unwrap();
+        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["path", "summary"],
+            "不应引入第二套行限参数: {keys:?}"
+        );
+    }
+
     use super::*;
     use crate::ConflictHistory;
     use crate::InMemorySnapshotStore;

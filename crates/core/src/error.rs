@@ -134,6 +134,11 @@ pub enum ContextError {
     /// 压缩失败。
     #[error("压缩失败: {0}")]
     Compaction(String),
+    /// 分支 handoff 有独有后缀需折叠，但上下文未注入摘要器。
+    #[error(
+        "分支 handoff 需要摘要器折叠被离开分支的独有进展，但当前会话未注入摘要器；可改用不带摘要的分支切换"
+    )]
+    BranchSummaryUnavailable,
     /// 标准库 IO 错误。
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -145,6 +150,15 @@ pub enum ConfigError {
     /// 配置文件读取失败。
     #[error("读取配置失败 {path}: {source}")]
     Read {
+        /// 配置文件路径。
+        path: String,
+        /// 底层 IO 错误。
+        #[source]
+        source: std::io::Error,
+    },
+    /// 配置文件写入失败（`agent config set`；H23）。
+    #[error("写入配置失败 {path}: {source}")]
+    Write {
         /// 配置文件路径。
         path: String,
         /// 底层 IO 错误。

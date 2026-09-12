@@ -167,6 +167,7 @@ agent-acp     = { path = "crates/acp" }
 agent-i18n    = { path = "crates/i18n" }
 agent-ttsr    = { path = "crates/ttsr" }
 agent-cli     = { path = "crates/cli" }
+agent-sdk     = { path = "crates/sdk" }
 
 agent-shell  = { path = "crates/shell" }
 

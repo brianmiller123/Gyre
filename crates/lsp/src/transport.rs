@@ -336,100 +336,77 @@ async fn write_loop(
 }
 
 /// 后台读任务：从 stdout 读 Content-Length 帧，路由响应或通知。
+///
+/// 帧解析**收敛到 [`agent_core::jsonrpc_frame::decode_frames`]**（H45：此前 LSP 自写
+/// `read_line` + `read_exact` 逐行解析，与 DAP 的实现各有一套上限/行尾兼容语义）。
 async fn read_loop(
     stdout: tokio::process::ChildStdout,
     notification_tx: mpsc::Sender<JsonRpcMessage>,
     pending: PendingMap,
 ) {
+    use tokio::io::AsyncReadExt;
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
 
     loop {
-        line.clear();
-
-        // 读取 Content-Length 头
-        match reader.read_line(&mut line).await {
+        let read = match reader.read(&mut chunk).await {
             Ok(0) => {
                 info!("stdout 已关闭，读循环退出");
                 break;
             }
-            Ok(_) => {}
+            Ok(n) => n,
             Err(e) => {
-                error!(error = %e, "读取 Content-Length 头失败");
+                error!(error = %e, "读取 stdout 失败，读循环退出");
                 break;
             }
-        }
-
-        let content_length = if let Some(len) = parse_content_length(line.trim()) {
-            len
-        } else {
-            warn!(line = %line.trim(), "无法解析 Content-Length 头，跳过");
-            continue;
         };
+        buf.extend_from_slice(&chunk[..read]);
 
-        // 跳过空行
-        line.clear();
-        if let Err(e) = reader.read_line(&mut line).await {
-            error!(error = %e, "读取头部空行失败");
-            break;
-        }
-
-        // 读取 JSON 主体
-        let mut body = vec![0u8; content_length];
-        if let Err(e) = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await {
-            error!(error = %e, len = content_length, "读取 JSON 主体失败");
-            break;
-        }
-
-        let payload = match String::from_utf8(body) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = %e, "JSON 主体非 UTF-8");
-                continue;
-            }
-        };
-
-        debug!(len = content_length, "收到帧");
-
-        // 解析以判断是响应还是通知
-        let parsed: serde_json::Value = match serde_json::from_str(&payload) {
+        let (frames, consumed) = match agent_core::jsonrpc_frame::decode_frames(&buf) {
             Ok(v) => v,
             Err(e) => {
-                error!(error = %e, "JSON 解析失败");
+                // 帧协议错误（头非法/长度超限/body 非 JSON）：丢弃缓冲并继续，
+                // 避免一段坏字节让读循环永久卡死。
+                error!(error = %e, "帧解码失败，丢弃缓冲");
+                buf.clear();
                 continue;
             }
         };
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
+        for parsed in frames {
+            debug!(len = ?parsed, "收到帧");
+            let payload = parsed.to_string();
+            let has_id = parsed.get("id").is_some();
+            let has_method = parsed.get("method").is_some();
+            let has_result_or_error =
+                parsed.get("result").is_some() || parsed.get("error").is_some();
 
-        // 判断消息类型：
-        // - 有 "id" 且有 "result" 或 "error" → 响应 → 路由到 pending map
-        // - 有 "method" 且无 "id" → 通知 → 推到 notification channel
-        let has_id = parsed.get("id").is_some();
-        let has_method = parsed.get("method").is_some();
-        let has_result_or_error = parsed.get("result").is_some() || parsed.get("error").is_some();
-
-        if has_id && has_result_or_error {
-            // 这是一个响应
-            let id = parsed.get("id").and_then(serde_json::Value::as_u64);
-            if let Some(id) = id {
-                let mut pending_map = pending.lock().await;
-                if let Some(tx) = pending_map.remove(&id) {
-                    let _ = tx.send(Ok(payload));
-                    debug!(id = id, "响应已路由");
-                } else {
-                    warn!(id = id, "收到未知请求 ID 的响应（可能已超时）");
+            if has_id && has_result_or_error {
+                // 响应 → 路由到 pending map。
+                let id = parsed.get("id").and_then(serde_json::Value::as_u64);
+                if let Some(id) = id {
+                    let mut pending_map = pending.lock().await;
+                    if let Some(tx) = pending_map.remove(&id) {
+                        let _ = tx.send(Ok(payload));
+                        debug!(id = id, "响应已路由");
+                    } else {
+                        warn!(id = id, "收到未知请求 ID 的响应（可能已超时）");
+                    }
                 }
+            } else if has_method && !has_id {
+                // 通知 → 推到 notification channel。
+                let msg = JsonRpcMessage { payload };
+                if notification_tx.send(msg).await.is_err() {
+                    debug!("通知信道已关闭，读循环退出");
+                    break;
+                }
+            } else {
+                // 服务端发起的请求（如 window/workDoneProgress/create）：暂不支持。
+                warn!(?parsed, "收到未预期的消息类型");
             }
-        } else if has_method && !has_id {
-            // 这是一个通知
-            let msg = JsonRpcMessage { payload };
-            if notification_tx.send(msg).await.is_err() {
-                debug!("通知信道已关闭，读循环退出");
-                break;
-            }
-        } else {
-            // 也可能是服务器发起的请求（如 window/workDoneProgress/create）
-            // 目前不支持，记录警告
-            warn!(?parsed, "收到未预期的消息类型");
         }
     }
     debug!("读循环退出");
@@ -458,12 +435,6 @@ async fn log_stderr(stderr: tokio::process::ChildStderr) {
 
 /// 构建 Content-Length 帧：`Content-Length: {N}\r\n\r\n{json}`
 fn format_frame(json: &str) -> String {
-    format!("Content-Length: {}\r\n\r\n{json}", json.len())
-}
-
-/// 从 `Content-Length: N` 行解析字节数。
-fn parse_content_length(header: &str) -> Option<usize> {
-    header
-        .strip_prefix("Content-Length:")
-        .and_then(|s| s.trim().parse().ok())
+    // H45：编码走共享实现（长度按 UTF-8 字节计）。
+    agent_core::jsonrpc_frame::encode_str_frame(json)
 }

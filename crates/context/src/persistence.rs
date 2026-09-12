@@ -33,6 +33,62 @@ pub struct SessionHeader {
     pub created_at_unix: i64,
     /// 写入方标识（如 `"gyre"`）。
     pub agent: String,
+
+    // ── H31：对齐 omp `SessionHeader` 的身份/位置字段（全部可选，旧文件原样可读）──
+    /// 会话 id（通常等于文件名主干；供 header 自描述与跨目录引用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// 会话工作目录（绝对路径；多项目共用 config_dir 时区分来源）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// 父会话 id（fork / branch / handoff 来源）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// 历史上成功迁移过的文件绝对路径（omp `previousSessionFiles`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_session_files: Vec<String>,
+    /// Provider prompt-cache 身份（跨 fork 继承时保持前缀缓存命中）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_prompt_cache_key: Option<String>,
+}
+
+impl SessionHeader {
+    /// 构造一份最小 header（`id` 由调用方按需补齐）。
+    #[must_use]
+    pub fn new(agent: impl Into<String>) -> Self {
+        Self {
+            version: CURRENT_SESSION_VERSION,
+            created_at_unix: now_unix(),
+            agent: agent.into(),
+            id: None,
+            cwd: None,
+            parent_session: None,
+            previous_session_files: Vec::new(),
+            provider_prompt_cache_key: None,
+        }
+    }
+
+    /// 按会话文件路径补齐 `id`（文件名主干）与 `cwd`（`<cwd>/.agent/sessions/<id>.jsonl` 反推）。
+    #[must_use]
+    pub fn with_path(mut self, path: &Path) -> Self {
+        if self.id.is_none() {
+            self.id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+        }
+        if self.cwd.is_none() {
+            // `<cwd>/.agent/sessions/<id>.jsonl` → `<cwd>`；形状不符则留空（不猜）。
+            let derived = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string());
+            self.cwd = derived;
+        }
+        self
+    }
 }
 
 /// `version` 字段缺省值（供 serde `default`）。
@@ -111,7 +167,7 @@ fn header_line(header: &SessionHeader) -> Result<String, serde_json::Error> {
 
 /// 新会话文件写入首行 header 记录（文件缺失或为空时；已有内容的 legacy 文件保持
 /// 不动——append-only，不为一纸 header 重写历史）。
-async fn ensure_session_header(path: &Path) {
+async fn ensure_session_header(path: &Path, header: &SessionHeader) {
     if let Ok(meta) = tokio::fs::metadata(path).await {
         if meta.len() > 0 {
             return;
@@ -123,11 +179,7 @@ async fn ensure_session_header(path: &Path) {
             return;
         }
     }
-    let header = SessionHeader {
-        version: CURRENT_SESSION_VERSION,
-        created_at_unix: now_unix(),
-        agent: SESSION_AGENT.to_string(),
-    };
+    let header = header.clone().with_path(path);
     let Ok(line) = header_line(&header) else {
         tracing::warn!("序列化会话 header 失败");
         return;
@@ -166,11 +218,24 @@ impl PersistentContext {
         system: Vec<String>,
         path: impl Into<PathBuf>,
     ) -> Result<Self, agent_core::ContextError> {
+        Self::open_with_header(system, path, SessionHeader::new(SESSION_AGENT)).await
+    }
+
+    /// [`PersistentContext::open`] 的 header 注入版本（H31）：调用方给出 `cwd` /
+    /// `parent_session` / `provider_prompt_cache_key` 等身份字段，新建文件时落盘。
+    ///
+    /// # Errors
+    /// 会话文件读取/解析失败时返回 [`agent_core::ContextError`]。
+    pub async fn open_with_header(
+        system: Vec<String>,
+        path: impl Into<PathBuf>,
+        header: SessionHeader,
+    ) -> Result<Self, agent_core::ContextError> {
         let path = path.into();
         let leaf_path = leaf_sidecar(&path);
         let inner = crate::InMemoryContext::new(system);
         // 新会话（文件缺失或空）写入首行 header 记录；已有内容的 legacy 文件不动。
-        ensure_session_header(&path).await;
+        ensure_session_header(&path, &header).await;
         if path.exists() {
             let nodes = load_jsonl(&path).await?;
             inner.restore_nodes(nodes).await;
@@ -412,6 +477,42 @@ impl SessionStore {
         out
     }
 
+    /// 最近会话面包屑文件名（H31）：`<sessions_dir>/.last`，内容为会话 id。
+    ///
+    /// 与「按 mtime 取最新」的区别：面包屑记录的是**用户最后一次实际使用**的会话
+    /// （`--resume`/`--continue`/`/resume` 都可能作用于旧会话），因此比 mtime 更准；
+    /// 且当该文件被外部删改时自动回退到 mtime。
+    const LAST_BREADCRUMB: &'static str = ".last";
+
+    /// 面包屑路径。
+    #[must_use]
+    pub fn last_breadcrumb_path(&self) -> PathBuf {
+        self.dir.join(Self::LAST_BREADCRUMB)
+    }
+
+    /// 写入面包屑（best-effort：失败只影响 `--continue` 的精确性，不影响会话本身）。
+    pub fn mark_last(&self, id: &str) {
+        if !is_safe_session_id(id) {
+            return;
+        }
+        if let Err(e) = std::fs::write(self.last_breadcrumb_path(), id) {
+            tracing::debug!(error = %e, "写入会话面包屑失败（--continue 将回退到 mtime）");
+        }
+    }
+
+    /// 解析 `--continue` / 「最近会话」目标：优先面包屑（存在且文件仍在），否则按
+    /// mtime 取最新。空目录返回 `None`。
+    #[must_use]
+    pub fn resolve_last(&self) -> Option<String> {
+        if let Ok(raw) = std::fs::read_to_string(self.last_breadcrumb_path()) {
+            let id = raw.trim();
+            if is_safe_session_id(id) && self.path_for(id).exists() {
+                return Some(id.to_string());
+            }
+        }
+        self.list().into_iter().next().map(|info| info.id)
+    }
+
     /// 复制 `src_id` 会话为新 id（fork），返回新 id。
     ///
     /// # Errors
@@ -620,11 +721,15 @@ async fn rewrite_jsonl(path: &Path, nodes: &[SessionNode]) -> Result<(), std::io
     {
         let mut file = tokio::fs::File::create(&tmp).await?;
         use tokio::io::AsyncWriteExt;
-        let header = SessionHeader {
-            version: CURRENT_SESSION_VERSION,
-            created_at_unix: read_session_header(path).map_or_else(now_unix, |h| h.created_at_unix),
-            agent: SESSION_AGENT.to_string(),
-        };
+        // 重写保留既有 header 的身份字段（id/cwd/parent/cache key），仅刷新版本与
+        // 创建时间语义（legacy 无 header 时以当前时刻补齐）。
+        let header = read_session_header(path).map_or_else(
+            || SessionHeader::new(SESSION_AGENT).with_path(path),
+            |mut h| {
+                h.version = CURRENT_SESSION_VERSION;
+                h.with_path(path)
+            },
+        );
         let header = header_line(&header)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         file.write_all(header.as_bytes()).await?;
@@ -882,6 +987,7 @@ mod tests {
                 version: CURRENT_SESSION_VERSION + 1,
                 created_at_unix: 1_700_000_000,
                 agent: "future".into(),
+                ..SessionHeader::new("future")
             };
             let mut f = std::fs::File::create(&path).unwrap();
             writeln!(f, "{}", header_line(&header).unwrap()).unwrap();
@@ -915,6 +1021,75 @@ mod tests {
         }
     }
 
+    /// H31：header 身份字段落盘 + 旧格式（仅 3 字段）仍可读。
+    #[tokio::test]
+    async fn header_carries_identity_fields_and_reads_legacy() {
+        let dir = std::env::temp_dir().join(format!("gyre-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::for_cwd(&dir);
+        let id = SessionStore::new_id();
+        let path = store.path_for(&id);
+        let mut header = SessionHeader::new("gyre").with_path(&path);
+        header.parent_session = Some("parent-1".into());
+        let pc = PersistentContext::open_with_header(vec!["sys".into()], &path, header)
+            .await
+            .unwrap();
+        pc.append(AgentMessage::user_text("hi")).await;
+        let read = read_session_header(&path).expect("应有 header");
+        assert_eq!(read.id.as_deref(), Some(id.as_str()));
+        assert_eq!(read.agent, "gyre");
+        assert_eq!(read.parent_session.as_deref(), Some("parent-1"));
+        // `with_path` 从 `<cwd>/.agent/sessions/<id>.jsonl` 反推 cwd。
+        assert!(
+            read.cwd
+                .as_deref()
+                .is_some_and(|c| c.ends_with(dir.file_name().unwrap().to_str().unwrap())),
+            "cwd 应从路径反推: {:?}",
+            read.cwd
+        );
+
+        // legacy（无新字段）header 行仍可解析，新字段为 None/空。
+        let legacy_path = store.path_for(&SessionStore::new_id());
+        std::fs::write(
+            &legacy_path,
+            "{\"type\":\"header\",\"version\":1,\"created_at_unix\":42,\"agent\":\"gyre\"}\n",
+        )
+        .unwrap();
+        let legacy = read_session_header(&legacy_path).expect("legacy header 应可读");
+        assert_eq!(legacy.created_at_unix, 42);
+        assert!(legacy.id.is_none() && legacy.cwd.is_none());
+        assert!(legacy.previous_session_files.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H31：`--continue` 目标解析——面包屑优先、失效回退 mtime、空目录为 None。
+    #[test]
+    fn resolve_last_prefers_breadcrumb_then_mtime() {
+        let dir = std::env::temp_dir().join(format!("gyre-last-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".agent").join("sessions")).unwrap();
+        let store = SessionStore::for_cwd(&dir);
+        assert!(store.resolve_last().is_none(), "空目录应无最近会话");
+
+        // 造两个会话；后写的 mtime 更新。
+        for id in ["aaaa", "bbbb"] {
+            std::fs::write(store.path_for(id), "{\"type\":\"header\"}\n").unwrap();
+        }
+        let newest = store.resolve_last().expect("应按 mtime 取最新");
+        assert_eq!(newest, "bbbb", "mtime 回退应取最新");
+
+        // 面包屑指向旧会话 → 以面包屑为准（用户最后一次实际使用的）。
+        store.mark_last("aaaa");
+        assert_eq!(store.resolve_last().as_deref(), Some("aaaa"));
+
+        // 面包屑失效（文件被删）→ 回退 mtime。
+        std::fs::remove_file(store.path_for("aaaa")).unwrap();
+        assert_eq!(store.resolve_last().as_deref(), Some("bbbb"));
+        // 非法 id（路径穿越）不被采信。
+        store.mark_last("../evil");
+        assert_eq!(store.resolve_last().as_deref(), Some("bbbb"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// header 行识别：读取方据此跳过 header；节点行/垃圾行/空行不误判。
     #[test]
     fn is_session_header_line_detection() {
@@ -922,6 +1097,7 @@ mod tests {
             version: 1,
             created_at_unix: 42,
             agent: "gyre".into(),
+            ..SessionHeader::new("gyre")
         };
         assert!(is_session_header_line(&header_line(&header).unwrap()));
         assert!(!is_session_header_line(&test_node_json("x")));

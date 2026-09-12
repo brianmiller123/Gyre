@@ -22,7 +22,10 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::client::{CloseHandler, McpError, McpTransport, NotificationHandler, resolve_timeout};
+use crate::client::{
+    CloseHandler, McpError, McpTransport, NotificationHandler, ServerRequestHandler,
+    resolve_timeout,
+};
 use crate::http::build_http_parts;
 
 /// MCP legacy HTTP+SSE 传输：SSE 读循环常驻连接，message 端点收发请求。
@@ -38,6 +41,8 @@ pub(crate) struct SseTransport {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     /// server→client 通知处理器槽（读循环经此分发）。
     notifications: Arc<Mutex<Option<NotificationHandler>>>,
+    /// server→client **请求**处理器槽（H16：读循环据应答 POST 回 message 端点）。
+    server_requests: Arc<Mutex<Option<ServerRequestHandler>>>,
     /// 异常断连处理器槽（读循环退出时触发；主动 `close` 前由 [`crate::client::McpClient`] 摘除）。
     on_close: Arc<Mutex<Option<CloseHandler>>>,
     /// SSE 读循环任务句柄（`close` / `Drop` 时 abort）。
@@ -95,6 +100,7 @@ impl SseTransport {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notifications: Arc<Mutex<Option<NotificationHandler>>> = Arc::new(Mutex::new(None));
+        let server_requests: Arc<Mutex<Option<ServerRequestHandler>>> = Arc::new(Mutex::new(None));
         let on_close: Arc<Mutex<Option<CloseHandler>>> = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), McpError>>();
@@ -105,8 +111,11 @@ impl SseTransport {
             Arc::clone(&endpoint),
             Arc::clone(&pending),
             Arc::clone(&notifications),
+            Arc::clone(&server_requests),
             Arc::clone(&on_close),
             Arc::clone(&closed),
+            http.clone(),
+            extra_headers.clone(),
             ready_tx,
         ));
 
@@ -130,6 +139,7 @@ impl SseTransport {
             endpoint,
             pending,
             notifications,
+            server_requests,
             on_close,
             read_task: Mutex::new(Some(read_task)),
             closed,
@@ -139,10 +149,7 @@ impl SseTransport {
 
     /// 当前 message 端点（未完成握手即断流时为 `None`）。
     fn message_endpoint(&self) -> Result<reqwest::Url, McpError> {
-        self.endpoint
-            .lock()
-            .clone()
-            .ok_or_else(|| McpError::Closed)
+        self.endpoint.lock().clone().ok_or(McpError::Closed)
     }
 
     /// 组装发往 message 端点的 POST。
@@ -150,7 +157,10 @@ impl SseTransport {
         self.http
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
             .headers(self.extra_headers.clone())
             .body(body)
     }
@@ -174,8 +184,11 @@ async fn read_loop(
     endpoint: Arc<Mutex<Option<reqwest::Url>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     notifications: Arc<Mutex<Option<NotificationHandler>>>,
+    server_requests: Arc<Mutex<Option<ServerRequestHandler>>>,
     on_close: Arc<Mutex<Option<CloseHandler>>>,
     closed: Arc<AtomicBool>,
+    http: reqwest::Client,
+    extra_headers: reqwest::header::HeaderMap,
     ready: oneshot::Sender<Result<(), McpError>>,
 ) {
     use eventsource_stream::Eventsource;
@@ -214,7 +227,9 @@ async fn read_loop(
                 }
                 Err(e) => {
                     if let Some(tx) = ready.take() {
-                        let _ = tx.send(Err(McpError::Http(format!("非法 legacy endpoint {data:?}: {e}"))));
+                        let _ = tx.send(Err(McpError::Http(format!(
+                            "非法 legacy endpoint {data:?}: {e}"
+                        ))));
                     }
                     return;
                 }
@@ -241,7 +256,24 @@ async fn read_loop(
             }
         };
         for m in &messages {
-            dispatch_message(m, &pending, &notifications);
+            if let Some(reply) = dispatch_message(m, &pending, &notifications, &server_requests) {
+                // H16：server→client 请求的响应经 message 端点 POST 回（同一 SSE 流的反向通道）。
+                if let Some(ep) = endpoint.lock().clone() {
+                    let body = serde_json::to_vec(&reply).unwrap_or_default();
+                    let req = http
+                        .post(ep)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .headers(extra_headers.clone())
+                        .body(body);
+                    tokio::spawn(async move {
+                        if let Err(e) = req.send().await {
+                            tracing::warn!(target: "mcp::sse", error = %e, "回发 server→client 请求响应失败");
+                        }
+                    });
+                } else {
+                    tracing::warn!(target: "mcp::sse", "endpoint 未就绪，无法回发请求响应");
+                }
+            }
         }
     }
 
@@ -264,37 +296,50 @@ async fn read_loop(
     let _ = ready_tx.send(Err(McpError::Closed));
 }
 
-/// 分发一条 JSON-RPC 消息：响应（id + result/error）按 id 唤醒等待者；通知
-/// （有 method 无 id）转发注册的处理器；server→client 请求（有 method 有 id）
-/// 与 stdio / Streamable 读循环行为一致——忽略。
+/// 分发一条 JSON-RPC 消息。
+///
+/// - 响应（id + result/error）→ 按 id 唤醒等待者，返回 `None`；
+/// - server→client **请求**（有 `method` **且有** `id`）→ 返回待回发的响应帧（H16）；
+/// - 通知（有 method 无 id）→ 转发注册的处理器，返回 `None`。
 fn dispatch_message(
     m: &Value,
     pending: &Mutex<HashMap<u64, oneshot::Sender<Value>>>,
     notifications: &Mutex<Option<NotificationHandler>>,
-) {
-    if let Some(id) = m.get("id").and_then(Value::as_u64) {
-        let has_payload = m.get("result").is_some() || m.get("error").is_some();
-        if has_payload {
-            match pending.lock().remove(&id) {
-                Some(tx) => {
-                    let _ = tx.send(m.clone());
-                }
-                None => {
-                    tracing::debug!(target: "mcp::sse", id, "忽略未知 id 的 legacy SSE 响应")
-                }
-            }
-            return;
-        }
-        tracing::debug!(target: "mcp::sse", "忽略 server→client 请求");
-        return;
-    }
+    server_requests: &Mutex<Option<ServerRequestHandler>>,
+) -> Option<Value> {
     if let Some(method) = m.get("method").and_then(Value::as_str) {
+        let Some(id) = m.get("id") else {
+            // 通知。
+            let params = m.get("params").cloned().unwrap_or(Value::Null);
+            match notifications.lock().clone() {
+                Some(h) => h(method, &params),
+                None => tracing::debug!(target: "mcp::sse", method, "忽略 server 通知"),
+            }
+            return None;
+        };
+        // H16：server→client 请求——必须应答（此前直接丢弃 → server 永久等待）。
         let params = m.get("params").cloned().unwrap_or(Value::Null);
-        match notifications.lock().clone() {
-            Some(h) => h(method, &params),
-            None => tracing::debug!(target: "mcp::sse", method, "忽略 server 通知"),
+        let answer = match server_requests.lock().clone() {
+            Some(h) => h(id, method, &params),
+            None => Err((
+                crate::client::JSONRPC_METHOD_NOT_FOUND,
+                format!("Method not found: {method}"),
+            )),
+        };
+        return Some(match answer {
+            Ok(result) => crate::client::server_request_result(id, result),
+            Err((code, message)) => crate::client::server_request_error(id, code, &message),
+        });
+    }
+    if let Some(id) = m.get("id").and_then(Value::as_u64) {
+        match pending.lock().remove(&id) {
+            Some(tx) => {
+                let _ = tx.send(m.clone());
+            }
+            None => tracing::debug!(target: "mcp::sse", id, "忽略未知 id 的 legacy SSE 响应"),
         }
     }
+    None
 }
 
 impl Drop for SseTransport {
@@ -387,6 +432,10 @@ impl McpTransport for SseTransport {
 
     fn set_on_notification(&self, handler: NotificationHandler) {
         *self.notifications.lock() = Some(handler);
+    }
+
+    fn set_on_server_request(&self, handler: ServerRequestHandler) {
+        *self.server_requests.lock() = Some(handler);
     }
 
     fn set_on_close(&self, handler: CloseHandler) {

@@ -290,6 +290,16 @@ impl Tool for MemoryReflectTool {
 /// - `clear`：清空该项目全部记忆，须显式 `confirm: true`（防误触）。
 ///
 /// 只读写自管理记忆库、不触工作区——审批取 read 级（与 [`MemoryRetainTool`] 约定一致）。
+/// 读取 `memory_edit` 各 op 共用的 `id` 参数（缺省报错文案带上 op 名）。
+fn required_id<'a>(input: &'a serde_json::Value, op: &str) -> Result<&'a str, ToolError> {
+    input
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::InvalidArgs(format!("{op} 缺少 `id` 参数")))
+}
+
 pub struct MemoryEditTool {
     memory: Arc<dyn MemoryStore>,
 }
@@ -336,13 +346,67 @@ impl MemoryEditTool {
     }
 
     /// forget：按 id 删除一条记录。
-    async fn op_forget(&self, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("id")
+    /// update：就地改写内容/重要性（omp `memory_edit op=update`）。
+    async fn op_update(&self, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+        let id = required_id(input, "update")?;
+        let content = input
+            .get("content")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ToolError::InvalidArgs("forget 缺少 `id` 参数".into()))?;
+            .filter(|c| !c.is_empty());
+        let importance = input
+            .get("importance")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| u8::try_from(v.min(5)).unwrap_or(5));
+        if content.is_none() && importance.is_none() {
+            return Err(ToolError::InvalidArgs(
+                "update 需要 `content` 或 `importance` 至少一个".into(),
+            ));
+        }
+        let hit = self
+            .memory
+            .update(id, content, importance)
+            .await
+            .map_err(|e| ToolError::Execution(format!("记忆更新失败: {e}")))?;
+        Ok(ToolResult::text(if hit {
+            let mut changed = Vec::new();
+            if content.is_some() {
+                changed.push("content");
+            }
+            if importance.is_some() {
+                changed.push("importance");
+            }
+            format!("已更新记忆 {id}（{}）。", changed.join(", "))
+        } else {
+            format!("未找到记忆 {id}（可能已被删除，或当前后端不支持就地修改）。")
+        }))
+    }
+
+    /// invalidate：标记失效（不再参与检索，保留可追溯）。
+    async fn op_invalidate(&self, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+        let id = required_id(input, "invalidate")?;
+        let replacement = input
+            .get("replacement_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let hit = self
+            .memory
+            .invalidate(id, replacement)
+            .await
+            .map_err(|e| ToolError::Execution(format!("记忆失效标记失败: {e}")))?;
+        Ok(ToolResult::text(if hit {
+            match replacement {
+                Some(r) => format!("已标记记忆 {id} 失效（替代者 {r}）。"),
+                None => format!("已标记记忆 {id} 失效。"),
+            }
+        } else {
+            format!("未找到记忆 {id}（可能已被删除，或当前后端不支持失效标记）。")
+        }))
+    }
+
+    async fn op_forget(&self, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+        let id = required_id(input, "forget")?;
         let hit = self
             .memory
             .forget(id)
@@ -398,21 +462,29 @@ impl Tool for MemoryEditTool {
         "memory_edit"
     }
     fn description(&self) -> &'static str {
-        "管理跨会话长期记忆：search 检索（命中带记录 id）、forget 按 id 删除过期或错误记忆、\
+        "管理跨会话长期记忆：search 检索（命中带记录 id）、update 就地改写内容/重要性、\
+invalidate 标记失效（可指向替代记录，失效后不再参与检索但保留可追溯）、forget 按 id 删除、\
 banks 列出记忆库、clear 清空全部（须 confirm: true）。\
-先 search 拿 id 再 forget；仅 structured 后端支持删除。"
+先 search 拿 id 再 update/invalidate/forget；仅 structured 后端支持逐条修改/删除。"
     }
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": ["search", "forget", "banks", "clear"],
+                "op": { "type": "string",
+                        "enum": ["search", "update", "invalidate", "forget", "banks", "clear"],
                         "description": "操作" },
                 "query": { "type": "string", "description": "search：检索查询（自然语言）" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8,
                            "description": "search：返回条数上限（默认 8）" },
                 "id": { "type": "string",
-                        "description": "forget：要删除的记录 id（来自 search 命中）" },
+                        "description": "update/invalidate/forget：记录 id（来自 search 命中）" },
+                "content": { "type": "string",
+                             "description": "update：替换正文（与 importance 至少给一个）" },
+                "importance": { "type": "integer", "minimum": 0, "maximum": 5,
+                                "description": "update：替换重要性 0-5（与 content 至少给一个）" },
+                "replacement_id": { "type": "string",
+                                    "description": "invalidate：替代本条的记录 id（可省略）" },
                 "confirm": { "type": "boolean",
                              "description": "clear：须显式传 true 才执行清空" }
             },
@@ -440,11 +512,13 @@ banks 列出记忆库、clear 清空全部（须 confirm: true）。\
             .ok_or_else(|| ToolError::InvalidArgs("缺少 `op` 参数".into()))?;
         match op {
             "search" => self.op_search(&input).await,
+            "update" => self.op_update(&input).await,
+            "invalidate" => self.op_invalidate(&input).await,
             "forget" => self.op_forget(&input).await,
             "banks" => self.op_banks().await,
             "clear" => self.op_clear(&input).await,
             other => Err(ToolError::InvalidArgs(format!(
-                "未知 op `{other}`（可选 search/forget/banks/clear）"
+                "未知 op `{other}`（可选 search/update/invalidate/forget/banks/clear）"
             ))),
         }
     }
@@ -554,6 +628,130 @@ mod tests {
         assert!(t.chars().count() <= 11, "实际 {}", t.chars().count());
         assert!(t.ends_with('…'));
         assert_eq!(truncate_chars("短文本", 100), "短文本");
+    }
+
+    /// H32（omp `memory_edit`）：update 就地改写 + invalidate 失效后不再被检索。
+    #[tokio::test]
+    async fn memory_edit_update_and_invalidate() {
+        let root = std::env::temp_dir().join(format!(
+            "mem-edit-test-{}-{:#x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 保留具体类型句柄用于断言存储层效果，工具侧用 `dyn MemoryStore`。
+        let store =
+            std::sync::Arc::new(agent_memory::StructuredMemoryStore::with_root(root.clone()));
+        let store_dyn: std::sync::Arc<dyn MemoryStore> = store.clone();
+        let retain = MemoryRetainTool::new(std::sync::Arc::clone(&store_dyn));
+        let recall = MemoryRecallTool::new(std::sync::Arc::clone(&store_dyn));
+        let edit = MemoryEditTool::new(std::sync::Arc::clone(&store_dyn));
+
+        retain
+            .execute(
+                serde_json::json!({ "content": "部署使用 zzz-marker-旧", "importance": 2 }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        // search 拿 id（memory_edit search 输出带 `id: ...`）。
+        let found = edit
+            .execute(
+                serde_json::json!({ "op": "search", "query": "zzz-marker" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let id = extract_id(&text_of(&found));
+
+        // update：改 content + importance，存储层立即生效。
+        let out = edit
+            .execute(
+                serde_json::json!({ "op": "update", "id": id, "content": "部署使用 zzz-marker-新", "importance": 5 }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(text_of(&out).contains("已更新"), "{}", text_of(&out));
+        let found = store.search(&agent_memory::SearchFilter {
+            contains: Some("zzz-marker".into()),
+            ..Default::default()
+        });
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].importance, 5, "importance 应被改写");
+        assert!(
+            found[0].content.contains("zzz-marker-新"),
+            "content 应被改写"
+        );
+        let hits = recall
+            .execute(serde_json::json!({ "query": "zzz-marker" }), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            text_of(&hits).contains("zzz-marker-新"),
+            "{}",
+            text_of(&hits)
+        );
+
+        // update 缺 content/importance → 明确报错。
+        let err = edit
+            .execute(serde_json::json!({ "op": "update", "id": id }), &ctx())
+            .await
+            .expect_err("应拒绝空 update");
+        assert!(format!("{err}").contains("content"), "{err:?}");
+
+        // invalidate：失效后不再被检索（但记录仍在库内）。
+        let out = edit
+            .execute(
+                serde_json::json!({ "op": "invalidate", "id": id, "replacement_id": "other" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(text_of(&out).contains("已标记记忆"), "{}", text_of(&out));
+        let hits = recall
+            .execute(serde_json::json!({ "query": "zzz-marker" }), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            !text_of(&hits).contains("zzz-marker"),
+            "失效记录不应再出现在检索结果: {}",
+            text_of(&hits)
+        );
+        // 失效 ≠ 删除：记录仍在库内（stats 仍计数），只是不再被 recall/search 命中。
+        assert!(
+            store
+                .search(&agent_memory::SearchFilter {
+                    contains: Some("zzz-marker".into()),
+                    ..Default::default()
+                })
+                .is_empty(),
+            "search 也应过滤失效记录"
+        );
+        assert_eq!(store.stats().total, 1, "失效记录应保留可追溯");
+
+        // 未知 id → 友好提示而非报错。
+        let out = edit
+            .execute(
+                serde_json::json!({ "op": "invalidate", "id": "no-such-id" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(text_of(&out).contains("未找到记忆"), "{}", text_of(&out));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 从 `memory_edit search` 输出里取第一条 `id: xxx`。
+    fn extract_id(text: &str) -> String {
+        let after = text.split("id: ").nth(1).expect("输出应含 id");
+        after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-')
+            .collect()
     }
 
     // P0-1：recall/retain 工具与真实 structured 存储的往返闭环（无向量，纯词法）。

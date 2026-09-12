@@ -68,10 +68,12 @@ impl LlmProvider for GlmProvider {
         let body = build_body(&request);
         let model_id = request.model.id.clone();
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(ctx.api_key.as_deref().unwrap_or_default())
+        // H24：`auth = none`（或 key 为空）时不发内置鉴权头。
+        let mut http = self.client.post(&url);
+        if let Some(key) = ctx.builtin_api_key() {
+            http = http.bearer_auth(key);
+        }
+        let resp = crate::apply_custom_headers(http, &ctx.headers)
             .json(&body)
             .send()
             .await

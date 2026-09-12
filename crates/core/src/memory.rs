@@ -126,6 +126,37 @@ pub trait MemoryStore: Send + Sync {
         Vec::new()
     }
 
+    /// 就地更新一条记忆的内容/重要性（`memory_edit update`，H32）：返回是否找到并更新。
+    ///
+    /// `content` / `importance` 为 `None` 表示该字段保持不变（两者皆 `None` 时调用方已拒绝）。
+    /// 默认 `Ok(false)`——后端不支持就地修改（如 local 后端的笔记经 LLM 合并，无稳定记录）。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    async fn update(
+        &self,
+        _id: &str,
+        _content: Option<&str>,
+        _importance: Option<u8>,
+    ) -> Result<bool, std::io::Error> {
+        Ok(false)
+    }
+
+    /// 把一条记忆标记为**失效**（`memory_edit invalidate`，H32）：不再参与检索，但保留可追溯。
+    ///
+    /// `replacement_id` 给定时记录「被谁替代」（omp `invalidate` 语义）。返回是否找到。
+    /// 默认 `Ok(false)`——后端不支持失效标记（同上：无稳定记录 id）。
+    ///
+    /// # Errors
+    /// 重写失败时返回 IO 错误。
+    async fn invalidate(
+        &self,
+        _id: &str,
+        _replacement_id: Option<&str>,
+    ) -> Result<bool, std::io::Error> {
+        Ok(false)
+    }
+
     /// 追加一条心智模型（`reflect` 工具 / LLM 提炼用）：写入项目 `mental_models.md`，
     /// 下次会话经 [`Self::mental_models`] 注入 system prompt。
     ///

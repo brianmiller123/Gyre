@@ -1,106 +1,36 @@
-//! DAP `Content-Length` 帧编解码。
+//! DAP `Content-Length` 帧编解码（薄包装）。
 //!
-//! DAP 与 LSP 同源的帧格式：`Content-Length: <N>\r\n\r\n` + N 字节 JSON body。
-//! [`encode_frame`] 负责编码；[`decode_frames`] 为纯增量解码——给定累计缓冲区切片，
-//! 返回「完整帧列表 + 已消费字节数」，调用方 `drain` 消费后继续累积输入，天然支持
-//! 跨 chunk 分片（一帧拆多次写入、多帧合并在一次读取）。
+//! 帧格式与实现**收敛到 [`agent_core::jsonrpc_frame`]**（H45：此前 DAP 与 LSP 各写
+//! 一份帧解析/构造，上限与行尾兼容各不相同）。本模块只保留 DAP 的错误类型映射，
+//! 公共 API（[`encode_frame`] / [`decode_frames`]）不变。
 
 use serde_json::Value;
 
 use crate::DapError;
 
-/// 单帧 body 长度上限（约 512 MiB，防恶意/损坏适配器撑爆内存）。
-const MAX_BODY_LEN: usize = 512 * 1024 * 1024;
-/// 帧头最大长度：64 KiB 内必须出现头终止符，否则视为非 DAP 字节流。
-const MAX_HEADER_LEN: usize = 64 * 1024;
-
 /// 将 JSON body 编码为一帧（`Content-Length` 头 + body）。
 ///
 /// # Errors
-/// JSON 序列化失败（对 `serde_json::Value` 实际不会发生）。
+/// JSON 序列化失败时返回 [`DapError::Json`]。
 pub fn encode_frame(body: &Value) -> Result<Vec<u8>, DapError> {
-    let payload = serde_json::to_vec(body)?;
-    let mut out = Vec::with_capacity(payload.len() + 64);
-    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes());
-    out.extend_from_slice(&payload);
-    Ok(out)
+    agent_core::jsonrpc_frame::encode_frame(body).map_err(frame_err)
 }
 
-/// 从累计缓冲区解码所有完整帧。
-///
-/// 返回 `(帧列表, 已消费字节数)`。缓冲区中只含不完整帧（头未完整或 body 未收齐）时
-/// 返回空列表与 `0`，调用方应继续追加输入后重试。
+/// 从累计缓冲区解码所有完整帧（详见 [`agent_core::jsonrpc_frame::decode_frames`]）。
 ///
 /// # Errors
 /// 头格式非法、`Content-Length` 缺失/超限，或 body 非合法 JSON 时返回
 /// [`DapError::Protocol`] / [`DapError::Json`]。
 pub fn decode_frames(input: &[u8]) -> Result<(Vec<Value>, usize), DapError> {
-    let mut frames = Vec::new();
-    let mut consumed = 0usize;
-    loop {
-        let rest = &input[consumed..];
-        if rest.is_empty() {
-            break;
-        }
-        let Some((header_len, body_start)) = find_header_end(rest) else {
-            // 头未完整：超过上限视为非 DAP 字节流，否则等更多数据
-            if rest.len() > MAX_HEADER_LEN {
-                return Err(DapError::Protocol(
-                    "未找到帧头终止符（输入疑似非 DAP 字节流）".into(),
-                ));
-            }
-            break;
-        };
-        let content_length = parse_content_length(&rest[..header_len])?;
-        if content_length > MAX_BODY_LEN {
-            return Err(DapError::Protocol(format!(
-                "Content-Length 超限: {content_length}"
-            )));
-        }
-        let total = body_start + content_length;
-        if rest.len() < total {
-            break; // body 未完整，等待更多数据
-        }
-        let body = &rest[body_start..total];
-        let value: Value = serde_json::from_slice(body)?;
-        frames.push(value);
-        consumed += total;
-    }
-    Ok((frames, consumed))
+    agent_core::jsonrpc_frame::decode_frames(input).map_err(frame_err)
 }
 
-/// 定位帧头终止符，返回 `(头字节长度, body 起始偏移)`。
-///
-/// 兼容 `\r\n\r\n` 与 `\n\n` 两种行尾（部分适配器用裸 `\n`）。
-fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
-    if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
-        return Some((pos, pos + 4));
+/// 共享帧错误 → DAP 错误。
+fn frame_err(e: agent_core::jsonrpc_frame::FrameError) -> DapError {
+    match e {
+        agent_core::jsonrpc_frame::FrameError::Json(e) => DapError::Json(e),
+        agent_core::jsonrpc_frame::FrameError::Protocol(msg) => DapError::Protocol(msg),
     }
-    find_subslice(buf, b"\n\n").map(|pos| (pos, pos + 2))
-}
-
-/// 朴素子串定位。
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// 从头字节中解析 `Content-Length`（头名大小写不敏感，行尾 `\r\n` 或 `\n` 均可）。
-fn parse_content_length(header: &[u8]) -> Result<usize, DapError> {
-    let text = String::from_utf8_lossy(header);
-    for line in text.split('\n') {
-        let line = line.trim_end_matches('\r');
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            let n: usize = value
-                .trim()
-                .parse()
-                .map_err(|_| DapError::Protocol(format!("Content-Length 头非法: {line:?}")))?;
-            return Ok(n);
-        }
-    }
-    Err(DapError::Protocol("缺少 Content-Length 头".into()))
 }
 
 #[cfg(test)]
@@ -194,7 +124,10 @@ mod tests {
 
     #[test]
     fn oversized_content_length_is_protocol_error() {
-        let raw = format!("Content-Length: {}\r\n\r\n", MAX_BODY_LEN + 1);
+        let raw = format!(
+            "Content-Length: {}\r\n\r\n",
+            agent_core::jsonrpc_frame::MAX_BODY_LEN + 1
+        );
         assert!(matches!(
             decode_frames(raw.as_bytes()),
             Err(DapError::Protocol(_))
@@ -203,7 +136,7 @@ mod tests {
 
     #[test]
     fn garbage_stream_is_protocol_error() {
-        let garbage = vec![b'x'; MAX_HEADER_LEN + 1];
+        let garbage = vec![b'x'; agent_core::jsonrpc_frame::MAX_HEADER_LEN + 1];
         assert!(matches!(
             decode_frames(&garbage),
             Err(DapError::Protocol(_))

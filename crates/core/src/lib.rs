@@ -24,6 +24,8 @@ pub mod context;
 pub mod error;
 pub mod hook;
 pub mod hub;
+pub mod jobs;
+pub mod jsonrpc_frame;
 pub mod llm;
 pub mod memory;
 pub mod message;
@@ -33,20 +35,25 @@ pub mod platform;
 pub mod prompt_sections;
 pub mod resource;
 pub mod secrets;
+pub mod session_event;
 pub mod skill;
+pub mod todo_loop;
 pub mod tool;
 pub mod workspace;
 pub mod write_effect;
 
 pub use context::{
-    CompactionBackend, CompactionStrategy, ContextManager, NodeId, ProviderContext, SessionNode,
-    TokenUsage,
+    CompactionBackend, CompactionPolicy, CompactionStrategy, ContextManager, NodeId,
+    ProviderContext, SessionNode, TokenUsage,
 };
 pub use error::{AgentError, ConfigError, ContextError, LlmError, ToolError};
 pub use hook::{Hook, HookEvent, TurnEndContext};
+pub use jobs::AsyncWakeProbe;
+pub use jsonrpc_frame::{FrameError, decode_frames, encode_frame, parse_content_length};
 pub use llm::{
-    AssistantEvent, AssistantEventStream, CompletionRequest, Effort, LlmProvider,
-    ProviderCallContext, ThinkingClassifier, ThinkingConfig, ThinkingPolicy,
+    AssistantEvent, AssistantEventStream, AuthMode, CompletionRequest, Effort, LlmProvider,
+    MaxTokensField, ProviderCallContext, ProviderQuirks, ThinkingClassifier, ThinkingConfig,
+    ThinkingPolicy,
 };
 pub use memory::{MemoryHit, MemoryNote, MemoryStore};
 pub use message::{
@@ -55,15 +62,18 @@ pub use message::{
     StopReason, ToolCounters, ToolImage, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use model::{Api, Model};
-pub use platform::{config_dir, forced_utf8_locale};
+pub use platform::{config_dir, forced_utf8_locale, project_config_dir_name};
 pub use prompt_sections::{
     DELEGATION_SECTION, DELIVERY_SECTION, TOOL_POLICY_SECTION, WORKFLOW_SECTION,
 };
 pub use resource::{ResourceEntry, ResourceError, ResourceResolver};
+pub use secrets::PatternRedactor;
 pub use secrets::SecretsObfuscator;
+pub use session_event::{CompactionAction, CompactionReason, CompactionStage, SessionEvent};
 pub use skill::{
     Skill, SkillError, SkillLevel, SkillLoadOptions, SkillProvider, SkillResolver, SkillSource,
 };
+pub use todo_loop::{TodoLoopEntry, TodoLoopSnapshot, TodoLoopSource};
 pub use tool::{
     ApprovalDecision, ApprovalMode, ApprovalPolicy, ApprovalRequest, CapabilityTier,
     SoftToolRequirement, ToolChoice, ToolChoiceDirective, ToolResult, ToolSpec,

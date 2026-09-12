@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use agent_core::{ApprovalRequest, CapabilityTier, ToolError, ToolResult};
@@ -22,21 +22,82 @@ use crate::{Tool, ToolContext};
 /// （Unix `/bin/sh -c`、Windows `cmd /C`）仅兜底：破坏性三件套（rm/mv/ln）维持走
 /// 系统二进制、`GYRE_DISABLE_INPROC_BUILTINS=1` 显式退出、或进程内引擎初始化失败。
 /// 子进程路径由 `kill_on_drop` 确保取消时回收。
+/// PTY 执行端口（H33）：`run_command(pty: true)` 经此委托给伪终端实现。
+///
+/// 端口属 `agent-tools`，适配器在 `agent-pty`（后者依赖本 crate，故不能反向依赖）——
+/// 与仓库既有的 Ports & Adapters 装配方式一致。装配层经 [`set_pty_executor`] 注入。
+pub trait PtyExecutor: Send + Sync {
+    /// 在伪终端执行一次命令。
+    fn run(
+        &self,
+        command: String,
+        cwd: Option<std::path::PathBuf>,
+        env: HashMap<String, String>,
+        timeout_ms: Option<u64>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PtyExecOutcome, String>> + Send + '_>,
+    >;
+}
+
+/// PTY 执行结果（端口层视图，避免 tools 依赖 pty crate 的具体类型）。
+#[derive(Debug, Clone, Default)]
+pub struct PtyExecOutcome {
+    /// 合并的 stdout/stderr。
+    pub output: String,
+    /// 退出码。
+    pub exit_code: Option<i32>,
+    /// 是否超时。
+    pub timed_out: bool,
+}
+
+/// 全局 PTY 执行器（`None` = 未接入：`pty:true` 会给出明确错误而非静默降级）。
+static PTY_EXECUTOR: std::sync::OnceLock<std::sync::Arc<dyn PtyExecutor>> =
+    std::sync::OnceLock::new();
+
+/// 注入 PTY 执行器（装配层启动时调用一次；重复调用以首次为准）。
+pub fn set_pty_executor(executor: std::sync::Arc<dyn PtyExecutor>) {
+    let _ = PTY_EXECUTOR.set(executor);
+}
+
+/// 当前 PTY 执行器。
+#[must_use]
+pub fn pty_executor() -> Option<&'static std::sync::Arc<dyn PtyExecutor>> {
+    PTY_EXECUTOR.get()
+}
+
 pub struct RunCommandTool {
     /// 命令拦截规则（命中即在 spawn 前重定向到专用工具）。空 Vec = 不拦截。
     intercept: Vec<CompiledRule>,
     /// 输出最小化器：git/cargo/python 等冗长命令输出压缩为摘要。传 [`minimizer::disabled`] 关闭。
-    minimizer: Minimizer,
+    minimizer: std::sync::Arc<Minimizer>,
+    /// 异步作业管理器（可选；`async:true` 参数依赖）。`None` 时 async 参数报错。
+    jobs: Option<std::sync::Arc<agent_core::jobs::AsyncJobManager>>,
+    /// 注册方代理 id（owner 范围取消/投递路由；与 hub 身份一致，缺省 "main"）。
+    owner_id: String,
 }
 
 impl RunCommandTool {
     /// 构造带指定拦截规则与输出最小化器的 `run_command` 工具。
     #[must_use]
-    pub const fn new(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> Self {
+    pub fn new(intercept: Vec<CompiledRule>, minimizer: Minimizer) -> Self {
         Self {
             intercept,
-            minimizer,
+            minimizer: std::sync::Arc::new(minimizer),
+            jobs: None,
+            owner_id: "main".into(),
         }
+    }
+
+    /// 挂接异步作业管理器（装配层注入；`async:true` 随之可用）。
+    #[must_use]
+    pub fn with_jobs(
+        mut self,
+        jobs: std::sync::Arc<agent_core::jobs::AsyncJobManager>,
+        owner_id: impl Into<String>,
+    ) -> Self {
+        self.jobs = Some(jobs);
+        self.owner_id = owner_id.into();
+        self
     }
 }
 
@@ -45,7 +106,9 @@ impl Default for RunCommandTool {
     fn default() -> Self {
         Self {
             intercept: intercept::default_compiled(),
-            minimizer: minimizer::disabled(),
+            minimizer: std::sync::Arc::new(minimizer::disabled()),
+            jobs: None,
+            owner_id: "main".into(),
         }
     }
 }
@@ -69,7 +132,9 @@ impl Tool for RunCommandTool {
                     "additionalProperties": { "type": "string" },
                     "description": "附加环境变量（覆盖会话同名变量）；键须为合法环境变量名"
                 },
-                "timeout": { "type": "integer", "minimum": 0, "maximum": 3600, "description": "超时秒数（1–3600）；0 表示不限时。默认 120" }
+                "timeout": { "type": "integer", "minimum": 0, "maximum": 3600, "description": "超时秒数（1–3600）；0 表示不限时。默认 120" },
+                "async": { "type": "boolean", "description": "true = 后台执行：立即返回作业 id，命令继续运行；完成后结果自动投回会话，hub 的 jobs/cancel/wait 可查询/取消/等待" },
+                "pty": { "type": "boolean", "description": "true = 在伪终端（PTY）中运行：需要 TTY 的命令（top/vim/交互式安装器等）用此项；与 async 互斥。未接入 PTY 时返回明确错误" }
             },
             "required": ["command"]
         })
@@ -125,65 +190,176 @@ impl Tool for RunCommandTool {
                 rule.tool, rule.message
             )));
         }
-
         // 拆分命令名与参数，供输出最小化器做过滤器匹配（只读，命中才改写结果文本）。
         let (cmd_name, cmd_args) = minimizer::split_command(command);
 
-        // 引擎分派：进程内 brush 优先（跨平台一致的 bash 兼容语义）。子进程仅兜底：
-        // - 破坏性三件套（rm/mv/ln）维持走系统二进制（ withheld 属性）；
-        // - `GYRE_DISABLE_INPROC_BUILTINS` 环境变量整体退出；
-        // - 进程内引擎初始化失败时回退（超时/取消不回退，保持语义）。
-        let (exit_success, exit_code, combined) = if inproc_enabled()
-            && !agent_shell::is_withheld_command(&cmd_name)
-        {
-            match run_inproc_command(command, &cwd, env_overrides.clone(), timeout, ctx.cancel)
+        // H33：`pty:true` → 委托给注入的 PTY 执行器（需要 TTY 的命令）。与 async 互斥：
+        // 后台作业体走管道路径，PTY 的交互语义无法在后台成立。
+        if input.get("pty").and_then(Value::as_bool).unwrap_or(false) {
+            if input.get("async").and_then(Value::as_bool).unwrap_or(false) {
+                return Err(ToolError::InvalidArgs(
+                    "`pty` 与 `async` 互斥：伪终端需要前台交互，后台化请去掉 pty".into(),
+                ));
+            }
+            let Some(exec) = pty_executor() else {
+                return Err(ToolError::Execution(
+                    "本会话未接入 PTY 执行器（pty:true 不可用）；请改用普通 run_command，或让宿主启用 PTY（[tools.enabled] pty = true）"
+                        .into(),
+                ));
+            };
+            // 秒 → 毫秒（`timeout: 0` = 不限时）。
+            let timeout_ms = timeout.and_then(|d| {
+                (!d.is_zero()).then_some(d.as_millis().min(u128::from(u64::MAX)) as u64)
+            });
+            let out = exec
+                .run(
+                    command.to_string(),
+                    Some(cwd.clone()),
+                    env_overrides.iter().cloned().collect(),
+                    timeout_ms,
+                )
                 .await
-            {
-                Ok(output) => (
-                    output.exit_code == Some(0),
-                    output.exit_code,
-                    output.combined,
-                ),
-                Err(InprocFailure::Setup(msg)) => {
-                    tracing::warn!(target: "tools::shell", "进程内引擎初始化失败，回退子进程: {msg}");
-                    run_child_command(command, &cwd, &env_overrides, timeout, ctx.cancel).await?
-                }
-                Err(InprocFailure::Cancelled) => {
-                    return Err(ToolError::Execution("命令被取消".into()));
-                }
-                Err(InprocFailure::TimedOut(timeout)) => {
-                    return Err(ToolError::Execution(format!(
-                        "命令超时（{}s）",
-                        timeout.as_secs()
-                    )));
-                }
+                .map_err(ToolError::Execution)?;
+            let mut text = out.output.trim_end().to_string();
+            if out.timed_out {
+                text.push_str("\n[pty] 命令超时，已终止");
             }
-        } else {
-            run_child_command(command, &cwd, &env_overrides, timeout, ctx.cancel).await?
-        };
-
-        // 输出最小化：命中过滤器时以摘要替代完整输出（退出码语义由下方分支保留）。
-        // 空输出不压缩（过滤器对空输出返回 None，落到原路径）。
-        let text = match self.minimizer.apply(&cmd_name, &cmd_args, &combined) {
-            Some(Minimized { summary, filter }) => format!(
-                "{summary}\n> 输出已由 minimizer 压缩（{filter}）；如需完整输出请重跑该命令。"
-            ),
-            None if combined.is_empty() => {
-                // 成功且无输出（mkdir/touch/git config 等静默命令）：显式标注。
-                // 既让模型明确「命令已成功执行」避免误判/重试，又在源头消除空文本
-                // （序列化层另有兜底，此处为语义与 UI 改善）。
-                "(命令成功，无输出)".to_string()
+            if let Some(code) = out.exit_code.filter(|c| *c != 0) {
+                text.push_str(&format!("\n[pty] 退出码 {code}"));
             }
-            None => combined,
-        };
-        if exit_success {
-            Ok(ToolResult::text(text))
-        } else {
-            Ok(ToolResult::text(format!(
-                "[exit {}]\n{text}",
-                exit_code.unwrap_or(-1)
-            )))
+            return Ok(ToolResult::text(text));
         }
+
+        // async:true → 注册后台作业，立即返回作业 id；结果经管理器投递回会话。
+        // （omp bash.ts:1011-1031。作业体使用作业自身的取消令牌——批级 cancel
+        // 不再波及已后台化的命令，这是后台语义的本意。）
+        if input.get("async").and_then(Value::as_bool).unwrap_or(false) {
+            let Some(jobs) = self.jobs.as_ref() else {
+                return Err(ToolError::InvalidArgs(
+                    "async:true 需要后台作业管理器（本会话未启用）".into(),
+                ));
+            };
+            let label = if command.chars().count() > 120 {
+                let head: String = command.chars().take(117).collect();
+                format!("{head}...")
+            } else {
+                command.to_string()
+            };
+            let job_command = command.to_string();
+            let job_cwd = cwd.clone();
+            let job_env = env_overrides.clone();
+            let job_timeout = timeout;
+            let minimizer = Arc::clone(&self.minimizer);
+            let opts = agent_core::jobs::RegisterOptions {
+                owner_id: Some(self.owner_id.clone()),
+                ..Default::default()
+            };
+            let job_id = jobs
+                .register(
+                    agent_core::jobs::AsyncJobType::Bash,
+                    label,
+                    move |run| {
+                        Box::pin(async move {
+                            let (cmd_name, cmd_args) = minimizer::split_command(&job_command);
+                            run_shell_core(
+                                &job_command,
+                                &job_cwd,
+                                &job_env,
+                                job_timeout,
+                                &run.cancel,
+                            )
+                            .await
+                            .map(|(exit_success, exit_code, combined)| {
+                                finish_shell_output(
+                                    &minimizer,
+                                    &(&cmd_name, cmd_args),
+                                    &combined,
+                                    exit_success,
+                                    exit_code,
+                                )
+                            })
+                            .map_err(|e| e.to_string())
+                        })
+                    },
+                    opts,
+                )
+                .map_err(ToolError::Execution)?;
+            let timeout_note = if timeout.is_none() {
+                "（不限时）"
+            } else {
+                ""
+            };
+            return Ok(ToolResult::text(format!(
+                "已在后台启动为作业 {job_id}（bash{timeout_note}）；命令继续运行，完成后结果自动投回会话。\
+                 可用 hub 的 jobs 查看、wait 等待、cancel 取消。"
+            )));
+        }
+
+        let (exit_success, exit_code, combined) =
+            run_shell_core(command, &cwd, &env_overrides, timeout, ctx.cancel).await?;
+        let text = finish_shell_output(
+            &self.minimizer,
+            &(&cmd_name, cmd_args),
+            &combined,
+            exit_success,
+            exit_code,
+        );
+        Ok(ToolResult::text(text))
+    }
+}
+
+/// 公共执行核心：引擎分派（进程内 brush 优先，子进程兜底）。
+/// 超时/取消由调用方令牌与时长决定；错误即 [`ToolError`]（前台转结果、后台转作业失败）。
+async fn run_shell_core(
+    command: &str,
+    cwd: &Path,
+    env_overrides: &[(String, String)],
+    timeout: Option<Duration>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(bool, Option<i32>, String), ToolError> {
+    let (cmd_name, _cmd_args) = minimizer::split_command(command);
+    if inproc_enabled() && !agent_shell::is_withheld_command(&cmd_name) {
+        match run_inproc_command(command, cwd, env_overrides.to_vec(), timeout, cancel).await {
+            Ok(output) => Ok((
+                output.exit_code == Some(0),
+                output.exit_code,
+                output.combined,
+            )),
+            Err(InprocFailure::Setup(msg)) => {
+                tracing::warn!(target: "tools::shell", "进程内引擎初始化失败，回退子进程: {msg}");
+                run_child_command(command, cwd, env_overrides, timeout, cancel).await
+            }
+            Err(InprocFailure::Cancelled) => Err(ToolError::Execution("命令被取消".into())),
+            Err(InprocFailure::TimedOut(timeout)) => Err(ToolError::Execution(format!(
+                "命令超时（{}s）",
+                timeout.as_secs()
+            ))),
+        }
+    } else {
+        run_child_command(command, cwd, env_overrides, timeout, cancel).await
+    }
+}
+
+/// 公共结果整形：最小化压缩 → 空输出标注 → 失败退出码前缀。
+fn finish_shell_output(
+    minimizer: &Minimizer,
+    cmd: &(&str, Vec<String>),
+    combined: &str,
+    exit_success: bool,
+    exit_code: Option<i32>,
+) -> String {
+    let (cmd_name, cmd_args) = cmd;
+    let text = match minimizer.apply(cmd_name, cmd_args, combined) {
+        Some(Minimized { summary, filter }) => {
+            format!("{summary}\n> 输出已由 minimizer 压缩（{filter}）；如需完整输出请重跑该命令。")
+        }
+        None if combined.is_empty() => "(命令成功，无输出)".to_string(),
+        None => combined.to_string(),
+    };
+    if exit_success {
+        text
+    } else {
+        format!("[exit {}]\n{text}", exit_code.unwrap_or(-1))
     }
 }
 
@@ -863,6 +1039,93 @@ fn critical_reason(command: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// 最小 ToolContext（无审批/无流式；shell 测试用）。
+    fn shell_ctx<'a>(
+        ws: &'a agent_core::Workspace,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> ToolContext<'a> {
+        ToolContext {
+            workspace: ws,
+            approval: &NoopApproval,
+            cancel,
+            skills: None,
+            memory: None,
+            resources: None,
+            write_effect: None,
+            update_tx: None,
+            conflicts: None,
+            pending_rewrites: None,
+            context: None,
+            snapshots: None,
+            tool_call_id: None,
+        }
+    }
+
+    struct NoopApproval;
+    #[async_trait::async_trait]
+    impl agent_core::ApprovalPolicy for NoopApproval {
+        fn decide(&self, _req: &agent_core::ApprovalRequest<'_>) -> agent_core::ApprovalDecision {
+            agent_core::ApprovalDecision::Allow
+        }
+        async fn prompt(
+            &self,
+            _ask: &agent_core::AskMessage,
+        ) -> Result<agent_core::AskResponse, agent_core::ToolError> {
+            Err(agent_core::ToolError::Execution("测试桩不交互".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn async_true_registers_job_and_delivers_result() {
+        use std::sync::Mutex as StdMutex;
+        let log: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        let sink: agent_core::jobs::DeliverySink = Arc::new(move |job_id, text, _j| {
+            let log = Arc::clone(&log2);
+            Box::pin(async move {
+                log.lock().unwrap().push((job_id, text));
+                Ok(())
+            })
+        });
+        let jobs = agent_core::jobs::AsyncJobManager::build(2, 60_000, None);
+        // owner sink（与生产装配一致）：owner 作业只投给 owner sink，缺省即死信。
+        let _guard = jobs.register_delivery_sink("main", sink);
+        let tool = RunCommandTool::default().with_jobs(Arc::clone(&jobs), "main");
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &shell_ctx(&ws, &cancel);
+        // async:true：立即返回作业 id，不等待命令完成。
+        let out = tool
+            .execute(
+                serde_json::json!({"command": "echo async-e2e", "async": true}),
+                c,
+            )
+            .await
+            .unwrap()
+            .to_llm_text();
+        assert!(out.contains("后台启动为作业 bg_1"), "{out}");
+        // 投递 sink 收到最终结果（2s 上限足够单线程运行时轮转）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while log.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "exactly one delivery: {log:?}");
+        assert!(log[0].1.contains("async-e2e"), "result delivered: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn async_true_errors_without_manager() {
+        let tool = RunCommandTool::default();
+        let ws = agent_core::Workspace::new(std::env::temp_dir());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = &shell_ctx(&ws, &cancel);
+        let err = tool
+            .execute(serde_json::json!({"command": "echo x", "async": true}), c)
+            .await;
+        assert!(err.is_err(), "async without manager must error");
+    }
+
     #[test]
     fn windows_wrapper_prepends_utf8_codepage() {
         assert_eq!(
@@ -1199,5 +1462,73 @@ mod tests {
             matches!(err, Err(InprocFailure::Cancelled)),
             "批级取消应中断进程内命令"
         );
+    }
+
+    /// H33：`run_command(pty:true)` 委托注入的 PTY 执行器；未接入时给明确错误；与 async 互斥。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_flag_delegates_and_reports_unavailable() {
+        struct StubPty;
+        impl PtyExecutor for StubPty {
+            fn run(
+                &self,
+                command: String,
+                cwd: Option<std::path::PathBuf>,
+                env: HashMap<String, String>,
+                timeout_ms: Option<u64>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<PtyExecOutcome, String>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    Ok(PtyExecOutcome {
+                        output: format!(
+                            "pty:{command}|cwd={}|env={}|t={timeout_ms:?}",
+                            cwd.map_or_else(|| "-".into(), |p| p.display().to_string()),
+                            env.len()
+                        ),
+                        exit_code: Some(0),
+                        timed_out: false,
+                    })
+                })
+            }
+        }
+        // 未注入时：明确错误（不静默降级为管道执行）。
+        assert!(
+            pty_executor().is_none(),
+            "测试进程不应预设 PTY 执行器（其它测试若已注入则本断言失败）"
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = agent_core::Workspace::new(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = shell_ctx(&ws, &cancel);
+        let tool = RunCommandTool::new(Vec::new(), crate::minimizer::disabled());
+        let err = tool
+            .execute(json!({"command": "top", "pty": true}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("未接入 PTY 执行器"), "{err}");
+
+        // 与 async 互斥（先于执行器检查）。
+        let err = tool
+            .execute(json!({"command": "top", "pty": true, "async": true}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("互斥"), "{err}");
+
+        // 注入后：委托并把 cwd/env/timeout 透传（此处直接调用端口验证契约，
+        // 避免依赖进程级 OnceLock 的注入顺序）。
+        let stub = StubPty;
+        let out = stub
+            .run(
+                "top".into(),
+                Some(dir.path().to_path_buf()),
+                HashMap::from([("A".to_string(), "1".to_string())]),
+                Some(1500),
+            )
+            .await
+            .unwrap();
+        assert!(out.output.starts_with("pty:top|"), "{}", out.output);
+        assert!(out.output.contains("env=1"), "{}", out.output);
+        assert!(out.output.contains("t=Some(1500)"), "{}", out.output);
     }
 }

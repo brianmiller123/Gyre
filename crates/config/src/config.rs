@@ -5,7 +5,43 @@ use std::path::Path;
 use agent_core::platform::{config_dir, project_config_dir_name};
 use agent_core::{Api, ApprovalMode, ConfigError, Mode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// 配置分层候选路径（低 → 高优先级）：用户 `<config_dir>/config.toml` → 项目
+/// `<cwd>/.agent/config.toml`。`load` / `load_raw` / `set_key` 共用，避免分层顺序漂移。
+#[must_use]
+pub fn config_candidates(cwd: &Path) -> Vec<std::path::PathBuf> {
+    [
+        config_dir().map(|d| d.join("config.toml")),
+        Some(cwd.join(project_config_dir_name()).join("config.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// 读取并深合并全部存在的配置层；无任何文件时返回 `Ok(None)`。
+fn load_merged_value(
+    candidates: &[std::path::PathBuf],
+) -> Result<Option<toml::Value>, ConfigError> {
+    let mut merged: Option<toml::Value> = None;
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let value: toml::Value = toml::from_str(&text)
+            .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+        match &mut merged {
+            Some(base) => merge_value(base, &value),
+            None => merged = Some(value),
+        }
+    }
+    Ok(merged)
+}
 
 /// 顶层配置。
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +92,12 @@ pub struct Config {
     /// goals 目标预算配置（token / 墙钟 / 硬停开关）。
     #[serde(default)]
     pub goals: GoalsConfig,
+    /// todo 循环配置（H28：eager prelude + 完成提醒续跑）。
+    #[serde(default)]
+    pub todo: TodoConfig,
+    /// H5 键位覆盖（`[keybindings]`；键为 action wire 名如 `app.clear`，值为键位如 `f5`）。
+    #[serde(default)]
+    pub keybindings: KeybindingsConfig,
     /// eval 内核配置（Python NDJSON 内核 + 环回桥）。
     #[serde(default)]
     pub eval: EvalConfig,
@@ -81,32 +123,26 @@ impl Config {
     /// # Errors
     /// 无任何配置文件，或解析失败时返回 [`ConfigError`]。
     pub fn load(cwd: &Path) -> Result<Self, ConfigError> {
-        let candidates: Vec<std::path::PathBuf> = [
-            config_dir().map(|d| d.join("config.toml")),
-            Some(cwd.join(project_config_dir_name()).join("config.toml")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        let mut merged: Option<toml::Value> = None;
-        for path in &candidates {
-            if !path.exists() {
-                continue;
-            }
-            let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let value: toml::Value = toml::from_str(&text)
-                .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
-            match &mut merged {
-                Some(base) => merge_value(base, &value),
-                None => merged = Some(value),
-            }
+        let (cfg, warnings) = Self::load_with_warnings(cwd)?;
+        for warning in &warnings {
+            tracing::warn!(target: "agent_config", "{warning}");
         }
+        Ok(cfg)
+    }
 
-        let Some(merged) = merged else {
+    /// [`Config::load`] 的带诊断版本（H23）：额外返回合并配置里的**未知键**告警。
+    ///
+    /// 未知键**不改变加载语义**（serde 仍按默认行为忽略），只用于提示拼写错误。
+    /// 需要传统日志的调用方用 [`Config::load`]（它会 `tracing::warn!` 每条告警）；
+    /// 需要自己渲染的调用方（CLI `config check` / 启动提示）用本方法，避免重复输出。
+    ///
+    /// # Errors
+    /// 同 [`Config::load`]。
+    pub fn load_with_warnings(
+        cwd: &Path,
+    ) -> Result<(Self, Vec<crate::schema::ConfigWarning>), ConfigError> {
+        let candidates = config_candidates(cwd);
+        let Some(merged) = load_merged_value(&candidates)? else {
             let searched = candidates
                 .iter()
                 .map(|p| p.display().to_string())
@@ -116,9 +152,147 @@ impl Config {
                 "未找到配置文件（已查找: {searched}）"
             )));
         };
+        let mut cfg = Self::from_merged(&merged)?;
+        // 多来源 `mcp.json` 合并（user → project 三级，低 → 高）；TOML `[mcp.servers]`
+        // 已在上面合并，故最高优先——同名条目保留 TOML 定义。disabledServers 为
+        // 跨源并集拒绝名单，合并后统一剔除（warn 与说明见下）。
+        let loads = crate::mcp_json::load_mcp_json_sources(cwd);
+        for note in crate::mcp_json::merge_mcp_json_sources(&mut cfg.mcp, &loads) {
+            tracing::warn!(target: "agent_config::mcp", "{note}");
+        }
+        for load in &loads {
+            for warning in &load.warnings {
+                tracing::warn!(target: "agent_config::mcp", "{warning}");
+            }
+        }
+        // H23：未知键诊断（合并后统一检查；只告警，不影响加载结果）。
+        let warnings = crate::schema::unknown_keys(&merged);
+        Ok((cfg, warnings))
+    }
 
-        let cfg = Self::from_merged(&merged)?;
-        Ok(cfg)
+    /// 读取**合并后的原始 TOML**（不做反序列化/校验）——供 `agent config get/show`
+    /// 内省任意键（包括尚未被 `Config` 结构体建模的键）。
+    ///
+    /// # Errors
+    /// 无任何配置文件或 TOML 解析失败时返回错误。
+    pub fn load_raw(cwd: &Path) -> Result<toml::Value, ConfigError> {
+        let candidates = config_candidates(cwd);
+        match load_merged_value(&candidates)? {
+            Some(v) => Ok(v),
+            None => Err(ConfigError::Invalid(format!(
+                "未找到配置文件（已查找: {}）",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// `agent config set <key> <value>`：把点分键写入**用户级** `config.toml`
+    /// （H23），保留文件既有注释与排版（`toml_edit`）。
+    ///
+    /// 语义：
+    /// - 值按 TOML 字面量解析（`true` / `42` / `1.5` / `["a","b"]` / `"str"`），
+    ///   解析失败则按裸字符串写入（`agent.mode = code` 与 `= "code"` 等价）；
+    /// - **写入后必须能通过完整加载管线**（`from_merged` + 校验），否则**回滚**原文件并报错；
+    /// - 拒绝写入数组表（`[[models]]` / `[[hooks]]`）——那类结构请直接编辑文件；
+    /// - 返回写入路径（供调用方展示）。
+    ///
+    /// # Errors
+    /// 键为空、目标是数组表、写入后校验失败或 IO 失败时返回错误。
+    pub fn set_key(cwd: &Path, key: &str, value: &str) -> Result<std::path::PathBuf, ConfigError> {
+        let path = config_dir().map_or_else(
+            || cwd.join(project_config_dir_name()).join("config.toml"),
+            |d| d.join("config.toml"),
+        );
+        Self::set_key_at(&path, key, value)?;
+        Ok(path)
+    }
+
+    /// [`Config::set_key`] 的路径注入版本（测试可指定临时文件，无需改 `HOME`）。
+    ///
+    /// # Errors
+    /// 同 [`Config::set_key`]。
+    pub fn set_key_at(path: &Path, key: &str, value: &str) -> Result<(), ConfigError> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(ConfigError::Invalid("键不能为空".into()));
+        }
+        let segments: Vec<&str> = key
+            .split('.')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return Err(ConfigError::Invalid(format!("非法键: {key:?}")));
+        }
+        // 数组表（`[[models]]` / `[[hooks]]`）无法用点分键表达元素语义——提前给出明确
+        // 提示，而不是让用户写坏文件后再被校验拒绝。
+        const ARRAY_TABLE_ROOTS: &[&str] = &["models", "hooks"];
+        if segments.len() > 1 && ARRAY_TABLE_ROOTS.contains(&segments[0]) {
+            return Err(ConfigError::Invalid(format!(
+                "无法写入 {key:?}：`{}` 是数组表（如 [[{}]]），请直接编辑配置文件",
+                segments[0], segments[0]
+            )));
+        }
+        let original = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = original
+            .parse()
+            .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+
+        // 逐段下行；目标必须是普通表（数组表拒绝——无法用点分键表达元素语义）。
+        // 用 `(&mut Table, key)` 游标避免在循环中重复可变借用一个 `&mut Item`。
+        {
+            let mut table: &mut toml_edit::Table = doc.as_table_mut();
+            for (i, seg) in segments.iter().enumerate() {
+                let last = i + 1 == segments.len();
+                if last {
+                    table.insert(seg, scalar_to_item(value));
+                    break;
+                }
+                if table
+                    .get(seg)
+                    .is_some_and(toml_edit::Item::is_array_of_tables)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "无法写入 {key:?}：`{}` 是数组表（请直接编辑配置文件）",
+                        segments[..=i].join(".")
+                    )));
+                }
+                if table.get(seg).is_none() {
+                    table.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
+                }
+                table = table
+                    .get_mut(seg)
+                    .and_then(toml_edit::Item::as_table_mut)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(format!(
+                            "无法写入 {key:?}：`{}` 不是普通表（数组表/标量请直接编辑配置文件）",
+                            segments[..=i].join(".")
+                        ))
+                    })?;
+            }
+        }
+
+        let written = doc.to_string();
+        std::fs::write(path, &written).map_err(|source| ConfigError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+        // 校验：完整加载管线（含合并 + 反序列化 + 语义校验）。失败则回滚。
+        if let Err(e) = Self::from_merged(
+            &toml::from_str::<toml::Value>(&written)
+                .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?,
+        ) {
+            let _ = std::fs::write(path, &original);
+            return Err(ConfigError::Invalid(format!(
+                "写入后被校验拒绝，已回滚 {}: {e}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// 从合并后的 `toml::Value` 构建 Config：`[models.roles]` 段提升为顶层
@@ -256,6 +430,60 @@ impl Config {
 }
 
 /// `toml::Value` 深度合并：overlay 覆盖 base 同路径字段，table 递归合并。
+/// 把命令行给的标量文本解析为 TOML 项（H23）。
+///
+/// 顺序：`true`/`false` → 整数 → 浮点 → `[...]` 数组 → 带引号字符串 → 裸字符串。
+/// 裸字符串按字符串写入（`agent.mode = code` 与 `= "code"` 等价），避免把
+/// `0123` 之类的值意外变成整数。
+fn scalar_to_item(raw: &str) -> toml_edit::Item {
+    let v = raw.trim();
+    match v {
+        "true" => return toml_edit::value(true),
+        "false" => return toml_edit::value(false),
+        _ => {}
+    }
+    if let Ok(i) = v.parse::<i64>() {
+        return toml_edit::value(i);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        return toml_edit::value(f);
+    }
+    if v.starts_with('[') && v.ends_with(']') {
+        // 宽容解析：`[a, b]` 这类裸词列表按字符串元素处理（TOML 本身要求引号，
+        // 但命令行里写引号很别扭，且配置项多为字符串列表如 `tools.enabled`）。
+        let inner = &v[1..v.len() - 1];
+        let mut out = toml_edit::Array::new();
+        for element in inner.split(',') {
+            let e = element.trim();
+            if e.is_empty() {
+                continue;
+            }
+            let unquoted = e
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| e.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+            if let Some(s) = unquoted {
+                out.push(s);
+            } else if e == "true" || e == "false" {
+                out.push(e == "true");
+            } else if let Ok(i) = e.parse::<i64>() {
+                out.push(i);
+            } else if let Ok(f) = e.parse::<f64>() {
+                out.push(f);
+            } else {
+                out.push(e);
+            }
+        }
+        return toml_edit::Item::Value(toml_edit::Value::Array(out));
+    }
+    let unquoted = v
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(v);
+    toml_edit::value(unquoted)
+}
+
 fn merge_value(base: &mut toml::Value, overlay: &toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base_t), toml::Value::Table(overlay_t)) => {
@@ -363,6 +591,77 @@ pub struct ModelProfile {
     /// ```
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
+    /// H26：tokenizer 家族声明（`o200k` / `cl100k` / `heuristic[:chars_per_token]`）。
+    ///
+    /// 缺省按模型 id 推断；非 OpenAI provider（Claude/Gemini/DeepSeek/Qwen…）建议用
+    /// `heuristic:<chars/token>` 声明近似比（CJK 语料约 1.5，英文约 4）。
+    #[serde(default)]
+    pub tokenizer: Option<String>,
+    /// 自定义请求头（H24）：`${ENV}` 会展开；同名头覆盖内置鉴权头。
+    ///
+    /// ```toml
+    /// [default_model.headers]
+    /// "HTTP-Referer" = "https://my.app"      # OpenRouter 归因
+    /// "X-Api-Version" = "2024-10-01"
+    /// Authorization = "Bearer ${MY_TOKEN}"   # 非标准鉴权方案
+    /// ```
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// 兼容开关（H24）：网关拒绝某参数时才开启。
+    #[serde(default)]
+    pub quirks: agent_core::ProviderQuirks,
+    /// 内置鉴权模式（H24，对齐 omp provider `auth`）：`api_key`（默认）/ `none` / `oauth`。
+    ///
+    /// - `none`：不发送内置鉴权头（本地 vLLM / Ollama / 免鉴权网关）；
+    /// - `oauth`：只用 OAuth 凭据存储中的令牌，缺失即报错（不回退 env / auth.toml）。
+    #[serde(default)]
+    pub auth: agent_core::AuthMode,
+    /// omp 风格 `compat` 段（H24）：与 [`ModelProfile::quirks`] 取并集后生效。
+    ///
+    /// 仅收录 Gyre **实际生效**的开关（未收录的 omp 旗标会被忽略，并由 H23 未知键
+    /// 诊断在 `agent config check` 里点名提示）。
+    #[serde(default)]
+    pub compat: CompatConfig,
+}
+
+/// omp 风格 `compat` 段（H24）：字段名沿用 oh-my-pi 的 camelCase 形状。
+///
+/// 映射规则（与 [`agent_core::ProviderQuirks`] 取并集，显式 `quirks` 优先级更高）：
+/// - `supportsUsageInStreaming = false` → `omit_stream_options`；
+/// - `supportsToolChoice = false` → `omit_tool_choice`；
+/// - `supportsReasoningEffort = false` / `supportsReasoningParams = false` → `omit_reasoning`；
+/// - `maxTokensField` → `max_tokens_field`。
+///
+/// 未知键**不报错**（omp 的完整 compat 表远大于 Gyre 实现面；报错会让既有 omp 配置
+/// 直接加载失败）。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CompatConfig {
+    /// 流式响应是否带 usage（`false` → 省略 `stream_options`）。
+    pub supports_usage_in_streaming: Option<bool>,
+    /// 是否支持 `tool_choice`（`false` → 省略）。
+    pub supports_tool_choice: Option<bool>,
+    /// 是否支持 `reasoning_effort`（`false` → 省略推理参数）。
+    pub supports_reasoning_effort: Option<bool>,
+    /// 是否支持推理参数（`false` → 省略推理参数）。
+    pub supports_reasoning_params: Option<bool>,
+    /// `max_tokens` 的 wire 字段名。
+    pub max_tokens_field: Option<agent_core::MaxTokensField>,
+}
+
+impl CompatConfig {
+    /// 映射到 Gyre 的 [`agent_core::ProviderQuirks`]（未设置的开关保持默认）。
+    #[must_use]
+    pub fn to_quirks(self) -> agent_core::ProviderQuirks {
+        agent_core::ProviderQuirks {
+            omit_stream_options: self.supports_usage_in_streaming == Some(false),
+            omit_tool_choice: self.supports_tool_choice == Some(false),
+            omit_reasoning: self.supports_reasoning_effort == Some(false)
+                || self.supports_reasoning_params == Some(false),
+            max_tokens_field: self.max_tokens_field,
+            ..Default::default()
+        }
+    }
 }
 
 impl ModelProfile {
@@ -374,10 +673,75 @@ impl ModelProfile {
         SecretString::from(super::env::expand_env(raw))
     }
 
-    /// 有效上下文窗口（最大输入 token）：显式指定则用之，否则回退内置默认 `128_000`。
+    /// 有效兼容开关（H24）：`quirks` 与 omp 风格 `compat` 的并集。
+    ///
+    /// `omit_*` 取「任一为 true 即 true」（更保守）；`max_tokens_field` 以显式 `quirks`
+    /// 为准，`quirks` 缺省时用 `compat.maxTokensField`。
+    #[must_use]
+    pub fn effective_quirks(&self) -> agent_core::ProviderQuirks {
+        let compat = self.compat.to_quirks();
+        let mut merged = self.quirks;
+        merged.omit_temperature |= compat.omit_temperature;
+        merged.omit_stream_options |= compat.omit_stream_options;
+        merged.omit_tool_choice |= compat.omit_tool_choice;
+        merged.omit_reasoning |= compat.omit_reasoning;
+        merged.max_tokens_field = merged.max_tokens_field.or(compat.max_tokens_field);
+        merged
+    }
+
+    /// 有效上下文窗口（最大输入 token）：显式配置 > 内置目录（H25，按模型 id 匹配）> `128_000`。
     #[must_use]
     pub fn effective_max_input_tokens(&self) -> usize {
-        self.max_input_tokens.unwrap_or(128_000)
+        self.max_input_tokens
+            .or_else(|| crate::model_catalog::lookup(&self.id).map(|e| e.max_input_tokens))
+            .unwrap_or(128_000)
+    }
+
+    /// 有效最大输出 token：显式配置 > 内置目录（H25）> `4096`。
+    #[must_use]
+    pub fn effective_max_output_tokens(&self) -> usize {
+        self.max_output_tokens
+            .or_else(|| crate::model_catalog::lookup(&self.id).map(|e| e.max_output_tokens))
+            .unwrap_or(4096)
+    }
+
+    /// 有效思考能力位（H25）：`enable_thinking` 为总开关；目录明确声明不支持的模型
+    /// （如 `gpt-4o` / `deepseek-chat`）即便总开关打开也不带思考配置；未收录的模型沿用总开关。
+    #[must_use]
+    pub fn effective_supports_thinking(&self, enable_thinking: bool) -> bool {
+        enable_thinking
+            && crate::model_catalog::lookup(&self.id).is_none_or(|e| e.supports_thinking)
+    }
+
+    /// 是否存在 ChatGPT（Codex）OAuth 凭据（`openai-responses` / `codex` store key）。
+    fn has_codex_oauth() -> bool {
+        let Some(dir) = config_dir() else {
+            return false;
+        };
+        let store = super::oauth_store::load(&dir);
+        store.get("openai-responses").is_some() || store.get("codex").is_some()
+    }
+
+    /// 生效的 base URL（H14）：显式 `base_url` 优先；为空时按 `api` 推导默认端点。
+    ///
+    /// `openai-responses` 有两种部署形态，用「是否存在 ChatGPT OAuth 凭据」区分：
+    /// - 有 `openai-responses`（或 `codex`）OAuth 凭据 → ChatGPT 后端
+    ///   `https://chatgpt.com/backend-api/codex`（`agent auth login codex` 后可直接用）；
+    /// - 否则 → 标准 `https://api.openai.com/v1`（API key 用户）。
+    ///
+    /// 其余 wire 保持既有行为（空串 = 由适配器回退到各自默认端点）。
+    #[must_use]
+    pub fn effective_base_url(&self) -> String {
+        if !self.base_url.trim().is_empty() {
+            return self.base_url.clone();
+        }
+        if self.api == Api::OpenAiResponses {
+            if Self::has_codex_oauth() {
+                return "https://chatgpt.com/backend-api/codex".to_string();
+            }
+            return "https://api.openai.com/v1".to_string();
+        }
+        self.base_url.clone()
     }
 
     /// 展开后的 API key 轮换环：`api_keys` 非空用多 key 环（`${ENV}` 已展开），
@@ -398,18 +762,22 @@ impl ModelProfile {
     }
 
     /// 转为运行时 [`Model`](agent_core::Model)（provider 标识 `openai-compatible`）。
+    ///
+    /// `enable_thinking` 透传为模型能力位 `supports_thinking`——统一注入全局思考开关
+    /// （`[agent].enable_thinking`），避免 CLI/RPC（曾恒 false）与 server（事后覆盖）路径分叉。
     #[must_use]
-    pub fn to_model(&self) -> agent_core::Model {
+    pub fn to_model(&self, enable_thinking: bool) -> agent_core::Model {
         agent_core::Model {
             id: self.id.clone(),
             provider: "openai-compatible".into(),
             api: self.api,
             max_input_tokens: self.effective_max_input_tokens(),
-            max_output_tokens: self.max_output_tokens.unwrap_or(4096),
+            max_output_tokens: self.effective_max_output_tokens(),
             supports_tools: true,
             supports_streaming: true,
-            supports_thinking: false,
+            supports_thinking: self.effective_supports_thinking(enable_thinking),
             extra_body: self.extra_body.clone(),
+            tokenizer: self.tokenizer.clone(),
         }
     }
 }
@@ -420,6 +788,18 @@ pub struct AgentConfig {
     /// 智能体模式。
     #[serde(default)]
     pub mode: Mode,
+    /// H40：追加到 system prompt 末尾的定制文本（`--append-system-prompt` 或
+    /// `[agent] append_system_prompt`）。值为字面文本；需要读文件时由装配层先解析。
+    #[serde(default)]
+    pub append_system_prompt: Option<String>,
+    /// H26：自动压缩的**绝对 token 阈值**（最高优先级；超过即触发压缩级联）。
+    /// 与 `context_window_guard` / `compaction_reserve_tokens` 三选一，未设为 `None`。
+    #[serde(default)]
+    pub compaction_threshold_tokens: Option<u64>,
+    /// H26：自动压缩的**预留余量**（次优先级；阈值 = 窗口 − 余量）。
+    /// 配置值 ≥ 窗口时按窗口 15% 兜底（对齐 omp「不可能默认值」回退）。
+    #[serde(default)]
+    pub compaction_reserve_tokens: Option<u64>,
     /// 审批模式。
     #[serde(default)]
     pub approval_mode: ApprovalMode,
@@ -452,12 +832,29 @@ pub struct AgentConfig {
     /// 命令级 allow/deny/ask 规则。
     #[serde(default)]
     pub commands: CommandRules,
+    /// H5 流式守卫（对应 TOML `[agent.stream_guards]`）。
+    #[serde(default)]
+    pub stream_guards: StreamGuardsConfig,
+    /// H3 异步后台执行（`run_command async:true` 与后续 task 后台化；对齐 omp
+    /// `async.enabled`，默认启用）。
+    #[serde(default = "default_true")]
+    pub async_enabled: bool,
+    /// 异步作业运行中上限（对齐 omp `DEFAULT_MAX_RUNNING_JOBS`；排队态不占槽）。
+    #[serde(default = "default_async_max_jobs")]
+    pub async_max_jobs: usize,
+}
+
+const fn default_async_max_jobs() -> usize {
+    15
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             mode: Mode::Code,
+            append_system_prompt: None,
+            compaction_threshold_tokens: None,
+            compaction_reserve_tokens: None,
             approval_mode: ApprovalMode::AlwaysAsk,
             max_mistakes: default_max_mistakes(),
             max_turns: default_max_turns(),
@@ -468,6 +865,9 @@ impl Default for AgentConfig {
             auto_thinking_model: None,
             tools: ToolsConfig::default(),
             commands: CommandRules::default(),
+            stream_guards: StreamGuardsConfig::default(),
+            async_enabled: default_true(),
+            async_max_jobs: default_async_max_jobs(),
         }
     }
 }
@@ -480,6 +880,55 @@ const fn default_max_turns() -> usize {
 }
 const fn default_guard() -> f32 {
     0.8
+}
+
+/// H5 流式守卫配置（对应 TOML `[agent.stream_guards]`；对齐 oh-my-pi stream-guards
+/// / auto-generated-guard 语义，快照 v18.1.2）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct StreamGuardsConfig {
+    /// 生成文件编辑拦截：apply_hashline 补丁命中生成文件模式即拒绝（流式中提前
+    /// 中断 + 执行前兜底；对齐 omp `edit.blockAutoGenerated`，默认 true）。
+    #[serde(default = "default_true")]
+    pub block_auto_generated: bool,
+    /// 编辑补丁结构预检：apply_hashline 流式结束即试解析，必败（解析错误）即中断
+    /// 本轮并注入错误让模型修正（对齐 omp streamingAbort 的 previewPatch 预检；
+    /// stale-hash 不拦截——hashline 自带快照回放恢复，默认 true）。
+    #[serde(default = "default_true")]
+    pub edit_parse_guard: bool,
+    /// 跨轮同参工具循环守卫（对齐 omp `model.toolCallLoopGuard.enabled`，默认 true）。
+    #[serde(default = "default_true")]
+    pub tool_loop_guard: bool,
+    /// 连续同参调用阈值（**恰好等于**时触发一次，随后 run 不再重复；对齐 omp
+    /// `model.toolCallLoopGuard.threshold`，默认 5）。
+    #[serde(default = "default_tool_loop_threshold")]
+    pub tool_loop_threshold: usize,
+    /// 豁免工具（轮询类工具天然重复；对齐 omp 默认 `["hub"]`）。
+    #[serde(default = "default_tool_loop_exempt_tools")]
+    pub tool_loop_exempt_tools: Vec<String>,
+    /// Gemini 思考标题连跑中断（对齐 omp `model.loopGuard`；仅 gemini 系模型生效，
+    /// 默认 true）。
+    #[serde(default = "default_true")]
+    pub gemini_header_guard: bool,
+}
+
+impl Default for StreamGuardsConfig {
+    fn default() -> Self {
+        Self {
+            block_auto_generated: true,
+            edit_parse_guard: true,
+            tool_loop_guard: true,
+            tool_loop_threshold: default_tool_loop_threshold(),
+            tool_loop_exempt_tools: default_tool_loop_exempt_tools(),
+            gemini_header_guard: true,
+        }
+    }
+}
+
+const fn default_tool_loop_threshold() -> usize {
+    5
+}
+fn default_tool_loop_exempt_tools() -> Vec<String> {
+    vec!["hub".to_string()]
 }
 
 /// 工具相关配置。
@@ -803,6 +1252,11 @@ pub struct MemoryConfig {
     /// 对齐 oh-my-pi `retainEveryNTurns`；两个后端均生效（local → raw notes，structured → 记录）。
     #[serde(default = "default_auto_retain_every_n_turns")]
     pub auto_retain_every_n_turns: usize,
+    /// H30：合并改在**后台任务**执行（默认 `false` = 内联等待）。开启后停止边界不再被
+    /// LLM 沉淀阻塞；并发保护仍由合并租约保证（同一时刻只有一个会话真正沉淀）。
+    /// 注意：进程在后台任务完成前退出可能丢弃本轮沉淀（租约 TTL 到期后可被下次接手）。
+    #[serde(default)]
+    pub background_consolidate: bool,
 }
 
 const fn default_auto_consolidate() -> bool {
@@ -820,6 +1274,7 @@ impl Default for MemoryConfig {
             backend: MemoryBackend::Local,
             auto_consolidate: true,
             auto_retain_every_n_turns: 4,
+            background_consolidate: false,
         }
     }
 }
@@ -832,11 +1287,13 @@ pub struct McpConfig {
     pub servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
-/// 单个 MCP server 配置：stdio 子进程（`command`）或 Streamable HTTP 端点（`url`）。
+/// 单个 MCP server 配置：stdio 子进程（`command`）或 HTTP 端点（`url`；`type = "sse"`
+/// 选 legacy HTTP+SSE 传输，缺省 Streamable）。
 ///
-/// 无标签 enum：按必填键区分——含 `command` 即 stdio（向后兼容既有配置），
-/// 含 `url` 即 HTTP；两者皆无时反序列化失败并提示需 `command` 或 `url`。
-#[derive(Debug, Clone, Deserialize)]
+/// 无标签 enum：按必填键区分——含 `command` 即 stdio（向后兼容既有配置，omp 的
+/// `type = "stdio"` 键同样命中），含 `url` 即 HTTP；两者皆无时反序列化失败并提示需
+/// `command` 或 `url`。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
     /// stdio 子进程传输（JSON-RPC 2.0 over stdin/stdout）。
@@ -857,26 +1314,55 @@ impl McpServerConfig {
 }
 
 /// 单个 MCP server 的 stdio 启动配置。
-#[derive(Debug, Clone, Deserialize)]
+///
+/// 序列化形状（Claude / Cursor 兼容）：`{command, args, env, timeout_ms}`，
+/// 空集合与 `None` 省略。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct McpStdioConfig {
     /// 可执行命令（如 `npx` / `node` / `uvx`）。
     pub command: String,
     /// 命令参数。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// 额外环境变量。
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty",
+        serialize_with = "serialize_sorted_map"
+    )]
     pub env: std::collections::HashMap<String, String>,
     /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+}
+
+/// 以键序序列化 `HashMap`（`env` / `headers`）。
+///
+/// `HashMap` 迭代序随进程随机，直接序列化会让 `serde_json::to_string` 每次输出不同字节：
+/// 工具缓存指纹（MCP 工具集指纹）会永久 miss，写回文件也无法稳定 diff。此处按键排序输出。
+fn serialize_sorted_map<S>(
+    map: &std::collections::HashMap<String, String>,
+    ser: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap as _;
+
+    let mut entries: Vec<(&String, &String)> = map.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut out = ser.serialize_map(Some(entries.len()))?;
+    for (k, v) in entries {
+        out.serialize_entry(k, v)?;
+    }
+    out.end()
 }
 
 /// MCP OAuth 子配置（对齐 oh-my-pi `MCPServerConfigBase.oauth`）。
 ///
 /// 全部可选：缺省时走 RFC 9728/8414 自动发现 + RFC 7591 动态客户端注册；
 /// 显式 `client_id` 供不开放 DCR 的服务商（如 Figma MCP Catalog 白名单制）。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct McpOAuthConfig {
     /// 手工指定的 OAuth client id（跳过 DCR）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -904,20 +1390,42 @@ pub struct McpOAuthConfig {
     pub resource: Option<String>,
 }
 
+/// HTTP 族 MCP 传输模式（配置键 `type`，对齐 oh-my-pi `"http" | "sse"`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum McpHttpTransport {
+    /// Streamable HTTP（POST JSON-RPC + 可选 SSE 响应流；MCP 2025-03-26 规范，默认）。
+    #[default]
+    #[serde(rename = "http")]
+    Streamable,
+    /// Legacy HTTP+SSE（GET 起 SSE 读流 + POST message 端点；2024-11-05 规范前的存量 server）。
+    #[serde(rename = "sse")]
+    Sse,
+}
+
 /// 单个 MCP server 的 Streamable HTTP 配置（参考 oh-my-pi `MCPHttpServerConfig`）。
-#[derive(Debug, Clone, Deserialize)]
+///
+/// 序列化形状（Claude / Cursor 兼容）：`{url, headers, timeout_ms, oauth, type}`，
+/// `type` 始终输出（自描述：`"http"` / `"sse"`），空集合与 `None` 省略。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct McpHttpConfig {
     /// server 端点 URL（如 `http://127.0.0.1:3000/mcp`）。
     pub url: String,
     /// 额外请求头（如 `Authorization`；`Mcp-Session-Id` / `MCP-Protocol-Version` 由传输层独占）。
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty",
+        serialize_with = "serialize_sorted_map"
+    )]
     pub headers: std::collections::HashMap<String, String>,
     /// 单次请求超时毫秒数（缺省 30000，`0` = 不限制；覆盖整个 POST + SSE 响应期）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// OAuth 授权配置（Remote MCP 授权；缺省不发授权请求）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpOAuthConfig>,
+    /// 传输模式：`type = "http"`（默认 Streamable）或 `type = "sse"`（legacy HTTP+SSE）。
+    #[serde(rename = "type", alias = "transport", default)]
+    pub transport: McpHttpTransport,
 }
 
 const fn default_true() -> bool {
@@ -1028,35 +1536,17 @@ fn split_command_frontmatter(content: &str) -> (String, String) {
 /// 缺失或读取失败静默跳过。移植自 oh-my-pi context-files（AGENTS.md）能力。
 #[must_use]
 pub fn discover_context_files(cwd: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    // 用户级
-    if let Some(cfg) = config_dir() {
-        let p = cfg.join("AGENTS.md");
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            out.push(format!("项目约定（用户级）:\n\n{content}"));
-        }
-    }
-    // 项目级 walkup（cwd 在前 → 收集后反转，使 cwd 最近者排最后注入）
-    let home = dirs::home_dir();
-    let mut project: Vec<(std::path::PathBuf, String)> = Vec::new();
-    let mut current = Some(cwd);
-    while let Some(dir) = current {
-        let p = dir.join(".agent").join("AGENTS.md");
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            project.push((p, content));
-        }
-        if let Some(h) = &home {
-            if dir == h.as_path() {
-                break;
-            }
-        }
-        current = dir.parent();
-    }
-    // cwd 最近者最后注入（覆盖语义：后注入的段在 prompt 更靠后/优先）
-    for (p, content) in project.into_iter().rev() {
-        out.push(format!("项目约定（{}）:\n\n{content}", p.display()));
-    }
-    out
+    // H40：发现 → `@import` 展开 → 双通道（用户级/项目级）包含去重，再渲染为注入段落。
+    crate::context_files::dedupe_contained(crate::context_files::collect_context_files(cwd))
+        .iter()
+        .map(crate::context_files::render_context_file)
+        .collect()
+}
+
+/// H40：项目/用户级 `SYSTEM.md` 定制段（项目级覆盖用户级）；无则 `None`。
+#[must_use]
+pub fn discover_system_prompt(cwd: &Path) -> Option<String> {
+    crate::context_files::system_prompt_file(cwd).map(|f| f.content)
 }
 
 /// GitHub 工具配置（对应 TOML `[github]`）。
@@ -1119,6 +1609,10 @@ pub struct SubagentConfig {
     /// 子 Agent 独立输出 token 预算（`None` 回退到父 profile）。
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+    /// H41：子代理名册上限（0 = 不限，**不含父 agent**）。达到上限后 `task` 在
+    /// **派生之前**拒绝（`at_capacity` 预拒），避免注册表无限增长后才在投递时失败。
+    #[serde(default)]
+    pub max_registry: usize,
 }
 
 impl Default for SubagentConfig {
@@ -1126,6 +1620,7 @@ impl Default for SubagentConfig {
         Self {
             enabled: default_subagent_enabled(),
             max_concurrent: default_max_concurrent(),
+            max_registry: 0,
             inherit_parent: true,
             max_output_tokens: None,
         }
@@ -1159,6 +1654,13 @@ pub struct TtsrConfig {
     pub enabled: Option<bool>,
     /// 禁用的规则名（按 frontmatter `name` 或文件名主干）。
     pub disabled_rules: Vec<String>,
+    /// 内置规则集开关（H44；`None`/缺省 = 启用）。
+    ///
+    /// 内置集是随二进制分发的 27 条语言约定规则（Go/Rust/TypeScript，全部
+    /// `interruptMode: never`：命中只折叠为工具结果提醒、不打断流）。同名用户/项目规则
+    /// 覆盖内置副本；`disabled_rules` 可逐条剔除（对内置与用户规则一视同仁）。
+    /// 置 `false` 则整套不加载——此时若 `.gyre/rules` 为空，TTSR 完全不启用。
+    pub builtin_rules: Option<bool>,
 }
 
 /// ACP（Agent Client Protocol）服务端配置（对应 TOML `[acp]`）。
@@ -1204,6 +1706,55 @@ pub struct GoalsConfig {
     /// 超限后硬停（true 停止；false 注入提醒后继续）。默认 `false`。
     #[serde(default)]
     pub hard_stop: bool,
+}
+
+/// 键位覆盖（对应 TOML `[keybindings]`；H5）。
+///
+/// 键是动作 wire 名（`app.interrupt` / `app.clear` / `app.message.dequeue` 等，见
+/// `agent --help` 或 REPL `/hotkeys`），值是键位说明（`ctrl-y` / `alt-enter` / `f5`）。
+/// 未知动作或非法键位在启动时告警并忽略（不阻断启动）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KeybindingsConfig {
+    /// 动作名 → 键位说明。
+    #[serde(flatten)]
+    pub bindings: std::collections::BTreeMap<String, String>,
+}
+
+/// todo 循环配置（对应 TOML `[todo]`；H28）。
+///
+/// - `eager`：首轮是否注入「先规划再动手」prelude（`off` 默认 / `preferred` 仅提醒 /
+///   `always` 提醒并在首轮强制 `tool_choice=todo`）。
+/// - `reminders`：模型在仍有未完成待办时停止 → 注入提醒并续跑（默认开）。
+/// - `reminders_max`：单轮 prompt 内提醒次数上限（0 = 不限，默认 3）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoConfig {
+    /// eager prelude 模式（缺省 `off`）。
+    #[serde(default)]
+    pub eager: Option<String>,
+    /// 完成提醒续跑开关（默认 `true`）。
+    #[serde(default = "default_true")]
+    pub reminders: bool,
+    /// 提醒次数上限（默认 `3`；`0` = 不限）。
+    #[serde(default = "default_todo_reminders_max")]
+    pub reminders_max: usize,
+    /// H28：中途对账 nudge（连续变更类工具调用后提醒回归清单；默认 `true`）。
+    #[serde(default = "default_true")]
+    pub mid_run_nudge: bool,
+}
+
+impl Default for TodoConfig {
+    fn default() -> Self {
+        Self {
+            eager: None,
+            reminders: true,
+            reminders_max: default_todo_reminders_max(),
+            mid_run_nudge: true,
+        }
+    }
+}
+
+const fn default_todo_reminders_max() -> usize {
+    3
 }
 
 /// eval 内核配置（对应 TOML `[eval]`）。
@@ -1401,23 +1952,93 @@ pub fn parse_compaction_backend(raw: &str) -> agent_core::CompactionBackend {
 /// Shell 钩子超时缺省值（秒）。
 const HOOK_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// 钩子事件类型（TOML 小写蛇形字符串：`before_tool` / `after_tool` / `stop`）。
+/// 钩子事件类型（TOML 小写蛇形字符串；H20 扩展到与
+/// [`agent_core::HOOK_EVENT_NAMES`] 同一集合）。
+///
+/// 语义分两类：
+/// - **可决策**：`tool_call`（旧名 `before_tool`）——stdout 首行 JSON 的 `decision` 生效；
+/// - **通知型**：其余全部——触发命令但不解析决定（输出仅记日志）。
+///
+/// 兼容：旧配置里的 `before_tool` / `after_tool` 仍接受（别名映射到 `tool_call` /
+/// `tool_result`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventKind {
-    /// 工具执行前（可经 `before_tool_intercept` 通道拦截）。
-    BeforeTool,
-    /// 工具执行后（通知型：触发命令但不解析决定）。
-    AfterTool,
-    /// 任务结束（通知型：触发命令但不解析决定）。
+    /// 会话开始（装配完成后、首个任务前）。
+    SessionStart,
+    /// 会话关闭（进程退出 / 会话销毁）。
+    SessionShutdown,
+    /// 首个轮次之前（可观察初始提示词）。
+    BeforeAgentStart,
+    /// 智能体开始运行一轮任务。
+    AgentStart,
+    /// 智能体结束（成功/失败/取消）。
+    AgentEnd,
+    /// 轮次开始。
+    TurnStart,
+    /// 轮次结束（携带 assistant 消息与工具结果）。
+    TurnEnd,
+    /// 工具执行前（可决策；旧名 `before_tool` 为其别名）。
+    #[serde(alias = "before_tool")]
+    ToolCall,
+    /// 工具执行后（旧名 `after_tool` 为其别名）。
+    #[serde(alias = "after_tool")]
+    ToolResult,
+    /// 任务结束（通知型）。
     Stop,
+    /// 自动压缩开始。
+    AutoCompactionStart,
+    /// 自动压缩结束。
+    AutoCompactionEnd,
+    /// 自动重试开始。
+    AutoRetryStart,
+    /// 自动重试结束。
+    AutoRetryEnd,
+    /// 模型回退已应用。
+    RetryFallbackApplied,
+    /// 模型回退成功。
+    RetryFallbackSucceeded,
+    /// TTSR 流规则命中。
+    TtsrTriggered,
+}
+
+impl HookEventKind {
+    /// 线协议事件名（与 [`agent_core::HOOK_EVENT_NAMES`] 一致；用于匹配与 stdin `event` 字段）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::SessionShutdown => "session_shutdown",
+            Self::BeforeAgentStart => "before_agent_start",
+            Self::AgentStart => "agent_start",
+            Self::AgentEnd => "agent_end",
+            Self::TurnStart => "turn_start",
+            Self::TurnEnd => "turn_end",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Stop => "stop",
+            Self::AutoCompactionStart => "auto_compaction_start",
+            Self::AutoCompactionEnd => "auto_compaction_end",
+            Self::AutoRetryStart => "auto_retry_start",
+            Self::AutoRetryEnd => "auto_retry_end",
+            Self::RetryFallbackApplied => "retry_fallback_applied",
+            Self::RetryFallbackSucceeded => "retry_fallback_succeeded",
+            Self::TtsrTriggered => "ttsr_triggered",
+        }
+    }
+
+    /// 是否为可决策事件（stdout 首行 JSON 的 `decision` 生效）。
+    #[must_use]
+    pub const fn is_decidable(self) -> bool {
+        matches!(self, Self::ToolCall)
+    }
 }
 
 /// 单条 shell 钩子规则（对应 TOML `[[hooks]]` 数组表）。
 ///
 /// ```toml
 /// [[hooks]]
-/// event = "before_tool"            # before_tool / after_tool / stop
+/// event = "tool_call"              # 见 HookEventKind（旧名 before_tool/after_tool 仍接受）
 /// tool = "shell"                   # 可选；缺省匹配所有工具（stop 忽略此项）
 /// command = "/usr/local/bin/gate"  # `sh -c`（Windows `cmd /C`）执行
 /// timeout_secs = 5                 # 可选；1..=600，缺省 10
@@ -1451,6 +2072,37 @@ impl HookRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// H14：`openai-responses` 的默认端点推导（显式值优先；无凭据走标准端点）。
+    #[test]
+    fn effective_base_url_prefers_explicit_then_api_default() {
+        let mut profile = ModelProfile {
+            id: "gpt-5".into(),
+            alias: None,
+            api: Api::OpenAiResponses,
+            base_url: String::new(),
+            api_key: secrecy::SecretString::from("k"),
+            api_keys: Vec::new(),
+            fallbacks: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            max_input_tokens: None,
+            extra_body: None,
+            tokenizer: None,
+            headers: std::collections::BTreeMap::new(),
+            quirks: agent_core::ProviderQuirks::default(),
+            auth: agent_core::AuthMode::ApiKey,
+            compat: CompatConfig::default(),
+        };
+        // 无 OAuth 凭据（测试环境）→ 标准 Responses 端点。
+        assert_eq!(profile.effective_base_url(), "https://api.openai.com/v1");
+        // 显式配置始终优先。
+        profile.base_url = "https://gateway.example/v1".into();
+        assert_eq!(profile.effective_base_url(), "https://gateway.example/v1");
+        // 其它 wire 保持空串（由适配器回退各自默认）。
+        profile.base_url = String::new();
+        profile.api = Api::OpenAiCompletions;
+        assert_eq!(profile.effective_base_url(), "");
+    }
 
     fn nano() -> u128 {
         std::time::SystemTime::now()
@@ -1847,12 +2499,68 @@ api_keys = ["k1", "k2"]
         let cfg2: Config = toml::from_str(&toml_src2).expect("解析2");
         assert_eq!(cfg2.default_model.key_ring(), ["single"]);
 
-        // to_model：字段映射 + 默认输出 token。
-        let m = cfg.default_model.to_model();
+        // to_model：字段映射 + 默认输出 token + 思考能力位透传。
+        let m = cfg.default_model.to_model(false);
         assert_eq!(m.id, "m");
         assert_eq!(m.api, super::Api::OpenAiCompletions);
         assert_eq!(m.max_input_tokens, 128_000);
         assert_eq!(m.max_output_tokens, 4096);
+        assert!(!m.supports_thinking);
+        assert!(cfg.default_model.to_model(true).supports_thinking);
+    }
+
+    /// H26：`tokenizer` 声明透传到运行时 `Model`（计数家族由上下文层消费）。
+    #[test]
+    fn tokenizer_declaration_reaches_runtime_model() {
+        let cfg: Config = toml::from_str(
+            "[default_model]\nid = \"deepseek-chat\"\napi = \"deepseek\"\nbase_url = \"https://api.deepseek.com\"\ntokenizer = \"heuristic:1.5\"\n",
+        )
+        .expect("解析应成功");
+        let m = cfg.default_model.to_model(false);
+        assert_eq!(m.tokenizer.as_deref(), Some("heuristic:1.5"));
+        // 未声明 → None（上下文层按 id 推断，行为与引入前一致）。
+        let cfg: Config = toml::from_str(
+            "[default_model]\nid = \"gpt-4o\"\napi = \"openai-completions\"\nbase_url = \"https://api.openai.com/v1\"\n",
+        )
+        .expect("解析应成功");
+        assert_eq!(cfg.default_model.to_model(false).tokenizer, None);
+    }
+
+    /// H25：内置目录只做补缺——显式配置优先、未知模型行为不变、目录命中的模型拿到正确默认。
+    #[test]
+    fn model_catalog_fills_unknown_defaults_only() {
+        let parse = |toml_src: &str| -> ModelProfile {
+            let cfg: Config = toml::from_str(toml_src).expect("解析应成功");
+            cfg.default_model
+        };
+        // 目录命中：claude-sonnet-4 的 200k 窗口 / 64k 输出 / 支持思考。
+        let p = parse(
+            "[default_model]\nid = \"claude-sonnet-4-20250514\"\napi = \"anthropic-messages\"\nbase_url = \"https://api.anthropic.com\"\n",
+        );
+        assert_eq!(p.effective_max_input_tokens(), 200_000);
+        assert_eq!(p.effective_max_output_tokens(), 64_000);
+        assert!(p.effective_supports_thinking(true));
+        // 目录声明不支持思考：gpt-4o-mini 即便总开关打开也不带思考。
+        let p = parse(
+            "[default_model]\nid = \"gpt-4o-mini\"\napi = \"openai-completions\"\nbase_url = \"https://api.openai.com/v1\"\n",
+        );
+        assert_eq!(p.effective_max_input_tokens(), 128_000);
+        assert_eq!(p.effective_max_output_tokens(), 16_384);
+        assert!(!p.effective_supports_thinking(true), "gpt-4o 系列不带思考");
+        assert!(!p.to_model(true).supports_thinking);
+        // 显式配置覆盖目录。
+        let p = parse(
+            "[default_model]\nid = \"gpt-4o-mini\"\napi = \"openai-completions\"\nbase_url = \"https://x\"\nmax_input_tokens = 32000\nmax_output_tokens = 2048\n",
+        );
+        assert_eq!(p.effective_max_input_tokens(), 32_000);
+        assert_eq!(p.effective_max_output_tokens(), 2_048);
+        // 未知模型：完全沿用引入目录前的兜底（128k / 4096 / 总开关透传）。
+        let p = parse(
+            "[default_model]\nid = \"my-local-model\"\napi = \"openai-completions\"\nbase_url = \"http://localhost:8000/v1\"\n",
+        );
+        assert_eq!(p.effective_max_input_tokens(), 128_000);
+        assert_eq!(p.effective_max_output_tokens(), 4_096);
+        assert!(p.effective_supports_thinking(true));
     }
 
     // SOCKS5 代理配置：默认值 / 全字段 / 缺端口 / 未知字段容忍 / ${ENV} 展开 / 脱敏。
@@ -1989,6 +2697,135 @@ Authorization = "Bearer tok"
         );
         assert_eq!(servers["remote"].timeout_ms(), 5_000);
     }
+    #[test]
+    fn mcp_server_config_sse_transport_type_key() {
+        // `type = "sse"` 选 legacy 传输；`type = "http"` / 缺省为 Streamable；omp stdio 配置兼容。
+        let src = r#"
+[default_model]
+id = "m"
+api = "deepseek"
+base_url = "https://api.deepseek.com"
+[mcp.servers.legacy]
+type = "sse"
+url = "http://127.0.0.1:3000/sse"
+[mcp.servers.streamable]
+type = "http"
+url = "http://127.0.0.1:3000/mcp"
+[mcp.servers.stdio_omp]
+type = "stdio"
+command = "npx"
+"#;
+        let cfg: Config = toml::from_str(src).expect("解析应成功");
+        let servers = &cfg.mcp.servers;
+        let McpServerConfig::Http(legacy) = &servers["legacy"] else {
+            panic!("type = \"sse\" 应解析为 Http 变体");
+        };
+        assert_eq!(legacy.transport, McpHttpTransport::Sse);
+        let McpServerConfig::Http(streamable) = &servers["streamable"] else {
+            panic!("type = \"http\" 应解析为 Http 变体");
+        };
+        assert_eq!(streamable.transport, McpHttpTransport::Streamable);
+        let McpServerConfig::Stdio(stdio_omp) = &servers["stdio_omp"] else {
+            panic!("omp 风格 type = \"stdio\" + command 应解析为 Stdio 变体");
+        };
+        assert_eq!(stdio_omp.command, "npx");
+    }
+
+    /// H24：`auth` 与 omp 风格 `compat` 的解析与映射。
+    #[test]
+    fn model_profile_auth_and_compat_mapping() {
+        let base = "id = \"m\"\napi = \"openai-completions\"\nbase_url = \"x\"\n";
+        // 默认：api_key + 无 compat。
+        let cfg: Config = toml::from_str(&format!("[default_model]\n{base}")).unwrap();
+        assert_eq!(cfg.default_model.auth, agent_core::AuthMode::ApiKey);
+        assert!(cfg.default_model.effective_quirks().is_empty());
+
+        // omp 形状 compat：false → omit_*；maxTokensField → max_tokens_field。
+        let cfg: Config = toml::from_str(&format!(
+            "[default_model]\n{base}auth = \"none\"\n[default_model.compat]\n\
+             supportsUsageInStreaming = false\nsupportsToolChoice = false\n\
+             supportsReasoningParams = false\nmaxTokensField = \"max_completion_tokens\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.default_model.auth, agent_core::AuthMode::None);
+        let q = cfg.default_model.effective_quirks();
+        assert!(q.omit_stream_options && q.omit_tool_choice && q.omit_reasoning);
+        assert!(!q.omit_temperature);
+        assert_eq!(
+            q.max_tokens_field,
+            Some(agent_core::MaxTokensField::MaxCompletionTokens)
+        );
+
+        // 显式 quirks 与 compat 取并集；`quirks` 显式设置的 max_tokens_field 优先。
+        let cfg: Config = toml::from_str(&format!(
+            "[default_model]\n{base}[default_model.quirks]\nomit_temperature = true\n\
+             max_tokens_field = \"max_tokens\"\n[default_model.compat]\n\
+             supportsToolChoice = false\nmaxTokensField = \"max_completion_tokens\"\n"
+        ))
+        .unwrap();
+        let q = cfg.default_model.effective_quirks();
+        assert!(q.omit_temperature && q.omit_tool_choice, "并集");
+        assert_eq!(
+            q.max_tokens_field,
+            Some(agent_core::MaxTokensField::MaxTokens),
+            "显式 quirks 优先于 compat"
+        );
+
+        // omp 完整 compat 表里的**未实现**旗标不报错（否则既有 omp 配置直接加载失败）。
+        let cfg: Result<Config, _> = toml::from_str(&format!(
+            "[default_model]\n{base}[default_model.compat]\nsupportsStore = true\n\
+             reasoningContentField = \"reasoning_content\"\nthinkingFormat = \"qwen\"\n"
+        ));
+        assert!(cfg.is_ok(), "未实现的 compat 旗标应被忽略: {cfg:?}");
+        assert!(cfg.unwrap().default_model.effective_quirks().is_empty());
+    }
+
+    /// H44：`[ttsr] builtin_rules` 缺省 = `None`（装配层按 `true` 处理，向后兼容）；
+    /// 显式 `false` 关闭整套内置规则。
+    #[test]
+    fn ttsr_builtin_rules_defaults_and_parse() {
+        let cfg: TtsrConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.builtin_rules, None, "缺省 = None（装配层视为启用）");
+        assert_eq!(cfg.enabled, None);
+
+        let off: TtsrConfig = toml::from_str("builtin_rules = false").unwrap();
+        assert_eq!(off.builtin_rules, Some(false));
+        let on: TtsrConfig =
+            toml::from_str("builtin_rules = true\ndisabled_rules = [\"rs-box-leak\"]").unwrap();
+        assert_eq!(on.builtin_rules, Some(true));
+        assert_eq!(on.disabled_rules, vec!["rs-box-leak".to_string()]);
+    }
+
+    /// H23：`load_with_warnings` 报告未知键且**不影响加载结果**（未知键被忽略）。
+    #[test]
+    fn load_with_warnings_reports_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "gyre-cfg-warn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        std::fs::write(
+            dir.join(".agent/config.toml"),
+            "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"x\"\n\n[agent]\nmax_turn = 3\n",
+        )
+        .unwrap();
+
+        let (cfg, warnings) = Config::load_with_warnings(&dir).expect("未知键不应让加载失败");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "agent.max_turn"
+                    && w.suggestion.as_deref() == Some("max_turns")),
+            "应报告 agent.max_turn 并给出建议: {warnings:?}"
+        );
+        // 未知键被忽略：不会写入任何字段（max_turns 保持默认）。
+        assert_ne!(cfg.agent.max_turns, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn mcp_server_config_timeout_zero_disables() {
@@ -2032,6 +2869,200 @@ Authorization = "Bearer tok"
     // ── [[hooks]]：解析 + 校验 ────────────────────────────────────────────────
 
     /// 合法 `[[hooks]]`：小写蛇形 event、可选字段缺省、timeout 生效值与工具过滤。
+    /// H20：配置面事件名必须与 `agent-core` 的运行期事件名集合逐项一致
+    /// （配置声明了却永不触发的事件会误导用户；运行期发了而配置不接受则无法订阅）。
+    /// H24：`[default_model.headers]` / `quirks` 从 TOML 解析 + `${ENV}` 展开留给装配层。
+    #[test]
+    fn model_profile_headers_and_quirks_parse() {
+        let src = r#"
+[default_model]
+id = "m"
+api = "openai-completions"
+base_url = "https://gw.example/v1"
+api_key = "k"
+
+[default_model.headers]
+"HTTP-Referer" = "https://my.app"
+Authorization = "Bearer ${MY_TOKEN}"
+
+[default_model.quirks]
+omit_stream_options = true
+omit_temperature = true
+"#;
+        let cfg: Config = toml::from_str(src).expect("应可解析");
+        assert_eq!(
+            cfg.default_model
+                .headers
+                .get("HTTP-Referer")
+                .map(String::as_str),
+            Some("https://my.app")
+        );
+        assert!(cfg.default_model.quirks.omit_stream_options);
+        assert!(cfg.default_model.quirks.omit_temperature);
+        assert!(!cfg.default_model.quirks.omit_tool_choice);
+        assert!(!cfg.default_model.quirks.is_empty());
+        // 默认：无头、无开关（标准 wire）。
+        let bare: Config = toml::from_str(
+            "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(bare.default_model.headers.is_empty());
+        assert!(bare.default_model.quirks.is_empty());
+        // 未知开关被拒（deny_unknown_fields：拼错键不会静默失效）。
+        let bad = toml::from_str::<Config>(
+            "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://x\"\n[default_model.quirks]\nomit_temperatur = true\n",
+        );
+        assert!(bad.is_err(), "未知 quirks 键应报错");
+    }
+    /// H23：`set_key_at` 写入配置（保留注释）、可回读、非法值回滚、数组表拒绝。
+    #[test]
+    fn set_key_writes_preserves_comments_and_rolls_back() {
+        let dir = std::env::temp_dir().join(format!("gyre-cfgset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "# 顶部注释必须保留\n[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://x\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        // 标量：整数 / 浮点 / 布尔 / 裸字符串 / 引号字符串。
+        Config::set_key_at(&path, "default_model.max_output_tokens", "8192").unwrap();
+        Config::set_key_at(&path, "agent.context_window_guard", "0.75").unwrap();
+        Config::set_key_at(&path, "agent.enable_thinking", "true").unwrap();
+        Config::set_key_at(&path, "agent.mode", "code").unwrap();
+        Config::set_key_at(&path, "language", "zh").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# 顶部注释必须保留"),
+            "注释必须保留：\n{text}"
+        );
+        let merged = load_merged_value(std::slice::from_ref(&path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged["default_model"]["max_output_tokens"].as_integer(),
+            Some(8192)
+        );
+        assert_eq!(
+            merged["agent"]["context_window_guard"].as_float(),
+            Some(0.75)
+        );
+        assert_eq!(merged["agent"]["enable_thinking"].as_bool(), Some(true));
+        assert_eq!(merged["agent"]["mode"].as_str(), Some("code"));
+        assert_eq!(merged["language"].as_str(), Some("zh"));
+
+        // 数组（裸词 → 字符串元素）。
+        Config::set_key_at(&path, "hooks", "[]").ok(); // 允许（空数组合法）
+        let bad_before = std::fs::read_to_string(&path).unwrap();
+        // 非法值（越界）→ 校验失败并回滚到写入前内容。
+        let err = Config::set_key_at(&path, "agent.context_window_guard", "9.0").unwrap_err();
+        assert!(err.to_string().contains("回滚"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bad_before,
+            "失败写入必须回滚"
+        );
+
+        // 数组表不可用点分键写入（明确报错而非静默破坏结构）。
+        let err = Config::set_key_at(&path, "models.id", "x").unwrap_err();
+        assert!(err.to_string().contains("数组表"), "{err}");
+        // 空键拒绝。
+        assert!(Config::set_key_at(&path, "  ", "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H23：标量类型推断。
+    #[test]
+    fn scalar_to_item_infers_types() {
+        assert!(
+            scalar_to_item("true")
+                .as_value()
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            scalar_to_item("42").as_value().unwrap().as_integer(),
+            Some(42)
+        );
+        assert_eq!(
+            scalar_to_item("1.5").as_value().unwrap().as_float(),
+            Some(1.5)
+        );
+        assert_eq!(
+            scalar_to_item("code").as_value().unwrap().as_str(),
+            Some("code")
+        );
+        assert_eq!(
+            scalar_to_item("\"quoted\"").as_value().unwrap().as_str(),
+            Some("quoted")
+        );
+        let arr = scalar_to_item("[read_file, grep, 3]");
+        let arr = arr.as_value().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.get(0).unwrap().as_str(), Some("read_file"));
+        assert_eq!(arr.get(2).unwrap().as_integer(), Some(3));
+    }
+
+    /// H23：`config_candidates` 顺序为 用户 → 项目（项目覆盖用户）。
+    #[test]
+    fn config_candidates_are_user_then_project() {
+        let candidates = config_candidates(Path::new("/tmp/proj"));
+        assert_eq!(candidates.len(), 2, "应有两层: {candidates:?}");
+        assert!(candidates[0].ends_with("config.toml"));
+        assert!(
+            candidates[0]
+                .parent()
+                .is_some_and(|p| !p.ends_with(".agent"))
+        );
+        assert!(candidates[1].ends_with(".agent/config.toml"));
+    }
+    #[test]
+    fn hook_event_names_match_core_vocabulary() {
+        let configured = [
+            HookEventKind::SessionStart,
+            HookEventKind::SessionShutdown,
+            HookEventKind::BeforeAgentStart,
+            HookEventKind::AgentStart,
+            HookEventKind::AgentEnd,
+            HookEventKind::TurnStart,
+            HookEventKind::TurnEnd,
+            HookEventKind::ToolCall,
+            HookEventKind::ToolResult,
+            HookEventKind::Stop,
+            HookEventKind::AutoCompactionStart,
+            HookEventKind::AutoCompactionEnd,
+            HookEventKind::AutoRetryStart,
+            HookEventKind::AutoRetryEnd,
+            HookEventKind::RetryFallbackApplied,
+            HookEventKind::RetryFallbackSucceeded,
+            HookEventKind::TtsrTriggered,
+        ];
+        let mut names: Vec<&str> = configured.iter().map(|e| e.as_str()).collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = agent_core::hook::HOOK_EVENT_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "配置事件名与 core 清单漂移");
+        // 全部名字都能从 TOML 字符串解析（含旧别名）。
+        for name in expected {
+            let src = format!("[[hooks]]\nevent = \"{name}\"\ncommand = \"true\"\n");
+            let cfg: Config = toml::from_str(&format!(
+                "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://x\"\n{src}"
+            ))
+            .unwrap_or_else(|e| panic!("event={name} 应可解析: {e}"));
+            assert_eq!(cfg.hooks[0].event.as_str(), name);
+        }
+        // 旧别名仍可用（向后兼容）。
+        let legacy: Config = toml::from_str(
+            "[default_model]\nid = \"m\"\napi = \"deepseek\"\nbase_url = \"https://x\"\n[[hooks]]\nevent = \"before_tool\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.hooks[0].event, HookEventKind::ToolCall);
+        assert!(legacy.hooks[0].event.is_decidable());
+        // 仅 tool_call 可决策。
+        assert!(!HookEventKind::TurnStart.is_decidable());
+        assert!(!HookEventKind::Stop.is_decidable());
+    }
+
     #[test]
     fn hooks_parse_from_toml() {
         let src = r#"
@@ -2053,7 +3084,9 @@ command = "/bin/notify"
         let cfg: Config = toml::from_str(src).expect("解析应成功");
         assert_eq!(cfg.hooks.len(), 2);
         let h0 = &cfg.hooks[0];
-        assert_eq!(h0.event, HookEventKind::BeforeTool);
+        assert_eq!(h0.event, HookEventKind::ToolCall);
+        assert_eq!(h0.event.as_str(), "tool_call");
+        assert!(h0.event.is_decidable());
         assert_eq!(h0.tool.as_deref(), Some("shell"));
         assert_eq!(h0.command, "/bin/gate");
         assert_eq!(h0.timeout_secs, Some(5));

@@ -2,8 +2,8 @@
 //!
 //! 真实热路径函数（crates/tools/src/search.rs 的 `GrepTool` / `GlobTool` 经
 //! `spawn_blocking` 委托到 agent-search）：
-//! - `agent_search::grep(root, pattern, max_hits)`：crates/search/src/lib.rs:42
-//!   （ignore 并行遍历 + 逐行正则匹配；工具调用参数 `(root, pattern, 50)`）
+//! - `agent_search::grep_opts(root, pattern, opts)`：crates/search/src/lib.rs
+//!   （ignore 并行遍历 + 逐行正则匹配；工具调用参数 `GrepOptions::default()`）
 //! - `agent_search::glob_match(root, pattern, max)`：crates/search/src/lib.rs:105
 //!   （globset 匹配 + `fs_cache` 扫描缓存；工具调用参数 `(root, pattern, 100)`）
 //! - 内存行匹配内核 `agent_search::highlight_match(line, pattern)`：
@@ -15,7 +15,7 @@
 use std::hint::black_box;
 use std::path::Path;
 
-use agent_search::{glob_match, grep, highlight_match};
+use agent_search::{glob_match, grep_opts, highlight_match};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// 小仓库规模：200 个文件（约 8k 行），模拟一次轻量工作区遍历。
@@ -70,8 +70,13 @@ fn bench_grep(c: &mut Criterion) {
     build_fixture(dir.path());
     c.bench_function("grep/todo_200_files", |b| {
         b.iter(|| {
-            let hits = grep(dir.path(), GREP_PATTERN, FILE_COUNT).expect("grep 基准正则合法");
-            black_box(hits);
+            let outcome = grep_opts(
+                dir.path(),
+                GREP_PATTERN,
+                &agent_search::GrepOptions::default(),
+            )
+            .expect("grep 基准正则合法");
+            black_box(outcome.hits);
         });
     });
 }

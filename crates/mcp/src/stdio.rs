@@ -12,7 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::client::{McpError, McpTransport, NotificationHandler, resolve_timeout};
+use crate::client::{
+    McpError, McpTransport, NotificationHandler, ServerRequestHandler, resolve_timeout,
+    server_request_error, server_request_result,
+};
 
 /// MCP stdout 单行最大字节数：超过即丢弃缓冲（防无换行的超长行 OOM）。
 const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -21,9 +24,12 @@ const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) struct StdioTransport {
     /// server→client 通知处理器槽（读 task 与 `set_on_notification` 共享）。
     notifications: Arc<parking_lot::Mutex<Option<NotificationHandler>>>,
+    /// server→client **请求**处理器槽（H16；有 `method` 且有 `id` 的帧必须应答）。
+    server_requests: Arc<parking_lot::Mutex<Option<ServerRequestHandler>>>,
     /// 异常断连处理器槽（读 task 退出时触发；主动 `close` 前由 [`McpClient`] 摘除）。
     on_close: Arc<parking_lot::Mutex<Option<crate::client::CloseHandler>>>,
-    write: Mutex<ChildStdin>,
+    /// 写端共享句柄：请求路径与读 task（应答 server→client 请求）共用，避免交错误帧。
+    write: Arc<Mutex<ChildStdin>>,
     child: Mutex<Child>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -60,6 +66,11 @@ impl StdioTransport {
 
         let notifications: Arc<parking_lot::Mutex<Option<NotificationHandler>>> =
             Arc::new(parking_lot::Mutex::new(None));
+        let server_requests: Arc<parking_lot::Mutex<Option<ServerRequestHandler>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let write: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin));
+        let server_requests_clone = Arc::clone(&server_requests);
+        let write_clone = Arc::clone(&write);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         // 后台读 task：逐行解析 JSON-RPC，按 id 分发响应；stdout 关闭时清空 pending（rx 报错）。
@@ -91,7 +102,34 @@ impl StdioTransport {
                             let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                                 continue;
                             };
-                            if let Some(id) = val.get("id").and_then(Value::as_u64) {
+                            // H16：有 `method` **且**有 `id` → server→client 请求，必须应答
+                            // （此前与响应同路径处理：pending 查不到即静默丢弃 → server 永久等待）。
+                            if let (Some(id), Some(method)) =
+                                (val.get("id"), val.get("method").and_then(Value::as_str))
+                            {
+                                let params = val.get("params").cloned().unwrap_or(Value::Null);
+                                let answer = match server_requests_clone.lock().clone() {
+                                    Some(h) => h(id, method, &params),
+                                    None => Err((
+                                        crate::client::JSONRPC_METHOD_NOT_FOUND,
+                                        format!("Method not found: {method}"),
+                                    )),
+                                };
+                                let frame = match answer {
+                                    Ok(result) => server_request_result(id, result),
+                                    Err((code, message)) => {
+                                        server_request_error(id, code, &message)
+                                    }
+                                };
+                                let mut w = write_clone.lock().await;
+                                if let Ok(s) = serde_json::to_string(&frame) {
+                                    if w.write_all(s.as_bytes()).await.is_ok()
+                                        && w.write_all(b"\n").await.is_ok()
+                                    {
+                                        let _ = w.flush().await;
+                                    }
+                                }
+                            } else if let Some(id) = val.get("id").and_then(Value::as_u64) {
                                 let mut p = pending_clone.lock().await;
                                 if let Some(tx) = p.remove(&id) {
                                     let _ = tx.send(val);
@@ -140,7 +178,8 @@ impl StdioTransport {
         });
 
         Ok(Self {
-            write: Mutex::new(stdin),
+            server_requests,
+            write,
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
             pending,
@@ -208,6 +247,10 @@ impl McpTransport for StdioTransport {
 
     fn set_on_notification(&self, handler: NotificationHandler) {
         *self.notifications.lock() = Some(handler);
+    }
+
+    fn set_on_server_request(&self, handler: ServerRequestHandler) {
+        *self.server_requests.lock() = Some(handler);
     }
 
     fn set_on_close(&self, handler: crate::client::CloseHandler) {
