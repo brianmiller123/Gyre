@@ -364,7 +364,6 @@ name = "agent-iso"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "libc",
  "similar 3.1.1",
  "tokio",
 ]
